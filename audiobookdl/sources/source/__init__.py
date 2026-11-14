@@ -6,6 +6,7 @@ from audiobookdl.utils import CustomSSLContextHTTPAdapter
 
 # External imports
 import requests
+from requests.adapters import HTTPAdapter
 import lxml.html
 from lxml.cssselect import CSSSelector
 import re
@@ -31,12 +32,10 @@ class Source(Generic[T]):
     _authentication_methods: List[str] = [ "cookies" ]
     # Create database directory for source
     create_storage_dir: bool = False
-    # If cookies are loaded
-    __authenticated = False
-    # Cache of previously loaded pages
-    __pages: Dict[str, bytes] = {}
 
     def __init__(self, options: Any):
+        self.__authenticated: bool = False
+        self.__pages: Dict[str, bytes] = {}
         self.database_directory = os.path.join(options.database_directory, self.name)
         self.skip_downloaded = options.skip_downloaded
         self._session: requests.Session = self.create_session(options)
@@ -113,10 +112,10 @@ class Source(Generic[T]):
 
     def _get_page(self, url: str, use_cache: bool = True, **kwargs) -> bytes:
         """Download a page and caches it"""
-        if url not in self.__pages and use_cache:
-            resp = self.get(url, **kwargs)
-            if use_cache:
-                self.__pages[url] = resp
+        if not use_cache:
+            return self.get(url, **kwargs)
+        if url not in self.__pages:
+            self.__pages[url] = self.get(url, **kwargs)
         return self.__pages[url]
 
 
@@ -195,6 +194,12 @@ class Source(Generic[T]):
     def create_session(self, options: Any) -> requests.Session:
         session = requests.Session()
         ssl_context: SSLContext = self.create_ssl_context(options)
-        # session.adapters.pop("https://", None)
-        session.mount("https://", CustomSSLContextHTTPAdapter(ssl_context))
+        session.mount(
+            "https://",
+            CustomSSLContextHTTPAdapter(ssl_context, pool_connections=20, pool_maxsize=20),
+        )
+        session.mount(
+            "http://",
+            HTTPAdapter(pool_connections=20, pool_maxsize=20),
+        )
         return session

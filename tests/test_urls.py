@@ -1,10 +1,13 @@
+from audiobookdl.exceptions import NoSourceFound
 from audiobookdl.sources import find_compatible_source
+import pytest
 
 TEST_DATA = {
     "https://www.audiobooks.com/book/stream/413879": "Audiobooksdotcom",
     "https://www.audiobooks.com/browse/library": "Audiobooksdotcom",
     "https://www.bookbeat.no/bok/somethingsomething-999999": "BookBeat",
-    "https://ereolen.dk/ting/object/870970-basis%3A53978223": "Ereolen",
+    "https://bibliotek.kk.dk/work/work-of:870970-basis:53978223": "Ereolen",
+    "https://www.aakb.dk/work/work-of:870970-basis:53978223": "Ereolen",
     "https://www.everand.com/listen/579426746": "Everand",
     "https://www.chirpbooks.com/player/11435746": "Chirp",
     "https://librivox.org/library-of-the-worlds-best-literature-ancient-and-modern-volume-3-by-various/": "Librivox",
@@ -18,3 +21,10 @@ def test_url_to_source():
     for url, source_name in TEST_DATA.items():
         source = find_compatible_source(url)
         assert source.__name__ == source_name + "Source"
+
+
+def test_ereolen_rejects_empty_domain_and_unlisted_host():
+    with pytest.raises(NoSourceFound):
+        find_compatible_source("https://www./work/work-of:870970-basis:53978223")
+    with pytest.raises(NoSourceFound):
+        find_compatible_source("https://evil-aakb.dk/work/work-of:870970-basis:53978223")

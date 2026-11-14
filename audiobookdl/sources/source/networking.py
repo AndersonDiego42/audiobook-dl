@@ -1,7 +1,8 @@
 from audiobookdl import AudiobookFile, exceptions, logging
 from audiobookdl.utils.audiobook import AESEncryption
+from audiobookdl.utils.http import DEFAULT_HTTP_TIMEOUT
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 import json
 import os
 import m3u8
@@ -10,7 +11,8 @@ import requests
 
 def post(self, url: str, **kwargs) -> bytes:
     """Make post request with `Source` session"""
-    resp = self._session.post(url, **kwargs)
+    timeout = kwargs.pop("timeout", DEFAULT_HTTP_TIMEOUT)
+    resp = self._session.post(url, timeout=timeout, **kwargs)
     if resp.status_code == 200:
         return resp.content
     logging.debug(f"Failed to download data from: {url}\nResponse:\n{resp.content}")
@@ -19,14 +21,16 @@ def post(self, url: str, **kwargs) -> bytes:
 
 def get(self, url: str, force_cookies: bool = False, **kwargs) -> bytes:
     """Make get request with `Source` session"""
+    timeout = kwargs.pop("timeout", DEFAULT_HTTP_TIMEOUT)
     if force_cookies:
         resp = self._session.get(
             url,
             cookies=_get_all_cookies(self._session),
+            timeout=timeout,
             **kwargs
         )
     else:
-        resp = self._session.get(url, **kwargs)
+        resp = self._session.get(url, timeout=timeout, **kwargs)
     if resp.status_code == 200:
         return resp.content
     logging.debug(f"Failed to download data from: {url}\nResponse:\n{resp.content}")
@@ -45,9 +49,18 @@ def get_json(self, url: str, **kwargs) -> dict:
     return json.loads(resp.decode('utf8'))
 
 
-def get_stream_files(self, url: str, headers={}, extension=None, expected_content_type="application/octet-stream") -> List[AudiobookFile]:
+def get_stream_files(
+    self,
+    url: str,
+    headers: Optional[Dict[str, str]] = None,
+    extension=None,
+    expected_content_type="application/octet-stream",
+) -> List[AudiobookFile]:
     """Creates a list of audio files from an m3u8 file"""
-    playlist = m3u8.load(url, headers=headers)
+    if headers is None:
+        headers = {}
+    content = self.get(url, headers=headers).decode("utf-8")
+    playlist = m3u8.loads(content, uri=url)
     files = []
     for _, seg in enumerate(playlist.segments):
         if extension is None:

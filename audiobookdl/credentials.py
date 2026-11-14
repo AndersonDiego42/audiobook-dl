@@ -1,0 +1,331 @@
+from abc import ABC, abstractmethod
+import base64
+import ctypes
+from ctypes import wintypes
+import json
+import os
+from typing import Any, Dict, Optional, Tuple
+
+from audiobookdl import logging
+
+
+PLAINTEXT_OPT_IN_ENV = "AUDIOBOOK_DL_ALLOW_PLAINTEXT_CREDENTIALS"
+_CRYPTPROTECT_UI_FORBIDDEN = 0x1
+
+
+class CredentialStore(ABC):
+    """Abstract storage backend for service passwords."""
+
+    is_secure: bool = True
+
+    @abstractmethod
+    def get_password(self, service_key: str, username: Optional[str]) -> Optional[str]:
+        """Retrieve stored password for `(service_key, username)`, or `None`."""
+
+    @abstractmethod
+    def set_password(
+        self, service_key: str, username: Optional[str], password: str
+    ) -> None:
+        """Persist `password` for `(service_key, username)`."""
+
+    @abstractmethod
+    def delete_password(self, service_key: str, username: Optional[str]) -> None:
+        """Remove any stored password for `(service_key, username)`."""
+
+    def stored_services(self) -> Dict[str, Optional[str]]:
+        """Return `{service_key: username}` for entries known to this store."""
+        return {}
+
+
+class _DataBlob(ctypes.Structure):
+    _fields_ = [
+        ("cbData", wintypes.DWORD),
+        ("pbData", ctypes.POINTER(ctypes.c_ubyte)),
+    ]
+
+
+def _make_blob(data: bytes) -> Tuple[_DataBlob, Optional[ctypes.Array]]:
+    if not data:
+        return _DataBlob(0, None), None
+    buf = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
+    return _DataBlob(len(data), buf), buf
+
+
+def _dpapi_entropy(service_key: str, username: Optional[str]) -> bytes:
+    return f"audiobook-dl\0{service_key}\0{username or ''}".encode("utf-8")
+
+
+def _dpapi_protect(plaintext: bytes, entropy: bytes) -> bytes:
+    crypt32 = ctypes.windll.crypt32  # type: ignore[attr-defined]
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    crypt32.CryptProtectData.argtypes = [
+        ctypes.POINTER(_DataBlob),
+        wintypes.LPCWSTR,
+        ctypes.POINTER(_DataBlob),
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(_DataBlob),
+    ]
+    crypt32.CryptProtectData.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+    kernel32.LocalFree.restype = wintypes.HLOCAL
+
+    in_blob, _in_buf = _make_blob(plaintext)
+    entropy_blob, _ent_buf = _make_blob(entropy)
+    out_blob = _DataBlob()
+    ok = crypt32.CryptProtectData(
+        ctypes.byref(in_blob),
+        "audiobook-dl",
+        ctypes.byref(entropy_blob),
+        None,
+        None,
+        _CRYPTPROTECT_UI_FORBIDDEN,
+        ctypes.byref(out_blob),
+    )
+    if not ok:
+        raise ctypes.WinError()  # type: ignore[attr-defined]
+    try:
+        return bytes(
+            ctypes.cast(
+                out_blob.pbData,
+                ctypes.POINTER(ctypes.c_ubyte * out_blob.cbData),
+            ).contents
+        )
+    finally:
+        kernel32.LocalFree(out_blob.pbData)
+
+
+def _dpapi_unprotect(ciphertext: bytes, entropy: bytes) -> bytes:
+    crypt32 = ctypes.windll.crypt32  # type: ignore[attr-defined]
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    crypt32.CryptUnprotectData.argtypes = [
+        ctypes.POINTER(_DataBlob),
+        ctypes.POINTER(wintypes.LPWSTR),
+        ctypes.POINTER(_DataBlob),
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(_DataBlob),
+    ]
+    crypt32.CryptUnprotectData.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+    kernel32.LocalFree.restype = wintypes.HLOCAL
+
+    in_blob, _in_buf = _make_blob(ciphertext)
+    entropy_blob, _ent_buf = _make_blob(entropy)
+    out_blob = _DataBlob()
+    ok = crypt32.CryptUnprotectData(
+        ctypes.byref(in_blob),
+        None,
+        ctypes.byref(entropy_blob),
+        None,
+        None,
+        _CRYPTPROTECT_UI_FORBIDDEN,
+        ctypes.byref(out_blob),
+    )
+    if not ok:
+        raise ctypes.WinError()  # type: ignore[attr-defined]
+    try:
+        return bytes(
+            ctypes.cast(
+                out_blob.pbData,
+                ctypes.POINTER(ctypes.c_ubyte * out_blob.cbData),
+            ).contents
+        )
+    finally:
+        kernel32.LocalFree(out_blob.pbData)
+
+
+class DpapiCredentialStore(CredentialStore):
+    """Windows DPAPI-encrypted credential vault stored alongside `audiobook-dl.toml`."""
+
+    is_secure = True
+
+    def __init__(self, vault_path: str) -> None:
+        self.vault_path = vault_path
+
+    def _read_entries(self) -> Dict[str, Dict[str, Any]]:
+        if not os.path.exists(self.vault_path):
+            return {}
+        try:
+            with open(self.vault_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            entries = data.get("entries")
+            if isinstance(entries, dict):
+                return entries
+        except (OSError, ValueError, TypeError) as exc:
+            logging.debug(f"Failed to read DPAPI credential vault '{self.vault_path}': {exc}")
+        return {}
+
+    def _write_entries(self, entries: Dict[str, Dict[str, Any]]) -> None:
+        if not entries:
+            if os.path.exists(self.vault_path):
+                os.remove(self.vault_path)
+            return
+        parent = os.path.dirname(os.path.abspath(self.vault_path))
+        os.makedirs(parent, exist_ok=True)
+        tmp_path = f"{self.vault_path}.tmp"
+        payload = {"version": 1, "entries": entries}
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp_path, self.vault_path)
+
+    def get_password(self, service_key: str, username: Optional[str]) -> Optional[str]:
+        entries = self._read_entries()
+        entry = entries.get(service_key)
+        if not isinstance(entry, dict):
+            return None
+        stored_user = entry.get("username")
+        if stored_user != username:
+            return None
+        encoded = entry.get("ciphertext")
+        if not isinstance(encoded, str) or not encoded:
+            return None
+        try:
+            encrypted = base64.b64decode(encoded.encode("ascii"))
+            decrypted = _dpapi_unprotect(encrypted, _dpapi_entropy(service_key, username))
+            return decrypted.decode("utf-8")
+        except Exception as exc:
+            logging.debug(f"Failed to decrypt stored password for '{service_key}': {exc}")
+            return None
+
+    def set_password(
+        self, service_key: str, username: Optional[str], password: str
+    ) -> None:
+        encrypted = _dpapi_protect(
+            password.encode("utf-8"),
+            _dpapi_entropy(service_key, username),
+        )
+        entries = self._read_entries()
+        entries[service_key] = {
+            "username": username,
+            "ciphertext": base64.b64encode(encrypted).decode("ascii"),
+        }
+        self._write_entries(entries)
+
+    def delete_password(self, service_key: str, username: Optional[str]) -> None:
+        entries = self._read_entries()
+        entry = entries.get(service_key)
+        if not isinstance(entry, dict):
+            return
+        if username is None or entry.get("username") == username:
+            entries.pop(service_key, None)
+            self._write_entries(entries)
+
+    def stored_services(self) -> Dict[str, Optional[str]]:
+        return {
+            service_key: entry.get("username")
+            for service_key, entry in self._read_entries().items()
+            if isinstance(entry, dict)
+        }
+
+
+class KeyringCredentialStore(CredentialStore):
+    """Cross-platform OS keyring store backed by the `keyring` package."""
+
+    is_secure = True
+    _SERVICE_NAME = "audiobook-dl"
+
+    def __init__(self, keyring_module: Any) -> None:
+        self._keyring = keyring_module
+
+    @staticmethod
+    def _account_key(service_key: str, username: Optional[str]) -> str:
+        return f"{service_key}:{username or ''}"
+
+    def get_password(self, service_key: str, username: Optional[str]) -> Optional[str]:
+        try:
+            return self._keyring.get_password(
+                self._SERVICE_NAME,
+                self._account_key(service_key, username),
+            )
+        except Exception as exc:
+            logging.debug(f"Keyring lookup failed for '{service_key}': {exc}")
+            return None
+
+    def set_password(
+        self, service_key: str, username: Optional[str], password: str
+    ) -> None:
+        self._keyring.set_password(
+            self._SERVICE_NAME,
+            self._account_key(service_key, username),
+            password,
+        )
+
+    def delete_password(self, service_key: str, username: Optional[str]) -> None:
+        try:
+            self._keyring.delete_password(
+                self._SERVICE_NAME,
+                self._account_key(service_key, username),
+            )
+        except Exception as exc:
+            logging.debug(f"Keyring delete ignored for '{service_key}': {exc}")
+
+
+class PlaintextFallbackCredentialStore(CredentialStore):
+    """Fallback used when no OS keystore is available."""
+
+    is_secure = False
+
+    def __init__(self, allow_plaintext: bool = False) -> None:
+        self.allow_plaintext = allow_plaintext
+
+    def get_password(self, service_key: str, username: Optional[str]) -> Optional[str]:
+        return None
+
+    def set_password(
+        self, service_key: str, username: Optional[str], password: str
+    ) -> None:
+        if self.allow_plaintext:
+            logging.log(
+                f"Warning: No OS keyring backend available; saving password for "
+                f"'{service_key}' in plaintext."
+            )
+        else:
+            logging.log(
+                f"Warning: No OS keyring backend available; password for '{service_key}' "
+                f"was not persisted. Set {PLAINTEXT_OPT_IN_ENV}=1 to allow plaintext storage."
+            )
+
+    def delete_password(self, service_key: str, username: Optional[str]) -> None:
+        return None
+
+
+def _is_usable_keyring_backend(keyring_module: Any) -> bool:
+    try:
+        backend = keyring_module.get_keyring()
+    except Exception:
+        return False
+    backend_mod = type(backend).__module__.lower()
+    if "fail" in backend_mod or "null" in backend_mod:
+        return False
+    return getattr(backend, "priority", 0) > 0
+
+
+def get_vault_path(config_location: str) -> str:
+    """Return path to the DPAPI vault file beside `config_location`."""
+    config_dir = os.path.dirname(os.path.abspath(config_location))
+    return os.path.join(config_dir, "credentials.dpapi")
+
+
+def get_credential_store(
+    config_location: str,
+    allow_plaintext: Optional[bool] = None,
+) -> CredentialStore:
+    """Select the primary OS-backed `CredentialStore` for the current platform."""
+    if os.name == "nt":
+        return DpapiCredentialStore(get_vault_path(config_location))
+    try:
+        import keyring  # type: ignore[import-not-found]
+    except ImportError:
+        keyring = None
+    if keyring is not None and _is_usable_keyring_backend(keyring):
+        return KeyringCredentialStore(keyring)
+    if allow_plaintext is None:
+        allow_plaintext = os.environ.get(PLAINTEXT_OPT_IN_ENV, "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+    return PlaintextFallbackCredentialStore(allow_plaintext=allow_plaintext)

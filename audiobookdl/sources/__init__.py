@@ -15,8 +15,47 @@ from .storytel import StorytelSource
 from .yourcloudlibrary import YourCloudLibrarySource
 
 from ..exceptions import NoSourceFound
+from dataclasses import dataclass
 import re
-from typing import Iterable, List, Type
+from typing import Iterable, List, Optional, Tuple, Type
+
+
+@dataclass(frozen=True)
+class ServiceInfo:
+    """Metadata describing a supported audiobook service."""
+    key: str
+    label: str
+    auth_methods: Tuple[str, ...]
+    login_fields: Tuple[str, ...]
+
+
+def get_available_services() -> List[ServiceInfo]:
+    """Return sorted metadata for all supported audiobook services."""
+    services = [
+        ServiceInfo(
+            key=cls.names[0].lower(),
+            label=" / ".join(cls.names),
+            auth_methods=tuple(cls._authentication_methods),
+            login_fields=tuple(cls.login_data),
+        )
+        for cls in get_source_classes()
+        if cls.names
+    ]
+    return sorted(services, key=lambda s: s.label.lower())
+
+
+def detect_service_key(url: str) -> Optional[str]:
+    """Return the canonical service key matching `url`, or `None` if unrecognized."""
+    candidate = url.strip()
+    if not candidate:
+        return None
+    if not (candidate.startswith("http://") or candidate.startswith("https://")):
+        candidate = f"https://{candidate}"
+    try:
+        source_cls = find_compatible_source(candidate)
+    except NoSourceFound:
+        return None
+    return source_cls.names[0].lower() if source_cls.names else None
 
 def find_compatible_source(url: str) -> Type[Source]:
     """Finds the first source that supports the given url"""

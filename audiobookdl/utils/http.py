@@ -1,4 +1,8 @@
+from typing import Tuple
 import requests
+
+
+DEFAULT_HTTP_TIMEOUT: Tuple[int, int] = (15, 60)
 
 
 def redirect_of(url: str, amount: int = 1) -> str | None:

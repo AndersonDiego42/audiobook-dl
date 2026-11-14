@@ -3,7 +3,8 @@ from audiobookdl import logging, Chapter, AudiobookMetadata, Cover
 from audiobookdl.utils import program_in_path
 
 import os
-from typing import Sequence
+import threading
+from typing import Optional, Sequence
 
 def add_metadata(filepath: str, metadata: AudiobookMetadata):
     """Adds metadata to the given audio file"""
@@ -25,12 +26,16 @@ def embed_cover(filepath: str, cover: Cover):
         logging.debug("Could not embed cover")
 
 
-def add_chapters(filepath: str, chapters: Sequence[Chapter]):
+def add_chapters(
+    filepath: str,
+    chapters: Sequence[Chapter],
+    cancel_event: Optional[threading.Event] = None,
+):
     """Adds chapters to the given audio file"""
     if id3.is_id3_file(filepath):
         id3.add_id3_chapters(filepath, chapters)
     elif program_in_path("ffmpeg"):
-        ffmpeg.add_chapters_ffmpeg(filepath, chapters)
+        ffmpeg.add_chapters_ffmpeg(filepath, chapters, cancel_event=cancel_event)
     else:
         if logging.debug_mode:
             logging.debug("Could not add chapters")

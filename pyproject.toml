@@ -41,6 +41,9 @@ dynamic = ["version"]
 [project.scripts]
 audiobook-dl = "audiobookdl.__main__:main"
 
+[project.gui-scripts]
+audiobook-dl-gui = "audiobookdl.gui:main"
+
 [tool.setuptools.dynamic]
 version = {attr = "audiobookdl.__version__"}
 
@@ -48,7 +51,7 @@ version = {attr = "audiobookdl.__version__"}
 include = ["audiobookdl*"]
 
 [tool.setuptools.package-data]
-audiobookdl = ["*.txt"]
+audiobookdl = ["assets/*.txt", "assets/errors/*.txt", "assets/sources/**/*"]
 
 [tool.mypy]
 ignore_missing_imports = true

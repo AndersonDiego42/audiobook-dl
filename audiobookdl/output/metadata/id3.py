@@ -1,7 +1,7 @@
-import re
 import os
 from datetime import date
 from audiobookdl import logging, Chapter, AudiobookMetadata, Cover
+from ._cover import normalize_cover_image
 
 from mutagen import File as MutagenFile
 from mutagen.easyid3 import EasyID3, EasyID3KeyError
@@ -58,8 +58,8 @@ EXTENSION_TO_MIMETYPE = {
 
 def is_id3_file(filepath: str) -> bool:
     """Returns true if `filepath` points to an id3 file"""
-    ext = re.search(r"(?<=(\.))\w+$", filepath)
-    return ext is not None and ext.group(0) in ID3_FORMATS
+    ext = os.path.splitext(filepath)[1][1:].lower()
+    return ext in ID3_FORMATS
 
 
 def add_id3_metadata(filepath: str, metadata: AudiobookMetadata):
@@ -85,13 +85,14 @@ def add_id3_metadata(filepath: str, metadata: AudiobookMetadata):
 
 
 def embed_id3_cover(filepath: str, cover: Cover):
-    mimetype = EXTENSION_TO_MIMETYPE[cover.extension]
+    image_data, ext = normalize_cover_image(cover)
+    mimetype = EXTENSION_TO_MIMETYPE[ext]
     try:
         audio = ID3(filepath)
     except ID3NoHeaderError:
-        return
-    audio.add(APIC(type=0, data=cover.image, mime=mimetype))
-    audio.save()
+        audio = ID3()
+    audio.add(APIC(type=3, data=image_data, mime=mimetype))
+    audio.save(filepath)
 
 
 def add_id3_chapter(audio: ID3, start: int, end: int, title: str, index: int):
@@ -106,15 +107,32 @@ def add_id3_chapter(audio: ID3, start: int, end: int, title: str, index: int):
 
 def add_id3_chapters(filepath: str, chapters: Sequence[Chapter]):
     """Adds chapters to the given audio file"""
-    audio = ID3(filepath)
+    if not chapters:
+        return
+    try:
+        audio = ID3(filepath)
+    except ID3NoHeaderError:
+        audio = ID3()
+    audio.delall("CTOC")
+    audio.delall("CHAP")
+    child_ids = []
     for i in range(len(chapters)-1):
+        index = i + 1
+        child_ids.append(f"chp{index}")
         add_id3_chapter(
             audio,
             start = chapters[i].start,
             end = chapters[i+1].start,
             title = chapters[i].title,
-            index = i+1
+            index = index
         )
-    length = MutagenFile(filepath).info.length*1000
-    add_id3_chapter(audio, chapters[-1].start, length, chapters[-1].title, len(chapters))
-    audio.save()
+    length = int(MutagenFile(filepath).info.length*1000)
+    last_index = len(chapters)
+    child_ids.append(f"chp{last_index}")
+    add_id3_chapter(audio, chapters[-1].start, length, chapters[-1].title, last_index)
+    audio.add(CTOC(
+        element_id="toc",
+        flags=CTOCFlags.TOP_LEVEL | CTOCFlags.ORDERED,
+        child_element_ids=child_ids,
+    ))
+    audio.save(filepath)

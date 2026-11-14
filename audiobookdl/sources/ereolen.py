@@ -17,9 +17,13 @@ class EreolenSource(Source):
     ]
     names = [ "eReolen" ]
     login_data = [ "username", "password" ]
-    library_domains = utils.read_asset_file("assets/sources/ereolen/libraries.txt").split("\n")
+    library_domains = [
+        line.strip()
+        for line in utils.read_asset_file("assets/sources/ereolen/libraries.txt").splitlines()
+        if line.strip()
+    ]
     match = [
-        rf"https://(www.)?({"|".join(library_domains)})/work/work-of:.+",
+        rf"https://(www\.)?({'|'.join(re.escape(d) for d in library_domains)})/work/work-of:.+",
     ]
 
     def _login(self, url: str, username: str, password: str):

@@ -1,16 +1,17 @@
-import re
+import os
 from datetime import date
 
 from audiobookdl import logging, AudiobookMetadata, Cover
+from ._cover import normalize_cover_image
 from mutagen.easymp4 import EasyMP4, EasyMP4Tags
-from mutagen.mp4 import MP4, MP4Cover, Chapter as MP4Chapter, MP4Chapters
+from mutagen.mp4 import MP4, MP4Cover
 
 MP4_EXTENSIONS = ["mp4","m4a","m4p","m4b","m4r","m4v"]
 
 MP4_CONVERT = {
     "authors": "artist",
     "narrators": "narrator",
-    "publishers": "publisher",
+    "publisher": "publisher",
     "series": "album",
     "title": "title",
     "genres": "genre",
@@ -29,9 +30,9 @@ EasyMP4Tags.RegisterTextKey("track", '\xa9trk')
 EasyMP4Tags.RegisterFreeformKey("scrape_url", "URL")
 
 def is_mp4_file(filepath: str) -> bool:
-    """Returns true if `filepath` points to an id3 file"""
-    ext = re.search(r"(?<=(\.))\w+$", filepath)
-    return ext is not None and ext.group(0) in MP4_EXTENSIONS
+    """Returns true if `filepath` points to an mp4 file"""
+    ext = os.path.splitext(filepath)[1][1:].lower()
+    return ext in MP4_EXTENSIONS
 
 
 def add_mp4_metadata(filepath: str, metadata: AudiobookMetadata):
@@ -59,10 +60,11 @@ def add_mp4_metadata(filepath: str, metadata: AudiobookMetadata):
 
 
 def embed_mp4_cover(filepath: str, cover: Cover):
-    if not cover.extension in MP4_COVER_FORMATS:
+    image_data, ext = normalize_cover_image(cover)
+    if ext not in MP4_COVER_FORMATS:
         return
     audio = MP4(filepath)
     audio["covr"] = [
-        MP4Cover(cover.image, imageformat=MP4_COVER_FORMATS[cover.extension])
+        MP4Cover(image_data, imageformat=MP4_COVER_FORMATS[ext])
     ]
     audio.save()

@@ -5,6 +5,39 @@ from audiobookdl import __version__
 from typing import Any, List
 
 
+def default_database_directory() -> str:
+    """Return the default directory for sources to store data."""
+    return os.path.join(appdirs.user_config_dir("audiobook-dl", "jo1gi"), "db")
+
+
+def build_default_options(**overrides: Any) -> argparse.Namespace:
+    """Build an options Namespace matching CLI defaults with optional overrides."""
+    defaults = {
+        "urls": [],
+        "cookie_file": None,
+        "combine": False,
+        "output_template": "{title}",
+        "remove_chars": "",
+        "debug": False,
+        "quiet": False,
+        "print_output": False,
+        "cover": False,
+        "no_chapters": False,
+        "output_format": None,
+        "ffmpeg_output": False,
+        "input_file": None,
+        "username": None,
+        "password": None,
+        "library": None,
+        "skip_downloaded": False,
+        "database_directory": default_database_directory(),
+        "write_json_metadata": False,
+        "config_location": None,
+    }
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
 def parse_arguments() -> Any:
     parser = argparse.ArgumentParser(
         prog="audiobook-dl",
@@ -120,7 +153,7 @@ def parse_arguments() -> Any:
         '--database_directory',
         dest="database_directory",
         help="Directory for sources to store data (default: %(default)s)",
-        default=os.path.join(appdirs.user_config_dir("audiobook-dl", "jo1gi"), "db")
+        default=default_database_directory()
     )
     parser.add_argument(
         '--write-json-metadata',

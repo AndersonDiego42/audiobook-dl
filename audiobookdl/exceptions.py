@@ -64,3 +64,11 @@ class GenericAudiobookDLException(AudiobookDLException):
 
 class DownloadError(AudiobookDLException):
     error_description: str = "download_error"
+
+
+class DownloadCancelled(AudiobookDLException):
+    error_description: str = "cancelled"
+
+    def print(self) -> None:
+        from .logging import log
+        log("Download cancelled")

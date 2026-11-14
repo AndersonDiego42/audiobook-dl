@@ -1,5 +1,8 @@
 import importlib.resources
-from typing import Sequence
+import os
+import subprocess
+import sys
+from typing import Any, Dict, Optional, Sequence
 import shutil
 from urllib3.poolmanager import PoolManager
 from requests.adapters import HTTPAdapter
@@ -45,9 +48,48 @@ def read_asset_file(path: str) -> str:
         .read_text(encoding="utf8")
 
 
+def find_executable(program: str) -> Optional[str]:
+    """
+    Locate an external executable (e.g. ffmpeg, ffprobe).
+
+    Searches PyInstaller's bundle dir (`_MEIPASS`), the directory containing
+    the frozen executable, and finally the system PATH.
+    """
+    candidates = [program]
+    if os.name == "nt" and not program.lower().endswith(".exe"):
+        candidates.append(f"{program}.exe")
+
+    search_dirs = []
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            search_dirs.append(meipass)
+        search_dirs.append(os.path.dirname(sys.executable))
+
+    for directory in search_dirs:
+        for candidate in candidates:
+            full_path = os.path.join(directory, candidate)
+            if os.path.isfile(full_path):
+                return full_path
+
+    return shutil.which(program)
+
+
 def program_in_path(program: str) -> bool:
-    """Checks whethher `program` is in the path"""
-    return shutil.which(program) is not None
+    """Checks whether `program` is available locally or in PATH"""
+    return find_executable(program) is not None
+
+
+def subprocess_kwargs(capture_output: bool = True) -> Dict[str, Any]:
+    """Return platform-specific subprocess kwargs to avoid console flashes in windowed GUI apps."""
+    kwargs: Dict[str, Any] = {}
+    if (
+        os.name == "nt"
+        and hasattr(subprocess, "CREATE_NO_WINDOW")
+        and (capture_output or sys.stdout is None)
+    ):
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    return kwargs
 
 
 class CustomSSLContextHTTPAdapter(HTTPAdapter):

@@ -1,16 +1,27 @@
 from audiobookdl import Chapter, utils, logging
+from audiobookdl.utils.concurrency import run_cancellable_subprocess
 from mutagen import File as MutagenFile
-import subprocess
 import os
-from typing import Sequence
+import threading
+from typing import Optional, Sequence
 
-TMP_CHAPTER_FILE = "chapters.tmp.txt"
-TMP_MEDIA_FILE = "audiobook.tmp.mp4"
+def _escape_ffmetadata(text: str) -> str:
+    """Escape special FFMETADATA1 characters (=, ;, #, \\, and newlines)."""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    return (
+        normalized
+        .replace("\\", "\\\\")
+        .replace("=", "\\=")
+        .replace(";", "\\;")
+        .replace("#", "\\#")
+        .replace("\n", "\\\n")
+    )
+
 
 def create_chapter_text(title: str, start: int, end: int) -> str:
     chapter_template = utils.read_asset_file("assets/ffmpeg_chapter_template.txt")
     return chapter_template.format(
-        title = title,
+        title = _escape_ffmetadata(title),
         start = start,
         end = end
     )
@@ -18,6 +29,8 @@ def create_chapter_text(title: str, start: int, end: int) -> str:
 
 def create_tmp_chapter_file(filepath: str, chapters: Sequence[Chapter]) -> str:
     result = ";FFMETADATA1\n"
+    if not chapters:
+        return result
     for i in range(len(chapters)-1):
         chapter = chapters[i]
         result += create_chapter_text(chapter.title, chapter.start, chapters[i+1].start)
@@ -30,49 +43,63 @@ def create_tmp_chapter_file(filepath: str, chapters: Sequence[Chapter]) -> str:
     )
     return result
 
-def add_chapters_ffmpeg(filepath: str, chapters: Sequence[Chapter]):
+def add_chapters_ffmpeg(
+    filepath: str,
+    chapters: Sequence[Chapter],
+    cancel_event: Optional[threading.Event] = None,
+):
+    ffmpeg = utils.find_executable("ffmpeg")
+    if ffmpeg is None:
+        logging.log("ffmpeg not found; skipping chapter embedding")
+        return
+    stem, ext = os.path.splitext(filepath)
+    tmp_chapter_file = f"{filepath}.chapters.tmp.txt"
+    tmp_media_file = f"{stem}.tmp{ext or '.mp4'}"
+    capture = not logging.ffmpeg_output
     try:
-        with open(TMP_CHAPTER_FILE, "w") as f:
+        with open(tmp_chapter_file, "w", encoding="utf-8", newline="\n") as f:
             f.write(create_tmp_chapter_file(filepath, chapters))
-        result = subprocess.run(
-            ["ffmpeg", "-y",
+        result = run_cancellable_subprocess(
+            [ffmpeg, "-y",
              "-i", filepath,
-             "-i", TMP_CHAPTER_FILE,
+             "-i", tmp_chapter_file,
              "-map_chapters", "1",
              "-c", "copy",
              "-map", "0",
              "-metadata:s:a:0", "title=",
-             TMP_MEDIA_FILE],
-            capture_output = not logging.ffmpeg_output
+             tmp_media_file],
+            capture_output=capture,
+            cancel_event=cancel_event,
         )
         produced_output = (
-            os.path.exists(TMP_MEDIA_FILE) and os.path.getsize(TMP_MEDIA_FILE) > 0
+            os.path.exists(tmp_media_file) and os.path.getsize(tmp_media_file) > 0
         )
         if result.returncode != 0 or not produced_output:
             logging.debug("add_chapters_ffmpeg copy mode failed, retrying with re-encode")
-            if os.path.exists(TMP_MEDIA_FILE):
-                os.remove(TMP_MEDIA_FILE)
-            subprocess.run(
-                ["ffmpeg", "-y",
+            if os.path.exists(tmp_media_file):
+                os.remove(tmp_media_file)
+            run_cancellable_subprocess(
+                [ffmpeg, "-y",
                  "-i", filepath,
-                 "-i", TMP_CHAPTER_FILE,
+                 "-i", tmp_chapter_file,
                  "-map_chapters", "1",
                  "-c:a", "aac",
                  "-b:a", "128k",
                  "-map", "0",
                  "-metadata:s:a:0", "title=",
-                 TMP_MEDIA_FILE],
-                capture_output = not logging.ffmpeg_output
+                 tmp_media_file],
+                capture_output=capture,
+                cancel_event=cancel_event,
             )
         # ffmpeg produced no output: keep the chapterless original instead of crashing the run
-        if not (os.path.exists(TMP_MEDIA_FILE) and os.path.getsize(TMP_MEDIA_FILE) > 0):
+        if not (os.path.exists(tmp_media_file) and os.path.getsize(tmp_media_file) > 0):
             logging.log("Could not embed chapters; leaving file as-is")
             return
         os.remove(filepath)
-        os.rename(TMP_MEDIA_FILE, filepath)
+        os.rename(tmp_media_file, filepath)
     finally:
-        if os.path.exists(TMP_CHAPTER_FILE):
-            os.remove(TMP_CHAPTER_FILE)
-        if os.path.exists(TMP_MEDIA_FILE):
-            os.remove(TMP_MEDIA_FILE)
+        if os.path.exists(tmp_chapter_file):
+            os.remove(tmp_chapter_file)
+        if os.path.exists(tmp_media_file):
+            os.remove(tmp_media_file)
         
