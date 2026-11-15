@@ -417,7 +417,17 @@ def _parse_metadata_json(path: str) -> Tuple[Optional[AudiobookMetadata], List[C
     raw_series = payload.get("series")
     series_text: Optional[str] = None
     if isinstance(raw_series, list) and raw_series:
-        series_text = str(raw_series[0] or "").strip()
+        first_series = raw_series[0]
+        if isinstance(first_series, dict):
+            series_text = str(first_series.get("name") or "").strip()
+            if first_series.get("sequence") is not None and meta.series_order is None:
+                meta.series_order = _parse_series_order(first_series.get("sequence"))
+        else:
+            series_text = str(first_series or "").strip()
+    elif isinstance(raw_series, dict):
+        series_text = str(raw_series.get("name") or "").strip()
+        if raw_series.get("sequence") is not None and meta.series_order is None:
+            meta.series_order = _parse_series_order(raw_series.get("sequence"))
     elif isinstance(raw_series, str):
         series_text = raw_series.strip()
     if series_text:
@@ -430,8 +440,9 @@ def _parse_metadata_json(path: str) -> Tuple[Optional[AudiobookMetadata], List[C
     if payload.get("series_order") is not None and meta.series_order is None:
         meta.series_order = _parse_series_order(payload.get("series_order"))
 
-    if payload.get("release_date"):
-        meta.release_date = parse_release_date(str(payload["release_date"]))
+    rel_date_raw = payload.get("release_date") or payload.get("publishedDate") or payload.get("publishedYear")
+    if rel_date_raw:
+        meta.release_date = parse_release_date(str(rel_date_raw))
     if payload.get("language"):
         meta.language = _parse_language(payload["language"])
 
@@ -443,11 +454,15 @@ def _parse_metadata_json(path: str) -> Tuple[Optional[AudiobookMetadata], List[C
                 continue
             ch_title = str(item.get("title") or "").strip()
             start_ms = item.get("start_ms")
-            if start_ms is None and item.get("start_seconds") is not None:
-                try:
-                    start_ms = round(float(item["start_seconds"]) * 1000)
-                except (TypeError, ValueError):
-                    start_ms = None
+            if start_ms is None:
+                sec_val = item.get("start_seconds")
+                if sec_val is None:
+                    sec_val = item.get("start")
+                if sec_val is not None:
+                    try:
+                        start_ms = round(float(sec_val) * 1000)
+                    except (TypeError, ValueError):
+                        start_ms = None
             if ch_title and start_ms is not None:
                 try:
                     chapters.append(Chapter(start=max(0, int(start_ms)), title=ch_title))

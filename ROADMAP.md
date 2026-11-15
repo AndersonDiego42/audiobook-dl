@@ -23,23 +23,23 @@ This document catalogs verified bugs, performance bottlenecks, security/resilien
 ### Core, Pipeline & Encryption
 - [x] **Fix failed-job error formatting in GUI** — [`audiobookdl/gui/app.py`](audiobookdl/gui/app.py#L2839-L2841)  
   `summary.book_errors` is `List[Tuple[str, str]]` per [`audiobookdl/pipeline.py`](audiobookdl/pipeline.py#L39). Currently `detail = summary.book_errors[0]` yields a tuple and `detail[:120]` slices a tuple instead of formatting a string (e.g., `f"{detail[0]}: {detail[1]}"[:120]`).
-- [ ] **Integrate `downloads.db` ledger with `skip_downloaded`** — [`audiobookdl/pipeline.py`](audiobookdl/pipeline.py#L771-L799)  
+- [x] **Integrate `downloads.db` ledger with `skip_downloaded`** — [`audiobookdl/pipeline.py`](audiobookdl/pipeline.py#L771-L799)  
   `downloads.db` is written unconditionally when `database_directory` is set (L797), yet archive deduplication (L777–L784) only runs `if explicit_archive:` (`--download-archive`). Integrate default ledger checking with `options.skip_downloaded` (with an opt-out such as `--no-download-archive`) so repeated runs skip previously recorded books cleanly even if moved/renamed on disk.
 - [x] **Fix PKCS7 padding & block-alignment handling in AES decryption**
   - [`audiobookdl/output/encryption.py`](audiobookdl/output/encryption.py#L26-L32): `AESStreamDecryptor.finalize()` calls `self._cipher.decrypt(tail)` without guarding non-16-byte-aligned tails (which raises `ValueError`), and neither `AESStreamDecryptor` nor `decrypt_file_aes()` (L68) unpads PKCS7 trailing bytes.
   - [`audiobookdl/sources/chirp.py`](audiobookdl/sources/chirp.py#L70): `get_audio_url` strips `[:-1]` assuming padding length `1` instead of using proper PKCS7 unpadding (`Crypto.Util.Padding.unpad`), which corrupts decrypted URLs whenever padding length is `> 1`.
-- [ ] **Close leaked `requests.Session` instances & respect proxy/SSL config**
+- [x] **Close leaked `requests.Session` instances & respect proxy/SSL config**
   - [`audiobookdl/utils/http.py`](audiobookdl/utils/http.py#L18): `redirect_of()` calls bare `requests.get(...)` per hop, bypassing `Source._session`, cookies, custom headers, `SSLContext`, and `--proxy` (used by [`audiobookdl/sources/podimo.py`](audiobookdl/sources/podimo.py#L101)). Accept a `Session` or proxy/verify configuration instead.
   - [`audiobookdl/utils/enrichment.py`](audiobookdl/utils/enrichment.py#L23) (and L75) & [`audiobookdl/utils/updater.py`](audiobookdl/utils/updater.py#L66): Create unclosed `requests.Session()` objects whenever `session=None` (including calls from `pipeline.py` L340 & L787). Manage sessions with `with requests.Session() as sess:` or reuse a shared caller session.
-- [ ] **Remove module-global mutable state breaking `Downloader` isolation**
+- [x] **Remove module-global mutable state breaking `Downloader` isolation**
   - [`audiobookdl/utils/__init__.py`](audiobookdl/utils/__init__.py#L60): `_custom_ffmpeg_dir` is module-global, leaking across concurrent/multiple `Downloader` instances with distinct `Config.ffmpeg_dir`. Move it into `JobContext` / `DownloadOptions`.
   - [`audiobookdl/__main__.py`](audiobookdl/__main__.py#L26-L28): Mutates module-level flags on `audiobookdl.logging` even though `Downloader` encapsulates state in `JobContext`.
-- [ ] **Make directory preparation atomic (`setup_download_dir`)** — [`audiobookdl/output/download.py`](audiobookdl/output/download.py#L926)  
+- [x] **Make directory preparation atomic (`setup_download_dir`)** — [`audiobookdl/output/download.py`](audiobookdl/output/download.py#L926)  
   Calling `shutil.rmtree(path)` before downloading deletes an existing book directory up front; if a transfer fails or cancels mid-way, the previous files are lost. Stage downloads in a temporary directory and atomically replace/commit after completion.
 - [x] **Fix metadata typing, identity checks & dropped ID3 keys**
   - [`audiobookdl/utils/audiobook.py`](audiobookdl/utils/audiobook.py#L89): Replace `== None` / `== True` with `is None` / `is True`, and update `all_properties_dict()` ([L119](audiobookdl/utils/audiobook.py#L119)) return annotation from `Dict[str, str]` to match actual value types (`date`, `int`, `pycountry.db.Data`).
   - [`audiobookdl/output/metadata/id3.py`](audiobookdl/output/metadata/id3.py#L85-L86): Keys absent from `EasyID3.valid_keys` (such as `source`, unlike `isbn` registered at L18) are silently dropped, whereas [`audiobookdl/output/metadata/mp4.py`](audiobookdl/output/metadata/mp4.py#L69-L72) persists them as freeform atoms (`----:com.apple.iTunes:Source`). Register/map custom ID3 TXXX frames consistently.
-- [ ] **Wire Cancel support during GUI metadata previews** — [`audiobookdl/gui/app.py`](audiobookdl/gui/app.py#L2326-L2372)  
+- [x] **Wire Cancel support during GUI metadata previews** — [`audiobookdl/gui/app.py`](audiobookdl/gui/app.py#L2326-L2372)  
   `_preview_cancel_event` is initialized, yet the Cancel button stays disabled during preview fetches because `_set_running_state` is not engaged for preview jobs.
 
 ### Source Adapter Bugs
@@ -73,12 +73,12 @@ This document catalogs verified bugs, performance bottlenecks, security/resilien
 
 ## 3. Security, Reliability & Resilience
 
-- [ ] **Persist session cookies after normal `login()` with `0o600` permissions**
+- [x] **Persist session cookies after normal `login()` with `0o600` permissions**
   - [`audiobookdl/pipeline.py`](audiobookdl/pipeline.py#L629-L686): Save cookies after normal authentication in `authenticate()` (not solely inside `verify_service_auth()`) so subsequent CLI/GUI runs reuse live tokens instead of re-logging in on every execution.
   - [`audiobookdl/sources/source/__init__.py`](audiobookdl/sources/source/__init__.py#L105-L115): Enforce owner-only file permissions (`0o600` on POSIX / user-restricted ACLs on Windows) when writing cookie jars.
-- [ ] **Implement `KeyringCredentialStore.stored_services()` & multi-account profiles** — [`audiobookdl/credentials.py`](audiobookdl/credentials.py#L219-L269)  
+- [x] **Implement `KeyringCredentialStore.stored_services()` & multi-account profiles** — [`audiobookdl/credentials.py`](audiobookdl/credentials.py#L219-L269)  
   `KeyringCredentialStore` lacks `stored_services()` (implemented on `DpapiCredentialStore` at L219–L226), making Windows vs. Linux/macOS credential discovery inconsistent in [`audiobookdl/config.py`](audiobookdl/config.py#L313-L324). Support multiple named accounts per service (e.g., `storytel:personal`, `ereolen:card2`).
-- [ ] **Pre-commit media integrity verification**  
+- [x] **Pre-commit media integrity verification**  
   Validate downloaded/combined audio with `ffprobe` (verifying non-zero duration, valid audio stream, and truncation check) *before* replacing existing files or marking entries completed in `downloads.db`.
 - [ ] **Replace manual TOML writer with `tomli-w`** — [`audiobookdl/config.py`](audiobookdl/config.py)  
   Replace hand-rolled `_dump_toml()` serialization with `tomli-w` to eliminate edge-case escaping bugs on Windows paths, special characters in templates, or nested tables.
@@ -116,7 +116,7 @@ This document catalogs verified bugs, performance bottlenecks, security/resilien
   Add `--dry-run` (resolves templates, skip rules, and metadata without downloading) and generate Bash/Zsh/Fish/PowerShell completions.
 - [ ] **Audio post-processing & silence-based chaptering**  
   Add `--loudnorm` (EBU R128 normalization), `--mono` (voice-friendly size reduction), `--sample-rate`, `--chapters-from-silence` (FFmpeg `silencedetect` for chapterless books), `--chapter-offset <ms>`, and `--square-cover` / max-dimension cover resizing.
-- [ ] **Audiobookshelf `metadata.json` export**  
+- [x] **Audiobookshelf `metadata.json` export**  
   Generate Audiobookshelf-compatible `metadata.json` alongside existing `.opf` and `.cue` sidecars.
 
 ---

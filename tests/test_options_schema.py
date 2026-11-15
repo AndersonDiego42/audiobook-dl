@@ -46,10 +46,12 @@ def test_download_options_parity_with_schema():
 
 
 def test_config_fields_parity_with_schema():
-    cfg_fields = {f.name for f in attrs_fields(Config) if f.name not in ("sources", "gui")}
+    cfg_fields = {
+        f.name for f in attrs_fields(Config) if f.name not in ("sources", "gui", "audiobookshelf")
+    }
     schema_config_keys = {spec.config_key for spec in CONFIG_OPTION_SPECS if spec.config_key}
     assert schema_config_keys == cfg_fields
-    assert KNOWN_TOP_LEVEL_CONFIG_KEYS == ({"sources", "gui"} | schema_config_keys)
+    assert KNOWN_TOP_LEVEL_CONFIG_KEYS == ({"sources", "gui", "audiobookshelf"} | schema_config_keys)
 
     assert {f.name for f in attrs_fields(GuiConfig)} == set(GUI_CONFIG_KEYS)
     assert {f.name for f in attrs_fields(SourceConfig)} == set(SOURCE_CONFIG_KEYS)
@@ -172,6 +174,7 @@ def test_schema_driven_merge_and_preset_precedence(tmp_path):
             "write_json_metadata": True,
             "write_cover": True,
             "write_opf": True,
+            "write_abs_metadata": True,
             "write_cue": True,
             "enrich_metadata": True,
             "enrich_providers": "itunes,google",

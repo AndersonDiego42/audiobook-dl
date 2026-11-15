@@ -216,6 +216,7 @@ class GuiController:
         self.run_seen_urls: Set[str] = set()
         self.queue_records: Dict[str, Dict[str, Any]] = {}
         self.catalog_request_id = 0
+        self.preview_request_id = 0
         self._http_session: Optional[Any] = None
 
     @staticmethod
@@ -260,6 +261,7 @@ class GuiController:
         password: Optional[str] = None,
         library: Optional[str] = None,
         cookie_file: Optional[str] = None,
+        profile: Optional[str] = None,
     ) -> Config:
         save_source_credentials(
             service_key,
@@ -268,6 +270,7 @@ class GuiController:
             library=library,
             cookie_file=cookie_file,
             overwrite=self.config_location,
+            profile=profile,
         )
         return self.reload_config()
 
@@ -722,8 +725,16 @@ class GuiController:
             if saw_sentinel:
                 break
 
-    def start_preview(self, url: str, options: args.DownloadOptions) -> None:
+    def cancel_preview(self) -> None:
+        """Cancel any active metadata preview and unblock pending interaction prompts."""
+        self.preview_cancel_event.set()
+        if self.preview_interaction is not None:
+            self.preview_interaction.release_all()
+
+    def start_preview(self, url: str, options: args.DownloadOptions) -> int:
         """Fetch metadata and resolved `Result` for `url` on a background thread."""
+        self.preview_request_id += 1
+        request_id = self.preview_request_id
         self.preview_cancel_event.clear()
         interaction = GuiInteractionHandler(self.event_queue, self.preview_cancel_event)
         self.preview_interaction = interaction
@@ -731,10 +742,12 @@ class GuiController:
         def _worker() -> None:
             try:
                 config = self.config_snapshot()
+                ffmpeg_dir = config.ffmpeg_dir.strip() or None if config.ffmpeg_dir else None
                 ctx = logging.JobContext(
                     debug=options.debug,
                     quiet=options.quiet,
                     ffmpeg_output=options.ffmpeg_output or options.debug,
+                    ffmpeg_dir=ffmpeg_dir,
                     sink=self.sink,
                     interaction=interaction,
                     cancel_event=self.preview_cancel_event,
@@ -746,12 +759,20 @@ class GuiController:
                         config,
                         interaction=interaction,
                         cancel_event=self.preview_cancel_event,
+                        session=self.get_http_session(),
                     )
+                if self.preview_cancel_event.is_set() or request_id != self.preview_request_id:
+                    close_fn = getattr(source, "close", None)
+                    if callable(close_fn):
+                        close_fn()
+                    raise DownloadCancelled()
                 self.event_queue.put(("preview_done", url, (source, result), None))
             except Exception as exc:
-                self.event_queue.put(("preview_done", url, None, exc))
+                if request_id == self.preview_request_id:
+                    self.event_queue.put(("preview_done", url, None, exc))
 
         threading.Thread(target=_worker, daemon=True).start()
+        return request_id
 
     def start_auth_verification(
         self,

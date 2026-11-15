@@ -37,6 +37,7 @@ dependencies = [
 dynamic = ["version"]
 
 [project.optional-dependencies]
+export = ["openpyxl>=3.1"]
 dev = [
     "pytest>=8",
     "mypy>=1.10",
@@ -92,4 +93,5 @@ markers = [
     "e2e: End-to-end tests exercising real CLI/GUI processes, HTTP servers, and media pipelines",
     "gui: Tests requiring a Tkinter display",
     "ffmpeg: Tests requiring ffmpeg and ffprobe executables",
+    "real_integrity: Tests exercising real ffprobe media integrity verification without stubbing",
 ]

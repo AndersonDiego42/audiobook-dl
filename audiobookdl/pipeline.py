@@ -10,7 +10,14 @@ import requests
 
 from . import __version__, args, logging, output
 from .args import DownloadOptions
-from .config import Config, SourceConfig, load_config
+from .config import (
+    DEFAULT_PROFILE,
+    Config,
+    SourceConfig,
+    get_source_config,
+    load_config,
+    normalize_profile_name,
+)
 from .options_schema import MERGEABLE_OPTION_SPECS
 from .exceptions import (
     AudiobookDLException,
@@ -24,7 +31,6 @@ from .exceptions import (
 from .output.download import download
 from .sources import find_compatible_source, find_source_by_name
 from .sources.source import CatalogBook, Source
-from .utils import set_ffmpeg_dir
 from .utils.archive import DownloadArchive, default_archive_path, make_book_key
 from .utils.audiobook import Audiobook, BookId, Result, Series, is_ebook
 from .utils.enrichment import (
@@ -136,13 +142,13 @@ def apply_runtime_options(
             spec.merge_cast(cfg_value) if spec.merge_cast is not None else cfg_value,
         )
 
-    if config.ffmpeg_dir:
-        set_ffmpeg_dir(config.ffmpeg_dir)
+    ffmpeg_dir = config.ffmpeg_dir.strip() or None if config.ffmpeg_dir else None
     ffmpeg_out = options.ffmpeg_output or options.debug
     return logging.JobContext(
         debug=options.debug,
         quiet=options.quiet,
         ffmpeg_output=ffmpeg_out,
+        ffmpeg_dir=ffmpeg_dir,
     )
 
 
@@ -226,7 +232,10 @@ class Downloader:
 
     def fetch_metadata(self, url: str) -> Result:
         """Fetch `Audiobook` or `Series` metadata for `url` without downloading audio files."""
-        _, result = self.prepare(url)
+        source, result = self.prepare(url)
+        close_fn = getattr(source, "close", None)
+        if callable(close_fn):
+            close_fn()
         return result
 
     def download_result(
@@ -245,6 +254,7 @@ class Downloader:
                 interaction=self.interaction,
                 cancel_event=self.cancel_event,
                 selected_indices=selected_indices,
+                config=self.config,
             )
 
     def download(
@@ -451,6 +461,7 @@ def download_result(
     cancel_event: Optional[threading.Event] = None,
     selected_indices: Optional[Sequence[int]] = None,
     summary: Optional[DownloadSummary] = None,
+    config: Optional[Config] = None,
 ) -> None:
     """Download (or inspect when `options.info_only`) a resolved `Audiobook` or `Series` `Result`."""
     handler = interaction or logging.CliInteractionHandler()
@@ -483,6 +494,7 @@ def download_result(
             options,
             interaction=handler,
             cancel_event=cancel_event,
+            config=config,
         )
         if summary is not None:
             if processed is False:
@@ -528,6 +540,7 @@ def download_result(
                         options,
                         interaction=handler,
                         cancel_event=cancel_event,
+                        config=config,
                     )
                     if processed is False:
                         skip_count += 1
@@ -602,6 +615,7 @@ def process_url(
         cancel_event=cancel_event,
         selected_indices=selected_indices,
         summary=summary,
+        config=config,
     )
 
 
@@ -661,13 +675,25 @@ def authenticate(
     interaction: Optional[logging.InteractionHandler] = None,
 ) -> None:
     """Authenticate `source` using cookie file and/or login credentials."""
-    logging.log(f"Authenticating with [magenta]{source.name}[/]")
-    source_config = config.sources.get(source.name)
-    if source_config is None:
-        for alias in getattr(source, "names", ()):
-            source_config = config.sources.get(alias.lower())
-            if source_config is not None:
-                break
+    req_profile = normalize_profile_name(getattr(options, "profile", None))
+    profile_label = f" ({req_profile})" if req_profile != DEFAULT_PROFILE else ""
+    logging.log(f"Authenticating with [magenta]{source.name}{profile_label}[/]")
+    source_config = get_source_config(
+        config,
+        source.name,
+        req_profile,
+        aliases=getattr(source, "names", ()),
+    )
+    if (
+        req_profile != DEFAULT_PROFILE
+        and source_config is None
+        and not getattr(options, "username", None)
+        and not getattr(options, "password", None)
+        and not getattr(options, "cookie_file", None)
+    ):
+        logging.log(
+            f"Warning: profile '{req_profile}' not found in config for {source.name}"
+        )
     cookie_path = get_cookie_path(options, source_config)
     if cookie_path is not None:
         source.load_cookie_file(cookie_path)
@@ -679,6 +705,16 @@ def authenticate(
         source.load_cookie_file(source.cached_cookie_path())
     if getattr(source, "supports_login", False) and not source.authenticated:
         login(url, source, options, source_config, interaction=interaction)
+        if (
+            getattr(source, "supports_cookies", False)
+            and hasattr(source, "save_cookie_file")
+            and getattr(options, "database_directory", None)
+            and len(source._session.cookies) > 0
+        ):
+            try:
+                source.save_cookie_file()
+            except OSError as exc:
+                logging.debug(f"Could not persist session cookies for {source.name}: {exc}")
 
 
 def _init_service_source(
@@ -698,6 +734,12 @@ def _init_service_source(
     return source
 
 
+def _close_source(source: Any) -> None:
+    close_fn = getattr(source, "close", None)
+    if callable(close_fn):
+        close_fn()
+
+
 def verify_service_auth(
     service_name: str,
     options: DownloadOptions,
@@ -709,10 +751,13 @@ def verify_service_auth(
     """Authenticate against `service_name` and optionally cache session cookies."""
     with logging.job_context(apply_runtime_options(options, config)):
         source = _init_service_source(service_name, options, config, interaction=interaction)
-        ok = source.verify_auth()
-        if ok and persist_cookies and source.supports_cookies and len(source._session.cookies) > 0:
-            source.save_cookie_file()
-        return ok
+        try:
+            ok = source.verify_auth()
+            if ok and persist_cookies and source.supports_cookies and len(source._session.cookies) > 0:
+                source.save_cookie_file()
+            return ok
+        finally:
+            _close_source(source)
 
 
 def search_service(
@@ -726,7 +771,10 @@ def search_service(
     """Search `service_name` catalog for `query`."""
     with logging.job_context(apply_runtime_options(options, config)):
         source = _init_service_source(service_name, options, config, interaction=interaction)
-        return source.search(query)
+        try:
+            return source.search(query)
+        finally:
+            _close_source(source)
 
 
 def list_service_library(
@@ -739,7 +787,10 @@ def list_service_library(
     """List books from `service_name`'s user library/bookshelf."""
     with logging.job_context(apply_runtime_options(options, config)):
         source = _init_service_source(service_name, options, config, interaction=interaction)
-        return source.list_library()
+        try:
+            return source.list_library()
+        finally:
+            _close_source(source)
 
 
 def _flatten_resolved_books(source: Source, resolved: Result) -> List[Audiobook]:
@@ -853,6 +904,7 @@ def process_audiobook(
     options: DownloadOptions,
     interaction: Optional[logging.InteractionHandler] = None,
     cancel_event: Optional[threading.Event] = None,
+    config: Optional[Config] = None,
 ) -> bool:
     """Operate on `audiobook` based on `options`. Return False if skipped via archive."""
     if not audiobook.metadata.source and source is not None:
@@ -870,15 +922,20 @@ def process_audiobook(
         else (audiobook.metadata.source or "unknown")
     )
     book_key = make_book_key(source_name, audiobook)
-    explicit_archive = getattr(options, "download_archive", None)
-    ledger_path = explicit_archive or (
-        default_archive_path(options.database_directory)
-        if getattr(options, "database_directory", None)
-        else None
+    use_archive = not bool(getattr(options, "no_download_archive", False))
+    explicit_archive = getattr(options, "download_archive", None) if use_archive else None
+    ledger_path = (
+        explicit_archive
+        or (
+            default_archive_path(options.database_directory)
+            if use_archive and getattr(options, "database_directory", None)
+            else None
+        )
     )
     archive: Optional[DownloadArchive] = None
-    if explicit_archive:
-        archive = DownloadArchive(explicit_archive)
+    check_archive = bool(use_archive and (explicit_archive or (options.skip_downloaded and ledger_path)))
+    if check_archive and ledger_path:
+        archive = DownloadArchive(ledger_path)
         if archive.contains(source_name, book_key):
             logging.log(
                 f"Skipping [blue]{audiobook.title}[/], already recorded in download archive."
@@ -897,24 +954,54 @@ def process_audiobook(
     if source is not None:
         source.on_download_complete(audiobook)
 
+    location = output.gen_output_location(
+        options.output_template,
+        audiobook.metadata,
+        options.remove_chars,
+    )
+    raw_ext = audiobook.files[0].ext if audiobook.files else None
+    fmt = raw_ext if is_ebook(audiobook) else (options.output_format or raw_ext)
+    candidate_file = f"{location}.{fmt}" if fmt else ""
+    resolved_output = candidate_file if (candidate_file and os.path.isfile(candidate_file)) else location
+
     if ledger_path:
         target_archive = archive if archive is not None else DownloadArchive(ledger_path)
-        location = output.gen_output_location(
-            options.output_template,
-            audiobook.metadata,
-            options.remove_chars,
-        )
-        raw_ext = audiobook.files[0].ext if audiobook.files else None
-        fmt = raw_ext if is_ebook(audiobook) else (options.output_format or raw_ext)
+        active_profile = normalize_profile_name(getattr(options, "profile", None))
         target_archive.record(
             source_name,
             book_key,
             title=audiobook.title,
             author=audiobook.metadata.author,
             url=audiobook.metadata.scrape_url,
-            output_path=location,
+            output_path=resolved_output,
             audio_format=fmt,
+            profile=active_profile,
+            status="downloaded",
+            series=audiobook.metadata.series,
+            series_order=audiobook.metadata.series_order,
+            narrator=audiobook.metadata.narrator,
+            isbn=audiobook.metadata.isbn,
+            asin=audiobook.metadata.asin,
         )
+
+    force_abs = bool(getattr(options, "upload_to_abs", False))
+    abs_cfg = config.audiobookshelf if config is not None else None
+    if abs_cfg is None and force_abs:
+        abs_cfg = load_config(getattr(options, "config_location", None)).audiobookshelf
+    if abs_cfg is not None:
+        try:
+            from audiobookdl.integrations.audiobookshelf import sync_book_to_audiobookshelf
+
+            if sync_book_to_audiobookshelf(
+                resolved_output,
+                audiobook.metadata,
+                abs_cfg,
+                force_upload=force_abs,
+                session=getattr(audiobook, "session", None),
+            ):
+                logging.log(f"Synced [blue]{audiobook.title}[/] to Audiobookshelf")
+        except Exception as exc:
+            logging.error(f"Audiobookshelf sync failed for '{audiobook.title}': {exc}")
     return True
 
 

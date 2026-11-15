@@ -177,3 +177,29 @@ def test_concurrent_config_writes_do_not_corrupt_or_drop_entries(tmp_path):
     assert len(parsed["sources"]) == 16
     for idx in range(16):
         assert parsed["sources"][f"svc_{idx}"]["username"] == f"user_{idx}"
+
+
+def test_keyring_store_index_tracks_stored_services_across_profiles(tmp_path):
+    backing = {}
+
+    class _FakeKeyring:
+        def get_password(self, service, account):
+            return backing.get((service, account))
+
+        def set_password(self, service, account, password):
+            backing[(service, account)] = password
+
+        def delete_password(self, service, account):
+            backing.pop((service, account), None)
+
+    index_path = str(tmp_path / "credentials.keyring.json")
+    store = KeyringCredentialStore(_FakeKeyring(), index_path=index_path)
+    store.set_password("storytel", "main@example.com", "pw-main")
+    store.set_password("storytel:family", "fam@example.com", "pw-fam")
+
+    assert store.stored_services() == {
+        "storytel": "main@example.com",
+        "storytel:family": "fam@example.com",
+    }
+    store.delete_password("storytel:family", "fam@example.com")
+    assert store.stored_services() == {"storytel": "main@example.com"}

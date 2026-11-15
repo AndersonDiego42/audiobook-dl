@@ -2282,4 +2282,34 @@ def test_gui_preview_dialog_enrichment_updates_fields_and_cover(tmp_path):
         root.destroy()
 
 
+def test_gui_preview_cancel_enables_cancel_button_and_cancels_cleanly(tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+        app.urls_text.insert("1.0", "https://example.com/slow-book")
+        app._set_previewing_state(True)
+        assert str(app.cancel_btn.cget("state")) == "normal"
+        assert str(app.preview_btn.cget("state")) == "disabled"
+        assert str(app.download_btn.cget("state")) == "disabled"
+
+        app.cancel_download()
+        assert app.controller.preview_cancel_event.is_set()
+        assert app.status_var.get() == "Cancelling preview..."
+        assert str(app.cancel_btn.cget("state")) == "disabled"
+
+        app._handle_preview_done("https://example.com/slow-book", None, DownloadCancelled())
+        assert not app._is_previewing
+        assert app.status_var.get() == "Preview cancelled"
+        assert str(app.preview_btn.cget("state")) == "normal"
+        assert str(app.download_btn.cget("state")) == "normal"
+        assert str(app.cancel_btn.cget("state")) == "disabled"
+    finally:
+        root.destroy()
+
+
+
 

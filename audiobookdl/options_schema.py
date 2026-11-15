@@ -664,6 +664,16 @@ OPTION_REGISTRY: Tuple[OptionSpec, ...] = (
         cli_flags=(CliFlag(("--library",), help="Library for source"),),
     ),
     OptionSpec(
+        name="profile",
+        default=None,
+        cli_flags=(
+            CliFlag(
+                ("--profile",),
+                help="Named service account profile from config (default: 'default')",
+            ),
+        ),
+    ),
+    OptionSpec(
         name="skip_downloaded",
         default=False,
         cli_flags=(
@@ -708,6 +718,17 @@ OPTION_REGISTRY: Tuple[OptionSpec, ...] = (
             var_type="bool",
             gui_default=False,
             from_config=_gui_init_bool_from_truthy,
+        ),
+    ),
+    OptionSpec(
+        name="no_download_archive",
+        default=False,
+        cli_flags=(
+            CliFlag(
+                ("--no-download-archive",),
+                action="store_true",
+                help="Disable reading and recording entries in the SQLite download archive (downloads.db)",
+            ),
         ),
     ),
     OptionSpec(
@@ -781,6 +802,39 @@ OPTION_REGISTRY: Tuple[OptionSpec, ...] = (
             var_type="bool",
             gui_default=False,
             persisted_in_output_prefs=True,
+        ),
+    ),
+    OptionSpec(
+        name="write_abs_metadata",
+        default=False,
+        cli_flags=(
+            CliFlag(
+                ("--write-abs-metadata",),
+                action="store_true",
+                help="Write Audiobookshelf-compatible metadata.json sidecar alongside downloaded files",
+            ),
+        ),
+        config_key="write_abs_metadata",
+        config_kind="bool",
+        toml_serializer=_serialize_bool,
+        merge_from_config=True,
+        merge_only_if_default=True,
+        gui=GuiBinding(
+            var_attr="write_abs_metadata_var",
+            var_type="bool",
+            gui_default=False,
+            persisted_in_output_prefs=True,
+        ),
+    ),
+    OptionSpec(
+        name="upload_to_abs",
+        default=False,
+        cli_flags=(
+            CliFlag(
+                ("--upload-to-abs",),
+                action="store_true",
+                help="Upload completed audiobooks to the configured Audiobookshelf server",
+            ),
         ),
     ),
     OptionSpec(
@@ -1159,5 +1213,6 @@ PERSISTED_GUI_OPTION_SPECS: Tuple[OptionSpec, ...] = tuple(
     spec for spec in OPTION_REGISTRY if spec.gui is not None and spec.gui.persisted_in_output_prefs
 )
 KNOWN_TOP_LEVEL_CONFIG_KEYS: FrozenSet[str] = frozenset(
-    {"sources", "gui"} | {spec.config_key for spec in CONFIG_OPTION_SPECS if spec.config_key is not None}
+    {"sources", "gui", "audiobookshelf"}
+    | {spec.config_key for spec in CONFIG_OPTION_SPECS if spec.config_key is not None}
 )

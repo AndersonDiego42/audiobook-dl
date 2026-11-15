@@ -889,3 +889,131 @@ def test_enrichment_and_updater_close_auto_sessions_and_process_reuses_source_se
     enrich_metadata_from_openlibrary(AudiobookMetadata(title="Fallback Close"))
     assert closed_count == 2
 
+
+def test_authenticate_isolates_profiles_and_persists_login_cookies(tmp_path):
+    import os
+
+    from audiobookdl.config import SourceConfig
+    from audiobookdl.pipeline import authenticate
+    from audiobookdl.sources.source import Source
+
+    login_calls = []
+
+    class _ProfileSource(Source):
+        name = "profilesvc"
+        names = ["ProfileSvc"]
+        _authentication_methods = ["login", "cookies"]
+
+        def _login(self, url: str, username: str, password: str):
+            login_calls.append((url, username, password))
+            self._session.cookies.set("auth_user", username, domain="example.com")
+
+    cfg = Config(
+        sources={
+            "profilesvc": SourceConfig("main@example.com", "pw1", None, None),
+            "profilesvc:work": SourceConfig("work@example.com", "pw2", None, None),
+        },
+        output_template=None,
+        database_directory=str(tmp_path),
+        skip_downloaded=False,
+    )
+
+    work_opts = args.build_default_options(database_directory=str(tmp_path), profile="work")
+    work_src = _ProfileSource(work_opts)
+    authenticate("https://example.com/book", work_src, work_opts, cfg)
+    assert login_calls == [("https://example.com/book", "work@example.com", "pw2")]
+    assert work_src.cached_cookie_path().endswith("session_cookies_work.txt")
+    assert os.path.isfile(work_src.cached_cookie_path())
+
+    # Fresh source for same profile reloads cached cookies without re-logging in
+    work_src2 = _ProfileSource(work_opts)
+    authenticate("https://example.com/book", work_src2, work_opts, cfg)
+    assert len(login_calls) == 1
+    assert work_src2._session.cookies.get("auth_user") == "work@example.com"
+
+    # Default profile uses its own credentials and separate cookie file
+    default_opts = args.build_default_options(database_directory=str(tmp_path))
+    default_src = _ProfileSource(default_opts)
+    authenticate("https://example.com/book", default_src, default_opts, cfg)
+    assert login_calls[-1] == ("https://example.com/book", "main@example.com", "pw1")
+    assert default_src.cached_cookie_path().endswith("session_cookies.txt")
+
+
+def test_no_download_archive_bypasses_reading_and_writing_downloads_db(tmp_path):
+    from unittest.mock import MagicMock, patch
+    from audiobookdl import AudiobookFile
+    from audiobookdl.pipeline import process_audiobook
+    from audiobookdl.utils.archive import DownloadArchive, make_book_key
+
+    db_dir = tmp_path / "db"
+    archive_path = db_dir / "downloads.db"
+    book = Audiobook(
+        session=MagicMock(),
+        metadata=AudiobookMetadata(title="Opt Out Book", authors=["A"], scrape_url="https://ex.com/opt"),
+        files=[AudiobookFile(url="https://ex.com/opt.mp3", ext="mp3")],
+    )
+    key = make_book_key("storytel", book)
+    DownloadArchive(str(archive_path)).record("storytel", key, title="Opt Out Book", output_path="old.mp3")
+
+    parsed = args.parse_arguments(["--no-download-archive", "--skip-downloaded", "https://ex.com/opt"])
+    assert parsed.no_download_archive is True
+
+    opts = args.build_default_options(
+        output_template=str(tmp_path / "{title}"),
+        database_directory=str(db_dir),
+        skip_downloaded=True,
+        no_download_archive=True,
+    )
+    src = MagicMock()
+    src.name = "storytel"
+
+    new_book = Audiobook(
+        session=MagicMock(),
+        metadata=AudiobookMetadata(title="Fresh Opt Out", authors=["B"], scrape_url="https://ex.com/fresh"),
+        files=[AudiobookFile(url="https://ex.com/fresh.mp3", ext="mp3")],
+    )
+
+    with patch("audiobookdl.pipeline.download") as mock_dl:
+        # Must NOT skip pre-recorded entry when no_download_archive=True
+        assert process_audiobook(src, book, opts) is True
+        # Must NOT insert new entry into downloads.db when no_download_archive=True
+        assert process_audiobook(src, new_book, opts) is True
+    assert mock_dl.call_count == 2
+    assert len(DownloadArchive(str(archive_path)).list_entries()) == 1
+
+
+def test_apply_runtime_options_isolates_ffmpeg_dir_per_job_context(tmp_path):
+    import sys
+    from audiobookdl import logging, utils
+    from audiobookdl.pipeline import apply_runtime_options
+
+    bin_a = tmp_path / "ff_a"
+    bin_b = tmp_path / "ff_b"
+    bin_a.mkdir()
+    bin_b.mkdir()
+    exe_name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+    (bin_a / exe_name).write_bytes(b"a")
+    (bin_b / exe_name).write_bytes(b"b")
+
+    prev_global = utils.get_ffmpeg_dir()
+    try:
+        utils.set_ffmpeg_dir(None)
+        cfg_a = Config(sources={}, output_template=None, database_directory=None, skip_downloaded=None, ffmpeg_dir=str(bin_a))
+        cfg_b = Config(sources={}, output_template=None, database_directory=None, skip_downloaded=None, ffmpeg_dir=str(bin_b))
+        ctx_a = apply_runtime_options(args.build_default_options(), cfg_a)
+        ctx_b = apply_runtime_options(args.build_default_options(), cfg_b)
+
+        # Global singleton was NOT mutated
+        assert utils.get_ffmpeg_dir() is None
+
+        with logging.job_context(ctx_a):
+            assert utils.get_ffmpeg_dir() == str(bin_a)
+            assert utils.find_executable("ffmpeg") == str(bin_a / exe_name)
+        with logging.job_context(ctx_b):
+            assert utils.get_ffmpeg_dir() == str(bin_b)
+            assert utils.find_executable("ffmpeg") == str(bin_b / exe_name)
+        assert utils.get_ffmpeg_dir() is None
+    finally:
+        utils.set_ffmpeg_dir(prev_global)
+
+

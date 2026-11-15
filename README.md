@@ -192,3 +192,26 @@ Useful build flags:
 
 ## Contributions
 Issues, bug-reports, pull requests, or ideas for features and improvements are **very welcome**.
+
+
+## Docker & Headless Auto-Sync
+
+Run automated periodic library synchronization in Docker or headless environments:
+
+```yaml
+services:
+  audiobook-dl:
+    build: .
+    container_name: audiobook-dl
+    restart: unless-stopped
+    volumes:
+      - ./config:/config
+      - ./audiobooks:/audiobooks
+    command: ["sync", "--watch", "--interval", "3600"]
+```
+
+Additional CLI subcommands:
+- `audiobook-dl library list|tag|hide|unhide|trash|restore`: Query and manage persistent library items, tags, hidden items, and trash in `downloads.db`.
+- `audiobook-dl scan <paths...> [--verify-missing] [--json]`: Discover existing local audiobooks and reconcile `downloads.db`.
+- `audiobook-dl export <output.{csv,json,xlsx}> [--query ...]`: Export the library catalog/ledger.
+- `audiobook-dl sync [--service ...] [--profile ...] [--watch] [--interval 3600] [--scan-only]`: Poll configured accounts and download new pending titles.

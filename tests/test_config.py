@@ -354,3 +354,66 @@ def test_gui_notify_on_complete_config_round_trip_and_validation(tmp_path):
     assert any("notify_on_complete" in msg for msg in sink.messages)
 
 
+def test_multi_profile_source_config_round_trip_and_migration(tmp_path):
+    from audiobookdl.config import (
+        get_source_config,
+        list_configured_source_profiles,
+        list_source_profiles,
+    )
+    from audiobookdl.credentials import PlaintextFallbackCredentialStore
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    store = PlaintextFallbackCredentialStore(allow_plaintext=True)
+
+    save_source_credentials(
+        "storytel",
+        username="default@example.com",
+        password="pw1",
+        overwrite=str(cfg_path),
+        credential_store=store,
+    )
+    save_source_credentials(
+        "storytel",
+        username="family@example.com",
+        password="pw2",
+        library="se",
+        overwrite=str(cfg_path),
+        credential_store=store,
+        profile="Family",
+    )
+
+    loaded = load_config(str(cfg_path), credential_store=store)
+    assert list_source_profiles(loaded, "storytel") == ["default", "family"]
+    assert get_source_config(loaded, "storytel").username == "default@example.com"
+    assert get_source_config(loaded, "storytel", "family").username == "family@example.com"
+    assert get_source_config(loaded, "storytel", "family").library == "se"
+    assert get_source_config(loaded, "storytel", "missing") is None
+    assert [(s, p) for s, p, _ in list_configured_source_profiles(loaded)] == [
+        ("storytel", "default"),
+        ("storytel", "family"),
+    ]
+
+    # Removing default profile preserves named profile
+    save_source_credentials("storytel", overwrite=str(cfg_path), credential_store=store)
+    reloaded = load_config(str(cfg_path), credential_store=store)
+    assert list_source_profiles(reloaded, "storytel") == ["family"]
+    assert get_source_config(reloaded, "storytel") is None
+    assert get_source_config(reloaded, "storytel", "family").username == "family@example.com"
+
+    # Legacy plaintext password inside [sources.<svc>.profiles.<name>] migrates cleanly
+    cfg_path.write_text(
+        '[sources.ereolen.profiles.card2]\n'
+        'username = "reader2"\n'
+        'password = "legacy-profile-pw"\n'
+        'library = "aalborg"\n',
+        encoding="utf-8",
+    )
+    migrated = load_config(str(cfg_path))
+    prof_cfg = get_source_config(migrated, "ereolen", "card2")
+    assert prof_cfg is not None
+    assert prof_cfg.username == "reader2"
+    assert prof_cfg.password == "legacy-profile-pw"
+    assert prof_cfg.library == "aalborg"
+    assert "legacy-profile-pw" not in cfg_path.read_text(encoding="utf-8")
+
+

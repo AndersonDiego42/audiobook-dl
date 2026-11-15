@@ -22,6 +22,21 @@ from audiobookdl.utils.audiobook import AESEncryption, Cover
 from audiobookdl.utils.http import DEFAULT_HTTP_TIMEOUT
 
 
+@pytest.fixture(autouse=True)
+def _mock_probe_for_dummy_download_bytes(request, monkeypatch):
+    """Stub ffprobe in dummy-byte download unit tests unless marked `real_integrity`."""
+    if request.node.get_closest_marker("real_integrity") is not None:
+        return
+    from audiobookdl.output import output as output_mod
+    from audiobookdl.utils import AudioProbeInfo
+
+    monkeypatch.setattr(
+        output_mod,
+        "_probe_audio_info",
+        lambda _path: AudioProbeInfo(duration=10.0, codec_name="mp3"),
+    )
+
+
 def _make_audiobook(session, url="https://example.com/part.mp3"):
     return Audiobook(
         session=session,
@@ -1058,4 +1073,94 @@ def test_download_file_retries_on_429_and_5xx_with_retry_after(tmp_path, monkeyp
     with pytest.raises(DownloadError):
         download_file((fail_book, str(tmp_path / "fail"), 0, lambda _d: None, None))
     assert fail_session.get.call_count == DOWNLOAD_ATTEMPTS
+
+
+def test_download_audiobook_atomic_staging_preserves_existing_dir_on_cancel_or_error(tmp_path):
+    from unittest.mock import patch as _patch
+
+    book_dir = tmp_path / "Atomic Book"
+    book_dir.mkdir()
+    existing_part = book_dir / "Part 0.mp3"
+    existing_part.write_bytes(b"original-part-0")
+
+    cancel_event = threading.Event()
+    session_fail = MagicMock()
+    calls = 0
+
+    def _side_effect_get(url, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if url.endswith("/0.mp3"):
+            return _mock_response(headers={"Content-Length": "5"}, chunks=[b"new-0"])
+        cancel_event.set()
+        return _mock_response(headers={"Content-Length": "5"}, chunks=[b"new-1"])
+
+    session_fail.get.side_effect = _side_effect_get
+    book = Audiobook(
+        session=session_fail,
+        metadata=AudiobookMetadata(title="Atomic Book"),
+        files=[
+            AudiobookFile(url="https://example.com/0.mp3", ext="mp3"),
+            AudiobookFile(url="https://example.com/1.mp3", ext="mp3"),
+        ],
+    )
+    opts = DownloadOptions(skip_downloaded=False, resume=False, overwrite=True, no_chapters=True)
+
+    with pytest.raises(DownloadCancelled):
+        download_audiobook(book, str(book_dir), opts, cancel_event=cancel_event)
+
+    # Pre-existing directory and contents must survive intact when download cancels mid-batch
+    assert existing_part.exists()
+    assert existing_part.read_bytes() == b"original-part-0"
+    # Temporary staging directories must be cleaned up
+    assert [p.name for p in tmp_path.iterdir()] == ["Atomic Book"]
+
+    # Now succeed cleanly and verify atomic swap updates contents
+    session_ok = MagicMock()
+    session_ok.get.side_effect = [
+        _mock_response(headers={"Content-Length": "5"}, chunks=[b"new-0"]),
+        _mock_response(headers={"Content-Length": "5"}, chunks=[b"new-1"]),
+    ]
+    book_ok = Audiobook(
+        session=session_ok,
+        metadata=AudiobookMetadata(title="Atomic Book"),
+        files=[
+            AudiobookFile(url="https://example.com/0.mp3", ext="mp3"),
+            AudiobookFile(url="https://example.com/1.mp3", ext="mp3"),
+        ],
+    )
+    with _patch("audiobookdl.output.download.metadata.add_metadata"):
+        download_audiobook(book_ok, str(book_dir), opts)
+    assert existing_part.read_bytes() == b"new-0"
+    assert (book_dir / "Part 1.mp3").read_bytes() == b"new-1"
+    assert [p.name for p in tmp_path.iterdir()] == ["Atomic Book"]
+
+
+@pytest.mark.real_integrity
+def test_download_file_rejects_corrupt_audio_before_replacing_existing_file(tmp_path):
+    from audiobookdl.exceptions import GenericAudiobookDLException
+    from audiobookdl.output import output as output_mod
+    from audiobookdl.utils import AudioProbeInfo
+
+    target = tmp_path / "Existing.mp3"
+    target.write_bytes(b"valid-existing-audio")
+
+    session = MagicMock()
+    session.get.return_value = _mock_response(
+        headers={"Content-Length": "26"},
+        chunks=[b"<html>403 Forbidden</html>"],
+    )
+    book = _make_audiobook(session)
+
+    with (
+        patch("audiobookdl.output.output.find_executable", return_value="ffprobe"),
+        patch.object(output_mod, "_probe_audio_info", return_value=AudioProbeInfo(duration=0.0, codec_name="")),
+    ):
+        with pytest.raises(GenericAudiobookDLException):
+            download_file((book, str(tmp_path / "Existing"), 0, lambda _d: None, None))
+
+    # Original file is preserved untouched and corrupt .tmp file is cleaned up
+    assert target.read_bytes() == b"valid-existing-audio"
+    assert not (tmp_path / "Existing.mp3.tmp").exists()
+
 

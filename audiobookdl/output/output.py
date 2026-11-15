@@ -35,6 +35,7 @@ import platform
 import subprocess
 import tempfile
 import threading
+import uuid
 from typing import Any, Dict, List, Optional, Sequence, Mapping
 from urllib.parse import urlparse
 
@@ -120,6 +121,48 @@ def _ffprobe_duration(path: str) -> float:
     return _probe_audio_info(path).duration
 
 
+def verify_audio_integrity(
+    path: str,
+    *,
+    expected_duration: float = 0.0,
+    min_duration_ratio: float = 0.98,
+    probe_cache: Optional[Dict[str, AudioProbeInfo]] = None,
+    require_ffprobe: bool = False,
+) -> AudioProbeInfo:
+    """
+    Validate that `path` exists, is non-empty, has a valid audio stream and positive duration,
+    and was not materially truncated relative to `expected_duration`.
+
+    Raises `FailedCombining` on verification failure.
+    """
+    if not (os.path.isfile(path) and os.path.getsize(path) > 0):
+        raise FailedCombining(message=f"Media file is missing or empty: {path}")
+
+    info = _get_cached_probe(path, probe_cache)
+    ffprobe_available = require_ffprobe or (find_executable("ffprobe") is not None)
+
+    if expected_duration > 0 and info.duration < expected_duration * min_duration_ratio:
+        logging.debug(
+            f"Media output '{os.path.basename(path)}' is shorter than expected "
+            f"({info.duration:.1f}s vs {expected_duration:.1f}s)"
+        )
+        raise FailedCombining(
+            message=f"Media file appears truncated ({info.duration:.1f}s vs {expected_duration:.1f}s)"
+        )
+
+    if not info.codec_name or info.duration <= 0.0:
+        if ffprobe_available or info.duration > 0.0 or info.codec_name:
+            logging.debug(
+                f"Media integrity check failed for '{os.path.basename(path)}': "
+                f"codec={info.codec_name!r}, duration={info.duration:.2f}s"
+            )
+            raise FailedCombining(
+                message=f"Invalid or corrupt media output: {os.path.basename(path)}"
+            )
+
+    return info
+
+
 def _ffprobe_audio_bitrate(path: str) -> Optional[int]:
     """Return the bitrate of `path` in bits/sec via `ffprobe`, or `None` if unavailable."""
     return _probe_audio_info(path).bitrate
@@ -152,6 +195,32 @@ def resolve_aac_bitrate(source_path: str, audio_bitrate: Optional[str] = None) -
     return resolve_audio_bitrate(source_path, audio_bitrate, probe_bps=_ffprobe_audio_bitrate)
 
 
+def _run_mpegts_part(
+    source: str,
+    ts_path: str,
+    codec_args: Sequence[str],
+    cancel_event: Optional[threading.Event] = None,
+) -> bool:
+    """Run an FFmpeg step producing a single MPEG-TS segment at `ts_path`."""
+    ffmpeg = _require_executable("ffmpeg")
+    capture = not logging.is_ffmpeg_output()
+    try:
+        result = run_cancellable_subprocess(
+            [ffmpeg, "-y", "-i", source, "-vn", *codec_args, "-f", "mpegts", ts_path],
+            capture_output=capture,
+            cancel_event=cancel_event,
+        )
+    except DownloadCancelled:
+        if os.path.exists(ts_path):
+            os.remove(ts_path)
+        raise
+    if os.path.exists(ts_path) and os.path.getsize(ts_path) > 0:
+        return True
+    if result.stderr:
+        logging.debug(result.stderr.decode("utf8", "replace"))
+    return False
+
+
 def _remux_to_mpegts(
     source: str,
     ts_path: str,
@@ -167,23 +236,43 @@ def _remux_to_mpegts(
 
     :returns: `True` if a non-empty file was produced
     """
-    ffmpeg = _require_executable("ffmpeg")
-    capture = not logging.is_ffmpeg_output()
-    try:
-        result = run_cancellable_subprocess(
-            [ffmpeg, "-y", "-i", source, "-vn", "-c:a", "copy", "-f", "mpegts", ts_path],
-            capture_output=capture,
+    return _run_mpegts_part(source, ts_path, ("-c:a", "copy"), cancel_event=cancel_event)
+
+
+def _encode_to_aac_mpegts(
+    source: str,
+    ts_path: str,
+    target_bitrate: str,
+    sample_rate: Optional[int] = None,
+    channels: Optional[int] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> bool:
+    """Transcode a single non-AAC segment directly into an AAC MPEG-TS part."""
+    codec_args: List[str] = ["-c:a", "aac", "-b:a", target_bitrate]
+    if sample_rate is not None and sample_rate > 0:
+        codec_args += ["-ar", str(sample_rate)]
+    if channels is not None and channels > 0:
+        codec_args += ["-ac", str(channels)]
+    return _run_mpegts_part(source, ts_path, codec_args, cancel_event=cancel_event)
+
+
+def _probe_uncached_audio_info(
+    paths: Sequence[str],
+    cache: Dict[str, AudioProbeInfo],
+    cancel_event: Optional[threading.Event] = None,
+) -> List[AudioProbeInfo]:
+    """Populate `cache` for any uncached `paths` in parallel and return infos in order."""
+    uncached = [p for p in dict.fromkeys(paths) if p not in cache]
+    if uncached:
+        probed = run_cancellable_pool(
+            _probe_audio_info,
+            uncached,
+            max_workers=COMBINE_REMUX_THREADS,
             cancel_event=cancel_event,
         )
-    except DownloadCancelled:
-        if os.path.exists(ts_path):
-            os.remove(ts_path)
-        raise
-    if os.path.exists(ts_path) and os.path.getsize(ts_path) > 0:
-        return True
-    if result.stderr:
-        logging.debug(result.stderr.decode("utf8", "replace"))
-    return False
+        for path, info in zip(uncached, probed):
+            cache[path] = info
+    return [cache[p] for p in paths]
 
 
 _MPEGTS_PACKET_SIZE = 188
@@ -312,12 +401,16 @@ def _build_reencode_codec_args(
     source_path: str,
     info: AudioProbeInfo,
     audio_bitrate: Optional[str],
+    faststart: bool = True,
 ) -> List[str]:
     """Return FFmpeg codec/container flags forcing re-encode into `target_ext`."""
     explicit_bitrate = normalize_audio_bitrate(audio_bitrate)
     if target_ext in MP4_CONTAINERS:
         target_bitrate = _resolve_aac_bitrate_from_info(source_path, info, explicit_bitrate)
-        return ["-c:a", "aac", "-b:a", target_bitrate, "-movflags", "+faststart"]
+        args = ["-c:a", "aac", "-b:a", target_bitrate]
+        if faststart:
+            args += ["-movflags", "+faststart"]
+        return args
     if target_ext == "mp3":
         bitrate = explicit_bitrate or (
             f"{max(64, min(round(info.bitrate / 1000), 320))}k"
@@ -336,6 +429,7 @@ def _build_mux_codec_args(
     source_path: str,
     info: AudioProbeInfo,
     audio_bitrate: Optional[str],
+    faststart: bool = True,
 ) -> List[str]:
     """Return FFmpeg codec/container flags for muxing or transcoding to `target_ext`."""
     explicit_bitrate = normalize_audio_bitrate(audio_bitrate)
@@ -348,13 +442,22 @@ def _build_mux_codec_args(
         else:
             target_bitrate = _resolve_aac_bitrate_from_info(source_path, info, explicit_bitrate)
             args = ["-c:a", "aac", "-b:a", target_bitrate]
-        args += ["-movflags", "+faststart"]
+        if faststart:
+            args += ["-movflags", "+faststart"]
         return args
     if target_ext == source_ext or target_ext in ("mka", "mkv") or (target_ext == "mp3" and codec == "mp3"):
         return ["-c:a", "copy"]
     if explicit_bitrate is not None and target_ext not in ffmpeg_metadata.LOSSLESS_CONTAINERS:
         return ["-b:a", explicit_bitrate]
     return []
+
+
+_MAX_CONCAT_ARG_CHARS = 16000
+
+
+def _transcode_pool_workers() -> int:
+    """Return bounded worker count for CPU-bound parallel FFmpeg transcodes."""
+    return min(COMBINE_REMUX_THREADS, max(1, os.cpu_count() or 4))
 
 
 def combine_audiofiles(
@@ -367,6 +470,7 @@ def combine_audiofiles(
     metadata: Optional[AudiobookMetadata] = None,
     cover: Optional[Cover] = None,
     probe_cache: Optional[Dict[str, AudioProbeInfo]] = None,
+    faststart: bool = True,
 ) -> bool:
     """
     Combines the given audiofiles into `output_path` (optionally transcoding and
@@ -393,19 +497,39 @@ def combine_audiofiles(
     os.makedirs(work_dir, exist_ok=True)
     chapters_embedded = False
     try:
-        if _all_inputs_mpegts(filepaths, probe_cache=cache):
+        all_mpegts = _all_inputs_mpegts(filepaths, probe_cache=cache)
+        parallel_aac_encoded = False
+        if all_mpegts:
             ts_paths = list(filepaths)
         else:
             os.makedirs(ts_dir, exist_ok=True)
-            # Remux every non-TS segment to MPEG-TS in parallel (lossless copy)
+            input_infos: Optional[List[AudioProbeInfo]] = None
+            target_bitrate = ""
+            target_sr: Optional[int] = None
+            target_ch: Optional[int] = None
+            if len(filepaths) > 1 and output_extension in MP4_CONTAINERS:
+                input_infos = _probe_uncached_audio_info(filepaths, cache, cancel_event=cancel_event)
+                sample_rates = {i.sample_rate for i in input_infos if i.sample_rate}
+                channel_counts = {i.channels for i in input_infos if i.channels}
+                any_non_aac = any(i.codec_name != "aac" for i in input_infos)
+                mixed_stream_params = len(sample_rates) > 1 or len(channel_counts) > 1
+                if any_non_aac or mixed_stream_params:
+                    parallel_aac_encoded = True
+                    bitrate_info = next((i for i in input_infos if i.bitrate and i.bitrate > 0), input_infos[0])
+                    target_bitrate = _resolve_aac_bitrate_from_info(filepaths[0], bitrate_info, audio_bitrate)
+                    target_sr = max(sample_rates) if sample_rates else None
+                    target_ch = max(channel_counts) if channel_counts else None
+
             padding = len(str(len(filepaths)))
             total_parts = len(filepaths)
             completed_parts = 0
             part_lock = threading.Lock()
+            verb = "Encoding parts" if parallel_aac_encoded else "Remuxing parts"
+            pool_workers = _transcode_pool_workers() if parallel_aac_encoded else COMBINE_REMUX_THREADS
 
             with logging.progress([]) as remux_prog:
                 remux_task = remux_prog.add_task(
-                    f"Remuxing parts (0/{total_parts})",
+                    f"{verb} (0/{total_parts})",
                     total=float(total_parts),
                 )
 
@@ -413,17 +537,51 @@ def combine_audiofiles(
                     nonlocal completed_parts
                     index, source = item
                     ts_path = os.path.join(ts_dir, f"{str(index).zfill(padding)}.ts")
-                    ok = _remux_to_mpegts(source, ts_path, cancel_event=cancel_event)
+                    with part_lock:
+                        src_info = input_infos[index] if input_infos is not None else cache.get(source)
+                    needs_encode = parallel_aac_encoded and (
+                        src_info is None
+                        or src_info.codec_name != "aac"
+                        or (target_sr is not None and src_info.sample_rate not in (None, target_sr))
+                        or (target_ch is not None and src_info.channels not in (None, target_ch))
+                    )
+                    if needs_encode:
+                        ok = _encode_to_aac_mpegts(
+                            source,
+                            ts_path,
+                            target_bitrate,
+                            sample_rate=target_sr,
+                            channels=target_ch,
+                            cancel_event=cancel_event,
+                        )
+                    else:
+                        ok = _remux_to_mpegts(source, ts_path, cancel_event=cancel_event)
+                    if ok:
+                        if src_info is None and len(filepaths) > 1:
+                            src_info = _probe_audio_info(source)
+                            with part_lock:
+                                cache[source] = src_info
+                        if src_info is not None and src_info.duration > 0:
+                            with part_lock:
+                                if ts_path not in cache:
+                                    cache[ts_path] = AudioProbeInfo(
+                                        duration=src_info.duration,
+                                        bitrate=src_info.bitrate,
+                                        codec_name="aac" if (parallel_aac_encoded or src_info.codec_name == "aac") else src_info.codec_name,
+                                        format_name="mpegts",
+                                        sample_rate=target_sr if needs_encode else src_info.sample_rate,
+                                        channels=target_ch if needs_encode else src_info.channels,
+                                    )
                     with part_lock:
                         completed_parts += 1
                         remux_prog.advance(remux_task, 1.0)
-                        logging.book_update(f"Remuxing parts ({completed_parts}/{total_parts})")
+                        logging.book_update(f"{verb} ({completed_parts}/{total_parts})")
                     return ts_path, ok
 
                 remuxed = run_cancellable_pool(
                     remux,
                     list(enumerate(filepaths)),
-                    max_workers=COMBINE_REMUX_THREADS,
+                    max_workers=pool_workers,
                     cancel_event=cancel_event,
                 )
             ts_paths = []
@@ -431,31 +589,41 @@ def combine_audiofiles(
                 if not ok:
                     raise FailedCombining
                 ts_paths.append(ts_path)
-        # Binary-concatenate the MPEG-TS parts. The ffmpeg concat *demuxer* aborts
-        # early on some segment junctions (returning success while silently dropping
-        # most of the audio); MPEG-TS is designed for splicing, so a raw byte
-        # concatenation of the remuxed parts is both robust and lossless.
-        with open(combined_ts, "wb") as out:
-            for ts_path in ts_paths:
-                if cancel_event is not None and cancel_event.is_set():
-                    raise DownloadCancelled
-                with open(ts_path, "rb") as part:
-                    shutil.copyfileobj(part, out)
+
+        # Feed MPEG-TS parts directly via `concat:` when path lengths fit safely;
+        # otherwise binary-concatenate into `combined.ts`. MPEG-TS is designed for
+        # splicing, avoiding early aborts seen with the ffmpeg concat demuxer.
+        if len(ts_paths) == 1:
+            ffmpeg_input = ts_paths[0]
+        else:
+            concat_candidate = "concat:" + "|".join(ts_paths)
+            if "|" not in "".join(ts_paths) and len(concat_candidate) <= _MAX_CONCAT_ARG_CHARS:
+                ffmpeg_input = concat_candidate
+            else:
+                with open(combined_ts, "wb") as out:
+                    for ts_path in ts_paths:
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise DownloadCancelled
+                        with open(ts_path, "rb") as part:
+                            shutil.copyfileobj(part, out)
+                ffmpeg_input = combined_ts
 
         sample_info = _get_cached_probe(ts_paths[0], cache)
         if len(ts_paths) == 1:
-            combined_info = sample_info
+            expected = sample_info.duration
+            chapter_duration = expected
         else:
-            combined_info = _get_cached_probe(combined_ts, cache)
-        expected = combined_info.duration
-
-        # Binary-concatenated multi-part MPEG-TS can reset PTS at junctions so ffprobe on
-        # `combined_ts` under-reports duration; sum cached/probed part durations when
-        # bounding chapters so later chapters are never clipped.
-        chapter_duration = expected
-        if chapters and len(ts_paths) > 1:
-            part_total = sum(_get_cached_probe(p, cache).duration for p in ts_paths)
-            if part_total > chapter_duration:
+            part_total = 0.0
+            if ffmpeg_input != combined_ts or chapters:
+                part_infos = _probe_uncached_audio_info(ts_paths, cache, cancel_event=cancel_event)
+                part_total = sum(info.duration for info in part_infos)
+            if ffmpeg_input == combined_ts:
+                expected = _get_cached_probe(combined_ts, cache).duration
+                # Binary-concatenated multi-part MPEG-TS can reset PTS at junctions so ffprobe on
+                # `combined_ts` under-reports duration; sum part durations when bounding chapters.
+                chapter_duration = max(expected, part_total) if chapters else expected
+            else:
+                expected = part_total
                 chapter_duration = part_total
 
         chapters_written, meta_written = _write_ffmetadata(
@@ -466,7 +634,7 @@ def combine_audiofiles(
         )
         cover_tmp_path = _prepare_ffmpeg_cover_file(cover, output_extension, cover_base_path)
 
-        command = [ffmpeg, "-y", "-i", combined_ts]
+        command = [ffmpeg, "-y", "-i", ffmpeg_input]
         if chapters_written:
             logging.book_update("Adding chapters")
             chapters_embedded = True
@@ -478,11 +646,12 @@ def combine_audiofiles(
             cover_path=cover_tmp_path,
         )
         command += _build_mux_codec_args(
-            source_extension,
+            "ts" if output_extension in MP4_CONTAINERS else source_extension,
             output_extension,
             ts_paths[0],
             sample_info,
             audio_bitrate,
+            faststart=faststart,
         )
         capture = not logging.is_ffmpeg_output()
         if capture and expected > 0:
@@ -522,17 +691,12 @@ def combine_audiofiles(
             if result.stderr:
                 logging.debug(result.stderr.decode("utf8", "replace"))
             raise FailedCombining
-        # Guard against silent truncation: the combined file must be about as long
-        # as the concatenated source. A large shortfall means ffmpeg dropped audio.
-        actual_info = _probe_audio_info(output_path)
-        cache[output_path] = actual_info
-        actual = actual_info.duration
-        if expected > 0 and actual < expected * 0.98:
-            logging.debug(
-                f"Combined output is shorter than expected "
-                f"({actual:.0f}s vs {expected:.0f}s); combine truncated the audio"
-            )
-            raise FailedCombining
+        # Guard against silent truncation or corrupt output before committing.
+        verify_audio_integrity(
+            output_path,
+            expected_duration=expected,
+            probe_cache=cache,
+        )
         if os.path.isdir(tmp_dir):
             shutil.rmtree(tmp_dir)
         return chapters_embedded
@@ -595,6 +759,8 @@ def convert_single_file(
     metadata: Optional[AudiobookMetadata] = None,
     cover: Optional[Cover] = None,
     probe_cache: Optional[Dict[str, AudioProbeInfo]] = None,
+    output_path: Optional[str] = None,
+    faststart: bool = True,
 ) -> tuple[str, bool]:
     """
     Convert a single file to `output_format`, optionally embedding `chapters`,
@@ -605,8 +771,10 @@ def convert_single_file(
     target_format = output_format.lstrip(".").lower()
     path_without_ext, old_ext_raw = os.path.splitext(old_path)
     old_ext = old_ext_raw.lstrip(".").lower()
-    new_path = f"{path_without_ext}.{target_format}"
-    if target_format == old_ext:
+    new_path = output_path or f"{path_without_ext}.{target_format}"
+    if target_format == old_ext and (
+        output_path is None or os.path.abspath(new_path) == os.path.abspath(old_path)
+    ):
         return new_path, False
 
     ffmpeg = _require_executable("ffmpeg")
@@ -635,10 +803,23 @@ def convert_single_file(
         meta_written=meta_written,
         cover_path=cover_tmp_path,
     )
-    command += _build_mux_codec_args(old_ext, target_format, old_path, info, explicit_bitrate)
+    command += _build_mux_codec_args(
+        old_ext,
+        target_format,
+        old_path,
+        info,
+        explicit_bitrate,
+        faststart=faststart,
+    )
     if capture and info.duration > 0:
         command += ["-progress", "pipe:1", "-nostats"]
-    command.append(new_path)
+    new_dir = os.path.dirname(os.path.abspath(new_path)) or os.getcwd()
+    os.makedirs(new_dir, exist_ok=True)
+    staged_path = os.path.join(
+        new_dir,
+        f".{os.path.basename(new_path)}.tmp.{uuid.uuid4().hex[:8]}.{target_format}",
+    )
+    command.append(staged_path)
 
     try:
         if capture and info.duration > 0:
@@ -672,23 +853,38 @@ def convert_single_file(
                 cancel_event=cancel_event,
             )
     except DownloadCancelled:
-        if os.path.exists(new_path):
-            os.remove(new_path)
+        if os.path.exists(staged_path):
+            os.remove(staged_path)
         raise
     finally:
         if os.path.exists(chapter_file):
             os.remove(chapter_file)
         if cover_tmp_path is not None and os.path.exists(cover_tmp_path):
             os.remove(cover_tmp_path)
-    if result.returncode != 0 or not (os.path.exists(new_path) and os.path.getsize(new_path) > 0):
+    if result.returncode != 0 or not (os.path.exists(staged_path) and os.path.getsize(staged_path) > 0):
         if result.stderr:
             logging.debug(result.stderr.decode("utf8", "replace"))
-        if os.path.exists(new_path):
-            os.remove(new_path)
+        if os.path.exists(staged_path):
+            os.remove(staged_path)
         raise GenericAudiobookDLException(
             f"Failed converting '{os.path.basename(old_path)}' to .{target_format}"
         )
-    if remove_source and os.path.exists(old_path):
+    try:
+        verified_info = verify_audio_integrity(
+            staged_path,
+            expected_duration=info.duration,
+            probe_cache=probe_cache,
+        )
+    except FailedCombining:
+        if os.path.exists(staged_path):
+            os.remove(staged_path)
+        raise GenericAudiobookDLException(
+            f"Converted file '{os.path.basename(new_path)}' failed media integrity verification"
+        ) from None
+    os.replace(staged_path, new_path)
+    if probe_cache is not None:
+        probe_cache[new_path] = verified_info
+    if remove_source and os.path.exists(old_path) and os.path.abspath(old_path) != os.path.abspath(new_path):
         os.remove(old_path)
     return new_path, chapters_embedded
 
@@ -814,6 +1010,14 @@ def _split_single_chapter(
         raise GenericAudiobookDLException(
             f"Failed splitting chapter {chapter_index + 1}: '{chapter_title}'"
         )
+    try:
+        verify_audio_integrity(out_path)
+    except FailedCombining:
+        if os.path.exists(out_path):
+            os.remove(out_path)
+        raise GenericAudiobookDLException(
+            f"Split chapter {chapter_index + 1} ('{chapter_title}') failed integrity check"
+        ) from None
     return out_path
 
 

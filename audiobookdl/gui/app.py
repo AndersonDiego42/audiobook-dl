@@ -13,7 +13,14 @@ import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from audiobookdl import __version__, args, output
-from audiobookdl.config import SourceConfig, is_portable_mode
+from audiobookdl.config import (
+    DEFAULT_PROFILE,
+    SourceConfig,
+    get_source_config,
+    is_portable_mode,
+    list_source_profiles,
+    normalize_profile_name,
+)
 from audiobookdl.exceptions import DownloadCancelled
 from audiobookdl.gui.archive_dialog import ArchiveLedgerDialog
 from audiobookdl.gui.catalog_dialog import CatalogBrowserDialog
@@ -88,6 +95,7 @@ class AudiobookDLApp:
     write_json_var: tk.BooleanVar
     write_cover_var: tk.BooleanVar
     write_opf_var: tk.BooleanVar
+    write_abs_metadata_var: tk.BooleanVar
     write_cue_var: tk.BooleanVar
     resume_var: tk.BooleanVar
     audio_bitrate_var: tk.StringVar
@@ -199,6 +207,7 @@ class AudiobookDLApp:
 
         first_label = self._services[0].label if self._services else ""
         self.service_label_var = tk.StringVar(value=first_label)
+        self.profile_var = tk.StringVar(value=DEFAULT_PROFILE)
         self.service_hint_var = tk.StringVar(value="")
         self.saved_badge_var = tk.StringVar(value="")
 
@@ -365,23 +374,36 @@ class AudiobookDLApp:
         ttk.Label(auth_frame, text="Service:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
         service_row = ttk.Frame(auth_frame)
         service_row.grid(row=0, column=1, columnspan=4, sticky="ew", pady=(0, 4))
-        service_row.columnconfigure(1, weight=1)
+        service_row.columnconfigure(3, weight=1)
 
         self.service_combo = ttk.Combobox(
             service_row,
             textvariable=self.service_label_var,
             values=[s.label for s in self._services],
             state="readonly",
-            width=24,
+            width=22,
         )
-        self.service_combo.grid(row=0, column=0, sticky="w", padx=(0, 10))
+        self.service_combo.grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.service_combo.bind("<<ComboboxSelected>>", self._on_service_selected)
 
+        ttk.Label(service_row, text="Profile:").grid(row=0, column=1, sticky="w", padx=(0, 4))
+        self.profile_combo = ttk.Combobox(
+            service_row,
+            textvariable=self.profile_var,
+            values=[DEFAULT_PROFILE],
+            state="normal",
+            width=12,
+        )
+        self.profile_combo.grid(row=0, column=2, sticky="w", padx=(0, 10))
+        self.profile_combo.bind("<<ComboboxSelected>>", self._on_profile_changed)
+        self.profile_combo.bind("<Return>", self._on_profile_changed)
+        self.profile_combo.bind("<FocusOut>", self._on_profile_changed)
+
         ttk.Label(service_row, textvariable=self.service_hint_var, style="Muted.TLabel").grid(
-            row=0, column=1, sticky="w"
+            row=0, column=3, sticky="w"
         )
         ttk.Label(service_row, textvariable=self.saved_badge_var, style="Success.TLabel").grid(
-            row=0, column=2, sticky="e", padx=(8, 0)
+            row=0, column=4, sticky="e", padx=(8, 0)
         )
 
         ttk.Label(auth_frame, text="Cookies File:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
@@ -583,8 +605,13 @@ class AudiobookDLApp:
         cb_write_cover = ttk.Checkbutton(sidecars_tab, text="Write cover", variable=self.write_cover_var)
         cb_write_cover.grid(row=1, column=3, sticky="w", pady=(4, 0))
 
+        cb_abs_meta = ttk.Checkbutton(
+            sidecars_tab, text="Write ABS metadata.json", variable=self.write_abs_metadata_var
+        )
+        cb_abs_meta.grid(row=2, column=0, columnspan=2, sticky="w", padx=(0, 14), pady=(4, 0))
+
         remove_row = ttk.Frame(sidecars_tab)
-        remove_row.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        remove_row.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(6, 0))
         ttk.Label(remove_row, text="Remove chars:").pack(side=tk.LEFT, padx=(0, 6))
         remove_chars_entry = ttk.Entry(remove_row, textvariable=self.remove_chars_var, width=18)
         remove_chars_entry.pack(side=tk.LEFT, padx=(0, 8))
@@ -735,6 +762,7 @@ class AudiobookDLApp:
             tpl_entry,
             self.preset_combo,
             self.service_combo,
+            self.profile_combo,
             self.cookie_entry,
             self.cookie_browse,
             self.cookie_import_btn,
@@ -810,7 +838,8 @@ class AudiobookDLApp:
         tools_menu.add_command(label="Browse Library / Search...", command=self._show_catalog_browser_dialog)
         tools_menu.add_command(label="Pack Local Audiobooks...", command=self._show_pack_dialog)
         tools_menu.add_command(label="Locate FFmpeg Folder...", command=self.browse_ffmpeg_dir)
-        tools_menu.add_command(label="Download History Ledger...", command=self._show_archive_ledger_dialog)
+        tools_menu.add_command(label="Library & Download Ledger...", command=self._show_archive_ledger_dialog)
+        tools_menu.add_command(label="Audiobookshelf Integration...", command=self._show_audiobookshelf_dialog)
         tools_menu.add_separator()
         tools_menu.add_command(label="Retry Failed Jobs", command=self._retry_failed_queue_items)
         tools_menu.add_command(label="Clear Completed History", command=self._clear_completed_history)
@@ -893,9 +922,33 @@ class AudiobookDLApp:
         return default_archive_path(db_dir)
 
     def _show_archive_ledger_dialog(self) -> ArchiveLedgerDialog:
+        def _on_queue_urls(urls_to_add: List[str]) -> None:
+            added = self._append_urls_to_input(urls_to_add)
+            self.status_var.set(f"Queued {len(added)} URL{'s' if len(added) != 1 else ''} from library")
+
         return ArchiveLedgerDialog(
             self.root,
             self._archive_ledger_path(),
+            on_queue_urls=_on_queue_urls,
+            palette=self._palette,
+        )
+
+    def _show_audiobookshelf_dialog(self):
+        from audiobookdl.config import load_config
+        from audiobookdl.gui.abs_dialog import AudiobookshelfDialog
+
+        cfg = self._controller.config_snapshot()
+        config_loc = self._controller.config_location
+
+        def _on_saved(_updated) -> None:
+            self._controller.config = load_config(config_loc)
+            self.status_var.set("Saved Audiobookshelf configuration.")
+
+        return AudiobookshelfDialog(
+            self.root,
+            cfg.audiobookshelf,
+            config_location=config_loc,
+            on_saved=_on_saved,
             palette=self._palette,
         )
 
@@ -905,11 +958,28 @@ class AudiobookDLApp:
             if options is None:
                 dialog.set_error_status("Invalid option value")
                 return
+            chosen_profile = normalize_profile_name(dialog.selected_profile)
+            options.profile = None if chosen_profile == DEFAULT_PROFILE else chosen_profile
             self._controller.start_catalog_fetch(mode, svc.key, query_text, options, dialog)
 
         def _on_add_urls(urls_to_add: List[str]) -> None:
             added = self._append_urls_to_input(urls_to_add)
             self.status_var.set(f"Added {len(added)} URL{'s' if len(added) != 1 else ''} from catalog")
+
+        def _profile_resolver(service_key: str) -> List[str]:
+            return list_source_profiles(self._controller.config_snapshot(), service_key)
+
+        def _on_save_to_library(svc_key: str, prof: str, books: Sequence[Any]) -> Tuple[int, int]:
+            from audiobookdl.utils.archive import DownloadArchive
+
+            archive = DownloadArchive(self._archive_ledger_path())
+            inserted, updated = archive.upsert_catalog_items(
+                svc_key,
+                list(books),
+                profile=normalize_profile_name(prof),
+            )
+            self.status_var.set(f"Library DB: +{inserted} new, {updated} refreshed")
+            return inserted, updated
 
         return CatalogBrowserDialog(
             self.root,
@@ -917,6 +987,9 @@ class AudiobookDLApp:
             self._selected_service(),
             on_fetch=_on_fetch,
             on_add_urls=_on_add_urls,
+            on_save_to_library=_on_save_to_library,
+            profile_resolver=_profile_resolver,
+            selected_profile=normalize_profile_name(self.profile_var.get()),
             palette=self._palette,
         )
 
@@ -1072,6 +1145,14 @@ class AudiobookDLApp:
         return self._services_by_label.get(self.service_label_var.get())
 
     def _on_service_selected(self, _event: Optional[tk.Event] = None) -> None:
+        self.profile_var.set(DEFAULT_PROFILE)
+        self._load_service_into_form()
+        self._update_service_field_states()
+
+    def _on_profile_changed(self, _event: Optional[tk.Event] = None) -> None:
+        normalized = normalize_profile_name(self.profile_var.get())
+        if self.profile_var.get() != normalized:
+            self.profile_var.set(normalized)
         self._load_service_into_form()
         self._update_service_field_states()
 
@@ -1086,6 +1167,7 @@ class AudiobookDLApp:
             service = self._services_by_key.get(detected)
             if service and self.service_label_var.get() != service.label:
                 self.service_label_var.set(service.label)
+                self.profile_var.set(DEFAULT_PROFILE)
                 self._load_service_into_form()
                 self._update_service_field_states()
 
@@ -1093,7 +1175,15 @@ class AudiobookDLApp:
         service = self._selected_service()
         if service is None:
             return
-        saved: Optional[SourceConfig] = self._controller.config.sources.get(service.key)
+        cfg = self._controller.config
+        configured_profiles = list_source_profiles(cfg, service.key)
+        combo_values = [DEFAULT_PROFILE] + [p for p in configured_profiles if p != DEFAULT_PROFILE]
+        self.profile_combo.configure(values=combo_values)
+        active_profile = normalize_profile_name(self.profile_var.get())
+        if self.profile_var.get() != active_profile:
+            self.profile_var.set(active_profile)
+
+        saved: Optional[SourceConfig] = get_source_config(cfg, service.key, active_profile)
         self.username_var.set((saved.username or "") if saved else "")
         self.password_var.set((saved.password or "") if saved else "")
         self.library_var.set((saved.library or "") if saved else "")
@@ -1127,12 +1217,14 @@ class AudiobookDLApp:
         supports_cookies = "cookies" in service.auth_methods
         supports_login = "login" in service.auth_methods
         needs_library = supports_login and "library" in service.login_fields
+        has_auth = bool(service.auth_methods)
 
         cookie_state = "normal" if supports_cookies else "disabled"
         login_state = "normal" if supports_login else "disabled"
         library_state = "normal" if needs_library else "disabled"
-        save_state = "normal" if service.auth_methods else "disabled"
+        save_state = "normal" if has_auth else "disabled"
 
+        self.profile_combo.configure(state="normal" if has_auth else "disabled")
         self.cookie_entry.configure(state=cookie_state)
         self.cookie_browse.configure(state=cookie_state)
         self.cookie_import_btn.configure(state=cookie_state)
@@ -1144,7 +1236,8 @@ class AudiobookDLApp:
             state="disabled" if self._is_verifying_auth else save_state
         )
         self.save_auth_btn.configure(state=save_state)
-        has_saved = service.key in self._controller.config.sources
+        active_profile = normalize_profile_name(self.profile_var.get())
+        has_saved = get_source_config(self._controller.config, service.key, active_profile) is not None
         self.forget_auth_btn.configure(state="normal" if has_saved else "disabled")
 
     def verify_current_auth(self) -> None:
@@ -1190,37 +1283,44 @@ class AudiobookDLApp:
         if quiet and not any((username, password, library, cookie_file)):
             return
 
+        active_profile = normalize_profile_name(self.profile_var.get())
         cfg = self._controller.save_source_credentials(
             service.key,
             username=username,
             password=password,
             library=library,
             cookie_file=cookie_file,
+            profile=active_profile,
         )
-        has_saved = service.key in cfg.sources
+        has_saved = get_source_config(cfg, service.key, active_profile) is not None
         self.saved_badge_var.set("Saved" if has_saved else "")
+        self._load_service_into_form()
         self._update_service_field_states()
+        profile_suffix = f" ({active_profile})" if active_profile != DEFAULT_PROFILE else ""
         if not quiet:
             if has_saved:
-                self.status_var.set(f"Saved credentials for {service.label}")
-                self._append_log(f"Saved login settings for {service.label}.")
+                self.status_var.set(f"Saved credentials for {service.label}{profile_suffix}")
+                self._append_log(f"Saved login settings for {service.label}{profile_suffix}.")
             else:
-                self.status_var.set(f"Cleared credentials for {service.label}")
+                self.status_var.set(f"Cleared credentials for {service.label}{profile_suffix}")
 
     def forget_current_credentials(self) -> None:
-        """Remove saved credentials for the currently selected service."""
+        """Remove saved credentials for the currently selected service and profile."""
         service = self._selected_service()
         if service is None:
             return
-        self._controller.save_source_credentials(service.key)
+        active_profile = normalize_profile_name(self.profile_var.get())
+        self._controller.save_source_credentials(service.key, profile=active_profile)
         self.username_var.set("")
         self.password_var.set("")
         self.library_var.set("")
         self.cookie_file_var.set("")
         self.saved_badge_var.set("")
+        self._load_service_into_form()
         self._update_service_field_states()
-        self.status_var.set(f"Removed saved login for {service.label}")
-        self._append_log(f"Removed saved login settings for {service.label}.")
+        profile_suffix = f" ({active_profile})" if active_profile != DEFAULT_PROFILE else ""
+        self.status_var.set(f"Removed saved login for {service.label}{profile_suffix}")
+        self._append_log(f"Removed saved login settings for {service.label}{profile_suffix}.")
 
     def _on_m4b_toggled(self) -> None:
         if self.m4b_var.get():
@@ -1404,7 +1504,9 @@ class AudiobookDLApp:
         self._is_running = running
         widget_state = "disabled" if running else "normal"
         for widget in self._interactive_widgets:
-            if isinstance(widget, ttk.Combobox):
+            if widget is self.profile_combo:
+                widget.configure(state="disabled" if running else "normal")
+            elif isinstance(widget, ttk.Combobox):
                 widget.configure(state="disabled" if running else "readonly")
             else:
                 widget.configure(state=widget_state)
@@ -1491,7 +1593,11 @@ class AudiobookDLApp:
         password = None
         library = None
         cookie_file = None
+        profile: Optional[str] = None
         if apply_form_auth and service is not None:
+            norm_profile = normalize_profile_name(self.profile_var.get())
+            if norm_profile != DEFAULT_PROFILE:
+                profile = norm_profile
             if "cookies" in service.auth_methods:
                 cookie_file = self.cookie_file_var.get().strip() or None
             if "login" in service.auth_methods:
@@ -1512,6 +1618,7 @@ class AudiobookDLApp:
             username=username,
             password=password,
             library=library,
+            profile=profile,
             download_archive=download_archive,
             config_location=effective_config_location,
             **option_values,
@@ -1772,7 +1879,12 @@ class AudiobookDLApp:
             info = self._services_by_key.get(key)
             if info is None or not info.auth_methods:
                 continue
-            src_cfg = cfg.sources.get(key)
+            src_cfg = get_source_config(cfg, key)
+            if src_cfg is None:
+                for prof in list_source_profiles(cfg, key):
+                    src_cfg = get_source_config(cfg, key, prof)
+                    if src_cfg is not None:
+                        break
             has_creds = src_cfg is not None and any((
                 src_cfg.username,
                 src_cfg.password,
@@ -1835,9 +1947,11 @@ class AudiobookDLApp:
         if previewing:
             self.preview_btn.configure(state="disabled")
             self.download_btn.configure(state="disabled")
+            self.cancel_btn.configure(state="normal")
         else:
             self.preview_btn.configure(state="disabled" if self._is_running else "normal")
-            self.download_btn.configure(state="normal")
+            self.download_btn.configure(state="disabled" if self._is_running else "normal")
+            self.cancel_btn.configure(state="normal" if self._is_running else "disabled")
 
     def preview_metadata(self) -> None:
         """Fetch book or series metadata for the first entered URL without downloading audio."""
@@ -1979,6 +2093,12 @@ class AudiobookDLApp:
         self._start_new_run([(url, self.build_options(urls_override=[url]), selected_indices, prefetched)])
 
     def cancel_download(self) -> None:
+        if self._is_previewing and not self._is_running:
+            self.status_var.set("Cancelling preview...")
+            self.cancel_btn.configure(state="disabled")
+            self._append_log("Cancelling metadata preview...")
+            self._controller.cancel_preview()
+            return
         if not self._is_running:
             return
         self.status_var.set("Cancelling...")

@@ -20,6 +20,98 @@ class TreeColumnSpec:
     anchor: str = "w"
 
 
+import typing
+
+_TreeItemT = typing.TypeVar("_TreeItemT")
+
+
+def resolve_selected_leaf_iids(tree: ttk.Treeview) -> typing.List[str]:
+    """Return selected leaf item IDs, expanding any selected group parent rows."""
+    seen: set[str] = set()
+    leaves: typing.List[str] = []
+
+    def _collect(iid: str) -> None:
+        children = tree.get_children(iid)
+        if children:
+            for child in children:
+                _collect(child)
+        elif iid not in seen:
+            seen.add(iid)
+            leaves.append(iid)
+
+    for iid in tree.selection():
+        _collect(iid)
+    return leaves
+
+
+def populate_grouped_tree(
+    tree: ttk.Treeview,
+    items: Sequence[_TreeItemT],
+    *,
+    grouped: bool,
+    get_iid: typing.Callable[[_TreeItemT, int], str],
+    get_values: typing.Callable[[_TreeItemT], typing.Tuple[str, ...]],
+    get_group_key: typing.Callable[[_TreeItemT], str],
+    format_group_values: typing.Callable[[str, int], typing.Tuple[str, ...]],
+    should_group: typing.Optional[typing.Callable[[_TreeItemT, int], bool]] = None,
+    group_prefix: str = "group:",
+    open_groups: bool = True,
+    get_tags: typing.Optional[typing.Callable[[_TreeItemT], typing.Tuple[str, ...]]] = None,
+) -> int:
+    """Populate `tree` flat or grouped under collapsible parent rows.
+
+    Returns the number of parent group rows inserted.
+    """
+    existing = tree.get_children()
+    if existing:
+        tree.delete(*existing)
+
+    if not grouped:
+        for idx, item in enumerate(items):
+            tags = get_tags(item) if get_tags is not None else ()
+            tree.insert("", "end", iid=get_iid(item, idx), values=get_values(item), tags=tags)
+        return 0
+
+    group_counts: Dict[str, int] = {}
+    for item in items:
+        key = get_group_key(item).strip()
+        if key:
+            group_counts[key] = group_counts.get(key, 0) + 1
+
+    group_iids: Dict[str, str] = {}
+    group_counter = 0
+    for idx, item in enumerate(items):
+        key = get_group_key(item).strip()
+        count = group_counts.get(key, 0) if key else 0
+        use_group = bool(
+            key
+            and (
+                should_group(item, count)
+                if should_group is not None
+                else count >= 2
+            )
+        )
+        parent_iid = ""
+        if use_group:
+            parent_iid = group_iids.get(key, "")
+            if not parent_iid:
+                group_counter += 1
+                parent_iid = f"{group_prefix}{group_counter}"
+                group_iids[key] = parent_iid
+                tree.insert(
+                    "",
+                    "end",
+                    iid=parent_iid,
+                    text="",
+                    values=format_group_values(key, count),
+                    open=open_groups,
+                    tags=("group",),
+                )
+        tags = get_tags(item) if get_tags is not None else ()
+        tree.insert(parent_iid, "end", iid=get_iid(item, idx), values=get_values(item), tags=tags)
+    return group_counter
+
+
 class ScrolledTreeview(ttk.Frame):
     """Frame containing a `ttk.Treeview` paired with a vertical `ttk.Scrollbar`."""
 
@@ -30,6 +122,9 @@ class ScrolledTreeview(ttk.Frame):
         *,
         selectmode: str = "browse",
         height: Optional[int] = None,
+        show_tree: bool = False,
+        tree_heading: str = "",
+        tree_width: int = 28,
     ) -> None:
         super().__init__(parent)
         self.columnconfigure(0, weight=1)
@@ -37,13 +132,21 @@ class ScrolledTreeview(ttk.Frame):
 
         tree_kwargs: Dict[str, Any] = {
             "columns": tuple(spec.key for spec in columns),
-            "show": "headings",
+            "show": "tree headings" if show_tree else "headings",
             "selectmode": selectmode,
         }
         if height is not None:
             tree_kwargs["height"] = height
 
         self.tree = ttk.Treeview(self, **tree_kwargs)
+        if show_tree:
+            self.tree.heading("#0", text=tree_heading)
+            self.tree.column(
+                "#0",
+                width=scale_px(self, tree_width),
+                minwidth=scale_px(self, 22),
+                stretch=False,
+            )
         for spec in columns:
             self.tree.heading(spec.key, text=spec.heading)
             self.tree.column(

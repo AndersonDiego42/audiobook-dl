@@ -98,7 +98,7 @@ def test_convert_output_aac_to_m4b_uses_stream_copy(tmp_path):
         return SimpleNamespace(returncode=0, stderr=b"")
 
     with patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"), \
-         patch("audiobookdl.output.output._probe_audio_info", return_value=AudioProbeInfo(codec_name="aac")), \
+         patch("audiobookdl.output.output._probe_audio_info", return_value=AudioProbeInfo(duration=10.0, codec_name="aac")), \
          patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run):
         result = convert_output([str(ts_file)], "m4b")
 
@@ -202,7 +202,14 @@ def test_gen_output_location_enforces_utf8_component_limit_and_windows_max_path(
 def test_combine_audiofiles_sizes_remux_pool_dynamically(tmp_path, monkeypatch):
     monkeypatch.setattr(output, "_require_executable", lambda name: name)
     monkeypatch.setattr(output, "_remux_to_mpegts", lambda src, dst, cancel_event=None: open(dst, "wb").write(b"ts") > 0)
-    monkeypatch.setattr(output, "_probe_audio_info", lambda path: AudioProbeInfo(duration=10.0, codec_name="mp3"))
+    def fake_probe(path: str) -> AudioProbeInfo:
+        if path.endswith("out3.mp3"):
+            return AudioProbeInfo(duration=30.0, codec_name="mp3")
+        if path.endswith("out20.mp3"):
+            return AudioProbeInfo(duration=200.0, codec_name="mp3")
+        return AudioProbeInfo(duration=10.0, codec_name="mp3")
+
+    monkeypatch.setattr(output, "_probe_audio_info", fake_probe)
 
     def fake_run(cmd, **kwargs):
         with open(cmd[-1], "wb") as f:
@@ -400,7 +407,7 @@ def test_convert_output_passes_auto_and_explicit_aac_bitrate(tmp_path):
 
     # Auto mode uses probed bitrate (e.g., 96k)
     with patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"), \
-         patch("audiobookdl.output.output._probe_audio_info", return_value=AudioProbeInfo(codec_name="mp3", bitrate=96000)), \
+         patch("audiobookdl.output.output._probe_audio_info", return_value=AudioProbeInfo(duration=10.0, codec_name="mp3", bitrate=96000)), \
          patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run):
         convert_output([str(mp3)], "m4b")
 
@@ -411,7 +418,7 @@ def test_convert_output_passes_auto_and_explicit_aac_bitrate(tmp_path):
     mp3.write_bytes(b"mp3-bytes")
     (tmp_path / "book.m4b").unlink()
     with patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"), \
-         patch("audiobookdl.output.output._probe_audio_info", return_value=AudioProbeInfo(codec_name="mp3", bitrate=64000)), \
+         patch("audiobookdl.output.output._probe_audio_info", return_value=AudioProbeInfo(duration=10.0, codec_name="mp3", bitrate=64000)), \
          patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run):
         convert_output([str(mp3)], "m4b", audio_bitrate="192k")
 
@@ -839,4 +846,195 @@ def test_split_audio_by_chapters_parallel_accurate_and_fallback(tmp_path):
     assert len(fb_result) == 3
     assert call_count == 4  # 3 fast copy attempts + 1 re-encode retry for chapter 2
     assert any(cmd.index("-i") < cmd.index("-ss") and "aac" in cmd for cmd in fallback_cmds)
+
+
+def test_combine_audiofiles_parallel_aac_transcode_concat_and_fallback(tmp_path):
+    from pathlib import Path
+    from unittest.mock import MagicMock
+
+    p0 = tmp_path / "01.mp3"
+    p1 = tmp_path / "02.m4a"
+    p0.write_bytes(b"mp3")
+    p1.write_bytes(b"m4a")
+    out_m4b = tmp_path / "Mixed.m4b"
+    cmds: list[list[str]] = []
+    probed_paths: list[str] = []
+
+    def fake_probe(path: str) -> AudioProbeInfo:
+        probed_paths.append(path)
+        if path == str(p0):
+            return AudioProbeInfo(duration=6.0, bitrate=96000, codec_name="mp3", format_name="mp3", sample_rate=44100, channels=1)
+        if path == str(p1):
+            return AudioProbeInfo(duration=4.0, bitrate=128000, codec_name="aac", format_name="mp4", sample_rate=44100, channels=2)
+        return AudioProbeInfo(duration=10.0, bitrate=128000, codec_name="aac", format_name="mp4", sample_rate=44100, channels=2)
+
+    def fake_run(cmd, capture_output=False, cancel_event=None):
+        cmds.append(cmd)
+        Path(cmd[-1]).write_bytes(b"data")
+        return MagicMock(returncode=0, stderr=b"")
+
+    cache = {
+        str(p0): fake_probe(str(p0)),
+        str(p1): fake_probe(str(p1)),
+    }
+    probed_paths.clear()
+    with (
+        patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
+        patch("audiobookdl.output.output._probe_audio_info", side_effect=fake_probe),
+        patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run),
+    ):
+        chapters_ok = combine_audiofiles(
+            [str(p0), str(p1)],
+            str(tmp_path / "work1"),
+            str(out_m4b),
+            chapters=[Chapter(start=0, title="Ch 1"), Chapter(start=6000, title="Ch 2")],
+            probe_cache=cache,
+            faststart=False,
+        )
+
+    assert chapters_ok is True
+    # Part 0 (mono MP3) encodes to 44100 Hz stereo AAC; Part 1 (already 44100 Hz stereo AAC) copies directly:
+    assert len(cmds) == 3
+    part_cmds = {c[c.index("-i") + 1]: c for c in cmds if c[-1].endswith(".ts")}
+    mux_cmd = [c for c in cmds if c[-1] == str(out_m4b)][0]
+    p0_cmd = part_cmds[str(p0)]
+    assert p0_cmd[p0_cmd.index("-c:a") + 1] == "aac"
+    assert p0_cmd[p0_cmd.index("-b:a") + 1] == "96k"
+    assert p0_cmd[p0_cmd.index("-ar") + 1] == "44100"
+    assert p0_cmd[p0_cmd.index("-ac") + 1] == "2"
+    p1_cmd = part_cmds[str(p1)]
+    assert p1_cmd[p1_cmd.index("-c:a") + 1] == "copy"
+    assert p1_cmd[p1_cmd.index("-f") + 1] == "mpegts"
+    assert mux_cmd[mux_cmd.index("-i") + 1].startswith("concat:")
+    assert mux_cmd[mux_cmd.index("-c:a") + 1] == "copy"
+    assert mux_cmd[mux_cmd.index("-bsf:a") + 1] == "aac_adtstoasc"
+    assert "-movflags" not in mux_cmd
+    # Only out_m4b should have been probed (cached input durations propagated to ts_parts)
+    assert probed_paths == [str(out_m4b)]
+
+    # Fallback to combined.ts when concat: length exceeds limit
+    cmds.clear()
+    out_m4b_2 = tmp_path / "Fallback.m4b"
+    with (
+        patch("audiobookdl.output.output._MAX_CONCAT_ARG_CHARS", 10),
+        patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
+        patch("audiobookdl.output.output._probe_audio_info", side_effect=fake_probe),
+        patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run),
+    ):
+        combine_audiofiles(
+            [str(p0), str(p1)],
+            str(tmp_path / "work2"),
+            str(out_m4b_2),
+            probe_cache={str(p0): cache[str(p0)], str(p1): cache[str(p1)]},
+        )
+    mux_cmd_2 = [c for c in cmds if c[-1] == str(out_m4b_2)][0]
+    assert mux_cmd_2[mux_cmd_2.index("-i") + 1].endswith("combined.ts")
+    assert "+faststart" in mux_cmd_2
+
+
+def test_real_ffmpeg_combine_mixed_mp3_and_m4a_to_m4b(tmp_path):
+    ffmpeg_bin = find_executable("ffmpeg")
+    ffprobe_bin = find_executable("ffprobe")
+    if not ffmpeg_bin or not ffprobe_bin:
+        pytest.skip("ffmpeg/ffprobe not available")
+    assert ffmpeg_bin is not None
+    assert ffprobe_bin is not None
+
+    p1 = tmp_path / "01.mp3"
+    p2 = tmp_path / "02.m4a"
+    subprocess.run(
+        [ffmpeg_bin, "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=1.2", "-ac", "1", "-c:a", "libmp3lame", "-b:a", "96k", str(p1)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [ffmpeg_bin, "-y", "-f", "lavfi", "-i", "sine=frequency=550:duration=1.2", "-ac", "2", "-c:a", "aac", "-b:a", "128k", str(p2)],
+        check=True,
+        capture_output=True,
+    )
+    out_m4b = tmp_path / "CombinedMixed.m4b"
+    chapters = [Chapter(start=0, title="Part One"), Chapter(start=1200, title="Part Two")]
+    embedded = combine_audiofiles(
+        [str(p1), str(p2)],
+        str(tmp_path / "work"),
+        str(out_m4b),
+        chapters=chapters,
+        faststart=False,
+    )
+    assert embedded is True
+    info = output._probe_audio_info(str(out_m4b))
+    assert info.codec_name == "aac"
+    assert 2.2 <= info.duration <= 2.7
+    assert info.channels == 2
+
+
+def test_faststart_flag_on_convert_single_file_and_explicit_output_path(tmp_path):
+    from pathlib import Path
+    from unittest.mock import MagicMock
+
+    src = tmp_path / "book.m4b"
+    src.write_bytes(b"m4b")
+    dst = tmp_path / "staged.m4b"
+    cmds: list[list[str]] = []
+
+    def fake_run(cmd, capture_output=False, cancel_event=None):
+        cmds.append(cmd)
+        Path(cmd[-1]).write_bytes(b"out")
+        return MagicMock(returncode=0, stderr=b"")
+
+    with (
+        patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
+        patch("audiobookdl.output.output._probe_audio_info", return_value=AudioProbeInfo(duration=10.0, codec_name="aac")),
+        patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run),
+    ):
+        new_path, chapters_ok = output.convert_single_file(
+            str(src),
+            "m4b",
+            chapters=[Chapter(start=0, title="Intro")],
+            remove_source=False,
+            output_path=str(dst),
+            faststart=False,
+        )
+
+    assert new_path == str(dst)
+    assert chapters_ok is True
+    assert src.exists()
+    assert dst.exists()
+    assert cmds[0][cmds[0].index("-c:a") + 1] == "copy"
+    assert "-movflags" not in cmds[0]
+
+
+def test_verify_audio_integrity_and_staged_convert_preserve_existing_on_failure(tmp_path):
+    from pathlib import Path
+    from unittest.mock import MagicMock
+
+    src = tmp_path / "book.mp3"
+    src.write_bytes(b"src-mp3")
+    existing_dst = tmp_path / "book.m4b"
+    existing_dst.write_bytes(b"previous-good-m4b")
+
+    def _corrupt_ffmpeg(cmd, capture_output=False, cancel_event=None):
+        Path(cmd[-1]).write_bytes(b"corrupt-m4b")
+        return MagicMock(returncode=0, stderr=b"")
+
+    def _probe_side_effect(path: str) -> AudioProbeInfo:
+        if path == str(src):
+            return AudioProbeInfo(duration=12.0, bitrate=128000, codec_name="mp3")
+        return AudioProbeInfo(duration=0.0, codec_name="")
+
+    with (
+        patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
+        patch("audiobookdl.output.output.find_executable", return_value="ffprobe"),
+        patch("audiobookdl.output.output._probe_audio_info", side_effect=_probe_side_effect),
+        patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=_corrupt_ffmpeg),
+    ):
+        with pytest.raises(GenericAudiobookDLException):
+            output.convert_single_file(str(src), "m4b", remove_source=True)
+
+    # Original source AND existing target remain untouched, and no temp file lingers
+    assert src.read_bytes() == b"src-mp3"
+    assert existing_dst.read_bytes() == b"previous-good-m4b"
+    assert [p.name for p in tmp_path.iterdir()] == sorted(["book.m4b", "book.mp3"])
+
+
 

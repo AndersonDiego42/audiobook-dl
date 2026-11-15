@@ -232,12 +232,42 @@ class KeyringCredentialStore(CredentialStore):
     is_secure = True
     _SERVICE_NAME = "audiobook-dl"
 
-    def __init__(self, keyring_module: Any) -> None:
+    def __init__(self, keyring_module: Any, index_path: Optional[str] = None) -> None:
         self._keyring = keyring_module
+        self.index_path = index_path
 
     @staticmethod
     def _account_key(service_key: str, username: Optional[str]) -> str:
         return f"{service_key}:{username or ''}"
+
+    def _read_index(self) -> Dict[str, Optional[str]]:
+        if not self.index_path or not os.path.exists(self.index_path):
+            return {}
+        try:
+            with open(self.index_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            entries = data.get("entries")
+            if isinstance(entries, dict):
+                return {
+                    str(k): (v if isinstance(v, str) or v is None else str(v))
+                    for k, v in entries.items()
+                }
+        except (OSError, ValueError, TypeError) as exc:
+            logging.debug(f"Failed to read keyring index '{self.index_path}': {exc}")
+        return {}
+
+    def _write_index(self, entries: Dict[str, Optional[str]]) -> None:
+        if not self.index_path:
+            return
+        if not entries:
+            if os.path.exists(self.index_path):
+                os.remove(self.index_path)
+            return
+        atomic_write_text(
+            self.index_path,
+            json.dumps({"version": 1, "entries": entries}, indent=2),
+            private=True,
+        )
 
     def get_password(self, service_key: str, username: Optional[str]) -> Optional[str]:
         try:
@@ -257,6 +287,11 @@ class KeyringCredentialStore(CredentialStore):
             self._account_key(service_key, username),
             password,
         )
+        if self.index_path:
+            with file_lock(self.index_path):
+                entries = self._read_index()
+                entries[service_key] = username
+                self._write_index(entries)
 
     def delete_password(self, service_key: str, username: Optional[str]) -> None:
         try:
@@ -266,6 +301,25 @@ class KeyringCredentialStore(CredentialStore):
             )
         except Exception as exc:
             logging.debug(f"Keyring delete ignored for '{service_key}': {exc}")
+        if self.index_path:
+            with file_lock(self.index_path):
+                entries = self._read_index()
+                if service_key in entries and (
+                    username is None or entries.get(service_key) == username
+                ):
+                    entries.pop(service_key, None)
+                    self._write_index(entries)
+
+    def stored_services(self) -> Dict[str, Optional[str]]:
+        if not self.index_path:
+            return {}
+        with file_lock(self.index_path):
+            entries = self._read_index()
+        active: Dict[str, Optional[str]] = {}
+        for service_key, username in entries.items():
+            if self.get_password(service_key, username) is not None:
+                active[service_key] = username
+        return active
 
 
 class PlaintextFallbackCredentialStore(CredentialStore):
@@ -314,6 +368,12 @@ def get_vault_path(config_location: str) -> str:
     return os.path.join(config_dir, "credentials.dpapi")
 
 
+def get_keyring_index_path(config_location: str) -> str:
+    """Return path to the non-secret keyring service index beside `config_location`."""
+    config_dir = os.path.dirname(os.path.abspath(config_location))
+    return os.path.join(config_dir, "credentials.keyring.json")
+
+
 def get_credential_store(
     config_location: str,
     allow_plaintext: Optional[bool] = None,
@@ -326,7 +386,10 @@ def get_credential_store(
     except ImportError:
         keyring = None
     if keyring is not None and _is_usable_keyring_backend(keyring):
-        return KeyringCredentialStore(keyring)
+        return KeyringCredentialStore(
+            keyring,
+            index_path=get_keyring_index_path(config_location),
+        )
     if allow_plaintext is None:
         allow_plaintext = os.environ.get(PLAINTEXT_OPT_IN_ENV, "").strip().lower() in (
             "1",

@@ -74,12 +74,16 @@ class DownloadOptions:
     username: Optional[str] = None
     password: Optional[str] = None
     library: Optional[str] = None
+    profile: Optional[str] = None
     skip_downloaded: bool = False
     download_archive: Optional[str] = None
+    no_download_archive: bool = False
     database_directory: str = field(default_factory=default_database_directory)
     write_json_metadata: bool = False
     write_cover: bool = False
     write_opf: bool = False
+    write_abs_metadata: bool = False
+    upload_to_abs: bool = False
     write_cue: bool = False
     config_location: Optional[str] = None
     resume: bool = False
@@ -120,7 +124,11 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> DownloadOptions:
     parser = argparse.ArgumentParser(
         prog="audiobook-dl",
         description="Download audiobooks from websites",
-        epilog="Subcommands:\n  audiobook-dl pack <paths...>   Repackage local folders/tracks offline into .m4b",
+        epilog=(
+            "Subcommands:\n"
+            "  audiobook-dl pack <paths...>      Repackage local folders/tracks offline into .m4b\n"
+            "  audiobook-dl library <action>     Manage unified library ledger, tags, and trash"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         argument_default=argparse.SUPPRESS,
     )
@@ -149,6 +157,7 @@ _PACK_SHARED_OPTION_NAMES: FrozenSet[str] = frozenset(
         "write_json_metadata",
         "write_cover",
         "write_opf",
+        "write_abs_metadata",
         "write_cue",
         "overwrite",
         "enrich_metadata",
@@ -285,6 +294,231 @@ def parse_pack_arguments(
         cover_path=raw.pop("pack_cover_path", None),
     )
     return build_default_options(**raw), pack_opts
+
+
+@dataclass
+class LibraryOptions:
+    """Arguments for `audiobook-dl library` subcommand."""
+
+    action: str
+    entry_ids: List[int] = field(default_factory=list)
+    query: str = ""
+    limit: int = 100
+    include_trashed: bool = False
+    include_hidden: bool = True
+    tags: List[str] = field(default_factory=list)
+    archive_path: Optional[str] = None
+    config_location: Optional[str] = None
+
+
+def parse_library_arguments(argv: Optional[Sequence[str]] = None) -> LibraryOptions:
+    """Parse arguments for `audiobook-dl library`."""
+    parser = argparse.ArgumentParser(
+        prog="audiobook-dl library",
+        description="Search, tag, hide, and manage library entries in downloads.db",
+    )
+    parser.add_argument(
+        "--config",
+        dest="config_location",
+        default=None,
+        help="Alternative location of config file",
+    )
+    parser.add_argument(
+        "--download-archive",
+        dest="archive_path",
+        default=None,
+        help="Path to SQLite library database",
+    )
+    sub = parser.add_subparsers(dest="action", required=True)
+
+    list_p = sub.add_parser("list", help="List or search library entries")
+    list_p.add_argument("-q", "--query", default="", help="Field-aware search query (e.g. author:herbert tag:scifi)")
+    list_p.add_argument("--limit", type=int, default=100, help="Maximum entries to print")
+    list_p.add_argument("--include-trashed", action="store_true", help="Include trashed entries")
+    list_p.add_argument("--no-hidden", action="store_true", help="Exclude entries tagged 'hidden'")
+
+    tag_p = sub.add_parser("tag", help="Add or remove tags on library entries")
+    tag_p.add_argument("entry_ids", nargs="+", type=int, help="Entry ID(s)")
+    tag_p.add_argument("--add", nargs="*", default=[], help="Tags to add")
+    tag_p.add_argument("--remove", nargs="*", default=[], help="Tags to remove")
+
+    for act, help_txt in (
+        ("hide", "Tag entries as 'hidden'"),
+        ("unhide", "Remove 'hidden' tag from entries"),
+        ("trash", "Move entries to trash"),
+        ("restore", "Restore trashed entries"),
+    ):
+        act_p = sub.add_parser(act, help=help_txt)
+        act_p.add_argument("entry_ids", nargs="+", type=int, help="Entry ID(s)")
+
+    ns = parser.parse_args(argv)
+    tags: List[str] = []
+    if ns.action == "tag":
+        tags = [*ns.add, *(f"-{t}" for t in ns.remove)]
+    return LibraryOptions(
+        action=ns.action,
+        entry_ids=list(getattr(ns, "entry_ids", [])),
+        query=getattr(ns, "query", ""),
+        limit=getattr(ns, "limit", 100),
+        include_trashed=bool(getattr(ns, "include_trashed", False)),
+        include_hidden=not bool(getattr(ns, "no_hidden", False)),
+        tags=tags,
+        archive_path=ns.archive_path,
+        config_location=ns.config_location,
+    )
+
+
+@dataclass
+class ScanOptions:
+    """CLI options parsed by `audiobook-dl scan`."""
+
+    paths: List[str] = field(default_factory=list)
+    verify_missing: bool = False
+    dry_run: bool = False
+    json_output: bool = False
+    profile: str = "default"
+    archive_path: Optional[str] = None
+    config_location: Optional[str] = None
+
+
+def parse_scan_arguments(argv: Optional[Sequence[str]] = None) -> ScanOptions:
+    """Parse arguments for `audiobook-dl scan`."""
+    parser = argparse.ArgumentParser(
+        prog="audiobook-dl scan",
+        description="Scan local folders for existing audiobooks and reconcile downloads.db",
+    )
+    parser.add_argument("paths", nargs="+", help="Local folder(s) or audio file(s) to scan")
+    parser.add_argument("--config", dest="config_location", default=None, help="Alternative location of config file")
+    parser.add_argument("--download-archive", dest="archive_path", default=None, help="Path to SQLite library database")
+    parser.add_argument("--profile", default="default", help="Profile label to record for newly registered books")
+    parser.add_argument(
+        "--verify-missing",
+        action="store_true",
+        help="Mark previously downloaded entries whose output_path no longer exists back to pending",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Inspect without writing to downloads.db")
+    parser.add_argument("--json", dest="json_output", action="store_true", help="Print scan summary as JSON")
+    ns = parser.parse_args(argv)
+    return ScanOptions(
+        paths=list(ns.paths),
+        verify_missing=bool(ns.verify_missing),
+        dry_run=bool(ns.dry_run),
+        json_output=bool(ns.json_output),
+        profile=str(ns.profile or "default").strip().lower() or "default",
+        archive_path=ns.archive_path,
+        config_location=ns.config_location,
+    )
+
+
+@dataclass
+class ExportOptions:
+    """CLI options parsed by `audiobook-dl export`."""
+
+    output_path: str
+    fmt: Optional[str] = None
+    query: str = ""
+    limit: int = 100000
+    include_trashed: bool = False
+    include_hidden: bool = True
+    archive_path: Optional[str] = None
+    config_location: Optional[str] = None
+
+
+def parse_export_arguments(argv: Optional[Sequence[str]] = None) -> ExportOptions:
+    """Parse arguments for `audiobook-dl export`."""
+    parser = argparse.ArgumentParser(
+        prog="audiobook-dl export",
+        description="Export library ledger entries to CSV, JSON, or Excel (.xlsx)",
+    )
+    parser.add_argument("output_path", help="Destination export path (.csv, .json, or .xlsx)")
+    parser.add_argument(
+        "-f",
+        "--format",
+        dest="fmt",
+        choices=("csv", "json", "xlsx"),
+        default=None,
+        help="Override export format (defaults to file extension)",
+    )
+    parser.add_argument("-q", "--query", default="", help="Filter entries before exporting")
+    parser.add_argument("--limit", type=int, default=100000, help="Maximum entries to export")
+    parser.add_argument("--include-trashed", action="store_true", help="Include trashed entries")
+    parser.add_argument("--no-hidden", action="store_true", help="Exclude entries tagged 'hidden'")
+    parser.add_argument("--config", dest="config_location", default=None, help="Alternative location of config file")
+    parser.add_argument("--download-archive", dest="archive_path", default=None, help="Path to SQLite library database")
+    ns = parser.parse_args(argv)
+    return ExportOptions(
+        output_path=str(ns.output_path),
+        fmt=ns.fmt,
+        query=str(ns.query or ""),
+        limit=max(1, int(ns.limit)),
+        include_trashed=bool(ns.include_trashed),
+        include_hidden=not bool(ns.no_hidden),
+        archive_path=ns.archive_path,
+        config_location=ns.config_location,
+    )
+
+
+@dataclass
+class SyncOptions:
+    """CLI options parsed by `audiobook-dl sync`."""
+
+    services: List[str] = field(default_factory=list)
+    profile: Optional[str] = None
+    scan_only: bool = False
+    dry_run: bool = False
+    watch: bool = False
+    interval_seconds: int = 3600
+    json_output: bool = False
+    output_template: Optional[str] = None
+    output_format: Optional[str] = None
+    archive_path: Optional[str] = None
+    config_location: Optional[str] = None
+
+
+def parse_sync_arguments(argv: Optional[Sequence[str]] = None) -> SyncOptions:
+    """Parse arguments for `audiobook-dl sync`."""
+    parser = argparse.ArgumentParser(
+        prog="audiobook-dl sync",
+        description="Poll configured account libraries and download new books automatically",
+    )
+    parser.add_argument(
+        "--service",
+        dest="services",
+        action="append",
+        default=[],
+        help="Specific source service to sync (repeatable; defaults to all configured library services)",
+    )
+    parser.add_argument("--profile", default=None, help="Limit sync to a single named profile")
+    parser.add_argument("--scan-only", action="store_true", help="Refresh downloads.db without downloading")
+    parser.add_argument("--dry-run", action="store_true", help="Preview pending downloads without writing DB")
+    parser.add_argument("--watch", action="store_true", help="Poll continuously at --interval seconds")
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=3600,
+        help="Polling interval in seconds when --watch is active (default: 3600)",
+    )
+    parser.add_argument("--json", dest="json_output", action="store_true", help="Print cycle results as JSON")
+    parser.add_argument("-o", "--output", dest="output_template", default=None, help="Override output template")
+    parser.add_argument("-f", "--output-format", dest="output_format", default=None, help="Override output format")
+    parser.add_argument("--config", dest="config_location", default=None, help="Alternative location of config file")
+    parser.add_argument("--download-archive", dest="archive_path", default=None, help="Path to SQLite library database")
+    ns = parser.parse_args(argv)
+    if ns.interval <= 0:
+        parser.error("--interval must be a positive integer")
+    return SyncOptions(
+        services=list(ns.services or []),
+        profile=ns.profile,
+        scan_only=bool(ns.scan_only),
+        dry_run=bool(ns.dry_run),
+        watch=bool(ns.watch),
+        interval_seconds=max(1, int(ns.interval)),
+        json_output=bool(ns.json_output),
+        output_template=ns.output_template,
+        output_format=ns.output_format,
+        archive_path=ns.archive_path,
+        config_location=ns.config_location,
+    )
 
 
 def get_urls(options: DownloadOptions) -> List[str]:

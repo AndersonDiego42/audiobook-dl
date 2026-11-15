@@ -68,7 +68,14 @@ def set_ffmpeg_dir(directory: Optional[str]) -> None:
 
 
 def get_ffmpeg_dir() -> Optional[str]:
-    """Return the configured custom FFmpeg directory, if any."""
+    """Return the configured custom FFmpeg directory from the active job or global setting."""
+    from audiobookdl import logging
+
+    ctx = logging.get_job_context()
+    if ctx is not None and ctx.ffmpeg_dir is not None:
+        cleaned = ctx.ffmpeg_dir.strip()
+        if cleaned:
+            return cleaned
     return _custom_ffmpeg_dir
 
 
@@ -109,8 +116,9 @@ def find_executable(program: str) -> Optional[str]:
             search_dirs.append(meipass)
         search_dirs.append(os.path.dirname(sys.executable))
 
-    if _custom_ffmpeg_dir and program.lower().removesuffix(".exe") in ("ffmpeg", "ffprobe"):
-        search_dirs.append(_custom_ffmpeg_dir)
+    custom_ffmpeg_dir = get_ffmpeg_dir()
+    if custom_ffmpeg_dir and program.lower().removesuffix(".exe") in ("ffmpeg", "ffprobe"):
+        search_dirs.append(custom_ffmpeg_dir)
 
     for directory in search_dirs:
         for candidate in candidates:
@@ -134,6 +142,8 @@ class AudioProbeInfo:
     bitrate: Optional[int] = None
     codec_name: str = ""
     format_name: str = ""
+    sample_rate: Optional[int] = None
+    channels: Optional[int] = None
 
 
 def _parse_positive_int(raw: Any) -> Optional[int]:
@@ -170,7 +180,7 @@ def probe_audio_info(path: str) -> AudioProbeInfo:
                 "-select_streams",
                 "a:0",
                 "-show_entries",
-                "format=duration,bit_rate,format_name:stream=codec_name,bit_rate,duration",
+                "format=duration,bit_rate,format_name:stream=codec_name,bit_rate,duration,sample_rate,channels",
                 "-of",
                 "json",
                 path,
@@ -194,11 +204,15 @@ def probe_audio_info(path: str) -> AudioProbeInfo:
     bitrate = _parse_positive_int(stream.get("bit_rate")) or _parse_positive_int(fmt.get("bit_rate"))
     codec_name = str(stream.get("codec_name") or "").strip()
     format_name = str(fmt.get("format_name") or "").strip()
+    sample_rate = _parse_positive_int(stream.get("sample_rate"))
+    channels = _parse_positive_int(stream.get("channels"))
     return AudioProbeInfo(
         duration=duration,
         bitrate=bitrate,
         codec_name=codec_name,
         format_name=format_name,
+        sample_rate=sample_rate,
+        channels=channels,
     )
 
 

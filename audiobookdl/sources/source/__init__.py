@@ -13,6 +13,7 @@ import lxml.html
 from lxml.cssselect import CSSSelector
 import re
 import os
+import weakref
 from dataclasses import dataclass
 from http.cookiejar import CookieJar, MozillaCookieJar
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, TypeVar, Generic
@@ -34,6 +35,8 @@ class CatalogBook:
     author: str = ""
     series: Optional[str] = None
     source: str = ""
+    series_order: Optional[int] = None
+    item_type: str = "book"
 
 
 class Source(Generic[T]):
@@ -61,8 +64,25 @@ class Source(Generic[T]):
         self.database_directory = os.path.join(options.database_directory, self.name)
         self.skip_downloaded = options.skip_downloaded
         self._session: requests.Session = self.create_session(options)
+        self._session_finalizer = weakref.finalize(self, self._session.close)
         if self.create_storage_dir:
             os.makedirs(self.database_directory, exist_ok=True)
+
+    def close(self) -> None:
+        """Close the HTTP session held by this source."""
+        finalizer = getattr(self, "_session_finalizer", None)
+        if finalizer is not None:
+            finalizer()
+            return
+        session = getattr(self, "_session", None)
+        if session is not None and hasattr(session, "close"):
+            session.close()
+
+    def __enter__(self) -> Source[T]:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
 
 
     @property
@@ -99,7 +119,11 @@ class Source(Generic[T]):
             self.__authenticated = True
 
     def cached_cookie_path(self) -> str:
-        """Return the per-source persistent session cookie jar file path."""
+        """Return the per-source, per-profile persistent session cookie jar file path."""
+        profile = (getattr(self._options, "profile", None) or "").strip().lower()
+        if profile and profile != "default":
+            safe_profile = re.sub(r"[^a-z0-9_-]", "_", profile)
+            return os.path.join(self.database_directory, f"session_cookies_{safe_profile}.txt")
         return os.path.join(self.database_directory, "session_cookies.txt")
 
     def save_cookie_file(self, cookie_file: Optional[str] = None) -> str:
@@ -112,6 +136,11 @@ class Source(Generic[T]):
         for cookie in CookieJar.__iter__(self._session.cookies):
             jar.set_cookie(cookie)
         jar.save(target, ignore_discard=True, ignore_expires=True)
+        if os.name != "nt":
+            try:
+                os.chmod(target, 0o600)
+            except OSError:
+                pass
         return target
 
     def search(self, query: str) -> List[CatalogBook]:

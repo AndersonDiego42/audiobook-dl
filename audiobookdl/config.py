@@ -16,7 +16,7 @@ from audiobookdl.options_schema import (
 from audiobookdl.utils.fs import atomic_write_text, file_lock
 from attrs import Factory, define
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import os
 import re
@@ -51,6 +51,16 @@ class GuiConfig:
 
 
 @define
+class AudiobookshelfConfig:
+    """Audiobookshelf server connection and sync configuration"""
+    url: Optional[str] = None
+    api_key: Optional[str] = None
+    library_id: Optional[str] = None
+    auto_upload: bool = False
+    auto_scan: bool = True
+
+
+@define
 class Config:
     """audiobook-dl config"""
     sources: Dict[str, SourceConfig]
@@ -78,11 +88,13 @@ class Config:
     write_json_metadata: Optional[bool] = None
     write_cover: Optional[bool] = None
     write_opf: Optional[bool] = None
+    write_abs_metadata: Optional[bool] = None
     write_cue: Optional[bool] = None
     enrich_metadata: Optional[bool] = None
     enrich_providers: Optional[str] = None
     enrich_interactive: Optional[bool] = None
     gui: GuiConfig = Factory(GuiConfig)
+    audiobookshelf: AudiobookshelfConfig = Factory(AudiobookshelfConfig)
 
     def clone(self) -> "Config":
         """Return an isolated copy of this configuration for background jobs."""
@@ -103,7 +115,18 @@ class Config:
             theme=self.gui.theme,
             notify_on_complete=self.gui.notify_on_complete,
         )
-        kwargs: Dict[str, Any] = {"sources": sources_copy, "gui": gui_copy}
+        abs_copy = AudiobookshelfConfig(
+            url=self.audiobookshelf.url,
+            api_key=self.audiobookshelf.api_key,
+            library_id=self.audiobookshelf.library_id,
+            auto_upload=self.audiobookshelf.auto_upload,
+            auto_scan=self.audiobookshelf.auto_scan,
+        )
+        kwargs: Dict[str, Any] = {
+            "sources": sources_copy,
+            "gui": gui_copy,
+            "audiobookshelf": abs_copy,
+        }
         for spec in CONFIG_OPTION_SPECS:
             if spec.config_key is not None:
                 kwargs[spec.config_key] = getattr(self, spec.config_key)
@@ -139,6 +162,73 @@ def normalize_source_key(raw_key: str) -> str:
     except Exception:
         pass
     return lowered
+
+
+DEFAULT_PROFILE = "default"
+
+
+def normalize_profile_name(profile: Optional[str]) -> str:
+    """Normalize a source profile identifier, defaulting empty/None to `'default'`."""
+    if profile is None:
+        return DEFAULT_PROFILE
+    cleaned = profile.strip().lower()
+    return cleaned or DEFAULT_PROFILE
+
+
+def make_source_profile_key(service_key: str, profile: Optional[str] = None) -> str:
+    """Build canonical `Config.sources` / `CredentialStore` key for `(service_key, profile)`."""
+    canonical = normalize_source_key(service_key)
+    norm_profile = normalize_profile_name(profile)
+    if norm_profile == DEFAULT_PROFILE:
+        return canonical
+    return f"{canonical}:{norm_profile}"
+
+
+def split_source_profile_key(raw_key: str) -> Tuple[str, str]:
+    """Split a `Config.sources` or vault key into `(canonical_service, profile)`."""
+    if ":" in raw_key:
+        service_part, profile_part = raw_key.split(":", 1)
+        return normalize_source_key(service_part), normalize_profile_name(profile_part)
+    return normalize_source_key(raw_key), DEFAULT_PROFILE
+
+
+def get_source_config(
+    config: Config,
+    service_key: str,
+    profile: Optional[str] = None,
+    aliases: Sequence[str] = (),
+) -> Optional[SourceConfig]:
+    """Look up `SourceConfig` for `(service_key, profile)` checking canonical and alias names."""
+    norm_profile = normalize_profile_name(profile)
+    candidates = [service_key, *(a for a in aliases if a)]
+    for candidate in candidates:
+        key = make_source_profile_key(candidate, norm_profile)
+        found = config.sources.get(key)
+        if found is not None:
+            return found
+    return None
+
+
+def list_source_profiles(config: Config, service_key: str) -> List[str]:
+    """Return configured profile names for `service_key`, with `'default'` first if present."""
+    canonical = normalize_source_key(service_key)
+    profiles: List[str] = []
+    for raw_key in config.sources:
+        svc, prof = split_source_profile_key(raw_key)
+        if svc == canonical and prof not in profiles:
+            profiles.append(prof)
+    profiles.sort(key=lambda p: (0 if p == DEFAULT_PROFILE else 1, p))
+    return profiles
+
+
+def list_configured_source_profiles(config: Config) -> List[Tuple[str, str, SourceConfig]]:
+    """Return all configured `(service_key, profile, SourceConfig)` entries sorted deterministically."""
+    out: List[Tuple[str, str, SourceConfig]] = []
+    for raw_key, src_cfg in config.sources.items():
+        svc, prof = split_source_profile_key(raw_key)
+        out.append((svc, prof, src_cfg))
+    out.sort(key=lambda item: (item[0], 0 if item[1] == DEFAULT_PROFILE else 1, item[1]))
+    return out
 
 
 def load_config(
@@ -227,6 +317,31 @@ def read_config(config_file: str) -> dict:
     return config_dict
 
 
+def _migrate_profile_password(
+    profile_key: str,
+    values: Dict[str, Any],
+    store: CredentialStore,
+) -> bool:
+    """Move plaintext `password` out of `values` into `store`; return True if modified."""
+    if "password" not in values:
+        return False
+    legacy_password = values.pop("password")
+    if legacy_password:
+        try:
+            store.set_password(
+                profile_key,
+                values.get("username"),
+                str(legacy_password),
+            )
+        except Exception as exc:
+            values["password"] = legacy_password
+            logging.debug(
+                f"Failed to migrate password for '{profile_key}' to OS keystore: {exc}"
+            )
+            return False
+    return True
+
+
 def _migrate_legacy_passwords(
     config_location: str,
     config_dict: Dict[str, Any],
@@ -240,25 +355,32 @@ def _migrate_legacy_passwords(
         return
     migrated = False
     for source_name, values in list(sources.items()):
-        if not isinstance(values, dict) or "password" not in values:
+        if not isinstance(values, dict):
             continue
-        legacy_password = values.pop("password")
-        if legacy_password:
-            try:
-                store.set_password(
-                    source_name,
-                    values.get("username"),
-                    str(legacy_password),
-                )
-            except Exception as exc:
-                values["password"] = legacy_password
-                logging.debug(
-                    f"Failed to migrate password for '{source_name}' to OS keystore: {exc}"
-                )
-                continue
-        if not any(v is not None and v != "" for v in values.values()):
+        base_svc, base_prof = split_source_profile_key(source_name)
+        if _migrate_profile_password(
+            make_source_profile_key(base_svc, base_prof),
+            values,
+            store,
+        ):
+            migrated = True
+        profiles = values.get("profiles")
+        if isinstance(profiles, dict):
+            for prof_name, prof_values in list(profiles.items()):
+                if not isinstance(prof_values, dict):
+                    continue
+                prof_key = make_source_profile_key(base_svc, str(prof_name))
+                if _migrate_profile_password(prof_key, prof_values, store):
+                    migrated = True
+                if not any(v is not None and v != "" for v in prof_values.values()):
+                    profiles.pop(prof_name, None)
+            if not profiles:
+                values.pop("profiles", None)
+        if not any(
+            k != "profiles" and v is not None and v != ""
+            for k, v in values.items()
+        ) and not values.get("profiles"):
             sources.pop(source_name, None)
-        migrated = True
     if migrated:
         if not sources:
             config_dict.pop("sources", None)
@@ -270,6 +392,42 @@ def _migrate_legacy_passwords(
                 logging.debug(
                     f"Could not scrub migrated password from '{config_location}': {exc}"
                 )
+
+
+def _build_source_config_from_dict(
+    *,
+    section_label: str,
+    raw_source_name: str,
+    profile_key: str,
+    values: Dict[str, Any],
+    config_dir_path: str,
+    credential_store: Optional[CredentialStore],
+    allowed_keys: Sequence[str],
+) -> SourceConfig:
+    """Validate and construct a `SourceConfig` from a parsed TOML source/profile table."""
+    for key in values:
+        if key not in allowed_keys:
+            logging.log(
+                f"Warning: unknown key '{key}' in '{section_label}' ignored"
+            )
+    username = values.get("username")
+    password = values.get("password")
+    if password is None and credential_store is not None:
+        password = credential_store.get_password(profile_key, username)
+    if password is None and credential_store is not None and raw_source_name != profile_key:
+        password = credential_store.get_password(raw_source_name, username)
+    cookie_file = values.get("cookie_file")
+    if cookie_file is not None and not isinstance(cookie_file, str):
+        logging.log(f"Warning: invalid 'cookie_file' in '{section_label}'; ignoring")
+        cookie_file = None
+    if cookie_file and not os.path.isabs(cookie_file):
+        cookie_file = os.path.normpath(os.path.join(config_dir_path, cookie_file))
+    return SourceConfig(
+        username=username if isinstance(username, str) or username is None else str(username),
+        password=password if isinstance(password, str) or password is None else str(password),
+        library=values.get("library"),
+        cookie_file=cookie_file,
+    )
 
 
 def structure_config(
@@ -297,51 +455,80 @@ def structure_config(
         logging.log("Warning: config '[sources]' must be a table; ignoring")
         raw_sources = {}
     if isinstance(raw_sources, dict):
+        allowed_with_profiles = tuple(SOURCE_CONFIG_KEYS) + ("profiles",)
         for raw_source_name, values in raw_sources.items():
             if not isinstance(values, dict):
                 logging.log(f"Warning: config '[sources.{raw_source_name}]' must be a table; ignoring")
                 continue
-            source_name = normalize_source_key(raw_source_name)
-            if source_name != raw_source_name.lower():
+            base_service, base_profile = split_source_profile_key(raw_source_name)
+            if base_service != raw_source_name.lower() and base_profile == DEFAULT_PROFILE:
                 logging.log(
-                    f"Warning: config source alias '{raw_source_name}' normalized to '{source_name}'"
+                    f"Warning: config source alias '{raw_source_name}' normalized to '{base_service}'"
                 )
-            for key in values:
-                if key not in SOURCE_CONFIG_KEYS:
-                    logging.log(
-                        f"Warning: unknown key '{key}' in '[sources.{raw_source_name}]' ignored"
-                    )
-            username = values.get("username")
-            password = values.get("password")
-            if password is None and credential_store is not None:
-                password = credential_store.get_password(source_name, username)
-            if password is None and credential_store is not None and raw_source_name != source_name:
-                password = credential_store.get_password(raw_source_name, username)
-            cookie_file = values.get("cookie_file")
-            if cookie_file is not None and not isinstance(cookie_file, str):
-                logging.log(f"Warning: invalid 'cookie_file' in '[sources.{raw_source_name}]'; ignoring")
-                cookie_file = None
-            if cookie_file and not os.path.isabs(cookie_file):
-                cookie_file = os.path.normpath(os.path.join(config_dir_path, cookie_file))
-            candidate_cfg = SourceConfig(
-                username=username if isinstance(username, str) or username is None else str(username),
-                password=password if isinstance(password, str) or password is None else str(password),
-                library=values.get("library"),
-                cookie_file=cookie_file,
+            has_scalar_fields = any(
+                k in values for k in values if k != "profiles"
             )
-            if source_name in sources and raw_source_name.lower() != source_name:
-                logging.log(
-                    f"Warning: duplicate config for '{source_name}' from alias '{raw_source_name}'; keeping canonical entry"
+            if has_scalar_fields:
+                profile_key = make_source_profile_key(base_service, base_profile)
+                candidate_cfg = _build_source_config_from_dict(
+                    section_label=f"[sources.{raw_source_name}]",
+                    raw_source_name=raw_source_name,
+                    profile_key=profile_key,
+                    values=values,
+                    config_dir_path=config_dir_path,
+                    credential_store=credential_store,
+                    allowed_keys=allowed_with_profiles,
                 )
-                continue
-            sources[source_name] = candidate_cfg
+                if profile_key in sources and raw_source_name.lower() != profile_key:
+                    logging.log(
+                        f"Warning: duplicate config for '{profile_key}' from alias '{raw_source_name}'; keeping canonical entry"
+                    )
+                else:
+                    sources[profile_key] = candidate_cfg
+            else:
+                for key in values:
+                    if key not in allowed_with_profiles:
+                        logging.log(
+                            f"Warning: unknown key '{key}' in '[sources.{raw_source_name}]' ignored"
+                        )
+
+            raw_profiles = values.get("profiles")
+            if raw_profiles is not None and not isinstance(raw_profiles, dict):
+                logging.log(
+                    f"Warning: config '[sources.{raw_source_name}.profiles]' must be a table; ignoring"
+                )
+            elif isinstance(raw_profiles, dict):
+                for raw_prof_name, prof_values in raw_profiles.items():
+                    section_label = f"[sources.{raw_source_name}.profiles.{raw_prof_name}]"
+                    if not isinstance(prof_values, dict):
+                        logging.log(f"Warning: config '{section_label}' must be a table; ignoring")
+                        continue
+                    prof_key = make_source_profile_key(base_service, str(raw_prof_name))
+                    prof_cfg = _build_source_config_from_dict(
+                        section_label=section_label,
+                        raw_source_name=f"{raw_source_name}:{raw_prof_name}",
+                        profile_key=prof_key,
+                        values=prof_values,
+                        config_dir_path=config_dir_path,
+                        credential_store=credential_store,
+                        allowed_keys=tuple(SOURCE_CONFIG_KEYS),
+                    )
+                    if prof_key in sources and raw_source_name.lower() != base_service:
+                        logging.log(
+                            f"Warning: duplicate config for '{prof_key}' from alias '{raw_source_name}'; keeping canonical entry"
+                        )
+                        continue
+                    sources[prof_key] = prof_cfg
     if credential_store is not None:
         for raw_service_key, stored_user in credential_store.stored_services().items():
-            service_key = normalize_source_key(raw_service_key)
-            if service_key not in sources:
+            if raw_service_key.startswith("integration:"):
+                continue
+            svc, prof = split_source_profile_key(raw_service_key)
+            profile_key = make_source_profile_key(svc, prof)
+            if profile_key not in sources:
                 stored_pw = credential_store.get_password(raw_service_key, stored_user)
                 if stored_pw is not None:
-                    sources[service_key] = SourceConfig(
+                    sources[profile_key] = SourceConfig(
                         username=stored_user,
                         password=stored_pw,
                         library=None,
@@ -386,6 +573,44 @@ def structure_config(
             notify_on_complete=notify_val,
         )
 
+    abs_section = config_dict.get("audiobookshelf")
+    abs_config = AudiobookshelfConfig()
+    if abs_section is not None and not isinstance(abs_section, dict):
+        logging.log("Warning: config '[audiobookshelf]' must be a table; ignoring")
+    else:
+        abs_dict = abs_section if isinstance(abs_section, dict) else {}
+        for key in abs_dict:
+            if key not in {"url", "api_key", "library_id", "auto_upload", "auto_scan"}:
+                logging.log(f"Warning: unknown key '{key}' in '[audiobookshelf]' ignored")
+        abs_url = abs_dict.get("url").strip().rstrip("/") if isinstance(abs_dict.get("url"), str) else None
+        if abs_url == "":
+            abs_url = None
+        abs_lib = abs_dict.get("library_id").strip() if isinstance(abs_dict.get("library_id"), str) else None
+        if abs_lib == "":
+            abs_lib = None
+        abs_auto_upload = abs_dict.get("auto_upload") if isinstance(abs_dict.get("auto_upload"), bool) else False
+        abs_auto_scan = abs_dict.get("auto_scan") if isinstance(abs_dict.get("auto_scan"), bool) else True
+        abs_key_raw = abs_dict.get("api_key")
+        abs_key: Optional[str] = abs_key_raw.strip() if isinstance(abs_key_raw, str) and abs_key_raw.strip() else None
+        abs_account = abs_url or "api"
+        if credential_store is not None:
+            if abs_key is not None and credential_store.is_secure:
+                try:
+                    credential_store.set_password("integration:audiobookshelf", abs_account, abs_key)
+                except Exception as exc:
+                    logging.log(f"Warning: could not store Audiobookshelf token in OS vault: {exc}")
+            elif abs_key is None:
+                abs_key = credential_store.get_password("integration:audiobookshelf", abs_account)
+                if abs_key is None and abs_account != "api":
+                    abs_key = credential_store.get_password("integration:audiobookshelf", "api")
+        abs_config = AudiobookshelfConfig(
+            url=abs_url,
+            api_key=abs_key,
+            library_id=abs_lib,
+            auto_upload=abs_auto_upload,
+            auto_scan=abs_auto_scan,
+        )
+
     parsed_options: Dict[str, Any] = {}
     for spec in CONFIG_OPTION_SPECS:
         key = spec.config_key
@@ -400,6 +625,7 @@ def structure_config(
     return Config(
         sources=sources,
         gui=gui_config,
+        audiobookshelf=abs_config,
         **parsed_options,
     )
 
@@ -440,7 +666,7 @@ def _format_toml_value(value: Any) -> str:
 
 
 def _dump_toml(data: Dict[str, Any]) -> str:
-    """Serialize config dictionary (top-level scalars + [gui] + [sources.<name>] tables) to TOML."""
+    """Serialize config dictionary (top-level scalars + [gui] + [sources.*] tables) to TOML."""
     lines = []
     for key, value in data.items():
         if isinstance(value, dict) or value is None:
@@ -457,19 +683,51 @@ def _dump_toml(data: Dict[str, Any]) -> str:
             for k, v in entries:
                 lines.append(f"{_format_toml_key(k)} = {_format_toml_value(v)}")
 
+    abs_tbl = data.get("audiobookshelf")
+    if isinstance(abs_tbl, dict):
+        entries = [(k, v) for k, v in abs_tbl.items() if v is not None and v != ""]
+        if entries:
+            if lines:
+                lines.append("")
+            lines.append("[audiobookshelf]")
+            for k, v in entries:
+                lines.append(f"{_format_toml_key(k)} = {_format_toml_value(v)}")
+
     sources = data.get("sources")
     if isinstance(sources, dict):
         for source_name, values in sources.items():
             if not isinstance(values, dict):
                 continue
-            entries = [(k, v) for k, v in values.items() if v is not None and v != ""]
-            if not entries:
-                continue
-            if lines:
-                lines.append("")
-            lines.append(f"[sources.{_format_toml_key(source_name)}]")
-            for k, v in entries:
-                lines.append(f"{_format_toml_key(k)} = {_format_toml_value(v)}")
+            entries = [
+                (k, v)
+                for k, v in values.items()
+                if k != "profiles" and not isinstance(v, dict) and v is not None and v != ""
+            ]
+            if entries:
+                if lines:
+                    lines.append("")
+                lines.append(f"[sources.{_format_toml_key(source_name)}]")
+                for k, v in entries:
+                    lines.append(f"{_format_toml_key(k)} = {_format_toml_value(v)}")
+            profiles = values.get("profiles")
+            if isinstance(profiles, dict):
+                for profile_name, prof_values in profiles.items():
+                    if not isinstance(prof_values, dict):
+                        continue
+                    prof_entries = [
+                        (k, v)
+                        for k, v in prof_values.items()
+                        if not isinstance(v, dict) and v is not None and v != ""
+                    ]
+                    if not prof_entries:
+                        continue
+                    if lines:
+                        lines.append("")
+                    lines.append(
+                        f"[sources.{_format_toml_key(source_name)}.profiles.{_format_toml_key(str(profile_name))}]"
+                    )
+                    for k, v in prof_entries:
+                        lines.append(f"{_format_toml_key(k)} = {_format_toml_value(v)}")
     return "\n".join(lines) + ("\n" if lines else "")
 
 
@@ -477,10 +735,18 @@ def _has_plaintext_password(config_dict: Dict[str, Any]) -> bool:
     sources = config_dict.get("sources")
     if not isinstance(sources, dict):
         return False
-    return any(
-        isinstance(values, dict) and bool(values.get("password"))
-        for values in sources.values()
-    )
+    for values in sources.values():
+        if not isinstance(values, dict):
+            continue
+        if values.get("password"):
+            return True
+        profiles = values.get("profiles")
+        if isinstance(profiles, dict) and any(
+            isinstance(pv, dict) and bool(pv.get("password"))
+            for pv in profiles.values()
+        ):
+            return True
+    return False
 
 
 def _write_config_dict(config_location: str, config_dict: Dict[str, Any]) -> str:
@@ -499,22 +765,32 @@ def save_source_credentials(
     cookie_file: Optional[str] = None,
     overwrite: Optional[str] = None,
     credential_store: Optional[CredentialStore] = None,
+    *,
+    profile: Optional[str] = None,
 ) -> str:
     """
-    Save or clear credentials for `service_key` in the configuration file.
+    Save or clear credentials for `(service_key, profile)` in the configuration file.
 
     Non-secret fields (`username`, `library`, `cookie_file`) are stored in
     `audiobook-dl.toml` while `password` is persisted in the OS credential store.
-    Preserves existing global settings and credentials for other services.
+    Preserves existing global settings and credentials for other services/profiles.
     Returns the path to the configuration file written.
     """
     config_location = overwrite or get_config_location(None)
     canonical_key = normalize_source_key(service_key)
+    norm_profile = normalize_profile_name(profile)
+    vault_key = make_source_profile_key(canonical_key, norm_profile)
     store = credential_store or get_credential_store(config_location)
     with file_lock(config_location):
         config_dict = read_config(config_location)
         sources_dict = dict(config_dict.get("sources") or {})
-        prev_entry = sources_dict.get(canonical_key)
+        service_table = dict(sources_dict.get(canonical_key) or {})
+
+        if norm_profile == DEFAULT_PROFILE:
+            prev_entry = service_table
+        else:
+            profiles_dict = dict(service_table.get("profiles") or {})
+            prev_entry = profiles_dict.get(norm_profile) if isinstance(profiles_dict.get(norm_profile), dict) else {}
         prev_username = prev_entry.get("username") if isinstance(prev_entry, dict) else None
 
         entry: Dict[str, Any] = {
@@ -528,10 +804,10 @@ def save_source_credentials(
         }
 
         if prev_username != username:
-            store.delete_password(canonical_key, prev_username)
+            store.delete_password(vault_key, prev_username)
 
         if password is not None and password != "":
-            store.set_password(canonical_key, username, password)
+            store.set_password(vault_key, username, password)
             if (
                 not store.is_secure
                 and isinstance(store, PlaintextFallbackCredentialStore)
@@ -539,12 +815,31 @@ def save_source_credentials(
             ):
                 entry["password"] = password
         else:
-            store.delete_password(canonical_key, username)
+            store.delete_password(vault_key, username)
 
-        if entry:
-            sources_dict[canonical_key] = entry
+        if norm_profile == DEFAULT_PROFILE:
+            existing_profiles = service_table.get("profiles")
+            new_service_table = dict(entry)
+            if isinstance(existing_profiles, dict) and existing_profiles:
+                new_service_table["profiles"] = existing_profiles
+            if new_service_table:
+                sources_dict[canonical_key] = new_service_table
+            else:
+                sources_dict.pop(canonical_key, None)
         else:
-            sources_dict.pop(canonical_key, None)
+            profiles_dict = dict(service_table.get("profiles") or {})
+            if entry:
+                profiles_dict[norm_profile] = entry
+            else:
+                profiles_dict.pop(norm_profile, None)
+            if profiles_dict:
+                service_table["profiles"] = profiles_dict
+            else:
+                service_table.pop("profiles", None)
+            if service_table:
+                sources_dict[canonical_key] = service_table
+            else:
+                sources_dict.pop(canonical_key, None)
 
         if sources_dict:
             config_dict["sources"] = sources_dict
@@ -574,6 +869,7 @@ def save_output_preferences(
     debug: Any = _UNSET,
     split_chapters: Any = _UNSET,
     write_opf: Any = _UNSET,
+    write_abs_metadata: Any = _UNSET,
     write_cue: Any = _UNSET,
     write_cover: Any = _UNSET,
     remove_chars: Any = _UNSET,
@@ -601,6 +897,7 @@ def save_output_preferences(
         "debug": debug,
         "split_chapters": split_chapters,
         "write_opf": write_opf,
+        "write_abs_metadata": write_abs_metadata,
         "write_cue": write_cue,
         "write_cover": write_cover,
         "remove_chars": remove_chars,
@@ -680,4 +977,71 @@ def save_ffmpeg_dir(
             config_dict["ffmpeg_dir"] = cleaned
         else:
             config_dict.pop("ffmpeg_dir", None)
+        return _write_config_dict(config_location, config_dict)
+
+
+def save_audiobookshelf_config(
+    *,
+    url: Optional[str] = None,
+    library_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+    auto_upload: Optional[bool] = None,
+    auto_scan: Optional[bool] = None,
+    overwrite: Optional[str] = None,
+    credential_store: Optional[CredentialStore] = None,
+) -> str:
+    """Persist Audiobookshelf settings in `audiobook-dl.toml` and store the API key in the OS vault."""
+    config_location = overwrite or get_config_location(None)
+    store = credential_store or get_credential_store(config_location)
+    with file_lock(config_location):
+        config_dict = read_config(config_location)
+        prev_section = config_dict.get("audiobookshelf")
+        prev_url = (
+            prev_section.get("url").strip().rstrip("/")
+            if isinstance(prev_section, dict) and isinstance(prev_section.get("url"), str)
+            else None
+        )
+        abs_dict = dict(prev_section) if isinstance(prev_section, dict) else {}
+
+        if url is not None:
+            cleaned_url = url.strip().rstrip("/")
+            if cleaned_url:
+                abs_dict["url"] = cleaned_url
+            else:
+                abs_dict.pop("url", None)
+        if library_id is not None:
+            cleaned_lib = library_id.strip()
+            if cleaned_lib:
+                abs_dict["library_id"] = cleaned_lib
+            else:
+                abs_dict.pop("library_id", None)
+        if auto_upload is not None:
+            abs_dict["auto_upload"] = bool(auto_upload)
+        if auto_scan is not None:
+            abs_dict["auto_scan"] = bool(auto_scan)
+
+        target_account = abs_dict.get("url") or "api"
+        if api_key is not None:
+            cleaned_key = api_key.strip()
+            if prev_url and prev_url != target_account:
+                store.delete_password("integration:audiobookshelf", prev_url)
+            if cleaned_key:
+                store.set_password("integration:audiobookshelf", target_account, cleaned_key)
+                if (
+                    not store.is_secure
+                    and isinstance(store, PlaintextFallbackCredentialStore)
+                    and store.allow_plaintext
+                ):
+                    abs_dict["api_key"] = cleaned_key
+                else:
+                    abs_dict.pop("api_key", None)
+            else:
+                store.delete_password("integration:audiobookshelf", target_account)
+                store.delete_password("integration:audiobookshelf", "api")
+                abs_dict.pop("api_key", None)
+
+        if abs_dict:
+            config_dict["audiobookshelf"] = abs_dict
+        else:
+            config_dict.pop("audiobookshelf", None)
         return _write_config_dict(config_location, config_dict)

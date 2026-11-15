@@ -699,3 +699,43 @@ def test_app_wires_pack_button_and_submission(tmp_path: Path):
         root.destroy()
 
 
+def test_pack_single_track_direct_staging_and_cached_chapter_probing(tmp_path: Path):
+    src_mp3 = tmp_path / "Solo Track.mp3"
+    _create_empty_id3_mp3(src_mp3)
+    out_dir = tmp_path / "out"
+
+    cached_info = AudioProbeInfo(duration=12.5, bitrate=128_000, codec_name="mp3", format_name="mp3")
+    probe_cache = {str(src_mp3.resolve()): cached_info}
+    convert_calls: list[dict] = []
+
+    def fake_convert(old_path, output_format, **kwargs):
+        convert_calls.append({"old_path": old_path, "output_format": output_format, **kwargs})
+        out_p = Path(kwargs["output_path"])
+        out_p.write_bytes(b"packed-m4b")
+        return str(out_p), False
+
+    opts = args.build_default_options(output_format="m4b", output_template="{title}", overwrite=True)
+    with (
+        patch("audiobookdl.pack.probe_audio_info", side_effect=AssertionError("should reuse probe_cache")),
+        patch("audiobookdl.pack.output.convert_single_file", side_effect=fake_convert),
+        patch("audiobookdl.pack.output_download.add_metadata_to_file"),
+    ):
+        spec = inspect_local_book(
+            str(src_mp3),
+            [str(src_mp3)],
+            opts,
+            output_dir=str(out_dir),
+            probe_cache=probe_cache,
+        )
+        final_path = pack_book(spec, opts, output_dir=str(out_dir), probe_cache=probe_cache)
+
+    assert final_path == str((out_dir / "Solo Track.m4b").resolve())
+    assert Path(final_path).read_bytes() == b"packed-m4b"
+    assert len(convert_calls) == 1
+    assert convert_calls[0]["old_path"] == str(src_mp3.resolve())
+    assert convert_calls[0]["remove_source"] is False
+    assert convert_calls[0]["faststart"] is False
+    assert convert_calls[0]["output_path"] is not None
+
+
+

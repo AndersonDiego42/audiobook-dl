@@ -1,6 +1,13 @@
 from audiobookdl import AudiobookFile, Source, logging, Audiobook
 from audiobookdl.args import DownloadOptions
-from audiobookdl.exceptions import UserNotAuthorized, NoFilesFound, DownloadError, DownloadCancelled
+from audiobookdl.exceptions import (
+    UserNotAuthorized,
+    NoFilesFound,
+    DownloadError,
+    DownloadCancelled,
+    FailedCombining,
+    GenericAudiobookDLException,
+)
 from audiobookdl.output.encryption import AESStreamDecryptor
 from audiobookdl.output.metadata import id3
 from audiobookdl.utils.audiobook import AESEncryption, is_ebook, is_ebook_extension
@@ -17,6 +24,7 @@ import shutil
 import tempfile
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 import requests
 from functools import partial
@@ -153,176 +161,225 @@ def download_audiobook(
             overwrite=options.overwrite,
         )
 
-    # Downloading files
-    filepaths = download_files_with_cli_output(
-        audiobook,
-        output_dir,
-        interaction=interaction,
-        cancel_event=cancel_event,
-        resume=options.resume,
-        confirm_overwrite=(not is_single_file) or (len(audiobook.files) > 1 and not confirmed_target_overwrite),
-        overwrite=options.overwrite,
-        max_workers=options.max_workers,
-        timeout=options.timeout,
-    )
-    if cancel_event is not None and cancel_event.is_set():
-        raise DownloadCancelled
-    # Converting & combining files (skipped for ebook files such as .epub)
-    current_format, output_format = get_output_audio_format(
-        None if ebook else options.output_format,
-        filepaths,
-    )
-    probe_cache: Dict[str, Any] = {}
-    chapters_embedded = False
-    cover_embedded = False
-    chapters_for_ffmpeg = (
-        audiobook.chapters
-        if (
-            not ebook
-            and audiobook.chapters
-            and not options.no_chapters
-            and not id3.is_id3_file(f"{output_dir}.{output_format}")
-        )
-        else None
-    )
-    cover_for_ffmpeg = (
-        audiobook.cover
-        if (
-            not ebook
-            and audiobook.cover is not None
-            and output_format in output.MP4_CONTAINERS
-        )
-        else None
-    )
-    if splitting:
-        if len(filepaths) > 1:
-            master_ext = (
-                "m4a"
-                if current_format in ("ts", "aac") and output_format in output.MP4_CONTAINERS
-                else output_format
+    use_staging_dir = (not options.resume) and (len(audiobook.files) > 1 or splitting)
+    stage_dir: Optional[str] = None
+    work_output_dir = output_dir
+    download_output_dir = output_dir
+    staged_combined_path: Optional[str] = None
+
+    if use_staging_dir:
+        if not is_single_file and os.path.isdir(output_dir):
+            _confirm_overwrite_dir(
+                output_dir,
+                interaction=interaction,
+                overwrite=options.overwrite,
             )
-            if master_ext == "ts":
-                master_ext = "m4a"
-            with tempfile.TemporaryDirectory() as tmp_split_dir:
-                combine_work = os.path.join(tmp_split_dir, "combine_work")
-                os.makedirs(combine_work, exist_ok=True)
-                master_path = os.path.join(tmp_split_dir, f"master.{master_ext}")
-                output.combine_audiofiles(
-                    filepaths,
-                    combine_work,
-                    master_path,
-                    cancel_event=cancel_event,
-                    audio_bitrate=options.audio_bitrate,
-                    probe_cache=probe_cache,
+        parent_dir = os.path.dirname(os.path.abspath(output_dir)) or os.getcwd()
+        os.makedirs(parent_dir, exist_ok=True)
+        stage_base = os.path.basename(output_dir) or "book"
+        stage_dir = tempfile.mkdtemp(prefix=f".{stage_base}.staging-", dir=parent_dir)
+        work_output_dir = stage_dir
+        if len(audiobook.files) == 1:
+            download_output_dir = os.path.join(stage_dir, stage_base)
+        else:
+            download_output_dir = stage_dir
+
+    try:
+        # Downloading files
+        filepaths = download_files_with_cli_output(
+            audiobook,
+            download_output_dir,
+            interaction=interaction,
+            cancel_event=cancel_event,
+            resume=options.resume,
+            confirm_overwrite=(
+                not use_staging_dir
+                and ((not is_single_file) or (len(audiobook.files) > 1 and not confirmed_target_overwrite))
+            ),
+            overwrite=options.overwrite,
+            max_workers=options.max_workers,
+            timeout=options.timeout,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            raise DownloadCancelled
+        # Converting & combining files (skipped for ebook files such as .epub)
+        current_format, output_format = get_output_audio_format(
+            None if ebook else options.output_format,
+            filepaths,
+        )
+        probe_cache: Dict[str, Any] = {}
+        chapters_embedded = False
+        cover_embedded = False
+        chapters_for_ffmpeg = (
+            audiobook.chapters
+            if (
+                not ebook
+                and audiobook.chapters
+                and not options.no_chapters
+                and not id3.is_id3_file(f"{output_dir}.{output_format}")
+            )
+            else None
+        )
+        cover_for_ffmpeg = (
+            audiobook.cover
+            if (
+                not ebook
+                and audiobook.cover is not None
+                and output_format in output.MP4_CONTAINERS
+            )
+            else None
+        )
+        if splitting:
+            if len(filepaths) > 1:
+                master_ext = (
+                    "m4a"
+                    if current_format in ("ts", "aac") and output_format in output.MP4_CONTAINERS
+                    else output_format
                 )
-                split_result = output.split_audio_by_chapters(
-                    master_path,
-                    output_dir,
+                if master_ext == "ts":
+                    master_ext = "m4a"
+                with tempfile.TemporaryDirectory() as tmp_split_dir:
+                    combine_work = os.path.join(tmp_split_dir, "combine_work")
+                    os.makedirs(combine_work, exist_ok=True)
+                    master_path = os.path.join(tmp_split_dir, f"master.{master_ext}")
+                    output.combine_audiofiles(
+                        filepaths,
+                        combine_work,
+                        master_path,
+                        cancel_event=cancel_event,
+                        audio_bitrate=options.audio_bitrate,
+                        probe_cache=probe_cache,
+                    )
+                    split_result = output.split_audio_by_chapters(
+                        master_path,
+                        work_output_dir,
+                        audiobook.chapters,
+                        output_format=output_format,
+                        cancel_event=cancel_event,
+                        audio_bitrate=options.audio_bitrate,
+                        probe_cache=probe_cache,
+                    )
+                for src_part in filepaths:
+                    if src_part not in split_result and os.path.exists(src_part):
+                        try:
+                            os.remove(src_part)
+                        except OSError:
+                            pass
+                filepaths = split_result
+            elif len(filepaths) == 1:
+                src_single = filepaths[0]
+                filepaths = output.split_audio_by_chapters(
+                    src_single,
+                    work_output_dir,
                     audiobook.chapters,
                     output_format=output_format,
                     cancel_event=cancel_event,
                     audio_bitrate=options.audio_bitrate,
                     probe_cache=probe_cache,
                 )
-            for src_part in filepaths:
-                if src_part not in split_result and os.path.exists(src_part):
-                    try:
-                        os.remove(src_part)
-                    except OSError:
-                        pass
-            filepaths = split_result
-        elif len(filepaths) == 1:
-            src_single = filepaths[0]
-            filepaths = output.split_audio_by_chapters(
-                src_single,
-                output_dir,
+                if src_single not in filepaths and os.path.exists(src_single):
+                    os.remove(src_single)
+            current_format = output_format
+        elif options.combine and not ebook and len(filepaths) > 1:
+            logging.book_update("Combining files")
+            output_path = f"{output_dir}.{output_format}"
+            out_parent = os.path.dirname(os.path.abspath(output_path)) or os.getcwd()
+            os.makedirs(out_parent, exist_ok=True)
+            staged_combined_path = os.path.join(
+                out_parent,
+                f".{os.path.basename(output_path)}.tmp.{uuid.uuid4().hex[:8]}.{output_format}",
+            )
+            try:
+                chapters_embedded = bool(
+                    output.combine_audiofiles(
+                        filepaths,
+                        work_output_dir,
+                        staged_combined_path,
+                        cancel_event=cancel_event,
+                        chapters=chapters_for_ffmpeg,
+                        audio_bitrate=options.audio_bitrate,
+                        metadata=audiobook.metadata,
+                        cover=cover_for_ffmpeg,
+                        probe_cache=probe_cache,
+                        faststart=False,
+                    )
+                )
+                os.replace(staged_combined_path, output_path)
+                staged_combined_path = None
+                cover_embedded = cover_for_ffmpeg is not None
+                current_format = output_format
+                filepaths = [output_path]
+            except DownloadCancelled:
+                if os.path.isdir(work_output_dir) and (use_staging_dir or not options.resume):
+                    shutil.rmtree(work_output_dir, ignore_errors=True)
+                raise
+        elif (
+            not options.combine
+            and not ebook
+            and len(filepaths) > 1
+            and output.should_smart_merge_hls(filepaths, audiobook.chapters, probe_cache=probe_cache)
+        ):
+            filepaths = output.merge_hls_segments_into_chapters(
+                filepaths,
+                work_output_dir,
                 audiobook.chapters,
                 output_format=output_format,
                 cancel_event=cancel_event,
                 audio_bitrate=options.audio_bitrate,
                 probe_cache=probe_cache,
             )
-            if src_single not in filepaths and os.path.exists(src_single):
-                os.remove(src_single)
-        current_format = output_format
-    elif options.combine and not ebook and len(filepaths) > 1:
-        logging.book_update("Combining files")
-        output_path = f"{output_dir}.{output_format}"
-        try:
-            chapters_embedded = bool(
-                output.combine_audiofiles(
-                    filepaths,
-                    output_dir,
-                    output_path,
+            current_format = output_format
+        if cancel_event is not None and cancel_event.is_set():
+            raise DownloadCancelled
+        if current_format != output_format and not splitting and not ebook:
+            logging.book_update("Converting files")
+            if len(filepaths) == 1:
+                converted_path, chapters_embedded = output.convert_single_file(
+                    filepaths[0],
+                    output_format,
                     cancel_event=cancel_event,
-                    chapters=chapters_for_ffmpeg,
                     audio_bitrate=options.audio_bitrate,
+                    chapters=chapters_for_ffmpeg,
                     metadata=audiobook.metadata,
                     cover=cover_for_ffmpeg,
                     probe_cache=probe_cache,
+                    faststart=False,
                 )
-            )
-            cover_embedded = cover_for_ffmpeg is not None
-            current_format = output_format
-            filepaths = [output_path]
-        except DownloadCancelled:
-            if os.path.isdir(output_dir) and not options.resume:
-                shutil.rmtree(output_dir, ignore_errors=True)
-            raise
-    elif (
-        not options.combine
-        and not ebook
-        and len(filepaths) > 1
-        and output.should_smart_merge_hls(filepaths, audiobook.chapters, probe_cache=probe_cache)
-    ):
-        filepaths = output.merge_hls_segments_into_chapters(
-            filepaths,
-            output_dir,
-            audiobook.chapters,
-            output_format=output_format,
-            cancel_event=cancel_event,
-            audio_bitrate=options.audio_bitrate,
-            probe_cache=probe_cache,
-        )
-        current_format = output_format
-    if cancel_event is not None and cancel_event.is_set():
-        raise DownloadCancelled
-    if current_format != output_format and not splitting and not ebook:
-        logging.book_update("Converting files")
-        if len(filepaths) == 1:
-            converted_path, chapters_embedded = output.convert_single_file(
+                cover_embedded = cover_for_ffmpeg is not None
+                filepaths = [converted_path]
+            else:
+                filepaths = output.convert_output(
+                    filepaths,
+                    output_format,
+                    cancel_event=cancel_event,
+                    audio_bitrate=options.audio_bitrate,
+                )
+        if cancel_event is not None and cancel_event.is_set():
+            raise DownloadCancelled
+        # Add metadata & commit staged directory atomically
+        if len(filepaths) == 1 and not splitting:
+            add_metadata_to_file(
+                audiobook,
                 filepaths[0],
-                output_format,
+                options,
                 cancel_event=cancel_event,
-                audio_bitrate=options.audio_bitrate,
-                chapters=chapters_for_ffmpeg,
-                metadata=audiobook.metadata,
-                cover=cover_for_ffmpeg,
-                probe_cache=probe_cache,
+                chapters_embedded=chapters_embedded,
+                cover_embedded=cover_embedded,
             )
-            cover_embedded = cover_for_ffmpeg is not None
-            filepaths = [converted_path]
         else:
-            filepaths = output.convert_output(
-                filepaths,
-                output_format,
-                cancel_event=cancel_event,
-                audio_bitrate=options.audio_bitrate,
-            )
-    if cancel_event is not None and cancel_event.is_set():
-        raise DownloadCancelled
-    # Add metadata
-    if len(filepaths) == 1:
-        add_metadata_to_file(
-            audiobook,
-            filepaths[0],
-            options,
-            cancel_event=cancel_event,
-            chapters_embedded=chapters_embedded,
-            cover_embedded=cover_embedded,
-        )
-    else:
-        add_metadata_to_dir(audiobook, filepaths, output_dir, options)
+            add_metadata_to_dir(audiobook, filepaths, work_output_dir, options)
+
+        if stage_dir is not None and not is_single_file:
+            _atomic_replace_dir(stage_dir, output_dir)
+            stage_dir = None
+    finally:
+        if staged_combined_path and os.path.exists(staged_combined_path):
+            try:
+                os.remove(staged_combined_path)
+            except OSError:
+                pass
+        if stage_dir is not None and os.path.isdir(stage_dir):
+            shutil.rmtree(stage_dir, ignore_errors=True)
 
 
 def add_metadata_to_file(
@@ -389,6 +446,15 @@ def add_metadata_to_file(
     if options.write_json_metadata:
         with open(f"{filepath}.json", "w", encoding="utf-8") as f:
             f.write(audiobook.metadata.as_json(chapters=audiobook.chapters))
+    if getattr(options, "write_abs_metadata", False):
+        abs_sidecar_path = os.path.join(
+            os.path.dirname(os.path.abspath(filepath)), "metadata.json"
+        )
+        sidecars.write_sidecar_abs_metadata(
+            audiobook.metadata,
+            abs_sidecar_path,
+            chapters=audiobook.chapters,
+        )
     if options.write_opf:
         sidecars.write_sidecar_opf(
             audiobook.metadata,
@@ -437,6 +503,12 @@ def add_metadata_to_dir(
         metadata_file_path = os.path.join(output_dir, "metadata.json")
         with open(metadata_file_path, "w", encoding="utf-8") as f:
             f.write(audiobook.metadata.as_json(chapters=audiobook.chapters))
+    if getattr(options, "write_abs_metadata", False):
+        sidecars.write_sidecar_abs_metadata(
+            audiobook.metadata,
+            os.path.join(output_dir, "metadata.json"),
+            chapters=audiobook.chapters,
+        )
     if options.write_opf:
         sidecars.write_sidecar_opf(
             audiobook.metadata,
@@ -486,9 +558,7 @@ def download_files_with_cli_output(
             setup_download_dir(output_dir, interaction=interaction, overwrite=overwrite)
         else:
             logging.book_update("Creating output dir")
-            if os.path.isdir(output_dir):
-                shutil.rmtree(output_dir)
-            os.makedirs(output_dir)
+            os.makedirs(output_dir, exist_ok=True)
     else:
         if confirm_overwrite and len(audiobook.files) == 1:
             filepath, _ = create_filepath(audiobook, output_dir, 0)
@@ -918,14 +988,43 @@ def download_file(
             if request is not None:
                 request.close()
     # Decrypt file if necessary (when resume mode wrote raw ciphertext to tmp),
-    # keeping ciphertext in filepath_tmp intact until the decrypted target is in place.
+    # verify audio integrity before committing, and keep any existing target intact on failure.
+    ext = file.ext.lstrip(".").lower()
     if file.encryption_method and not decrypted_inline:
-        encryption.decrypt_file(filepath_tmp, file.encryption_method, output_path=filepath)
+        dec_tmp = f"{filepath}.dec.{uuid.uuid4().hex[:8]}.tmp"
+        try:
+            encryption.decrypt_file(filepath_tmp, file.encryption_method, output_path=dec_tmp)
+            if not is_ebook_extension(ext):
+                try:
+                    output.verify_audio_integrity(dec_tmp)
+                except FailedCombining as exc:
+                    raise GenericAudiobookDLException(
+                        f"Downloaded file '{os.path.basename(filepath)}' failed media integrity verification"
+                    ) from exc
+            os.replace(dec_tmp, filepath)
+        finally:
+            if os.path.exists(dec_tmp):
+                try:
+                    os.remove(dec_tmp)
+                except OSError:
+                    pass
         try:
             os.remove(filepath_tmp)
         except OSError:
             pass
     else:
+        if not is_ebook_extension(ext):
+            try:
+                output.verify_audio_integrity(filepath_tmp)
+            except FailedCombining as exc:
+                if os.path.exists(filepath_tmp):
+                    try:
+                        os.remove(filepath_tmp)
+                    except OSError:
+                        pass
+                raise GenericAudiobookDLException(
+                    f"Downloaded file '{os.path.basename(filepath)}' failed media integrity verification"
+                ) from exc
         # Atomically move into place (overwrites confirmed existing single-file outputs on Windows)
         os.replace(filepath_tmp, filepath)
     # Return filepath
@@ -1013,6 +1112,51 @@ def confirm_overwrite_file(
             raise DownloadCancelled
 
 
+def _confirm_overwrite_dir(
+    path: str,
+    interaction: Optional[logging.InteractionHandler] = None,
+    overwrite: Optional[bool] = None,
+) -> None:
+    """Confirm before replacing an existing output directory without deleting it prematurely."""
+    if not os.path.isdir(path):
+        return
+    if overwrite is True:
+        answer = True
+    elif overwrite is False:
+        answer = False
+    else:
+        handler = interaction or logging.CliInteractionHandler()
+        answer = handler.confirm(
+            f"The folder '[blue]{path}[/blue]' already exists. Do you want to override it?"
+        )
+    if not answer:
+        raise DownloadCancelled
+
+
+def _atomic_replace_dir(stage_dir: str, target_dir: str) -> None:
+    """Replace `target_dir` with `stage_dir`, rolling back if an error occurs."""
+    target_abs = os.path.abspath(target_dir)
+    if not os.path.exists(target_abs):
+        os.replace(stage_dir, target_abs)
+        return
+    parent = os.path.dirname(target_abs) or os.getcwd()
+    backup_dir = os.path.join(
+        parent,
+        f".{os.path.basename(target_abs)}.old-{uuid.uuid4().hex[:8]}",
+    )
+    os.replace(target_abs, backup_dir)
+    try:
+        os.replace(stage_dir, target_abs)
+    except Exception:
+        if os.path.isdir(backup_dir) and not os.path.exists(target_abs):
+            try:
+                os.replace(backup_dir, target_abs)
+            except OSError:
+                pass
+        raise
+    shutil.rmtree(backup_dir, ignore_errors=True)
+
+
 def setup_download_dir(
     path: str,
     interaction: Optional[logging.InteractionHandler] = None,
@@ -1029,17 +1173,6 @@ def setup_download_dir(
     """
     logging.book_update("Creating output dir")
     if os.path.isdir(path):
-        if overwrite is True:
-            answer = True
-        elif overwrite is False:
-            answer = False
-        else:
-            handler = interaction or logging.CliInteractionHandler()
-            answer = handler.confirm(
-                f"The folder '[blue]{path}[/blue]' already exists. Do you want to override it?"
-            )
-        if answer:
-            shutil.rmtree(path)
-        else:
-            raise DownloadCancelled
+        _confirm_overwrite_dir(path, interaction=interaction, overwrite=overwrite)
+        shutil.rmtree(path)
     os.makedirs(path)

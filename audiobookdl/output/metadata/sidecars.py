@@ -138,3 +138,84 @@ def write_sidecar_cue(
     with open(target_path, "w", encoding="utf-8") as f:
         f.write(content)
     return target_path
+
+
+def build_abs_metadata_dict(
+    metadata: AudiobookMetadata,
+    chapters: Sequence[Chapter] = (),
+    *,
+    tags: Sequence[str] = (),
+    explicit: bool = False,
+    abridged: bool = False,
+) -> dict:
+    """Build an Audiobookshelf-compatible `metadata.json` dictionary."""
+    series_list = []
+    if metadata.series:
+        series_entry = {"name": metadata.series}
+        if metadata.series_order is not None:
+            series_entry["sequence"] = str(metadata.series_order)
+        series_list.append(series_entry)
+
+    abs_chapters = []
+    for idx, ch in enumerate(chapters):
+        start_sec = round(max(0, int(ch.start)) / 1000.0, 3)
+        if idx + 1 < len(chapters):
+            end_sec = round(max(start_sec, int(chapters[idx + 1].start) / 1000.0), 3)
+        else:
+            end_sec = start_sec
+        abs_chapters.append(
+            {
+                "id": idx,
+                "start": start_sec,
+                "end": end_sec,
+                "title": ch.title,
+            }
+        )
+
+    lang_val = None
+    if metadata.language is not None:
+        lang_val = getattr(metadata.language, "name", None) or str(metadata.language)
+
+    return {
+        "tags": list(tags),
+        "chapters": abs_chapters,
+        "title": metadata.title or None,
+        "subtitle": None,
+        "authors": list(metadata.authors),
+        "narrators": list(metadata.narrators),
+        "series": series_list,
+        "genres": list(metadata.genres),
+        "publishedYear": str(metadata.release_date.year) if metadata.release_date else None,
+        "publishedDate": metadata.release_date.isoformat() if metadata.release_date else None,
+        "publisher": metadata.publisher,
+        "description": metadata.description,
+        "isbn": metadata.isbn,
+        "asin": metadata.asin,
+        "language": lang_val,
+        "explicit": bool(explicit),
+        "abridged": bool(abridged),
+    }
+
+
+def write_sidecar_abs_metadata(
+    metadata: AudiobookMetadata,
+    target_path: str,
+    *,
+    chapters: Sequence[Chapter] = (),
+    tags: Sequence[str] = (),
+    explicit: bool = False,
+    abridged: bool = False,
+) -> str:
+    """Write an Audiobookshelf-compatible `metadata.json` sidecar file to `target_path`."""
+    import json
+
+    payload = build_abs_metadata_dict(
+        metadata,
+        chapters,
+        tags=tags,
+        explicit=explicit,
+        abridged=abridged,
+    )
+    with open(target_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    return target_path

@@ -37,6 +37,7 @@ from audiobookdl.utils import (
     subprocess_kwargs,
 )
 from audiobookdl.utils.audiobook import AudiobookFile
+from audiobookdl.utils.concurrency import run_cancellable_pool
 
 
 SUPPORTED_PACK_EXTENSIONS = frozenset(
@@ -293,7 +294,7 @@ def _most_common_non_empty(values: Iterable[Optional[str]]) -> Optional[str]:
     return counts.most_common(1)[0][0]
 
 
-def _aggregate_book_metadata(
+def aggregate_book_metadata(
     source_root: str,
     sorted_tracks: Sequence[str],
     tag_map: Mapping[str, TrackTagInfo],
@@ -383,11 +384,20 @@ def _build_pack_chapters(
     *,
     no_chapters: bool,
 ) -> Tuple[List[Chapter], float, str]:
+    uncached = [p for p in dict.fromkeys(sorted_tracks) if p not in probe_cache]
+    if uncached:
+        probed = run_cancellable_pool(
+            probe_audio_info,
+            uncached,
+            max_workers=output.COMBINE_REMUX_THREADS,
+        )
+        for path, info in zip(uncached, probed):
+            probe_cache[path] = info
+
     total_seconds = 0.0
     durations_ms: List[int] = []
     for path in sorted_tracks:
-        info = probe_audio_info(path)
-        probe_cache[path] = info
+        info = probe_cache[path]
         total_seconds += max(0.0, info.duration)
         durations_ms.append(max(0, round(info.duration * 1000)))
 
@@ -455,7 +465,7 @@ def inspect_local_book(
     audio_stem = os.path.splitext(os.path.basename(sorted_tracks[0]))[0] if len(sorted_tracks) == 1 else None
     sidecar_meta, sidecar_cover, sidecar_chapters = read_sidecar_metadata(sidecar_dir, audio_stem=audio_stem)
 
-    metadata = _aggregate_book_metadata(
+    metadata = aggregate_book_metadata(
         source_root,
         sorted_tracks,
         tag_map,
@@ -506,40 +516,41 @@ def inspect_local_book(
 def _pack_single_track(
     src_path: str,
     staged_path: str,
-    work_tmp_dir: str,
     spec: PackBookSpec,
     options: args.DownloadOptions,
     *,
     cancel_event: Optional[threading.Event],
     probe_cache: Dict[str, AudioProbeInfo],
 ) -> Tuple[bool, bool]:
-    """Convert or copy a single local track into `staged_path`.
+    """Convert or copy a single local track directly into `staged_path`.
 
     Returns `(chapters_embedded, cover_embedded)`.
     """
     src_ext = os.path.splitext(src_path)[1].lstrip(".").lower()
     target_ext = spec.output_format.lstrip(".").lower()
     chapters = None if options.no_chapters else (spec.audiobook.chapters or None)
-    if src_ext == target_ext:
+    needs_mp4_mux = (
+        src_ext == target_ext
+        and target_ext in output.MP4_CONTAINERS
+        and (chapters is not None or spec.audiobook.cover is not None)
+    )
+    if src_ext == target_ext and not needs_mp4_mux:
         shutil.copy2(src_path, staged_path)
         return False, False
 
-    staged_input = os.path.join(work_tmp_dir, f"input.{src_ext}")
-    shutil.copy2(src_path, staged_input)
-    if src_path in probe_cache:
-        probe_cache[staged_input] = probe_cache[src_path]
-    converted_path, chapters_embedded = output.convert_single_file(
-        staged_input,
+    _converted_path, chapters_embedded = output.convert_single_file(
+        src_path,
         target_ext,
         cancel_event=cancel_event,
         audio_bitrate=options.audio_bitrate,
         chapters=chapters,
-        remove_source=True,
+        remove_source=False,
         metadata=spec.audiobook.metadata,
         cover=spec.audiobook.cover,
         probe_cache=probe_cache,
+        output_path=staged_path,
+        faststart=False,
     )
-    shutil.move(converted_path, staged_path)
     cover_embedded = spec.audiobook.cover is not None and target_ext in output.MP4_CONTAINERS
     return chapters_embedded, cover_embedded
 
@@ -599,7 +610,7 @@ def pack_book(
         final_parent,
         f".{base_name}.pack-{uuid.uuid4().hex[:8]}.{spec.output_format}",
     )
-    work_tmp_dir = tempfile.mkdtemp(prefix="audiobookdl-pack-")
+    work_tmp_dir: Optional[str] = None
     cache = probe_cache if probe_cache is not None else {}
 
     try:
@@ -608,13 +619,13 @@ def pack_book(
             chapters_embedded, cover_embedded = _pack_single_track(
                 spec.track_paths[0],
                 staged_path,
-                work_tmp_dir,
                 spec,
                 options,
                 cancel_event=cancel_event,
                 probe_cache=cache,
             )
         else:
+            work_tmp_dir = tempfile.mkdtemp(prefix="audiobookdl-pack-")
             logging.book_update(f"Packing {len(spec.track_paths)} tracks to .{spec.output_format}")
             chapters_embedded = output.combine_audiofiles(
                 list(spec.track_paths),
@@ -626,6 +637,7 @@ def pack_book(
                 metadata=spec.audiobook.metadata,
                 cover=spec.audiobook.cover,
                 probe_cache=cache,
+                faststart=False,
             )
             cover_embedded = spec.audiobook.cover is not None and spec.output_format in output.MP4_CONTAINERS
 
@@ -651,7 +663,7 @@ def pack_book(
                 pass
         raise
     finally:
-        if os.path.isdir(work_tmp_dir):
+        if work_tmp_dir is not None and os.path.isdir(work_tmp_dir):
             shutil.rmtree(work_tmp_dir, ignore_errors=True)
 
     if delete_source:
@@ -748,6 +760,19 @@ def run_pack(
                     summary.output_paths.append(final_path)
                     summary.books_completed += 1
                     logging.log(f"Packed [green]{final_path}[/]")
+                    try:
+                        from audiobookdl.integrations.audiobookshelf import sync_book_to_audiobookshelf
+
+                        if sync_book_to_audiobookshelf(
+                            final_path,
+                            spec.audiobook.metadata,
+                            resolved_config.audiobookshelf,
+                            force_upload=bool(getattr(options, "upload_to_abs", False)),
+                            session=session,
+                        ):
+                            logging.log(f"Synced [blue]{spec.audiobook.title}[/] to Audiobookshelf")
+                    except Exception as exc:
+                        logging.error(f"Audiobookshelf sync failed for '{spec.audiobook.title}': {exc}")
                 except (DownloadCancelled, KeyboardInterrupt):
                     summary.cancelled = True
                     summary.books_skipped += 1

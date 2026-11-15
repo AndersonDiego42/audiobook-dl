@@ -89,6 +89,7 @@ class JobContext:
     debug: bool = False
     quiet: bool = False
     ffmpeg_output: bool = False
+    ffmpeg_dir: Optional[str] = None
     sink: Optional[LogSink] = None
     interaction: Optional[InteractionHandler] = None
     cancel_event: Optional[threading.Event] = None
