@@ -11,6 +11,7 @@ from .config import Config, SourceConfig, load_config
 from .exceptions import (
     AudiobookDLException,
     BookHasNoAudiobook,
+    BookHasNoEbook,
     BookNotReleased,
     DownloadCancelled,
     GenericAudiobookDLException,
@@ -21,7 +22,7 @@ from .sources import find_compatible_source, find_source_by_name
 from .sources.source import CatalogBook, Source
 from .utils import set_ffmpeg_dir
 from .utils.archive import DownloadArchive, default_archive_path, make_book_key
-from .utils.audiobook import Audiobook, BookId, Result, Series
+from .utils.audiobook import Audiobook, BookId, Result, Series, is_ebook
 from .utils.enrichment import enrich_metadata_from_openlibrary, resolve_redirect_url
 
 
@@ -112,6 +113,8 @@ def apply_runtime_options(
         options.download_archive = config.download_archive
     if "output_format" not in explicit and options.output_format is None and config.output_format:
         options.output_format = config.output_format
+    if "media_type" not in explicit and config.media_type:
+        options.media_type = config.media_type
     if "combine" not in explicit and config.combine is not None:
         options.combine = config.combine
     if "skip_downloaded" not in explicit and config.skip_downloaded is not None:
@@ -392,7 +395,8 @@ def print_result_info(
         )
         authors = ", ".join(result.metadata.authors) or "Unknown"
         narrators = ", ".join(result.metadata.narrators)
-        fmt = options.output_format or (result.files[0].ext if result.files else "unknown")
+        raw_ext = result.files[0].ext if result.files else "unknown"
+        fmt = raw_ext if is_ebook(result) else (options.output_format or raw_ext)
         logging.log(f"  Title:    {result.title}")
         logging.log(f"  Authors:  {authors}")
         if narrators:
@@ -489,19 +493,21 @@ def download_result(
                 _pause_between_books(options.book_delay, cancel_event)
             logging.emit_item_progress(index, count, getattr(book, "title", None) or result.title)
             try:
-                audiobook = audiobook_from_series(source, book)
-                logging.emit_item_progress(index, count, audiobook.title)
-                processed = process_audiobook(
-                    source,
-                    audiobook,
-                    options,
-                    interaction=handler,
-                    cancel_event=cancel_event,
-                )
-                if processed is False:
-                    skip_count += 1
-                else:
-                    done_count += 1
+                resolved = book if isinstance(book, Audiobook) else source.download_from_id(book.id)
+                audiobooks = _flatten_resolved_books(source, resolved)
+                for audiobook in audiobooks:
+                    logging.emit_item_progress(index, count, audiobook.title)
+                    processed = process_audiobook(
+                        source,
+                        audiobook,
+                        options,
+                        interaction=handler,
+                        cancel_event=cancel_event,
+                    )
+                    if processed is False:
+                        skip_count += 1
+                    else:
+                        done_count += 1
             except BookNotReleased:
                 skip_count += 1
                 logging.log(f"Skipped [blue]{book}[/] (not released)")
@@ -509,6 +515,10 @@ def download_result(
             except BookHasNoAudiobook:
                 skip_count += 1
                 logging.log(f"Skipped [blue]{book}[/] (no audiobook available)")
+                continue
+            except BookHasNoEbook:
+                skip_count += 1
+                logging.log(f"Skipped [blue]{book}[/] (no ebook available)")
                 continue
             except AudiobookDLException as e:
                 if isinstance(e, DownloadCancelled):
@@ -705,6 +715,20 @@ def list_service_library(
         return source.list_library()
 
 
+def _flatten_resolved_books(source: Source, resolved: Result) -> List[Audiobook]:
+    """Expand a `Result` (`Audiobook` or `Series`) into concrete `Audiobook` items."""
+    if isinstance(resolved, Audiobook):
+        return [resolved]
+    items: List[Audiobook] = []
+    for entry in resolved.books:
+        if isinstance(entry, Audiobook):
+            items.append(entry)
+        else:
+            nested = source.download_from_id(entry.id)
+            items.extend(_flatten_resolved_books(source, nested))
+    return items
+
+
 def audiobook_from_series(
     source: Source,
     book: Union[BookId[Any], Audiobook],
@@ -712,7 +736,13 @@ def audiobook_from_series(
     """Make an `Audiobook` object from a book entry in a `Series`."""
     if isinstance(book, Audiobook):
         return book
-    return source.download_from_id(book.id)
+    resolved = source.download_from_id(book.id)
+    if isinstance(resolved, Audiobook):
+        return resolved
+    items = _flatten_resolved_books(source, resolved)
+    if not items:
+        raise BookHasNoAudiobook
+    return items[0]
 
 
 def process_audiobook(
@@ -771,7 +801,8 @@ def process_audiobook(
             audiobook.metadata,
             options.remove_chars,
         )
-        fmt = options.output_format or (audiobook.files[0].ext if audiobook.files else None)
+        raw_ext = audiobook.files[0].ext if audiobook.files else None
+        fmt = raw_ext if is_ebook(audiobook) else (options.output_format or raw_ext)
         target_archive.record(
             source_name,
             book_key,

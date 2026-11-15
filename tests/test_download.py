@@ -17,7 +17,7 @@ from audiobookdl.output.download import (
     download_file,
     download_files,
 )
-from audiobookdl.utils.audiobook import AESEncryption
+from audiobookdl.utils.audiobook import AESEncryption, Cover
 from audiobookdl.utils.http import DEFAULT_HTTP_TIMEOUT
 
 
@@ -955,3 +955,58 @@ def test_download_file_resolves_lazy_url_resolver(tmp_path):
     out_path = download_file((book, str(tmp_path / "lazy"), 0, lambda _: None, None))
     assert open(out_path, "rb").read() == b"lazy"
     assert session.get.call_args.args[0] == "https://cdn.example.com/fresh-signed.mp3"
+
+
+def test_download_ebook_preserves_epub_skips_audio_conversion_and_writes_sidecars(tmp_path):
+    session = MagicMock()
+    epub_bytes = b"PK\x03\x04fake-epub-archive"
+    session.get.return_value = _mock_response(
+        headers={"Content-Length": str(len(epub_bytes))},
+        chunks=[epub_bytes],
+    )
+    meta = AudiobookMetadata(title="My Ebook")
+    meta.add_author("Ebook Author")
+    meta.add_genre("Ebook")
+    book = Audiobook(
+        session=session,
+        metadata=meta,
+        files=[AudiobookFile(url="https://cdn.example.com/book.epub", ext="epub")],
+        cover=Cover(b"\xff\xd8\xffcover", "jpg"),
+    )
+    output_dir = str(tmp_path / "My Ebook")
+    opts = DownloadOptions(
+        output_format="m4b",
+        combine=True,
+        write_cover=True,
+        write_opf=True,
+        write_json_metadata=True,
+        write_cue=True,
+        skip_downloaded=True,
+    )
+
+    with (
+        patch("audiobookdl.output.download.output.convert_single_file") as mock_convert,
+        patch("audiobookdl.output.download.output.combine_audiofiles") as mock_combine,
+        patch("audiobookdl.output.download.metadata.add_metadata") as mock_add_meta,
+        patch("audiobookdl.output.download.metadata.embed_cover") as mock_embed_cover,
+    ):
+        download_audiobook(book, output_dir, opts)
+
+    mock_convert.assert_not_called()
+    mock_combine.assert_not_called()
+    mock_add_meta.assert_not_called()
+    mock_embed_cover.assert_not_called()
+
+    epub_file = tmp_path / "My Ebook.epub"
+    assert epub_file.exists()
+    assert epub_file.read_bytes() == epub_bytes
+    assert (tmp_path / "My Ebook.jpg").read_bytes() == b"\xff\xd8\xffcover"
+    assert (tmp_path / "My Ebook.opf").exists()
+    assert (tmp_path / "My Ebook.epub.json").exists()
+    assert not (tmp_path / "My Ebook.cue").exists()
+
+    # Second run with skip_downloaded=True skips re-downloading existing .epub
+    session.get.reset_mock()
+    download_audiobook(book, output_dir, opts)
+    session.get.assert_not_called()
+

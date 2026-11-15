@@ -218,3 +218,40 @@ def test_config_normalizes_source_aliases_and_warns_on_unknown_keys(tmp_path):
     assert "bogus_gui_key" in joined
     assert "bad_field" in joined
     assert "normalized to 'everand'" in joined
+
+
+def test_load_and_save_media_type_config(tmp_path):
+    from audiobookdl import logging
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    cfg_path.write_text('media_type = "EBOOK"\n', encoding="utf-8")
+    loaded = load_config(str(cfg_path))
+    assert loaded.media_type == "ebook"
+
+    # Invalid value emits a warning and clears media_type
+    cfg_path.write_text('media_type = "comic"\n', encoding="utf-8")
+    messages: list[str] = []
+
+    class _Sink:
+        def on_log(self, _level: str, msg: str) -> None:
+            messages.append(msg)
+
+        def on_progress_start(self, _d: str, _t: float) -> None:
+            pass
+
+        def on_progress_advance(self, _c: float, _t: float) -> None:
+            pass
+
+        def on_progress_finish(self) -> None:
+            pass
+
+    with logging.job_context(logging.JobContext(sink=_Sink())):
+        invalid_loaded = load_config(str(cfg_path))
+    assert invalid_loaded.media_type is None
+    assert any("media_type" in msg for msg in messages)
+
+    # Round-trip save_output_preferences
+    save_output_preferences(None, False, overwrite=str(cfg_path), media_type="both")
+    saved = load_config(str(cfg_path))
+    assert saved.media_type == "both"
+

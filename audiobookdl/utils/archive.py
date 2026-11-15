@@ -4,7 +4,7 @@ import os
 import sqlite3
 from typing import List, Optional
 
-from audiobookdl.utils.audiobook import Audiobook
+from audiobookdl.utils.audiobook import Audiobook, is_ebook
 
 
 @dataclass(frozen=True)
@@ -31,12 +31,16 @@ def make_book_key(source_name: str, audiobook: Audiobook, fallback_url: Optional
     """Build a stable deduplication key for an `Audiobook`."""
     scrape_url = (audiobook.metadata.scrape_url or "").strip()
     if scrape_url:
-        return scrape_url
-    if fallback_url and fallback_url.strip():
-        return fallback_url.strip()
-    title = (audiobook.metadata.title or "").strip().lower()
-    author = (audiobook.metadata.author or "").strip().lower()
-    return f"{source_name.lower()}::{title}::{author}"
+        base_key = scrape_url
+    elif fallback_url and fallback_url.strip():
+        base_key = fallback_url.strip()
+    else:
+        title = (audiobook.metadata.title or "").strip().lower()
+        author = (audiobook.metadata.author or "").strip().lower()
+        base_key = f"{source_name.lower()}::{title}::{author}"
+    if is_ebook(audiobook):
+        return f"{base_key}::ebook"
+    return base_key
 
 
 class DownloadArchive:

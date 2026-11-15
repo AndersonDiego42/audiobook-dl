@@ -1430,3 +1430,51 @@ def test_gui_scroll_layout_prevents_lower_clipping(tmp_path):
         assert app._scroll_canvas.yview()[0] == pytest.approx(0.0)
     finally:
         root.destroy()
+
+
+def test_format_audiobook_preview_omits_chapters_for_ebook():
+    ebook = Audiobook(
+        session=MagicMock(),
+        metadata=AudiobookMetadata(title="Sample Ebook"),
+        files=[AudiobookFile(url="https://example.com/book.epub", ext="epub")],
+        chapters=[],
+    )
+    rows = dict(format_audiobook_preview(ebook))
+    assert rows["Title"] == "Sample Ebook"
+    assert rows["Parts"] == "1 file (epub)"
+    assert "Chapters" not in rows
+
+
+def test_gui_media_type_option_persistence_and_ffmpeg_bypass(tmp_path, monkeypatch):
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    try:
+        app = AudiobookDLApp(root, config_location=str(cfg_path))
+        assert app.media_type_var.get() == "Auto"
+        assert app.build_options().media_type == "auto"
+
+        app.media_type_var.set("Ebook")
+        opts = app.build_options()
+        assert opts.media_type == "ebook"
+
+        monkeypatch.setattr("audiobookdl.gui.app.find_executable", lambda _cmd: None)
+        assert app._ensure_ffmpeg_available(opts) is True
+
+        app._save_run_preferences(opts)
+    finally:
+        root.destroy()
+
+    root2 = tk.Tk()
+    root2.withdraw()
+    try:
+        app2 = AudiobookDLApp(root2, config_location=str(cfg_path))
+        assert app2.media_type_var.get() == "Ebook"
+        assert app2.build_options().media_type == "ebook"
+    finally:
+        root2.destroy()
+

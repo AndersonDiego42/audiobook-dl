@@ -53,6 +53,9 @@ class BookNotReleased(AudiobookDLException):
 class BookHasNoAudiobook(AudiobookDLException):
     error_description = "book_has_no_audiobook"
 
+class BookHasNoEbook(AudiobookDLException):
+    error_description = "book_has_no_ebook"
+
 class ConfigNotFound(AudiobookDLException):
     error_description = "config_not_found"
 

@@ -41,6 +41,7 @@ from audiobookdl.utils.audiobook import (
     Cover,
     Result,
     Series,
+    is_ebook,
 )
 
 import argparse
@@ -67,6 +68,7 @@ import uuid
 
 
 OUTPUT_FORMATS = ("Original", "m4b", "mp3", "m4a", "flac", "opus")
+MEDIA_TYPE_OPTIONS = ("Auto", "Audiobook", "Ebook", "Both")
 TEMPLATE_PRESET_LABELS: Tuple[Tuple[str, str], ...] = (
     ("Custom", ""),
     ("Default", output.OUTPUT_TEMPLATE_PRESETS["default"]),
@@ -167,7 +169,8 @@ def format_audiobook_preview(audiobook: Audiobook) -> List[Tuple[str, str]]:
     ext_suffix = f" ({', '.join(exts)})" if exts else ""
     rows.append(("Parts", f"{file_count} file{'s' if file_count != 1 else ''}{ext_suffix}"))
     chap_count = len(audiobook.chapters)
-    rows.append(("Chapters", f"{chap_count} chapter{'s' if chap_count != 1 else ''}"))
+    if not (is_ebook(audiobook) and chap_count == 0):
+        rows.append(("Chapters", f"{chap_count} chapter{'s' if chap_count != 1 else ''}"))
     return rows
 
 
@@ -464,6 +467,14 @@ class AudiobookDLApp:
             saved_format = "Original"
         self.output_format_var = tk.StringVar(value=saved_format)
         self.m4b_var = tk.BooleanVar(value=(saved_format == "m4b"))
+        saved_media_type = (self._config.media_type or "auto").strip().lower()
+        media_label = {
+            "auto": "Auto",
+            "audiobook": "Audiobook",
+            "ebook": "Ebook",
+            "both": "Both",
+        }.get(saved_media_type, "Auto")
+        self.media_type_var = tk.StringVar(value=media_label)
         saved_bitrate = (self._config.audio_bitrate or "").strip()
         if not saved_bitrate or saved_bitrate.lower() == "auto":
             saved_bitrate = "Auto"
@@ -839,6 +850,16 @@ class AudiobookDLApp:
         )
         cb_enrich.grid(row=2, column=4, columnspan=2, sticky="w", pady=(4, 0))
 
+        ttk.Label(opt_frame, text="Media:").grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        media_combo = ttk.Combobox(
+            opt_frame,
+            textvariable=self.media_type_var,
+            values=MEDIA_TYPE_OPTIONS,
+            state="readonly",
+            width=10,
+        )
+        media_combo.grid(row=3, column=2, columnspan=2, sticky="w", pady=(4, 0))
+
         # Actions, Progress & Log
         log_frame = ttk.LabelFrame(container, text="Activity", padding=(10, 6))
         log_frame.grid(row=5, column=0, sticky="nsew")
@@ -955,6 +976,7 @@ class AudiobookDLApp:
             cb_m4b,
             format_combo,
             bitrate_combo,
+            media_combo,
             cb_combine,
             cb_skip,
             cb_resume,
@@ -1378,6 +1400,8 @@ class AudiobookDLApp:
 
     def _ensure_ffmpeg_available(self, options: args.DownloadOptions) -> bool:
         """Validate FFmpeg/FFprobe up front when combine or format conversion is enabled."""
+        if getattr(options, "media_type", "auto") == "ebook":
+            return True
         if not (options.combine or options.output_format):
             return True
         has_ffmpeg = find_executable("ffmpeg") is not None
@@ -1819,6 +1843,7 @@ class AudiobookDLApp:
                 skip_downloaded=cfg.skip_downloaded,
                 ffmpeg_dir=cfg.ffmpeg_dir,
                 output_format=cfg.output_format,
+                media_type=cfg.media_type,
                 combine=cfg.combine,
                 audio_bitrate=cfg.audio_bitrate,
                 resume=cfg.resume,
@@ -1899,6 +1924,8 @@ class AudiobookDLApp:
         output_template = os.path.join(output_dir, template)
         selected_format = self.output_format_var.get().strip()
         output_format = None if selected_format in ("", "Original") else selected_format
+        selected_media = self.media_type_var.get().strip().lower()
+        media_type = selected_media if selected_media in args.MEDIA_TYPE_CHOICES else "auto"
         selected_bitrate = self.audio_bitrate_var.get().strip()
         audio_bitrate = None if selected_bitrate in ("", "Auto", "auto") else selected_bitrate
 
@@ -1942,6 +1969,7 @@ class AudiobookDLApp:
             debug=self.debug_var.get(),
             no_chapters=self.no_chapters_var.get(),
             output_format=output_format,
+            media_type=media_type,
             username=username,
             password=password,
             library=library,
@@ -2155,6 +2183,7 @@ class AudiobookDLApp:
             overwrite=self._config_location,
             audio_bitrate=options.audio_bitrate,
             resume=options.resume,
+            media_type=options.media_type,
         )
         save_gui_preferences(
             output_dir=self.output_dir_var.get().strip() or default_output_dir(),

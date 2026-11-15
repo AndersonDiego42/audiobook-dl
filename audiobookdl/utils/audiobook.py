@@ -243,3 +243,17 @@ Result = Union[
     Audiobook,
     Series
 ]
+
+EBOOK_EXTENSIONS = frozenset({"epub", "pdf", "mobi", "azw3", "cbz", "cbr"})
+
+
+def is_ebook_extension(ext: Optional[str]) -> bool:
+    """Return True when `ext` represents an ebook file rather than audio."""
+    if not ext:
+        return False
+    return ext.lstrip(".").lower() in EBOOK_EXTENSIONS
+
+
+def is_ebook(audiobook: Audiobook) -> bool:
+    """Return True when `audiobook` consists only of ebook file(s) (e.g. `.epub`)."""
+    return bool(audiobook.files) and all(is_ebook_extension(f.ext) for f in audiobook.files)

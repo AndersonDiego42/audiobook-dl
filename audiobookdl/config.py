@@ -48,6 +48,7 @@ class Config:
     database_directory: Optional[str]
     skip_downloaded: Optional[bool]
     output_format: Optional[str] = None
+    media_type: Optional[str] = None
     combine: Optional[bool] = None
     ffmpeg_dir: Optional[str] = None
     resume: Optional[bool] = None
@@ -69,6 +70,7 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     "database_directory",
     "skip_downloaded",
     "output_format",
+    "media_type",
     "combine",
     "ffmpeg_dir",
     "resume",
@@ -385,6 +387,15 @@ def structure_config(
         else:
             logging.log("Warning: invalid 'timeout' in config (expected number > 0); ignoring")
 
+    raw_media_type = _opt_str("media_type")
+    media_type: Optional[str] = None
+    if raw_media_type is not None:
+        normalized_media_type = raw_media_type.strip().lower()
+        if normalized_media_type in ("auto", "audiobook", "ebook", "both"):
+            media_type = normalized_media_type
+        else:
+            logging.log(f"Warning: invalid 'media_type' in config ('{raw_media_type}'); ignoring")
+
     # Create config object
     return Config(
         sources=sources,
@@ -392,6 +403,7 @@ def structure_config(
         database_directory=_opt_str("database_directory"),
         skip_downloaded=_opt_bool("skip_downloaded"),
         output_format=_opt_str("output_format"),
+        media_type=media_type,
         combine=_opt_bool("combine"),
         ffmpeg_dir=_opt_str("ffmpeg_dir"),
         resume=_opt_bool("resume"),
@@ -567,8 +579,9 @@ def save_output_preferences(
     *,
     audio_bitrate: Any = _UNSET,
     resume: Any = _UNSET,
+    media_type: Any = _UNSET,
 ) -> str:
-    """Persist GUI output format, combine, bitrate, and resume preferences in `audiobook-dl.toml`."""
+    """Persist GUI output format, combine, bitrate, resume, and media type preferences in `audiobook-dl.toml`."""
     config_location = overwrite or get_config_location(None)
     with file_lock(config_location):
         config_dict = read_config(config_location)
@@ -585,6 +598,12 @@ def save_output_preferences(
                 config_dict.pop("audio_bitrate", None)
         if resume is not _UNSET:
             config_dict["resume"] = bool(resume)
+        if media_type is not _UNSET:
+            normalized_media = str(media_type).strip().lower() if media_type else ""
+            if normalized_media and normalized_media != "auto":
+                config_dict["media_type"] = normalized_media
+            else:
+                config_dict.pop("media_type", None)
         return _write_config_dict(config_location, config_dict)
 
 

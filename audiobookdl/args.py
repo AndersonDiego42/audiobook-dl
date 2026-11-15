@@ -96,6 +96,9 @@ def parse_series_selection(spec: str, total: int) -> List[int]:
     return selected
 
 
+MEDIA_TYPE_CHOICES = ("auto", "audiobook", "ebook", "both")
+
+
 @dataclass
 class DownloadOptions:
     """Typed runtime options shared across CLI, GUI, pipeline, and sources."""
@@ -113,6 +116,7 @@ class DownloadOptions:
     no_chapters: bool = False
     split_chapters: bool = False
     output_format: Optional[str] = None
+    media_type: str = "auto"
     ffmpeg_output: bool = False
     input_file: Optional[str] = None
     username: Optional[str] = None
@@ -252,6 +256,12 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> DownloadOptions:
         '--output-format',
         dest="output_format",
         help="Output file format",
+    )
+    parser.add_argument(
+        '--media-type',
+        dest="media_type",
+        choices=MEDIA_TYPE_CHOICES,
+        help="Media format to download when sources offer both audiobooks and ebooks (auto, audiobook, ebook, both)",
     )
     parser.add_argument(
         '--verbose-ffmpeg',

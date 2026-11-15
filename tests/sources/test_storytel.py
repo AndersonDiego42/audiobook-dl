@@ -12,6 +12,7 @@ from audiobookdl import Audiobook, AudiobookMetadata, BookId, Series
 from audiobookdl.args import build_default_options
 from audiobookdl.exceptions import (
     BookHasNoAudiobook,
+    BookHasNoEbook,
     BookNotFound,
     BookNotReleased,
     CloudflareBlocked,
@@ -176,10 +177,34 @@ def test_get_metadata_full_fields_and_format_error_conditions(tmp_path):
     with pytest.raises(DataNotPresent):
         src.get_metadata(no_formats)
 
-    # Ebook only -> BookHasNoAudiobook
-    ebook_only = _sample_book_details(formats=[{"type": "ebook", "isReleased": True}])
+    # Ebook only in default "auto" mode -> falls back to ebook metadata
+    ebook_only = _sample_book_details(
+        formats=[
+            {
+                "type": "ebook",
+                "isReleased": True,
+                "isbn": "9780000000002",
+                "publisher": {"name": "Ebook Publisher"},
+                "releaseDate": "2023-01-10T00:00:00Z",
+            }
+        ]
+    )
+    ebook_meta = src.get_metadata(ebook_only)
+    assert ebook_meta.genres == ["Ebook", "Fiction"]
+    assert ebook_meta.narrators == []
+    assert ebook_meta.isbn == "9780000000002"
+    assert ebook_meta.publisher == "Ebook Publisher"
+    assert ebook_meta.release_date == date(2023, 1, 10)
+
+    # Ebook only when media_type="audiobook" -> BookHasNoAudiobook
+    src_audio = _make_source(tmp_path, media_type="audiobook")
     with pytest.raises(BookHasNoAudiobook):
-        src.get_metadata(ebook_only)
+        src_audio.get_metadata(ebook_only)
+
+    # Audiobook only when media_type="ebook" -> BookHasNoEbook
+    src_ebook = _make_source(tmp_path, media_type="ebook")
+    with pytest.raises(BookHasNoEbook):
+        src_ebook.get_metadata(_sample_book_details())
 
     # Multiple abook formats -> GenericAudiobookDLException
     multi_abook = _sample_book_details(
@@ -400,11 +425,26 @@ def test_download_routes_bookshelf_want_to_read_and_avoids_slug_collision(tmp_pa
     }
     src._session.post = MagicMock(return_value=_mock_resp(200, json_data=bookshelf_payload))
 
+    # Default "auto" mode includes both audiobook (101) and ebook-only (103)
     series = src.download("https://www.storytel.com/se/sv/want-to-read?sort=recent#top")
     assert isinstance(series, Series)
-    assert [b.id for b in series.books if isinstance(b, BookId)] == ["101"]
+    assert [b.id for b in series.books if isinstance(b, BookId)] == ["101", "103"]
     bookshelf_json = Path(src.database_directory_lists) / "bookshelf.json"
     assert json.loads(bookshelf_json.read_text(encoding="utf-8")) == bookshelf_payload
+
+    # "audiobook" mode skips ebook-only (103)
+    src_audio = _make_source(tmp_path, skip_downloaded=True, media_type="audiobook")
+    src_audio._session.post = MagicMock(return_value=_mock_resp(200, json_data=bookshelf_payload))
+    series_audio = src_audio.download("https://www.storytel.com/se/sv/want-to-read")
+    assert isinstance(series_audio, Series)
+    assert [b.id for b in series_audio.books if isinstance(b, BookId)] == ["101"]
+
+    # "ebook" mode selects only ebook (103)
+    src_ebook = _make_source(tmp_path, skip_downloaded=True, media_type="ebook")
+    src_ebook._session.post = MagicMock(return_value=_mock_resp(200, json_data=bookshelf_payload))
+    series_ebook = src_ebook.download("https://www.storytel.com/se/sv/want-to-read")
+    assert isinstance(series_ebook, Series)
+    assert [b.id for b in series_ebook.books if isinstance(b, BookId)] == ["103"]
 
     # Non-200 bookshelf response -> UserNotAuthorized
     src._session.post = MagicMock(return_value=_mock_resp(401))
@@ -453,11 +493,26 @@ def test_download_lists_api_paginates_filters_and_persists_json(tmp_path):
 
     assert isinstance(series, Series)
     assert series.title == "My Series — ÅÄÖ"
-    assert [b.id for b in series.books if isinstance(b, BookId)] == ["201", "205"]
+    assert [b.id for b in series.books if isinstance(b, BookId)] == ["201", "203", "205"]
+    assert captured_params[0]["includeFormats"] == "abook,ebook"
     assert "nextPageToken" not in captured_params[0]
     assert captured_params[1]["nextPageToken"] == "page-2-token"
-    saved_list = Path(src._get_lists_path("ser-42", "se", "abook"))
+    saved_list = Path(src._get_lists_path("ser-42", "se", "abook,ebook"))
     assert len(json.loads(saved_list.read_text(encoding="utf-8"))["items"]) == 5
+
+    # Explicit "audiobook" mode filters out ebook-only 203 and queries only "abook"
+    captured_params_audio = []
+
+    def fake_get_audio(url, params=None, **_kwargs):
+        captured_params_audio.append(dict(params or {}))
+        return _mock_resp(200, json_data=page_1 if len(captured_params_audio) == 1 else page_2)
+
+    src_audio = _make_source(tmp_path, skip_downloaded=True, media_type="audiobook")
+    src_audio._session.get = MagicMock(side_effect=fake_get_audio)
+    series_audio = src_audio.download("https://www.storytel.com/se/sv/series/cool-series-42")
+    assert [b.id for b in series_audio.books if isinstance(b, BookId)] == ["201", "205"]
+    assert captured_params_audio[0]["includeFormats"] == "abook"
+    assert Path(src_audio._get_lists_path("ser-42", "se", "abook")).exists()
 
 
 def test_download_books_from_website_filters_by_headphone_icon_and_skip(tmp_path):
@@ -469,6 +524,7 @@ def test_download_books_from_website_filters_by_headphone_icon_and_skip(tmp_path
         "<h1>Site Header</h1>"
         "<h1>Sci-Fi Category</h1>"
         f'<a href="/se/sv/books/audio-one-301"><svg><path d="{svg_headphone_path}"/></svg></a>'
+        f'<a href="/se/sv/books/audio-one-301">Duplicate Link</a>'
         f'<a href="/se/sv/books/audio-skip-302"><svg><path d="{svg_headphone_path}"/></svg></a>'
         '<a href="/se/sv/books/ebook-only-303"><svg><path d="M0 0h10"/></svg></a>'
         "</body></html>"
@@ -479,7 +535,13 @@ def test_download_books_from_website_filters_by_headphone_icon_and_skip(tmp_path
 
     assert isinstance(series, Series)
     assert series.title == "Sci-Fi Category"
-    assert [b.id for b in series.books if isinstance(b, BookId)] == ["301"]
+    assert [b.id for b in series.books if isinstance(b, BookId)] == ["301", "303"]
+
+    # Explicit "audiobook" mode filters by headphone SVG icon
+    src_audio = _make_source(tmp_path, skip_downloaded=True, media_type="audiobook")
+    src_audio._session.get = MagicMock(return_value=_mock_resp(200, content=html))
+    series_audio = src_audio.download("https://www.storytel.com/se/sv/categories/sci-fi-10")
+    assert [b.id for b in series_audio.books if isinstance(b, BookId)] == ["301"]
 
 
 def test_on_download_complete_writes_utf8_json(tmp_path):
@@ -520,5 +582,169 @@ def test_storytel_skips_playback_metadata_and_streams_on_print_output(tmp_path):
     assert audiobook.chapters == []
     assert src._session.get.call_count == 1
     assert not Path(src._get_playback_metadata_path("999")).exists()
+
+
+def test_download_ebook_only_book_in_auto_mode(tmp_path):
+    src = _make_source(tmp_path)
+    src._session.headers["authorization"] = "Bearer token-123"
+    details = _sample_book_details(
+        "555",
+        formats=[
+            {
+                "type": "ebook",
+                "isReleased": True,
+                "isbn": "9781234567897",
+                "publisher": {"name": "Ebook Press"},
+                "releaseDate": "2024-03-01",
+            }
+        ],
+    )
+
+    def _fake_get(url, **kwargs):
+        if "book-details/consumables/555" in url:
+            return _mock_resp(200, json_data=details)
+        if url.endswith("/assets/v2/consumables/555/ebook"):
+            assert kwargs.get("allow_redirects") is False
+            return _mock_resp(
+                302,
+                headers={"Location": "https://cdn.storytel.net/ebooks/sample.epub?sig=abc"},
+            )
+        if url == "https://covers.storytel.com/cover.jpg":
+            return _mock_resp(200, content=b"cover-bytes")
+        raise AssertionError(f"Unexpected URL requested: {url}")
+
+    src._session.get = MagicMock(side_effect=_fake_get)
+    book = src.download_book_from_book_id("555")
+
+    assert isinstance(book, Audiobook)
+    assert book.chapters == []
+    assert len(book.files) == 1
+    assert book.files[0].ext == "epub"
+    assert book.files[0].expected_content_type is None
+    assert book.files[0].url == "https://cdn.storytel.net/ebooks/sample.epub?sig=abc"
+    assert book.files[0].headers["authorization"] == "Bearer token-123"
+    assert book.metadata.genres == ["Ebook", "Fiction"]
+    assert book.metadata.narrators == []
+    assert book.metadata.isbn == "9781234567897"
+    assert book.metadata.publisher == "Ebook Press"
+    assert book.metadata.release_date == date(2024, 3, 1)
+    assert not Path(src._get_playback_metadata_path("555")).exists()
+
+
+def test_ebook_url_pdf_extension_and_error_handling(tmp_path):
+    src = _make_source(tmp_path)
+    src._session.get = MagicMock(
+        return_value=_mock_resp(
+            302,
+            headers={"Location": "https://cdn.storytel.net/ebooks/doc.PDF?token=1"},
+        )
+    )
+    files = src.get_files({"consumableId": "77"}, format_type="ebook")
+    assert files[0].ext == "pdf"
+
+    src._session.get = MagicMock(return_value=_mock_resp(404, text="missing"))
+    with pytest.raises(GenericAudiobookDLException):
+        src.get_ebook_url("77")
+
+
+def test_dual_format_ebook_and_both_modes_with_skip_and_cache(tmp_path):
+    details = _sample_book_details(
+        "888",
+        formats=[
+            {
+                "type": "abook",
+                "isReleased": True,
+                "publisher": {"name": "Audio Press"},
+                "releaseDate": "2023-01-01",
+            },
+            {
+                "type": "ebook",
+                "isReleased": True,
+                "isbn": "9789999999999",
+                "publisher": {"name": "Ebook Press"},
+                "releaseDate": "2023-02-02",
+            },
+        ],
+    )
+
+    def _make_get(details_payload):
+        def _fake_get(url, **kwargs):
+            if "book-details/consumables/888" in url:
+                return _mock_resp(200, json_data=details_payload)
+            if url.endswith("/assets/v2/consumables/888/abook"):
+                return _mock_resp(302, headers={"Location": "https://cdn.storytel.net/audio.mp3"})
+            if url.endswith("/assets/v2/consumables/888/ebook"):
+                return _mock_resp(302, headers={"Location": "https://cdn.storytel.net/book.epub"})
+            if "playback-metadata/consumable/888" in url:
+                return _mock_resp(200, json_data={"formats": [{"type": "abook", "chapters": []}]})
+            if url == "https://covers.storytel.com/cover.jpg":
+                return _mock_resp(200, content=b"cover")
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        return _fake_get
+
+    # Explicit ebook mode selects only ebook
+    ebook_src = _make_source(tmp_path, media_type="ebook")
+    ebook_src._session.get = MagicMock(side_effect=_make_get(details))
+    only_ebook = ebook_src.download_book_from_book_id("888")
+    assert isinstance(only_ebook, Audiobook)
+    assert only_ebook.files[0].ext == "epub"
+
+    # Both mode returns Series with audiobook + ebook, and writes separate cache files
+    both_src = _make_source(tmp_path, media_type="both", skip_downloaded=True)
+    both_src._session.get = MagicMock(side_effect=_make_get(details))
+    result = both_src.download_book_from_book_id("888")
+    assert isinstance(result, Series)
+    assert [b.files[0].ext for b in result.books] == ["mp3", "epub"]
+
+    both_src.on_download_complete(result.books[0])
+    both_src.on_download_complete(result.books[1])
+    assert Path(both_src._get_book_path("888", "abook")).exists()
+    assert Path(both_src._get_book_path("888", "ebook")).exists()
+
+    # If ebook already downloaded and skip_downloaded=True, only remaining abook is fetched
+    Path(both_src._get_book_path("888", "abook")).unlink()
+    both_src._session.get = MagicMock(side_effect=_make_get(details))
+    remaining = both_src.download_book_from_book_id("888")
+    assert isinstance(remaining, Audiobook)
+    assert remaining.files[0].ext == "mp3"
+
+
+def test_bookshelf_both_mode_skips_only_when_both_formats_exist(tmp_path):
+    src = _make_source(tmp_path, media_type="both", skip_downloaded=True)
+    shelf_payload = {
+        "items": {
+            "10": {
+                "model": {
+                    "id": "10",
+                    "name": "Dual Book",
+                    "state": "WILL_CONSUME",
+                    "formats": [
+                        {"type": "abook", "isReleased": True},
+                        {"type": "ebook", "isReleased": True},
+                    ],
+                },
+            },
+            "20": {
+                "model": {
+                    "id": "20",
+                    "name": "Already Both Done",
+                    "state": "WILL_CONSUME",
+                    "formats": [
+                        {"type": "abook", "isReleased": True},
+                        {"type": "ebook", "isReleased": True},
+                    ],
+                },
+            },
+        }
+    }
+    Path(src._get_book_path("10", "abook")).write_text("{}", encoding="utf-8")
+    Path(src._get_book_path("20", "abook")).write_text("{}", encoding="utf-8")
+    Path(src._get_book_path("20", "ebook")).write_text("{}", encoding="utf-8")
+
+    src._session.post = MagicMock(return_value=_mock_resp(200, json_data=shelf_payload))
+    series = src.download_bookshelf_wtr()
+    assert [b.id for b in series.books] == ["10"]
+
 
 

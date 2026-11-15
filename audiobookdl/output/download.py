@@ -3,7 +3,7 @@ from audiobookdl.args import DownloadOptions
 from audiobookdl.exceptions import UserNotAuthorized, NoFilesFound, DownloadError, DownloadCancelled
 from audiobookdl.output.encryption import AESStreamDecryptor
 from audiobookdl.output.metadata import id3
-from audiobookdl.utils.audiobook import AESEncryption
+from audiobookdl.utils.audiobook import AESEncryption, is_ebook, is_ebook_extension
 from audiobookdl.utils.concurrency import run_cancellable_pool
 from audiobookdl.utils.http import DEFAULT_HTTP_TIMEOUT
 from . import metadata, output, encryption
@@ -99,12 +99,17 @@ def download_audiobook(
 ):
     """Download, convert, combine, and add metadata to files from `Audiobook` object"""
     # Check if file/dir exists and should be skipped or confirmed before overwriting
-    splitting = bool(getattr(options, "split_chapters", False) and len(audiobook.chapters) > 1)
-    is_single_file = (len(audiobook.files) == 1 or options.combine) and not splitting
+    ebook = is_ebook(audiobook)
+    splitting = (not ebook) and bool(getattr(options, "split_chapters", False) and len(audiobook.chapters) > 1)
+    is_single_file = (len(audiobook.files) == 1 or (options.combine and not ebook)) and not splitting
     target_path = ""
     if audiobook.files:
         initial_ext = audiobook.files[0].ext.lstrip(".").lower()
-        output_format = (options.output_format or initial_ext).lstrip(".").lower()
+        output_format = (
+            initial_ext
+            if ebook
+            else (options.output_format or initial_ext).lstrip(".").lower()
+        )
         target_path = f"{output_dir}.{output_format}"
 
     confirmed_target_overwrite = False
@@ -155,12 +160,20 @@ def download_audiobook(
     )
     if cancel_event is not None and cancel_event.is_set():
         raise DownloadCancelled
-    # Converting & combining files
-    current_format, output_format = get_output_audio_format(options.output_format, filepaths)
+    # Converting & combining files (skipped for ebook files such as .epub)
+    current_format, output_format = get_output_audio_format(
+        None if ebook else options.output_format,
+        filepaths,
+    )
     chapters_embedded = False
     chapters_for_ffmpeg = (
         audiobook.chapters
-        if (audiobook.chapters and not options.no_chapters and not id3.is_id3_file(f"{output_dir}.{output_format}"))
+        if (
+            not ebook
+            and audiobook.chapters
+            and not options.no_chapters
+            and not id3.is_id3_file(f"{output_dir}.{output_format}")
+        )
         else None
     )
     if splitting:
@@ -211,7 +224,7 @@ def download_audiobook(
             if src_single not in filepaths and os.path.exists(src_single):
                 os.remove(src_single)
         current_format = output_format
-    elif options.combine and len(filepaths) > 1:
+    elif options.combine and not ebook and len(filepaths) > 1:
         logging.book_update("Combining files")
         output_path = f"{output_dir}.{output_format}"
         try:
@@ -233,6 +246,7 @@ def download_audiobook(
             raise
     elif (
         not options.combine
+        and not ebook
         and len(filepaths) > 1
         and output.should_smart_merge_hls(filepaths, audiobook.chapters)
     ):
@@ -247,7 +261,7 @@ def download_audiobook(
         current_format = output_format
     if cancel_event is not None and cancel_event.is_set():
         raise DownloadCancelled
-    if current_format != output_format and not splitting:
+    if current_format != output_format and not splitting and not ebook:
         logging.book_update("Converting files")
         if len(filepaths) == 1:
             converted_path, chapters_embedded = output.convert_single_file(
@@ -294,8 +308,9 @@ def add_metadata_to_file(
     :param filepath: Filepath of output file
     :options: Cli options
     """
+    ebook_file = is_ebook_extension(os.path.splitext(filepath)[1])
     # Chapters must be muxed before container metadata/cover because ffmpeg's remux drops unmapped MP4 atoms
-    if audiobook.chapters and not options.no_chapters and not chapters_embedded:
+    if not ebook_file and audiobook.chapters and not options.no_chapters and not chapters_embedded:
         logging.book_update("Adding chapters")
         metadata.add_chapters(
             filepath,
@@ -304,8 +319,9 @@ def add_metadata_to_file(
             audio_bitrate=options.audio_bitrate,
         )
     # General metadata
-    logging.book_update("Adding metadata")
-    metadata.add_metadata(filepath, audiobook.metadata)
+    if not ebook_file:
+        logging.book_update("Adding metadata")
+        metadata.add_metadata(filepath, audiobook.metadata)
     stem = os.path.splitext(filepath)[0]
     cover_sidecar_name: Optional[str] = None
     if audiobook.cover and options.write_cover:
@@ -321,7 +337,7 @@ def add_metadata_to_file(
             f"{stem}.opf",
             cover_filename=cover_sidecar_name,
         )
-    if options.write_cue and audiobook.chapters and not options.no_chapters:
+    if not ebook_file and options.write_cue and audiobook.chapters and not options.no_chapters:
         sidecars.write_sidecar_cue(
             audiobook.metadata,
             os.path.basename(filepath),
@@ -329,7 +345,7 @@ def add_metadata_to_file(
             f"{stem}.cue",
         )
     # Cover
-    if audiobook.cover:
+    if not ebook_file and audiobook.cover:
         logging.book_update("Embedding cover")
         metadata.embed_cover(filepath, audiobook.cover)
 
@@ -351,7 +367,8 @@ def add_metadata_to_dir(
     logging.book_update("Adding metadata")
     file_list = list(filepaths)
     for filepath in file_list:
-        metadata.add_metadata(filepath, audiobook.metadata)
+        if not is_ebook_extension(os.path.splitext(filepath)[1]):
+            metadata.add_metadata(filepath, audiobook.metadata)
     cover_sidecar_name: Optional[str] = None
     if audiobook.cover:
         logging.book_update("Adding cover")

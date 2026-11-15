@@ -722,3 +722,113 @@ def test_search_service_librivox_and_list_service_library_storytel(tmp_path, mon
     assert st_results[0].title == "Shelf Book"
     assert st_results[0].author == "A. Writer"
     assert st_results[0].url == "https://www.storytel.com/books/99"
+
+
+def test_apply_runtime_options_media_type_precedence():
+    from audiobookdl.pipeline import apply_runtime_options
+
+    cfg = Config(
+        sources={},
+        output_template=None,
+        database_directory="",
+        skip_downloaded=False,
+        media_type="ebook",
+    )
+    opts_default = args.build_default_options()
+    apply_runtime_options(opts_default, cfg)
+    assert opts_default.media_type == "ebook"
+
+    opts_cli = args.parse_arguments(["--media-type", "both", "https://example.com/book"])
+    apply_runtime_options(opts_cli, cfg)
+    assert opts_cli.media_type == "both"
+
+
+def test_archive_distinguishes_ebook_and_audiobook_and_records_epub_format(tmp_path, monkeypatch):
+    from audiobookdl import AudiobookFile
+    from audiobookdl.pipeline import process_audiobook
+    from audiobookdl.utils.archive import DownloadArchive, make_book_key
+
+    audio = Audiobook(
+        session=requests.Session(),
+        metadata=AudiobookMetadata(title="Same Title", scrape_url="https://www.storytel.com/books/1"),
+        files=[AudiobookFile(url="https://example.com/a.mp3", ext="mp3")],
+    )
+    ebook = Audiobook(
+        session=requests.Session(),
+        metadata=AudiobookMetadata(title="Same Title", scrape_url="https://www.storytel.com/books/1"),
+        files=[AudiobookFile(url="https://example.com/b.epub", ext="epub")],
+    )
+    key_audio = make_book_key("storytel", audio)
+    key_ebook = make_book_key("storytel", ebook)
+    assert key_audio != key_ebook
+    assert key_ebook.endswith("::ebook")
+
+    class _FakeSource:
+        name = "storytel"
+        skip_downloaded = False
+
+        def on_download_complete(self, _book):
+            pass
+
+    monkeypatch.setattr("audiobookdl.output.download.download_audiobook", lambda *a, **kw: None)
+    db_path = tmp_path / "downloads.db"
+    opts = args.build_default_options(
+        output_format="m4b",
+        output_template=str(tmp_path / "{title}"),
+        download_archive=str(db_path),
+    )
+    assert process_audiobook(_FakeSource(), ebook, opts) is True
+
+    archive = DownloadArchive(str(db_path))
+    assert archive.contains("storytel", key_ebook)
+    assert not archive.contains("storytel", key_audio)
+    entries = archive.list_entries()
+    assert len(entries) == 1
+    assert entries[0].book_key == key_ebook
+    assert entries[0].audio_format == "epub"
+
+
+def test_download_result_series_handles_book_has_no_ebook_and_dual_format_series(tmp_path, monkeypatch):
+    from audiobookdl import AudiobookFile
+    from audiobookdl.exceptions import BookHasNoEbook
+    from audiobookdl.pipeline import download_result
+
+    class _FakeDualSource:
+        name = "storytel"
+        skip_downloaded = False
+
+        def on_download_complete(self, _book):
+            pass
+
+        def download_from_id(self, book_id):
+            if book_id == "missing-ebook":
+                raise BookHasNoEbook
+            if book_id == "dual":
+                abook = Audiobook(
+                    session=requests.Session(),
+                    metadata=AudiobookMetadata(title="Dual"),
+                    files=[AudiobookFile(url="https://example.com/a.mp3", ext="mp3")],
+                )
+                ebook = Audiobook(
+                    session=requests.Session(),
+                    metadata=AudiobookMetadata(title="Dual"),
+                    files=[AudiobookFile(url="https://example.com/b.epub", ext="epub")],
+                )
+                return Series(title="Dual", books=[abook, ebook])
+            raise AssertionError(f"Unexpected id: {book_id}")
+
+    downloaded_exts: list[str] = []
+
+    def _fake_download_audiobook(book, *_args, **_kwargs):
+        downloaded_exts.append(book.files[0].ext)
+
+    monkeypatch.setattr("audiobookdl.output.download.download_audiobook", _fake_download_audiobook)
+    series = Series(title="Test Series", books=[BookId("missing-ebook"), BookId("dual")])
+    summary = DownloadSummary()
+    opts = args.build_default_options(output_template=str(tmp_path / "{title}"))
+
+    download_result(_FakeDualSource(), series, opts, summary=summary)
+    assert downloaded_exts == ["mp3", "epub"]
+    assert summary.books_completed == 2
+    assert summary.books_failed == 0
+

@@ -102,3 +102,18 @@ def test_parse_series_selection_and_new_cli_flags():
     assert opts.resume is False
     assert "combine" in opts._explicit_fields
     assert "output_template" not in opts._explicit_fields
+
+
+def test_parse_arguments_media_type_valid_and_invalid():
+    default_opts = args.parse_arguments(["https://example.com/book"])
+    assert default_opts.media_type == "auto"
+    assert "media_type" not in default_opts._explicit_fields
+
+    for choice in ("auto", "audiobook", "ebook", "both"):
+        opts = args.parse_arguments(["--media-type", choice, "https://example.com/book"])
+        assert opts.media_type == choice
+        assert "media_type" in opts._explicit_fields
+
+    with pytest.raises(SystemExit):
+        args.parse_arguments(["--media-type", "podcast", "https://example.com/book"])
+

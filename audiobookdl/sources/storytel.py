@@ -16,19 +16,21 @@ from audiobookdl import (
     BookId,
     Result,
 )
+from audiobookdl.utils.audiobook import is_ebook
 from audiobookdl.exceptions import (
     GenericAudiobookDLException,
     UserNotAuthorized,
     CloudflareBlocked,
     BookNotFound,
     BookHasNoAudiobook,
+    BookHasNoEbook,
     BookNotReleased,
     DataNotPresent,
     RequestError,
 )
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
-from typing import Any, List, Dict, Optional, Union
+from typing import Any, List, Dict, Optional, Sequence, Union
 from urllib3.util import parse_url
 from urllib.parse import urlunparse, parse_qs
 from datetime import datetime, date
@@ -124,8 +126,17 @@ class StorytelSource(Source):
         os.makedirs(self.database_directory_playback_metadata, exist_ok=True)
         os.makedirs(self.database_directory_lists, exist_ok=True)
 
-    def _get_book_path(self, consumableId: str) -> str:
-        return os.path.join(self.database_directory_books, f"{consumableId}.json")
+    @property
+    def media_type(self) -> str:
+        raw = getattr(self._options, "media_type", None) or "auto"
+        normalized = str(raw).strip().lower()
+        if normalized in ("auto", "audiobook", "ebook", "both"):
+            return normalized
+        return "auto"
+
+    def _get_book_path(self, consumableId: str, format_type: str = "abook") -> str:
+        suffix = "_ebook" if format_type == "ebook" else ""
+        return os.path.join(self.database_directory_books, f"{consumableId}{suffix}.json")
 
     def _get_playback_metadata_path(self, consumableId: str) -> str:
         return os.path.join(
@@ -137,12 +148,14 @@ class StorytelSource(Source):
             self.database_directory_lists, f"{list_name}_{languages}_{formats}.json"
         )
 
-    def _skip_download_check(self, book_id: str) -> bool:
-        if self.skip_downloaded:
-            book_path = self._get_book_path(book_id)
-            return os.path.exists(book_path)
-        else:
+    def _skip_download_check(self, book_id: str, format_type: Optional[str] = None) -> bool:
+        if not self.skip_downloaded:
             return False
+        if format_type is not None:
+            return os.path.exists(self._get_book_path(book_id, format_type))
+        if self.media_type == "ebook":
+            return os.path.exists(self._get_book_path(book_id, "ebook"))
+        return os.path.exists(self._get_book_path(book_id, "abook"))
 
     @staticmethod
     def encrypt_password(password: str) -> str:
@@ -218,10 +231,9 @@ class StorytelSource(Source):
         """remove query string/fragment from url"""
         return url.split("?")[0]
 
-    def download_from_id(self, book_id: str) -> Audiobook:
+    def download_from_id(self, book_id: str) -> Result:
         self._relogin_check()
-        audiobook = self.download_book_from_book_id(book_id)
-        return audiobook
+        return self.download_book_from_book_id(book_id)
 
     def download(self, url: str) -> Result:
         self._relogin_check()
@@ -245,6 +257,33 @@ class StorytelSource(Source):
                 return self.download_books_from_website(url)
         raise BookNotFound
 
+    def _item_selected_formats(self, formats: Sequence[Dict[str, Any]]) -> List[str]:
+        has_abook = any(f.get("type") == "abook" and f.get("isReleased") for f in formats)
+        has_ebook = any(f.get("type") == "ebook" and f.get("isReleased") for f in formats)
+        mode = self.media_type
+        if mode == "audiobook":
+            return ["abook"] if has_abook else []
+        if mode == "ebook":
+            return ["ebook"] if has_ebook else []
+        if mode == "both":
+            selected: List[str] = []
+            if has_abook:
+                selected.append("abook")
+            if has_ebook:
+                selected.append("ebook")
+            return selected
+        if has_abook:
+            return ["abook"]
+        if has_ebook:
+            return ["ebook"]
+        return []
+
+    def _should_include_item(self, book_id: str, formats: Sequence[Dict[str, Any]]) -> bool:
+        selected = self._item_selected_formats(formats)
+        if not selected:
+            return False
+        return any(not self._skip_download_check(book_id, fmt) for fmt in selected)
+
     def download_lists_api(
         self,
         url: str,
@@ -256,16 +295,8 @@ class StorytelSource(Source):
 
         books: List[Union[BookId[str], Audiobook]] = []
         for item in list_details["items"]:
-            abook_formats = [
-                format for format in item["formats"] if format["type"] == "abook"
-            ]
-            if (
-                len(abook_formats) > 0
-                and abook_formats[0]["isReleased"]
-                and not self._skip_download_check(item["id"])
-            ):
-                book_id = BookId(item["id"])
-                books.append(book_id)
+            if self._should_include_item(item["id"], item.get("formats", [])):
+                books.append(BookId(item["id"]))
 
         return Series(
             title=list_details["title"],
@@ -274,9 +305,8 @@ class StorytelSource(Source):
 
     def download_bookshelf_wtr(self) -> Series[str]:
         """
-        Download every audiobook in the user's bookshelf marked as "want to
-        read" (Storytel state ``WILL_CONSUME``). Entries without a released
-        abook format (e.g. ebook-only) are skipped.
+        Download books in the user's bookshelf marked as "want to read"
+        (Storytel state ``WILL_CONSUME``) matching the configured ``media_type``.
         """
         data = self.download_bookshelf()
         books: List[Union[BookId[str], Audiobook]] = []
@@ -285,46 +315,145 @@ class StorytelSource(Source):
             book_id = model.get("id")
             if not book_id or model.get("state") != "WILL_CONSUME":
                 continue
-            abook_formats = [
-                format for format in model.get("formats", []) if format.get("type") == "abook"
-            ]
-            if (
-                len(abook_formats) > 0
-                and abook_formats[0].get("isReleased")
-                and not self._skip_download_check(book_id)
-            ):
+            if self._should_include_item(book_id, model.get("formats", [])):
                 books.append(BookId(book_id))
         return Series(
             title="Storytel - Vill läsa",
             books=books,
         )
 
-    def download_book_from_book_id(
+    @staticmethod
+    def _validate_single_format(
+        candidates: List[Dict[str, Any]],
+        format_type: str,
+        *,
+        require_released: bool = True,
+    ) -> Dict[str, Any]:
+        if len(candidates) != 1:
+            raise GenericAudiobookDLException(
+                f"multiple {format_type} formats",
+                f"found multiple {format_type} formats, please report this book for bugfixing",
+            )
+        fmt = candidates[0]
+        if require_released and not fmt.get("isReleased", True):
+            raise BookNotReleased
+        return fmt
+
+    def _select_format_types(self, book_details: Dict[str, Any]) -> List[str]:
+        if "formats" not in book_details:
+            raise DataNotPresent
+        formats = book_details["formats"]
+        abook_formats = [f for f in formats if f.get("type") == "abook"]
+        ebook_formats = [f for f in formats if f.get("type") == "ebook"]
+        mode = self.media_type
+
+        if mode == "audiobook":
+            if not abook_formats:
+                raise BookHasNoAudiobook
+            self._validate_single_format(abook_formats, "abook")
+            return ["abook"]
+
+        if mode == "ebook":
+            if not ebook_formats:
+                raise BookHasNoEbook
+            self._validate_single_format(ebook_formats, "ebook")
+            return ["ebook"]
+
+        if mode == "both":
+            selected: List[str] = []
+            if abook_formats:
+                fmt = self._validate_single_format(abook_formats, "abook", require_released=False)
+                if fmt.get("isReleased", True):
+                    selected.append("abook")
+            if ebook_formats:
+                fmt = self._validate_single_format(ebook_formats, "ebook", require_released=False)
+                if fmt.get("isReleased", True):
+                    selected.append("ebook")
+            if not selected:
+                if abook_formats or ebook_formats:
+                    raise BookNotReleased
+                raise BookHasNoAudiobook
+            return selected
+
+        # mode == "auto": prefer audiobook when present, fall back to ebook
+        if abook_formats:
+            self._validate_single_format(abook_formats, "abook")
+            return ["abook"]
+        if ebook_formats:
+            self._validate_single_format(ebook_formats, "ebook")
+            return ["ebook"]
+        raise BookHasNoAudiobook
+
+    def _build_book_for_format(
         self,
         consumableId: str,
+        book_details: Dict[str, Any],
+        format_type: str,
+        *,
+        print_only: bool,
+        cover_only: bool,
+        no_chapters: bool,
+        cover: Optional[Cover],
     ) -> Audiobook:
-        book_details = self.download_book_details(consumableId)
-        metadata = self.get_metadata(book_details)
-        options = getattr(self, "_options", None)
-        print_only = bool(options and getattr(options, "print_output", False))
-        cover_only = bool(options and getattr(options, "cover", False))
-        no_chapters = bool(options and getattr(options, "no_chapters", False))
-
-        files = [] if (print_only or cover_only) else self.get_files(book_details)
-        cover = None if print_only else self.download_cover(book_details)
-        chapters = [] if (print_only or cover_only or no_chapters) else self.get_chapters(book_details)
-        self._update_metadata(consumableId, book_details, metadata, files)
-
+        metadata = self.get_metadata(book_details, format_type=format_type)
+        files = [] if (print_only or cover_only) else self.get_files(book_details, format_type=format_type)
+        chapters = (
+            []
+            if (print_only or cover_only or no_chapters or format_type != "abook")
+            else self.get_chapters(book_details)
+        )
+        source_data = dict(book_details)
+        source_data["_format_type"] = format_type
+        self._update_metadata(consumableId, source_data, metadata, files)
         return Audiobook(
             session=self._session,
             files=files,
             metadata=metadata,
             cover=cover,
             chapters=chapters,
-            source_data=book_details,
+            source_data=source_data,
         )
 
-    def download_book_from_url(self, url: str) -> Audiobook:
+    def download_book_from_book_id(
+        self,
+        consumableId: str,
+    ) -> Result:
+        book_details = self.download_book_details(consumableId)
+        selected_formats = self._select_format_types(book_details)
+        if len(selected_formats) > 1 and self.skip_downloaded:
+            remaining = [
+                fmt for fmt in selected_formats
+                if not self._skip_download_check(consumableId, fmt)
+            ]
+            if remaining:
+                selected_formats = remaining
+
+        options = getattr(self, "_options", None)
+        print_only = bool(options and getattr(options, "print_output", False))
+        cover_only = bool(options and getattr(options, "cover", False))
+        no_chapters = bool(options and getattr(options, "no_chapters", False))
+        cover = None if print_only else self.download_cover(book_details)
+
+        built_books: List[Audiobook] = []
+        for idx, fmt in enumerate(selected_formats):
+            if idx > 0:
+                self._relogin_check()
+            built_books.append(
+                self._build_book_for_format(
+                    consumableId,
+                    book_details,
+                    fmt,
+                    print_only=print_only,
+                    cover_only=cover_only,
+                    no_chapters=no_chapters,
+                    cover=cover,
+                )
+            )
+        if len(built_books) == 1:
+            return built_books[0]
+        return Series(title=built_books[0].title, books=built_books)
+
+    def download_book_from_url(self, url: str) -> Result:
         consumableId = self.get_id_from_url(url)
         return self.download_book_from_book_id(consumableId)
 
@@ -380,46 +509,64 @@ class StorytelSource(Source):
         return data
 
     def download_books_from_website(self, url: str) -> Series[str]:
-        """Download series details
-
-        :param formats: comma serapted list of formats (abook,ebook,podcast)
-        :param languages: comma seperated list of languages (en,de,tr,ar,ru,pl,it,es,sv,fr,nl)
-        """
+        """Download series details from a Storytel web page."""
         title = self.find_elems_in_page(url, "h1")[-1].text
         items = self.find_elems_in_page(url, 'a[href*="/books/"]')
         books: List[Union[BookId[str], Audiobook]] = []
+        seen_ids: set[str] = set()
+        audiobook_only = self.media_type == "audiobook"
         for item in items:
-            href: str = item.get("href")
-            # check for headphone icon to filter out non audiobooks
-            svg_headphone_element = item.cssselect(
-                f"svg > path[d='{svg_headphone_path}']"
-            )
-            if len(svg_headphone_element) == 0:
-                logging.debug(f"skipping {href} (has no audiobook)")
+            href: Optional[str] = item.get("href")
+            if not href:
                 continue
+            if audiobook_only:
+                svg_headphone_element = item.cssselect(
+                    f"svg > path[d='{svg_headphone_path}']"
+                )
+                if len(svg_headphone_element) == 0:
+                    logging.debug(f"skipping {href} (has no audiobook)")
+                    continue
 
             consumableId = self.get_id_from_url(href)
-            if not self._skip_download_check(consumableId):
-                book_id = BookId(consumableId)
-                books.append(book_id)
+            if consumableId in seen_ids:
+                continue
+            seen_ids.add(consumableId)
+            if self.media_type == "both":
+                already_downloaded = (
+                    self._skip_download_check(consumableId, "abook")
+                    and self._skip_download_check(consumableId, "ebook")
+                )
+            else:
+                already_downloaded = self._skip_download_check(consumableId)
+            if not already_downloaded:
+                books.append(BookId(consumableId))
 
         return Series(
             title=title,
             books=books,
         )
 
+    def _default_list_formats(self) -> str:
+        mode = self.media_type
+        if mode == "audiobook":
+            return "abook"
+        if mode == "ebook":
+            return "ebook"
+        return "abook,ebook"
+
     def download_list_books(
         self,
         list_id: str,
         list_type: str,
         languages: str,
-        formats: str = "abook",
+        formats: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Download details about book list
 
-        :param formats: comma serapted list of formats (abook,ebook,podcast)
-        :param languages: comma seperated list of languages (en,de,tr,ar,ru,pl,it,es,sv,fr,nl)
+        :param formats: comma separated list of formats (abook,ebook,podcast)
+        :param languages: comma separated list of languages (en,de,tr,ar,ru,pl,it,es,sv,fr,nl)
         """
+        resolved_formats = formats or self._default_list_formats()
         result: Optional[Dict[str, Any]] = None
         next_page_token: Optional[str] = None
         first_page = True
@@ -427,7 +574,7 @@ class StorytelSource(Source):
         while first_page or next_page_token is not None:
             params: dict[str, str] = {
                 "includeListDetails": "true",  # include listMetadata,filterOptions,sortOption sections
-                "includeFormats": formats,
+                "includeFormats": resolved_formats,
                 "includeLanguages": languages,
                 "kidsMode": "false",
             }
@@ -448,7 +595,7 @@ class StorytelSource(Source):
             next_page_token = data.get("nextPageToken")
 
         assert result is not None
-        lists_path = self._get_lists_path(result["id"], languages, formats)
+        lists_path = self._get_lists_path(result["id"], languages, resolved_formats)
         self._write_json(lists_path, result)
 
         return result
@@ -468,28 +615,53 @@ class StorytelSource(Source):
         data = resp.json()
         return data
 
-    def get_audio_url(self, consumableId: str) -> str:
-        """get audio URL
-
-        Get the final Audio URL by sending a requests to the assets API and return the redirect location.
-        """
+    def _get_asset_url(self, consumableId: str, asset_type: str) -> str:
+        """Get a final asset URL by requesting the assets API and returning the redirect location."""
         resp = self.request(
             "GET",
-            f"https://api.storytel.net/assets/v2/consumables/{consumableId}/abook",
+            f"https://api.storytel.net/assets/v2/consumables/{consumableId}/{asset_type}",
             allow_redirects=False,
         )
         self._download_counter += 1
-        if resp.status_code != 302:
+        if resp.status_code != 302 or "Location" not in resp.headers:
             raise GenericAudiobookDLException(
                 f"request to {resp.url} failed, got {resp.status_code} response: {resp.text}"
             )
         location: str = resp.headers["Location"]
         return location
 
-    def get_files(self, book_info) -> List[AudiobookFile]:
-        consumableId = book_info["consumableId"]
-        audio_url = self.get_audio_url(consumableId)
+    def get_audio_url(self, consumableId: str) -> str:
+        """Get the final Audio URL from Storytel's assets API."""
+        return self._get_asset_url(consumableId, "abook")
 
+    def get_ebook_url(self, consumableId: str) -> str:
+        """Get the final Ebook URL from Storytel's assets API."""
+        return self._get_asset_url(consumableId, "ebook")
+
+    @staticmethod
+    def _infer_ebook_extension(ebook_url: str) -> str:
+        path = (parse_url(ebook_url).path or "").lower()
+        if path.endswith(".pdf"):
+            return "pdf"
+        return "epub"
+
+    def get_files(
+        self,
+        book_info: Dict[str, Any],
+        format_type: str = "abook",
+    ) -> List[AudiobookFile]:
+        consumableId = book_info["consumableId"]
+        if format_type == "ebook":
+            ebook_url = self.get_ebook_url(consumableId)
+            return [
+                AudiobookFile(
+                    url=ebook_url,
+                    headers=dict(self._session.headers),
+                    ext=self._infer_ebook_extension(ebook_url),
+                    expected_status_code=200,
+                )
+            ]
+        audio_url = self.get_audio_url(consumableId)
         return [
             AudiobookFile(
                 url=audio_url,
@@ -500,58 +672,65 @@ class StorytelSource(Source):
             )
         ]
 
-    def get_metadata(self, book_details) -> AudiobookMetadata:
+    def get_metadata(
+        self,
+        book_details: Dict[str, Any],
+        format_type: Optional[str] = None,
+    ) -> AudiobookMetadata:
+        if "formats" not in book_details:
+            raise DataNotPresent
+        if format_type is None:
+            format_type = self._select_format_types(book_details)[0]
+            candidates = [f for f in book_details["formats"] if f.get("type") == format_type]
+            format_info = candidates[0]
+        else:
+            candidates = [f for f in book_details["formats"] if f.get("type") == format_type]
+            if not candidates:
+                raise BookHasNoEbook if format_type == "ebook" else BookHasNoAudiobook
+            format_info = self._validate_single_format(candidates, format_type)
+
         title = book_details["title"]
         metadata = AudiobookMetadata(title)
-        metadata.add_genre("Audiobook")
-        metadata.scrape_url = self._clean_share_url(book_details["shareUrl"])
-        logging.debug(f"URL {metadata.scrape_url}")
-        for author in book_details["authors"]:
+        metadata.add_genre("Ebook" if format_type == "ebook" else "Audiobook")
+        if book_details.get("shareUrl"):
+            metadata.scrape_url = self._clean_share_url(book_details["shareUrl"])
+            logging.debug(f"URL {metadata.scrape_url}")
+        for author in book_details.get("authors", []):
             metadata.add_author(author["name"])
-        for narrator in book_details["narrators"]:
-            metadata.add_narrator(narrator["name"])
-        if "isbn" in book_details:
-            if book_details["isbn"]:
-                metadata.isbn = book_details["isbn"]
+        if format_type == "abook":
+            for narrator in book_details.get("narrators", []):
+                metadata.add_narrator(narrator["name"])
+        if book_details.get("isbn"):
+            metadata.isbn = book_details["isbn"]
+        if format_info.get("isbn") and (format_type == "ebook" or not metadata.isbn):
+            metadata.isbn = format_info["isbn"]
         if "description" in book_details:
             metadata.description = book_details["description"]
-        if "language" in book_details:
-            if book_details["language"]:
-                metadata.language = pycountry.languages.get(
-                    alpha_2=book_details["language"]
-                )
-        if "category" in book_details:
-            if "name" in book_details["category"]:
-                metadata.add_genre(book_details["category"]["name"])
+        if book_details.get("language"):
+            metadata.language = pycountry.languages.get(
+                alpha_2=book_details["language"]
+            )
+        category = book_details.get("category")
+        if isinstance(category, dict) and "name" in category:
+            metadata.add_genre(category["name"])
         if "seriesInfo" in book_details and book_details["seriesInfo"]:
             metadata.series = book_details["seriesInfo"]["name"]
             if "orderInSeries" in book_details["seriesInfo"]:
                 metadata.series_order = book_details["seriesInfo"]["orderInSeries"]
 
-        if not "formats" in book_details:
-            raise DataNotPresent
-        abook_formats = [f for f in book_details["formats"] if f["type"] == "abook"]
-        if len(abook_formats) == 0:
-            raise BookHasNoAudiobook
-        elif len(abook_formats) != 1:
-            raise GenericAudiobookDLException(
-                "multiple abook formats",
-                f"found multiple abook formats, please report this audiobook for bugfixing",
-            )
-
-        format = abook_formats[0]
-        if "isReleased" in format:
-            if not format["isReleased"]:
-                raise BookNotReleased
-        if "publisher" in format:
-            if "name" in format["publisher"]:
-                metadata.publisher = format["publisher"]["name"]
-        if "releaseDate" in format:
-            date_str: str = format["releaseDate"]
-            # metadata.release_date = datetime.fromisoformat(date_str).date()
-            metadata.release_date = datetime.strptime(
-                date_str, "%Y-%m-%dT%H:%M:%SZ"
-            ).date()
+        publisher = format_info.get("publisher")
+        if isinstance(publisher, dict) and "name" in publisher:
+            metadata.publisher = publisher["name"]
+        if format_info.get("releaseDate"):
+            date_str: str = format_info["releaseDate"]
+            try:
+                metadata.release_date = datetime.strptime(
+                    date_str, "%Y-%m-%dT%H:%M:%SZ"
+                ).date()
+            except ValueError:
+                metadata.release_date = datetime.fromisoformat(
+                    date_str.replace("Z", "+00:00")
+                ).date()
         return metadata
 
     def download_audiobook_info(self, book_details) -> Dict[str, Any]:
@@ -587,8 +766,11 @@ class StorytelSource(Source):
             start_time += chapter["durationInMilliseconds"]
         return chapters
 
-    def download_cover(self, book_details) -> Cover:
-        cover_url = book_details["cover"]["url"]
+    def download_cover(self, book_details) -> Optional[Cover]:
+        cover_info = book_details.get("cover")
+        cover_url = cover_info.get("url") if isinstance(cover_info, dict) else None
+        if not cover_url:
+            return None
         # cover_url = f"https://www.storytel.com/images/{isbn}/640x640/cover.jpg"
         cover_data = self.get(cover_url)
         return Cover(cover_data, "jpg")
@@ -601,7 +783,12 @@ class StorytelSource(Source):
 
     def on_download_complete(self, audiobook: Audiobook) -> None:
         consumableId = audiobook.source_data["consumableId"]
-        book_path = self._get_book_path(consumableId)
+        raw_format = audiobook.source_data.get("_format_type")
+        if raw_format in ("abook", "ebook"):
+            format_type = raw_format
+        else:
+            format_type = "ebook" if is_ebook(audiobook) else "abook"
+        book_path = self._get_book_path(consumableId, format_type)
         self._write_json(book_path, audiobook.source_data)
 
     supports_library = True

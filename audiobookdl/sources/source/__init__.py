@@ -147,7 +147,7 @@ class Source(Generic[T]):
             self.__authenticated = True
 
 
-    def download_from_id(self, book_id: T) -> Audiobook:
+    def download_from_id(self, book_id: T) -> Result:
         """Download book specified by id"""
         raise NotImplementedError
 
