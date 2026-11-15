@@ -547,7 +547,12 @@ def test_combine_audiofiles_skips_remux_on_mpegts_and_single_file_embeds_chapter
         patch("audiobookdl.output.output._remux_to_mpegts") as mock_remux,
         patch(
             "audiobookdl.output.output._probe_audio_info",
-            return_value=output.AudioProbeInfo(duration=10.0, bitrate=128000, codec_name="aac", format_name="mpegts"),
+            side_effect=lambda path: output.AudioProbeInfo(
+                duration=5.0 if path.endswith(("0.ts", "1.ts")) else 10.0,
+                bitrate=128000,
+                codec_name="aac",
+                format_name="mpegts",
+            ),
         ),
         patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run),
     ):
@@ -557,7 +562,8 @@ def test_combine_audiofiles_skips_remux_on_mpegts_and_single_file_embeds_chapter
             str(out_path),
             chapters=[Chapter(start=0, title="Intro"), Chapter(start=5000, title="Ch 1")],
         )
-        assert chapters_embedded is False
+        assert chapters_embedded is True
+        assert "-map_chapters" in cmds[0]
         mock_remux.assert_not_called()
 
         single_mp3 = tmp_path / "Single.mp3"
@@ -735,4 +741,102 @@ def test_real_ffmpeg_split_chapters_and_hls_smart_merge(tmp_path):
     assert os.path.basename(split_paths[0]) == "01 - Intro.mp3"
     assert os.path.basename(split_paths[1]) == "02 - Act I.mp3"
     assert all(os.path.getsize(p) > 0 for p in split_paths)
+
+
+def test_combine_audiofiles_reuses_ffprobe_cache_and_skips_redundant_combined_probe(tmp_path):
+    from pathlib import Path
+    from unittest.mock import MagicMock
+
+    tmp_dir = tmp_path / "single_ts"
+    tmp_dir.mkdir()
+    sync_pkt = b"\x47" + b"\x00" * 187
+    p0 = tmp_dir / "0.ts"
+    p0.write_bytes(sync_pkt * 4)
+    out_path = tmp_path / "Book.m4b"
+    probed_paths: list[str] = []
+
+    def fake_probe(path: str):
+        probed_paths.append(path)
+        return output.AudioProbeInfo(duration=10.0, bitrate=128000, codec_name="aac", format_name="mpegts")
+
+    def fake_run(cmd, capture_output=False, cancel_event=None):
+        Path(cmd[-1]).write_bytes(b"combined-m4b")
+        return MagicMock(returncode=0, stderr=b"")
+
+    cache = {}
+    with (
+        patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
+        patch("audiobookdl.output.output._probe_audio_info", side_effect=fake_probe),
+        patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run),
+    ):
+        output.combine_audiofiles([str(p0)], str(tmp_dir), str(out_path), probe_cache=cache)
+
+    # Only 0.ts (once for _all_inputs_mpegts + cached for sample_info) and out_path are probed; combined.ts is skipped
+    assert probed_paths == [str(p0), str(out_path)]
+    assert str(p0) in cache and str(out_path) in cache
+
+
+def test_split_audio_by_chapters_parallel_accurate_and_fallback(tmp_path):
+    from pathlib import Path
+    from unittest.mock import MagicMock
+    from audiobookdl import Chapter
+
+    master = tmp_path / "master.m4b"
+    master.write_bytes(b"m4b")
+    chapters = [
+        Chapter(start=0, title="One"),
+        Chapter(start=5000, title="Two"),
+        Chapter(start=10000, title="Three"),
+    ]
+    cmds: list[list[str]] = []
+
+    # 1. accurate=True places -ss AFTER -i and uses re-encode flags via thread pool
+    def fake_run_ok(cmd, capture_output=False, cancel_event=None):
+        cmds.append(cmd)
+        Path(cmd[-1]).write_bytes(b"chunk")
+        return MagicMock(returncode=0, stderr=b"")
+
+    out_acc = tmp_path / "acc"
+    with (
+        patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
+        patch(
+            "audiobookdl.output.output._probe_audio_info",
+            return_value=output.AudioProbeInfo(duration=15.0, bitrate=128000, codec_name="aac", format_name="mov,mp4,m4a"),
+        ),
+        patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run_ok),
+    ):
+        result = output.split_audio_by_chapters(str(master), str(out_acc), chapters, accurate=True)
+
+    assert len(result) == 3
+    for cmd in cmds:
+        assert cmd.index("-i") < cmd.index("-ss")
+        assert "-c:a" in cmd and cmd[cmd.index("-c:a") + 1] == "aac"
+
+    # 2. accurate=False uses -avoid_negative_ts make_zero and falls back per-chapter on stream copy failure
+    fallback_cmds: list[list[str]] = []
+    call_count = 0
+
+    def fake_run_fallback(cmd, capture_output=False, cancel_event=None):
+        nonlocal call_count
+        call_count += 1
+        fallback_cmds.append(cmd)
+        if "-avoid_negative_ts" in cmd and "copy" in cmd and cmd[-1].endswith("02 - Two.m4b"):
+            return MagicMock(returncode=1, stderr=b"copy error")
+        Path(cmd[-1]).write_bytes(b"chunk")
+        return MagicMock(returncode=0, stderr=b"")
+
+    out_fb = tmp_path / "fb"
+    with (
+        patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
+        patch(
+            "audiobookdl.output.output._probe_audio_info",
+            return_value=output.AudioProbeInfo(duration=15.0, bitrate=128000, codec_name="aac", format_name="mov,mp4,m4a"),
+        ),
+        patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run_fallback),
+    ):
+        fb_result = output.split_audio_by_chapters(str(master), str(out_fb), chapters, accurate=False)
+
+    assert len(fb_result) == 3
+    assert call_count == 4  # 3 fast copy attempts + 1 re-encode retry for chapter 2
+    assert any(cmd.index("-i") < cmd.index("-ss") and "aac" in cmd for cmd in fallback_cmds)
 

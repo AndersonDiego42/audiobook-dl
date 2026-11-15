@@ -1,7 +1,7 @@
 import base64
 from io import BytesIO
 import os
-from typing import Sequence
+from typing import Any, Optional, Sequence
 
 from mutagen import File as MutagenFile
 from mutagen.flac import FLAC, Picture
@@ -32,11 +32,47 @@ def _as_tag_values(value: object) -> list[str]:
     return [text] if text else []
 
 
-def add_vorbis_metadata(filepath: str, metadata: AudiobookMetadata) -> None:
-    """Write VorbisComment metadata tags to FLAC, Ogg Vorbis, or Ogg Opus files."""
+def _build_vorbis_picture(cover: Cover) -> Optional[Picture]:
+    image_data, ext = normalize_cover_image(cover)
+    mimetype = _EXTENSION_TO_MIMETYPE.get(ext)
+    if not mimetype:
+        return None
+    picture = Picture()
+    picture.type = 3
+    picture.mime = mimetype
+    picture.desc = "Cover"
+    picture.data = image_data
+    try:
+        with Image.open(BytesIO(image_data)) as img:
+            picture.width, picture.height = img.size
+            picture.depth = 32 if img.mode in ("RGBA", "LA", "PA") else 24
+    except Exception:
+        picture.width = 0
+        picture.height = 0
+        picture.depth = 24
+    return picture
+
+
+def _attach_vorbis_picture(audio: Any, picture: Picture) -> None:
+    if audio.tags is None:
+        audio.add_tags()
+    if isinstance(audio, FLAC):
+        audio.clear_pictures()
+        audio.add_picture(picture)
+    else:
+        encoded = base64.b64encode(picture.write()).decode("ascii")
+        audio.tags["METADATA_BLOCK_PICTURE"] = [encoded]
+
+
+def add_vorbis_metadata(
+    filepath: str,
+    metadata: AudiobookMetadata,
+    cover: Optional[Cover] = None,
+) -> bool:
+    """Write VorbisComment metadata tags (and optional cover art) in a single save pass."""
     audio = MutagenFile(filepath)
     if audio is None:
-        return
+        return False
     if audio.tags is None:
         audio.add_tags()
     tags = audio.tags
@@ -97,39 +133,20 @@ def add_vorbis_metadata(filepath: str, metadata: AudiobookMetadata) -> None:
             if vals:
                 tags[key.upper()] = vals
 
+    picture = _build_vorbis_picture(cover) if cover is not None else None
+    if picture is not None:
+        _attach_vorbis_picture(audio, picture)
     audio.save()
+    return picture is not None
 
 
 def embed_vorbis_cover(filepath: str, cover: Cover) -> None:
     """Embed `cover` as a FLAC Picture block or Ogg `METADATA_BLOCK_PICTURE` tag."""
-    image_data, ext = normalize_cover_image(cover)
-    mimetype = _EXTENSION_TO_MIMETYPE.get(ext)
-    if not mimetype:
+    picture = _build_vorbis_picture(cover)
+    if picture is None:
         return
     audio = MutagenFile(filepath)
     if audio is None:
         return
-    if audio.tags is None:
-        audio.add_tags()
-
-    picture = Picture()
-    picture.type = 3
-    picture.mime = mimetype
-    picture.desc = "Cover"
-    picture.data = image_data
-    try:
-        with Image.open(BytesIO(image_data)) as img:
-            picture.width, picture.height = img.size
-            picture.depth = 32 if img.mode in ("RGBA", "LA", "PA") else 24
-    except Exception:
-        picture.width = 0
-        picture.height = 0
-        picture.depth = 24
-
-    if isinstance(audio, FLAC):
-        audio.clear_pictures()
-        audio.add_picture(picture)
-    else:
-        encoded = base64.b64encode(picture.write()).decode("ascii")
-        audio.tags["METADATA_BLOCK_PICTURE"] = [encoded]
+    _attach_vorbis_picture(audio, picture)
     audio.save()

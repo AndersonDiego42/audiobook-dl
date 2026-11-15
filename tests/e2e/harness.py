@@ -383,8 +383,8 @@ class GuiHarness:
                 self.app._on_close()
             except tk.TclError:
                 pass
-            if self.app._worker is not None and self.app._worker.is_alive():
-                self.app._worker.join(timeout=3.0)
+            if self.app.controller.worker is not None and self.app.controller.worker.is_alive():
+                self.app.controller.worker.join(timeout=3.0)
             self.app = None
         if self.root is not None:
             try:

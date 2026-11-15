@@ -17,6 +17,11 @@ from audiobookdl.config import Config, load_config, save_source_credentials
 from audiobookdl.exceptions import BookNotFound, DownloadCancelled
 from audiobookdl.gui.app import (
     AudiobookDLApp,
+    parse_gui_args,
+    run_self_test,
+)
+from audiobookdl.gui.controller import GuiInteractionHandler, QueuedJob
+from audiobookdl.gui.formatting import (
     describe_series_book,
     format_audiobook_preview,
     format_duration,
@@ -24,7 +29,6 @@ from audiobookdl.gui.app import (
     format_speed,
     is_valid_geometry,
     parse_url_text,
-    run_self_test,
 )
 from audiobookdl.output.download import setup_download_dir
 from audiobookdl.sources import detect_service_key, get_available_services
@@ -390,7 +394,7 @@ def test_gui_app_end_to_end_worker_and_prompts(tmp_path, monkeypatch):
             return DownloadSummary(completed=1, failed=0, cancelled=False)
 
         monkeypatch.setattr("audiobookdl.gui.app.find_executable", lambda name: name)
-        monkeypatch.setattr("audiobookdl.gui.app.run_downloads", fake_run_downloads)
+        monkeypatch.setattr("audiobookdl.gui.controller.run_downloads", fake_run_downloads)
 
         app.start_download()
         assert app.is_running
@@ -467,12 +471,12 @@ def test_gui_poll_queue_bounds_batch_and_coalesces_progress(tmp_path):
 
         # Queue 250 items: burst of progress_advance, a log in between, and more progress_advance
         for i in range(1, 151):
-            app._queue.put(("progress_advance", float(i), 300.0))
-        app._queue.put(("log", "INFO", "Midway"))
+            app.controller.event_queue.put(("progress_advance", float(i), 300.0))
+        app.controller.event_queue.put(("log", "INFO", "Midway"))
         for i in range(151, 250):
-            app._queue.put(("progress_advance", float(i), 300.0))
+            app.controller.event_queue.put(("progress_advance", float(i), 300.0))
 
-        # First tick drains up to _MAX_QUEUE_BATCH (200) items and coalesces consecutive advances
+        # First tick drains up to MAX_QUEUE_BATCH (200) items and coalesces consecutive advances
         app._poll_queue()
         assert handled == [
             ("progress_advance", 150.0, 300.0),
@@ -561,8 +565,8 @@ def test_gui_persists_and_restores_geometry_folder_and_template(tmp_path):
         root2.update_idletasks()
         assert app2.output_dir_var.get() == custom_dir
         assert app2.template_var.get() == "{author}/{title}"
-        assert app2._config.gui.window_geometry is not None
-        assert app2._config.gui.window_geometry.startswith("880x710")
+        assert app2.controller.config.gui.window_geometry is not None
+        assert app2.controller.config.gui.window_geometry.startswith("880x710")
     finally:
         root2.destroy()
 
@@ -600,7 +604,7 @@ def test_gui_add_to_queue_while_running_and_batch_progress(tmp_path, monkeypatch
             return DownloadSummary(completed=1, failed=0, cancelled=False)
 
         monkeypatch.setattr("audiobookdl.gui.app.find_executable", lambda name: name)
-        monkeypatch.setattr("audiobookdl.gui.app.run_downloads", fake_run_downloads)
+        monkeypatch.setattr("audiobookdl.gui.controller.run_downloads", fake_run_downloads)
 
         app.start_download()
         assert app.is_running
@@ -854,7 +858,7 @@ def test_gui_preview_audiobook_with_cover_and_series_checklist(tmp_path, monkeyp
 
         app.urls_text.insert("1.0", "https://example.com/book1\n")
         monkeypatch.setattr(
-            "audiobookdl.gui.app.prepare_source_result",
+            "audiobookdl.gui.controller.prepare_source_result",
             lambda _u, _o, _c, **_kw: (fake_source, audiobook),
         )
 
@@ -883,7 +887,7 @@ def test_gui_preview_audiobook_with_cover_and_series_checklist(tmp_path, monkeyp
             ],
         )
         monkeypatch.setattr(
-            "audiobookdl.gui.app.prepare_source_result",
+            "audiobookdl.gui.controller.prepare_source_result",
             lambda _u, _o, _c, **_kw: (fake_source, series),
         )
         captured: dict = {}
@@ -895,7 +899,7 @@ def test_gui_preview_audiobook_with_cover_and_series_checklist(tmp_path, monkeyp
             return DownloadSummary(completed=1, failed=0, cancelled=False)
 
         monkeypatch.setattr("audiobookdl.gui.app.find_executable", lambda name: name)
-        monkeypatch.setattr("audiobookdl.gui.app.run_downloads", fake_run_downloads)
+        monkeypatch.setattr("audiobookdl.gui.controller.run_downloads", fake_run_downloads)
 
         app.preview_metadata()
         for _ in range(100):
@@ -944,7 +948,7 @@ def test_gui_preview_error_displays_error_and_restores_buttons(tmp_path, monkeyp
             lambda title, msg, parent=None: errors.append((title, msg)),
         )
         monkeypatch.setattr(
-            "audiobookdl.gui.app.prepare_source_result",
+            "audiobookdl.gui.controller.prepare_source_result",
             lambda *_a, **_kw: (_ for _ in ()).throw(BookNotFound()),
         )
 
@@ -1050,7 +1054,7 @@ def test_gui_start_download_validates_ffmpeg_upfront(tmp_path, monkeypatch):
             lambda **_kw: str(ffmpeg_dir),
         )
         monkeypatch.setattr(
-            "audiobookdl.gui.app.run_downloads",
+            "audiobookdl.gui.controller.run_downloads",
             lambda *_a, **_kw: DownloadSummary(completed=1, failed=0, cancelled=False),
         )
 
@@ -1127,8 +1131,6 @@ def test_gui_log_caps_line_count(tmp_path):
 
 
 def test_gui_queue_move_remove_retry_and_clear(tmp_path, monkeypatch):
-    from audiobookdl.gui.app import _QueuedJob, _GuiInteractionHandler
-
     try:
         root = tk.Tk()
     except tk.TclError as exc:
@@ -1136,35 +1138,36 @@ def test_gui_queue_move_remove_retry_and_clear(tmp_path, monkeypatch):
     root.withdraw()
     try:
         app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
-        interaction = _GuiInteractionHandler(app._queue, app._cancel_event)
+        ctrl = app.controller
+        interaction = GuiInteractionHandler(ctrl.event_queue, ctrl.cancel_event)
         opts_a = app.build_options(urls_override=["https://librivox.org/book-a"])
         opts_b = app.build_options(urls_override=["https://librivox.org/book-b"])
-        job_a = _QueuedJob(job_id="job_a", run_id=1, url="https://librivox.org/book-a", options=opts_a, interaction=interaction)
-        job_b = _QueuedJob(job_id="job_b", run_id=1, url="https://librivox.org/book-b", options=opts_b, interaction=interaction)
-        with app._queue_cond:
-            app._worker_has_active_run = True
-            app._batch_total = 2
-            app._run_seen_urls = {job_a.url, job_b.url}
-            app._pending_jobs.extend([job_a, job_b])
+        job_a = QueuedJob(job_id="job_a", run_id=1, url="https://librivox.org/book-a", options=opts_a, interaction=interaction)
+        job_b = QueuedJob(job_id="job_b", run_id=1, url="https://librivox.org/book-b", options=opts_b, interaction=interaction)
+        with ctrl.queue_cond:
+            ctrl.worker_has_active_run = True
+            ctrl.batch_total = 2
+            ctrl.run_seen_urls = {job_a.url, job_b.url}
+            ctrl.pending_jobs.extend([job_a, job_b])
         app._register_queue_job(job_a)
         app._register_queue_job(job_b)
 
         # Move job_b up before job_a
         app.queue_tree.selection_set("job_b")
         app._move_selected_queue_item(-1)
-        assert [j.job_id for j in app._pending_jobs if j is not None] == ["job_b", "job_a"]
+        assert [j.job_id for j in ctrl.pending_jobs if j is not None] == ["job_b", "job_a"]
         assert list(app.queue_tree.get_children()) == ["job_b", "job_a"]
 
         # Remove job_a
         app.queue_tree.selection_set("job_a")
         app._remove_selected_queue_item()
-        assert [j.job_id for j in app._pending_jobs if j is not None] == ["job_b"]
+        assert [j.job_id for j in ctrl.pending_jobs if j is not None] == ["job_b"]
         assert list(app.queue_tree.get_children()) == ["job_b"]
-        assert app._batch_total == 1
+        assert ctrl.batch_total == 1
 
         # Retry failed items and clear history
-        app._pending_jobs.clear()
-        app._worker_has_active_run = False
+        ctrl.pending_jobs.clear()
+        ctrl.worker_has_active_run = False
         app._update_queue_row("job_b", "Failed", "timeout")
 
         retried = {}
@@ -1220,8 +1223,9 @@ def test_gui_series_preview_filter_and_shift_range(tmp_path):
         dialog = app._show_preview_dialog("https://www.storytel.com/series/1", fake_source, series)
         root.update_idletasks()
         try:
-            assert "[Exists]" in dialog._checkbuttons[0][1]
-            assert "[Exists]" not in dialog._checkbuttons[1][1]
+            assert "[Exists]" in dialog._item_labels[0]
+            assert "[Exists]" not in dialog._item_labels[1]
+            assert list(dialog._tree.get_children()) == ["0", "1", "2"]
 
             # Shift+Click range selection from 0 to 2 after unchecking index 0
             dialog._check_vars[0].set(False)
@@ -1229,12 +1233,12 @@ def test_gui_series_preview_filter_and_shift_range(tmp_path):
             dialog._check_vars[2].set(False)
             dialog._toggle_series_item(2, shift_held=True)
             assert [v.get() for v in dialog._check_vars] == [False, False, False]
+            assert dialog._tree.item("1", "values")[0] == "[ ]"
 
-            # Filter entry hides non-matching checkbuttons cleanly
+            # Filter entry detaches non-matching rows in Treeview cleanly
             dialog._filter_var.set("beta")
             root.update_idletasks()
-            mapped = [cb.winfo_manager() for _, _, cb in dialog._checkbuttons]
-            assert mapped == ["", "pack", ""]
+            assert list(dialog._tree.get_children()) == ["1"]
         finally:
             dialog.destroy()
     finally:
@@ -1242,8 +1246,6 @@ def test_gui_series_preview_filter_and_shift_range(tmp_path):
 
 
 def test_gui_ignores_stale_item_progress_and_warns_mixed_services(tmp_path, monkeypatch):
-    from audiobookdl.gui.app import parse_gui_args
-
     parsed = parse_gui_args(["--config", str(tmp_path / "custom.toml")])
     assert parsed.config_location == str(tmp_path / "custom.toml")
 
@@ -1310,7 +1312,7 @@ def test_gui_archive_ledger_dialog_filters_and_populates(tmp_path):
     try:
         app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
         archive_path = tmp_path / "downloads.db"
-        app._config.download_archive = str(archive_path)
+        app.controller.config.download_archive = str(archive_path)
         ledger = DownloadArchive(str(archive_path))
         ledger.record("storytel", "k1", title="First Audiobook", author="Alice")
         ledger.record("librivox", "k2", title="Second Audiobook", author="Bob")
@@ -1319,11 +1321,25 @@ def test_gui_archive_ledger_dialog_filters_and_populates(tmp_path):
         root.update_idletasks()
         try:
             assert len(dialog._tree.get_children()) == 2
+            assert dialog._ledger is not None
+            initial_ledger = dialog._ledger
             dialog._search_var.set("alice")
+            # Immediate tick has not refreshed yet due to debounce
             root.update_idletasks()
+            assert len(dialog._tree.get_children()) == 2
+            # Wait past 180ms debounce window and pump Tk events
+            import time
+
+            deadline = time.monotonic() + 1.0
+            while len(dialog._tree.get_children()) != 1 and time.monotonic() < deadline:
+                root.update()
+                time.sleep(0.02)
             assert len(dialog._tree.get_children()) == 1
+            # Same persistent DownloadArchive connection was reused across refreshes
+            assert dialog._ledger is initial_ledger
         finally:
             dialog.destroy()
+        assert dialog._ledger is None
     finally:
         root.destroy()
 
@@ -1365,7 +1381,7 @@ def test_gui_verify_auth_catalog_browser_and_update_handlers(tmp_path, monkeypat
         dialog = app._show_catalog_browser_dialog()
         root.update_idletasks()
         try:
-            dialog._populate_items(
+            dialog.populate_items(
                 [
                     CatalogBook(
                         title="Found Book 1",
@@ -1383,7 +1399,7 @@ def test_gui_verify_auth_catalog_browser_and_update_handlers(tmp_path, monkeypat
                 ]
             )
             dialog._tree.selection_set(("book-0",))
-            dialog._add_selected()
+            dialog.add_selected()
             assert "https://librivox.org/book-1" in app.urls_text.get("1.0", tk.END)
             assert "https://librivox.org/book-2" not in app.urls_text.get("1.0", tk.END)
         finally:
@@ -1405,30 +1421,31 @@ def test_gui_scroll_layout_prevents_lower_clipping(tmp_path):
     try:
         app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
         root.update_idletasks()
-        req_w = app._content_frame.winfo_reqwidth()
-        req_h = app._content_frame.winfo_reqheight()
+        scroll_frame = app._scroll_frame
+        req_w = scroll_frame.content_frame.winfo_reqwidth()
+        req_h = scroll_frame.content_frame.winfo_reqheight()
         assert req_w <= 650
 
         # Short viewport: vertical scrollbar activates and lower Activity controls are not crushed
         short_h = max(320, req_h - 220)
         # pyrefly: ignore[bad-argument-type]
-        app._sync_scroll_layout(SimpleNamespace(width=700, height=short_h))
+        scroll_frame.sync_layout(SimpleNamespace(width=700, height=short_h))
         root.update_idletasks()
-        assert app._vscroll_visible is True
-        configured_h = int(float(app._scroll_canvas.itemcget(app._scroll_window_id, "height")))
+        assert scroll_frame.vscroll_visible is True
+        configured_h = int(float(scroll_frame.canvas.itemcget(scroll_frame.window_id, "height")))
         assert configured_h == req_h
-        app._scroll_canvas.yview_moveto(1.0)
-        assert app._scroll_canvas.yview()[1] == pytest.approx(1.0)
+        scroll_frame.canvas.yview_moveto(1.0)
+        assert scroll_frame.canvas.yview()[1] == pytest.approx(1.0)
 
         # Tall viewport: vertical scrollbar hides and content expands to fill canvas height
         tall_h = req_h + 150
         # pyrefly: ignore[bad-argument-type]
-        app._sync_scroll_layout(SimpleNamespace(width=820, height=tall_h))
+        scroll_frame.sync_layout(SimpleNamespace(width=820, height=tall_h))
         # pyrefly: ignore[unnecessary-comparison]
-        assert app._vscroll_visible is False
-        assert int(float(app._scroll_canvas.itemcget(app._scroll_window_id, "height"))) == tall_h
-        assert app._scroll_canvas.cget("scrollregion") == f"0 0 820 {tall_h}"
-        assert app._scroll_canvas.yview()[0] == pytest.approx(0.0)
+        assert scroll_frame.vscroll_visible is False
+        assert int(float(scroll_frame.canvas.itemcget(scroll_frame.window_id, "height"))) == tall_h
+        assert scroll_frame.canvas.cget("scrollregion") == f"0 0 820 {tall_h}"
+        assert scroll_frame.canvas.yview()[0] == pytest.approx(0.0)
     finally:
         root.destroy()
 
@@ -1514,7 +1531,7 @@ def test_gui_failed_job_formats_book_error_tuple_as_string(tmp_path, monkeypatch
             )
 
         monkeypatch.setattr("audiobookdl.gui.app.find_executable", lambda name: name)
-        monkeypatch.setattr("audiobookdl.gui.app.run_downloads", fake_run_downloads)
+        monkeypatch.setattr("audiobookdl.gui.controller.run_downloads", fake_run_downloads)
 
         app.start_download()
         for _ in range(100):
@@ -1528,7 +1545,7 @@ def test_gui_failed_job_formats_book_error_tuple_as_string(tmp_path, monkeypatch
         children = app.queue_tree.get_children()
         assert len(children) == 1
         job_id = children[0]
-        rec = app._queue_records[job_id]
+        rec = app.controller.queue_records[job_id]
         expected_detail = "https://example.com/broken-book: Authentication failed"
         assert rec["status"] == "Failed"
         assert isinstance(rec["detail"], str)

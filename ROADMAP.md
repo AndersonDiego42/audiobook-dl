@@ -53,20 +53,20 @@ This document catalogs verified bugs, performance bottlenecks, security/resilien
 
 ## 2. Performance & Resource Optimizations
 
-- [ ] **Collapse redundant FFmpeg & Mutagen full-file rewrites** — [`audiobookdl/output/output.py`](audiobookdl/output/output.py#L336-L344)  
+- [x] **Collapse redundant FFmpeg & Mutagen full-file rewrites** — [`audiobookdl/output/output.py`](audiobookdl/output/output.py#L336-L344)  
   Multi-part MPEG-TS combines currently skip inline chapter muxing (`if len(ts_paths) == 1 and chapters`), forcing a second full container pass in `add_chapters_ffmpeg()`, followed by `mutagen` rewriting atoms for tags and cover art. For 1 GB+ `.m4b` files this multiplies disk I/O 3x–4x. Embed chapters metadata, tags, and cover art during the primary remux/combine FFmpeg invocation whenever possible.
-- [ ] **Parallelize `split_audio_by_chapters()` & improve cut accuracy** — [`audiobookdl/output/output.py`](audiobookdl/output/output.py#L588-L628)  
+- [x] **Parallelize `split_audio_by_chapters()` & improve cut accuracy** — [`audiobookdl/output/output.py`](audiobookdl/output/output.py#L588-L628)  
   Currently runs sequential `ffmpeg` subprocesses per chapter and places `-ss` before `-i` with `-c:a copy` (risking keyframe snap drift). Dispatch chapter exports via `run_cancellable_pool()` and offer exact-seek / re-encode fallback.
-- [ ] **Cache `ffprobe` metadata across pipeline stages**  
+- [x] **Cache `ffprobe` metadata across pipeline stages**  
   Avoid redundant `ffprobe` spawns (e.g., probing `ts_paths[0]` and immediately re-probing `combined_ts`) by attaching cached `MediaProbeInfo` to intermediate file descriptors.
-- [ ] **Tune default concurrency & add CDN retry/backoff in `download_file()`** — [`audiobookdl/output/download.py`](audiobookdl/output/download.py#L585-L798), [L853](audiobookdl/output/download.py#L853)  
+- [x] **Tune default concurrency & add CDN retry/backoff in `download_file()`** — [`audiobookdl/output/download.py`](audiobookdl/output/download.py#L585-L798), [L853](audiobookdl/output/download.py#L853)  
   `download_files()` defaults to `MAX_DOWNLOAD_WORKERS = 20` concurrent connections per book, risking `429` throttling or account anti-abuse locks. Lower the default worker cap (e.g., 4–8, tunable via `--max-workers`) and add exponential backoff + `Retry-After` handling for HTTP `429` and `5xx` responses inside `download_file()` (which currently only catches `RequestException`).
-- [ ] **Reuse cached scrapes & shared HTTP sessions**
+- [x] **Reuse cached scrapes & shared HTTP sessions**
   - [`audiobookdl/sources/audiobooksdotcom.py`](audiobookdl/sources/audiobooksdotcom.py#L137): Reuse `_get_page(scrape_url)` in `extract_file()` instead of calling `self.get(scrape_url)` a second time.
   - Pass persistent HTTP sessions into `enrich_metadata()` and `check_for_updates()`.
-- [ ] **Gate Storytel raw JSON disk dumps behind debug mode** — [`audiobookdl/sources/storytel.py`](audiobookdl/sources/storytel.py)  
+- [x] **Gate Storytel raw JSON disk dumps behind debug mode** — [`audiobookdl/sources/storytel.py`](audiobookdl/sources/storytel.py)  
   `download_lists_api()` and `download_bookshelf()` unconditionally write JSON payloads (`books/`, `playback-metadata/`, `lists/`) to `database_directory`. Make debug JSON persistence opt-in.
-- [ ] **Fix GUI `ArchiveLedgerDialog` SQLite re-opening & virtualize series pickers** — [`audiobookdl/gui/app.py`](audiobookdl/gui/app.py#L1155)  
+- [x] **Fix GUI `ArchiveLedgerDialog` SQLite re-opening & virtualize series pickers** — [`audiobookdl/gui/app.py`](audiobookdl/gui/app.py#L1155)  
   Keep a single `DownloadArchive` instance/connection open in `ArchiveLedgerDialog` and debounce `search_var` filter events (150–250ms) rather than re-opening SQLite on every keystroke. In `PreviewDialog`, replace per-episode `ttk.Checkbutton` canvas stacks with a virtualized `ttk.Treeview` for large series.
 
 ---
@@ -89,8 +89,8 @@ This document catalogs verified bugs, performance bottlenecks, security/resilien
 
 ## 4. Architecture, Code Quality & Packaging
 
-- [ ] **Decompose `audiobookdl/gui/app.py` (3,203 lines)**  
-  Split into clean submodules under `audiobookdl/gui/`: state/queue controller, `PreviewDialog`, `ArchiveLedgerDialog`, `CatalogBrowserDialog`, reusable widgets, and the main window view.
+- [x] **Decompose `audiobookdl/gui/app.py` (3,203 lines)**  
+  Split into clean submodules under `audiobookdl/gui/`: state/queue controller (`controller.py`), `PreviewDialog` (`preview_dialog.py`), `ArchiveLedgerDialog` (`archive_dialog.py`), `CatalogBrowserDialog` (`catalog_dialog.py`), formatting helpers (`formatting.py`), reusable widgets (`widgets.py`), and the main window view (`app.py`).
 - [ ] **Unify runtime option definitions across CLI, Config, Pipeline & GUI**  
   Options are currently synchronized manually across [`args.py`](audiobookdl/args.py), [`config.py`](audiobookdl/config.py), [`pipeline.py`](audiobookdl/pipeline.py), and [`app.py`](audiobookdl/gui/app.py). Introduce a declarative option registry/schema as the single source of truth for defaults, serialization, and UI/CLI bindings.
 - [ ] **Entry-point plugin architecture for sources** — [`audiobookdl/sources/__init__.py`](audiobookdl/sources/__init__.py)  

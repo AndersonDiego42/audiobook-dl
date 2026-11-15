@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from datetime import date
 import re
 from typing import Any, Optional
@@ -20,32 +21,33 @@ def resolve_redirect_url(
     cleaned = url.strip()
     if not cleaned.lower().startswith(("http://", "https://")):
         return url
-    sess = session or requests.Session()
     proxies = {"http": proxy, "https": proxy} if proxy else None
     headers = {"User-Agent": DEFAULT_USER_AGENT}
+    session_cm = nullcontext(session) if session is not None else requests.Session()
     try:
-        resp = sess.head(
-            cleaned,
-            allow_redirects=True,
-            timeout=timeout,
-            proxies=proxies,
-            headers=headers,
-        )
-        if resp.status_code in (403, 405) or resp.url == cleaned:
-            resp = sess.get(
+        with session_cm as sess:
+            resp = sess.head(
                 cleaned,
                 allow_redirects=True,
-                stream=True,
                 timeout=timeout,
                 proxies=proxies,
                 headers=headers,
             )
-            try:
-                final_url = resp.url or cleaned
-            finally:
-                resp.close()
-            return final_url
-        return resp.url or cleaned
+            if resp.status_code in (403, 405) or resp.url == cleaned:
+                resp = sess.get(
+                    cleaned,
+                    allow_redirects=True,
+                    stream=True,
+                    timeout=timeout,
+                    proxies=proxies,
+                    headers=headers,
+                )
+                try:
+                    final_url = resp.url or cleaned
+                finally:
+                    resp.close()
+                return final_url
+            return resp.url or cleaned
     except requests.RequestException:
         return url
 
@@ -72,7 +74,6 @@ def enrich_metadata_from_openlibrary(
     Existing non-empty fields on `metadata` are preserved; network or parse errors
     log a debug message and return `False` without failing the download.
     """
-    sess = session or requests.Session()
     proxies = {"http": proxy, "https": proxy} if proxy else None
     params: dict[str, Any] = {"limit": 1}
     if metadata.isbn:
@@ -82,16 +83,18 @@ def enrich_metadata_from_openlibrary(
         if metadata.authors:
             params["author"] = metadata.authors[0]
 
+    session_cm = nullcontext(session) if session is not None else requests.Session()
     try:
-        resp = sess.get(
-            "https://openlibrary.org/search.json",
-            params=params,
-            timeout=timeout,
-            proxies=proxies,
-            headers={"User-Agent": DEFAULT_USER_AGENT},
-        )
-        resp.raise_for_status()
-        payload = resp.json()
+        with session_cm as sess:
+            resp = sess.get(
+                "https://openlibrary.org/search.json",
+                params=params,
+                timeout=timeout,
+                proxies=proxies,
+                headers={"User-Agent": DEFAULT_USER_AGENT},
+            )
+            resp.raise_for_status()
+            payload = resp.json()
     except (requests.RequestException, ValueError) as exc:
         logging.debug(f"OpenLibrary metadata lookup skipped: {exc}")
         return False

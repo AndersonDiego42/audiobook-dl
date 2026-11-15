@@ -832,3 +832,60 @@ def test_download_result_series_handles_book_has_no_ebook_and_dual_format_series
     assert summary.books_completed == 2
     assert summary.books_failed == 0
 
+
+def test_enrichment_and_updater_close_auto_sessions_and_process_reuses_source_session(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock, patch
+    from audiobookdl import AudiobookFile
+    from audiobookdl.utils.enrichment import enrich_metadata_from_openlibrary
+    from audiobookdl.utils.updater import check_for_updates
+
+    closed_count = 0
+
+    class _FakeAutoSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            nonlocal closed_count
+            closed_count += 1
+
+        def get(self, *_args, **_kwargs):
+            return MagicMock(status_code=200, json=lambda: {"tag_name": "v9.9.9", "html_url": "https://x"})
+
+    monkeypatch.setattr("audiobookdl.utils.updater.requests.Session", _FakeAutoSession)
+    info = check_for_updates(current_version="0.1.0", respect_opt_out=False)
+    assert info is not None and info.has_update is True
+    assert closed_count == 1
+
+    enriched_sessions = []
+
+    def fake_enrich(metadata, **kwargs):
+        enriched_sessions.append(kwargs.get("session"))
+        return True
+
+    fake_session = MagicMock()
+    src = MagicMock()
+    src.name = "storytel"
+    src._session = fake_session
+    book = Audiobook(
+        session=fake_session,
+        metadata=AudiobookMetadata(title="Enrich Book"),
+        files=[AudiobookFile(url="https://example.com/a.mp3", ext="mp3")],
+    )
+    opts = args.build_default_options(
+        output_template=str(tmp_path / "{title}"),
+        enrich_metadata=True,
+    )
+    with (
+        patch("audiobookdl.pipeline.enrich_metadata_from_openlibrary", side_effect=fake_enrich),
+        patch("audiobookdl.pipeline.download"),
+    ):
+        from audiobookdl.pipeline import process_audiobook
+
+        process_audiobook(src, book, opts)
+    assert enriched_sessions == [fake_session]
+
+    monkeypatch.setattr("audiobookdl.utils.enrichment.requests.Session", _FakeAutoSession)
+    enrich_metadata_from_openlibrary(AudiobookMetadata(title="Fallback Close"))
+    assert closed_count == 2
+

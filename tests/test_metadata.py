@@ -605,3 +605,51 @@ def test_audiobook_metadata_all_properties_and_dict_value_types():
 
     multi = meta.all_properties(allow_duplicate_keys=True)
     assert [v for k, v in multi if k == "author"] == ["Frank Herbert", "Co-Author"]
+
+
+def test_single_save_pass_for_mp4_metadata_and_id3_chapters_cover(tmp_path):
+    from unittest.mock import patch
+    from mutagen.id3 import ID3
+    from mutagen.mp4 import MP4
+    from audiobookdl import Chapter
+
+    mp4_path = tmp_path / "book.m4b"
+    _create_silent_audio(mp4_path, ["-c:a", "aac", "-f", "mp4"])
+    meta = AudiobookMetadata(title="Single Save M4B", authors=["Author"])
+    cover = Cover(_make_image_bytes("JPEG", mode="RGB"), "jpg")
+
+    save_calls = []
+    orig_mp4_save = MP4.save
+
+    def tracking_mp4_save(self, *args, **kwargs):
+        save_calls.append(1)
+        return orig_mp4_save(self, *args, **kwargs)
+
+    with patch.object(MP4, "save", tracking_mp4_save):
+        embedded = output_metadata.add_metadata(str(mp4_path), meta, cover=cover)
+    assert embedded is True
+    assert len(save_calls) == 1
+    reloaded = MP4(str(mp4_path))
+    assert reloaded["\xa9nam"] == ["Single Save M4B"]
+    assert len(reloaded["covr"]) == 1
+
+    mp3_path = tmp_path / "book.mp3"
+    _create_silent_audio(mp3_path, ["-c:a", "libmp3lame"])
+    id3_save_calls = []
+    orig_id3_save = ID3.save
+
+    def tracking_id3_save(self, *args, **kwargs):
+        id3_save_calls.append(1)
+        return orig_id3_save(self, *args, **kwargs)
+
+    with patch.object(ID3, "save", tracking_id3_save):
+        id3_embedded = output_metadata.add_chapters(
+            str(mp3_path),
+            [Chapter(0, "Opening"), Chapter(1000, "Middle")],
+            cover=cover,
+        )
+    assert id3_embedded is True
+    assert len(id3_save_calls) == 1
+    tags = ID3(str(mp3_path))
+    assert len(tags.getall("APIC")) == 1
+    assert len(tags.getall("CHAP")) == 2

@@ -122,9 +122,15 @@ class StorytelSource(Source):
             self.database_directory, "playback-metadata"
         )
         self.database_directory_lists = os.path.join(self.database_directory, "lists")
-        os.makedirs(self.database_directory_books, exist_ok=True)
-        os.makedirs(self.database_directory_playback_metadata, exist_ok=True)
-        os.makedirs(self.database_directory_lists, exist_ok=True)
+        if self.skip_downloaded or self._debug_dump_enabled():
+            os.makedirs(self.database_directory_books, exist_ok=True)
+        if self._debug_dump_enabled():
+            os.makedirs(self.database_directory_playback_metadata, exist_ok=True)
+            os.makedirs(self.database_directory_lists, exist_ok=True)
+
+    def _debug_dump_enabled(self) -> bool:
+        """Return True when opt-in debug mode enables raw JSON payload persistence."""
+        return bool(getattr(self._options, "debug", False)) or logging.is_debug_mode()
 
     @property
     def media_type(self) -> str:
@@ -503,8 +509,9 @@ class StorytelSource(Source):
             json={"items": []},
         )
 
-        bookshelf_path = os.path.join(self.database_directory_lists, "bookshelf.json")
-        self._write_json(bookshelf_path, data)
+        if self._debug_dump_enabled():
+            bookshelf_path = os.path.join(self.database_directory_lists, "bookshelf.json")
+            self._write_json(bookshelf_path, data)
 
         return data
 
@@ -595,8 +602,9 @@ class StorytelSource(Source):
             next_page_token = data.get("nextPageToken")
 
         assert result is not None
-        lists_path = self._get_lists_path(result["id"], languages, resolved_formats)
-        self._write_json(lists_path, result)
+        if self._debug_dump_enabled():
+            lists_path = self._get_lists_path(result["id"], languages, resolved_formats)
+            self._write_json(lists_path, result)
 
         return result
 
@@ -738,8 +746,9 @@ class StorytelSource(Source):
         consumableId = book_details["consumableId"]
         url = f"https://api.storytel.net/playback-metadata/consumable/{consumableId}"
         playback_metadata = self.get_json(url)
-        playback_metadata_path = self._get_playback_metadata_path(consumableId)
-        self._write_json(playback_metadata_path, playback_metadata)
+        if self._debug_dump_enabled():
+            playback_metadata_path = self._get_playback_metadata_path(consumableId)
+            self._write_json(playback_metadata_path, playback_metadata)
         if not "formats" in playback_metadata:
             raise DataNotPresent
         for format in playback_metadata["formats"]:
@@ -778,10 +787,15 @@ class StorytelSource(Source):
     @staticmethod
     def _write_json(path: str, payload: Any) -> None:
         """Write `payload` as UTF-8 JSON to `path`."""
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(path, "w", encoding="utf-8") as json_file:
             json.dump(payload, json_file, indent=2, ensure_ascii=False)
 
     def on_download_complete(self, audiobook: Audiobook) -> None:
+        if not (self._debug_dump_enabled() or self.skip_downloaded):
+            return
         consumableId = audiobook.source_data["consumableId"]
         raw_format = audiobook.source_data.get("_format_type")
         if raw_format in ("abook", "ebook"):

@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from dataclasses import dataclass
 import os
 import re
@@ -63,43 +64,43 @@ def check_for_updates(
     """
     if respect_opt_out and updates_disabled():
         return None
-    sess = session or requests.Session()
     proxies = {"http": proxy, "https": proxy} if proxy else None
     headers = {"User-Agent": DEFAULT_USER_AGENT, "Accept": "application/json"}
+    session_cm = nullcontext(session) if session is not None else requests.Session()
+    with session_cm as sess:
+        # 1. Try GitHub latest release
+        try:
+            resp = sess.get(_GITHUB_LATEST_RELEASE_URL, timeout=timeout, proxies=proxies, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                tag = str(data.get("tag_name") or "").strip().lstrip("vV")
+                html_url = str(data.get("html_url") or _RELEASES_PAGE_URL)
+                if tag:
+                    return UpdateInfo(
+                        current_version=current_version,
+                        latest_version=tag,
+                        has_update=is_newer_version(tag, current_version),
+                        release_url=html_url,
+                    )
+        except (requests.RequestException, ValueError) as exc:
+            logging.debug(f"GitHub update check skipped: {exc}")
 
-    # 1. Try GitHub latest release
-    try:
-        resp = sess.get(_GITHUB_LATEST_RELEASE_URL, timeout=timeout, proxies=proxies, headers=headers)
-        if resp.status_code == 200:
-            data = resp.json()
-            tag = str(data.get("tag_name") or "").strip().lstrip("vV")
-            html_url = str(data.get("html_url") or _RELEASES_PAGE_URL)
-            if tag:
-                return UpdateInfo(
-                    current_version=current_version,
-                    latest_version=tag,
-                    has_update=is_newer_version(tag, current_version),
-                    release_url=html_url,
-                )
-    except (requests.RequestException, ValueError) as exc:
-        logging.debug(f"GitHub update check skipped: {exc}")
-
-    # 2. Fallback to PyPI JSON
-    try:
-        resp = sess.get(_PYPI_JSON_URL, timeout=timeout, proxies=proxies, headers=headers)
-        if resp.status_code == 200:
-            data = resp.json()
-            latest = str(data.get("info", {}).get("version") or "").strip()
-            project_url = str(data.get("info", {}).get("project_url") or _RELEASES_PAGE_URL)
-            if latest:
-                return UpdateInfo(
-                    current_version=current_version,
-                    latest_version=latest,
-                    has_update=is_newer_version(latest, current_version),
-                    release_url=project_url,
-                )
-    except (requests.RequestException, ValueError) as exc:
-        logging.debug(f"PyPI update check skipped: {exc}")
+        # 2. Fallback to PyPI JSON
+        try:
+            resp = sess.get(_PYPI_JSON_URL, timeout=timeout, proxies=proxies, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                latest = str(data.get("info", {}).get("version") or "").strip()
+                project_url = str(data.get("info", {}).get("project_url") or _RELEASES_PAGE_URL)
+                if latest:
+                    return UpdateInfo(
+                        current_version=current_version,
+                        latest_version=latest,
+                        has_update=is_newer_version(latest, current_version),
+                        release_url=project_url,
+                    )
+        except (requests.RequestException, ValueError) as exc:
+            logging.debug(f"PyPI update check skipped: {exc}")
 
     return None
 

@@ -10,7 +10,7 @@ from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, APIC, CHAP, TIT2, CTOC, CTOCFlags, WCOM, ID3NoHeaderError
 from requests import utils
 
-from typing import Sequence
+from typing import Optional, Sequence
 
 EasyID3.RegisterTextKey("comment", "COMM")
 EasyID3.RegisterTextKey("year", "TYER")
@@ -88,40 +88,23 @@ def add_id3_metadata(filepath: str, metadata: AudiobookMetadata):
     audio.save(v2_version=4)
 
 
-def embed_id3_cover(filepath: str, cover: Cover):
+def _apply_id3_cover(audio: ID3, cover: Cover) -> bool:
     image_data, ext = normalize_cover_image(cover)
-    mimetype = EXTENSION_TO_MIMETYPE[ext]
-    try:
-        audio = ID3(filepath)
-    except ID3NoHeaderError:
-        audio = ID3()
+    mimetype = EXTENSION_TO_MIMETYPE.get(ext)
+    if not mimetype:
+        return False
     audio.delall("APIC")
     audio.add(APIC(type=3, data=image_data, mime=mimetype))
-    audio.save(filepath)
+    return True
 
 
-def add_id3_chapter(audio: ID3, start: int, end: int, title: str, index: int):
-    """Adds a single chapter to the given audio file"""
-    audio.add(CHAP(
-        element_id=u"chp"+str(index),
-        start_time=int(start),
-        end_time=int(end),
-        sub_frames=[TIT2(text=[title])]
-    ))
-
-
-def add_id3_chapters(filepath: str, chapters: Sequence[Chapter]):
-    """Adds chapters to the given audio file"""
+def _apply_id3_chapters(audio: ID3, filepath: str, chapters: Sequence[Chapter]) -> bool:
     if not chapters:
-        return
+        return False
     bounded = build_bounded_chapters(filepath, chapters, mutagen_opener=MutagenFile)
     if not bounded:
         logging.debug(f"No valid chapters within audio duration for {filepath}; skipping ID3 chapters")
-        return
-    try:
-        audio = ID3(filepath)
-    except ID3NoHeaderError:
-        audio = ID3()
+        return False
     audio.delall("CTOC")
     audio.delall("CHAP")
     child_ids = []
@@ -139,4 +122,55 @@ def add_id3_chapters(filepath: str, chapters: Sequence[Chapter]):
         flags=CTOCFlags.TOP_LEVEL | CTOCFlags.ORDERED,
         child_element_ids=child_ids,
     ))
-    audio.save(filepath)
+    return True
+
+
+def embed_id3_cover(filepath: str, cover: Cover):
+    try:
+        audio = ID3(filepath)
+    except ID3NoHeaderError:
+        audio = ID3()
+    if _apply_id3_cover(audio, cover):
+        audio.save(filepath)
+
+
+def add_id3_chapter(audio: ID3, start: int, end: int, title: str, index: int):
+    """Adds a single chapter to the given audio file"""
+    audio.add(CHAP(
+        element_id=u"chp"+str(index),
+        start_time=int(start),
+        end_time=int(end),
+        sub_frames=[TIT2(text=[title])]
+    ))
+
+
+def add_id3_chapters(filepath: str, chapters: Sequence[Chapter]):
+    """Adds chapters to the given audio file"""
+    add_id3_chapters_and_cover(filepath, chapters=chapters, cover=None)
+
+
+def add_id3_chapters_and_cover(
+    filepath: str,
+    chapters: Optional[Sequence[Chapter]] = None,
+    cover: Optional[Cover] = None,
+) -> bool:
+    """Embed ID3 chapters and optional APIC cover art in a single `ID3.save()` pass.
+
+    Returns ``True`` when cover art was embedded.
+    """
+    if not chapters and cover is None:
+        return False
+    try:
+        audio = ID3(filepath)
+    except ID3NoHeaderError:
+        audio = ID3()
+    dirty = False
+    if chapters and _apply_id3_chapters(audio, filepath, chapters):
+        dirty = True
+    cover_embedded = False
+    if cover is not None and _apply_id3_cover(audio, cover):
+        dirty = True
+        cover_embedded = True
+    if dirty:
+        audio.save(filepath)
+    return cover_embedded

@@ -1,6 +1,6 @@
 import os
 from datetime import date
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from audiobookdl import AudiobookMetadata, Cover
 from ._cover import normalize_cover_image
@@ -45,8 +45,20 @@ def _freeform_atom(name: str, value: str) -> Tuple[str, List[MP4FreeForm]]:
     )
 
 
-def add_mp4_metadata(filepath: str, metadata: AudiobookMetadata) -> None:
-    """Add mp4 metadata tags to the given audio file"""
+def _build_mp4_cover(cover: Cover) -> Optional[MP4Cover]:
+    image_data, ext = normalize_cover_image(cover)
+    if ext not in MP4_COVER_FORMATS:
+        return None
+    return MP4Cover(image_data, imageformat=MP4_COVER_FORMATS[ext])
+
+
+def add_mp4_metadata(
+    filepath: str,
+    metadata: AudiobookMetadata,
+    cover: Optional[Cover] = None,
+) -> bool:
+    """Add mp4 metadata tags (and optional cover art) in a single save pass."""
+    mp4_cover = _build_mp4_cover(cover) if cover is not None else None
     audio = MP4(filepath)
     audio["stik"] = [MP4_MEDIA_KIND_AUDIOBOOK]
     for key, value in metadata.all_properties(allow_duplicate_keys=None):
@@ -70,15 +82,16 @@ def add_mp4_metadata(filepath: str, metadata: AudiobookMetadata) -> None:
             freeform_name = MP4_FREEFORM_NAMES.get(key, key.capitalize())
             atom, val = _freeform_atom(freeform_name, str(value))
             audio[atom] = val
+    if mp4_cover is not None:
+        audio["covr"] = [mp4_cover]
     audio.save()
+    return mp4_cover is not None
 
 
 def embed_mp4_cover(filepath: str, cover: Cover) -> None:
-    image_data, ext = normalize_cover_image(cover)
-    if ext not in MP4_COVER_FORMATS:
+    mp4_cover = _build_mp4_cover(cover)
+    if mp4_cover is None:
         return
     audio = MP4(filepath)
-    audio["covr"] = [
-        MP4Cover(image_data, imageformat=MP4_COVER_FORMATS[ext])
-    ]
+    audio["covr"] = [mp4_cover]
     audio.save()

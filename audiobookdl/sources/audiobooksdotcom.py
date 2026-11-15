@@ -134,7 +134,7 @@ class AudiobooksdotcomSource(Source):
         :param scrape_url: Url of page to scrape for audio link
         :returns: List of audio files with a single file in it
         """
-        page_text = self.get(scrape_url).decode("utf-8", errors="replace")
+        page_text = self._get_page(scrape_url).decode("utf-8", errors="replace")
         audio_match = re.search(
             r'(?<=(mp3: "))[^"]+',
             page_text

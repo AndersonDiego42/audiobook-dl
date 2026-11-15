@@ -277,7 +277,9 @@ def test_login_raises_cloudflare_blocked_or_user_not_authorized(tmp_path):
 
 def test_download_from_id_refreshes_login_at_threshold_and_skip_downloaded_false(tmp_path):
     src = _make_source(tmp_path, skip_downloaded=False)
-    Path(src._get_book_path("500")).write_text("{}", encoding="utf-8")
+    book_marker = Path(src._get_book_path("500"))
+    book_marker.parent.mkdir(parents=True, exist_ok=True)
+    book_marker.write_text("{}", encoding="utf-8")
 
     details = _sample_book_details(consumableId="500", title="ID Book")
     redirect_url = "https://cdn.storytel.net/audio/500.mp3?token=xyz"
@@ -374,9 +376,17 @@ def test_download_book_end_to_end_chapters_isbn_and_corrections(tmp_path):
         (17000, "Chapter 3"),
     ]
     assert src._download_counter == 1
+    # Without debug mode, raw playback-metadata JSON dump is NOT persisted
     saved_playback = Path(src._get_playback_metadata_path("1168061"))
-    assert saved_playback.exists()
-    assert json.loads(saved_playback.read_text(encoding="utf-8")) == playback_payload
+    assert not saved_playback.exists()
+
+    # With debug=True, playback-metadata JSON dump IS written cleanly
+    debug_src = _make_source(tmp_path / "dbg", debug=True)
+    debug_src._session.get = MagicMock(side_effect=fake_get)
+    debug_src.download("https://www.storytel.com/de/de/books/leo-da-vinci-1168061?appRedirect=true")
+    saved_debug_playback = Path(debug_src._get_playback_metadata_path("1168061"))
+    assert saved_debug_playback.exists()
+    assert json.loads(saved_debug_playback.read_text(encoding="utf-8")) == playback_payload
 
 
 def test_download_book_error_paths_and_missing_chapters(tmp_path):
@@ -409,7 +419,7 @@ def test_download_book_error_paths_and_missing_chapters(tmp_path):
 
 
 def test_download_routes_bookshelf_want_to_read_and_avoids_slug_collision(tmp_path):
-    src = _make_source(tmp_path, skip_downloaded=True)
+    src = _make_source(tmp_path, skip_downloaded=True, debug=True)
     # Mark book "104" as already downloaded
     Path(src._get_book_path("104")).write_text("{}", encoding="utf-8")
 
@@ -432,12 +442,14 @@ def test_download_routes_bookshelf_want_to_read_and_avoids_slug_collision(tmp_pa
     bookshelf_json = Path(src.database_directory_lists) / "bookshelf.json"
     assert json.loads(bookshelf_json.read_text(encoding="utf-8")) == bookshelf_payload
 
-    # "audiobook" mode skips ebook-only (103)
+    # "audiobook" mode skips ebook-only (103); with debug=False no bookshelf.json dump is written
+    bookshelf_json.unlink()
     src_audio = _make_source(tmp_path, skip_downloaded=True, media_type="audiobook")
     src_audio._session.post = MagicMock(return_value=_mock_resp(200, json_data=bookshelf_payload))
     series_audio = src_audio.download("https://www.storytel.com/se/sv/want-to-read")
     assert isinstance(series_audio, Series)
     assert [b.id for b in series_audio.books if isinstance(b, BookId)] == ["101"]
+    assert not bookshelf_json.exists()
 
     # "ebook" mode selects only ebook (103)
     src_ebook = _make_source(tmp_path, skip_downloaded=True, media_type="ebook")
@@ -459,7 +471,7 @@ def test_download_routes_bookshelf_want_to_read_and_avoids_slug_collision(tmp_pa
 
 
 def test_download_lists_api_paginates_filters_and_persists_json(tmp_path):
-    src = _make_source(tmp_path, skip_downloaded=True)
+    src = _make_source(tmp_path, skip_downloaded=True, debug=True)
     Path(src._get_book_path("202")).write_text("{}", encoding="utf-8")
 
     page_1 = {
@@ -513,7 +525,8 @@ def test_download_lists_api_paginates_filters_and_persists_json(tmp_path):
     assert isinstance(series_audio, Series)
     assert [b.id for b in series_audio.books if isinstance(b, BookId)] == ["201", "205"]
     assert captured_params_audio[0]["includeFormats"] == "abook"
-    assert Path(src_audio._get_lists_path("ser-42", "se", "abook")).exists()
+    # debug=False does not dump lists/*.json
+    assert not Path(src_audio._get_lists_path("ser-42", "se", "abook")).exists()
 
 
 def test_download_books_from_website_filters_by_headphone_icon_and_skip(tmp_path):
@@ -547,7 +560,6 @@ def test_download_books_from_website_filters_by_headphone_icon_and_skip(tmp_path
 
 
 def test_on_download_complete_writes_utf8_json(tmp_path):
-    src = _make_source(tmp_path)
     unicode_title = "日本語・Книга — Storytel"
     book = Audiobook(
         session=requests.Session(),
@@ -555,6 +567,12 @@ def test_on_download_complete_writes_utf8_json(tmp_path):
         files=[],
         source_data={"consumableId": "12345", "title": unicode_title},
     )
+
+    no_dbg_src = _make_source(tmp_path / "no_dbg")
+    no_dbg_src.on_download_complete(book)
+    assert not Path(no_dbg_src._get_book_path("12345")).exists()
+
+    src = _make_source(tmp_path / "dbg", debug=True)
     src.on_download_complete(book)
 
     saved = Path(src._get_book_path("12345")).read_text(encoding="utf-8")

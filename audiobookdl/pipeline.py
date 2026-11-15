@@ -3,7 +3,10 @@ import os
 import sys
 import threading
 import time
+import weakref
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+
+import requests
 
 from . import __version__, args, logging, output
 from .args import DownloadOptions
@@ -189,6 +192,18 @@ class Downloader:
             self.sink = _EventLogSink(on_event)
         else:
             self.sink = None
+        self._http_session = requests.Session()
+        self._http_session_finalizer = weakref.finalize(self, self._http_session.close)
+
+    def close(self) -> None:
+        """Close the shared HTTP session held by this `Downloader`."""
+        self._http_session_finalizer()
+
+    def __enter__(self) -> "Downloader":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
 
     def _build_context(self) -> logging.JobContext:
         ctx = apply_runtime_options(self.options, self.config)
@@ -206,6 +221,7 @@ class Downloader:
                 self.config,
                 interaction=self.interaction,
                 cancel_event=self.cancel_event,
+                session=self._http_session,
             )
 
     def fetch_metadata(self, url: str) -> Result:
@@ -273,6 +289,7 @@ class Downloader:
                         interaction=self.interaction,
                         cancel_event=self.cancel_event,
                         summary=summary,
+                        session=self._http_session,
                         **extra_kwargs,
                     )
                     if (
@@ -326,6 +343,7 @@ def prepare_source_result(
     config: Config,
     interaction: Optional[logging.InteractionHandler] = None,
     cancel_event: Optional[threading.Event] = None,
+    session: Optional[requests.Session] = None,
 ) -> Tuple[Source, Result]:
     """
     Resolve source for `url`, authenticate if required, and fetch `Result`
@@ -339,6 +357,7 @@ def prepare_source_result(
     except NoSourceFound:
         resolved_url = resolve_redirect_url(
             url,
+            session=session,
             proxy=getattr(options, "proxy", None),
             timeout=getattr(options, "timeout", None) or 10.0,
         )
@@ -552,6 +571,7 @@ def process_url(
     selected_indices: Optional[Sequence[int]] = None,
     prefetched: Optional[Tuple[Source, Result]] = None,
     summary: Optional[DownloadSummary] = None,
+    session: Optional[requests.Session] = None,
 ) -> None:
     """
     Process `url` based on `options` and `config`.
@@ -566,6 +586,7 @@ def process_url(
             config,
             interaction=interaction,
             cancel_event=cancel_event,
+            session=session,
         )
     download_result(
         source,
@@ -786,6 +807,7 @@ def process_audiobook(
     if getattr(options, "enrich_metadata", False):
         enrich_metadata_from_openlibrary(
             audiobook.metadata,
+            session=getattr(source, "_session", None),
             proxy=getattr(options, "proxy", None),
             timeout=getattr(options, "timeout", None) or 10.0,
         )

@@ -9,15 +9,18 @@ from audiobookdl.utils.http import DEFAULT_HTTP_TIMEOUT
 from . import metadata, output, encryption
 from .metadata import sidecars
 
+import email.utils
 import os
+import random
 import re
 import shutil
 import tempfile
 import threading
 import time
+from datetime import datetime, timezone
 import requests
 from functools import partial
-from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 from rich.progress import Progress, BarColumn, ProgressColumn, SpinnerColumn
 from pathlib import Path
 from math import log10
@@ -30,12 +33,16 @@ DOWNLOAD_PROGRESS: List[Union[str, ProgressColumn]] = [
     "[progress.percentage]{task.percentage:>3.0f}%"
 ]
 
-# Per-file download attempts before giving up (retries transient network/TLS errors)
+# Per-file download attempts before giving up (retries transient network/TLS errors and 429/5xx)
 DOWNLOAD_ATTEMPTS = 5
 # 64 KiB read chunks balance throughput with prompt cancel_event checks
 DOWNLOAD_CHUNK_SIZE = 64 * 1024
+# Conservative default parallel workers per book to reduce CDN 429/anti-abuse throttling
+DEFAULT_DOWNLOAD_WORKERS = 6
 # Upper bound on parallel file download workers (matched to Session pool_maxsize)
 MAX_DOWNLOAD_WORKERS = 20
+# Cap exponential backoff and server-supplied Retry-After sleeps
+MAX_RETRY_DELAY = 60.0
 
 
 def download(
@@ -165,7 +172,9 @@ def download_audiobook(
         None if ebook else options.output_format,
         filepaths,
     )
+    probe_cache: Dict[str, Any] = {}
     chapters_embedded = False
+    cover_embedded = False
     chapters_for_ffmpeg = (
         audiobook.chapters
         if (
@@ -173,6 +182,15 @@ def download_audiobook(
             and audiobook.chapters
             and not options.no_chapters
             and not id3.is_id3_file(f"{output_dir}.{output_format}")
+        )
+        else None
+    )
+    cover_for_ffmpeg = (
+        audiobook.cover
+        if (
+            not ebook
+            and audiobook.cover is not None
+            and output_format in output.MP4_CONTAINERS
         )
         else None
     )
@@ -195,6 +213,7 @@ def download_audiobook(
                     master_path,
                     cancel_event=cancel_event,
                     audio_bitrate=options.audio_bitrate,
+                    probe_cache=probe_cache,
                 )
                 split_result = output.split_audio_by_chapters(
                     master_path,
@@ -203,6 +222,7 @@ def download_audiobook(
                     output_format=output_format,
                     cancel_event=cancel_event,
                     audio_bitrate=options.audio_bitrate,
+                    probe_cache=probe_cache,
                 )
             for src_part in filepaths:
                 if src_part not in split_result and os.path.exists(src_part):
@@ -220,6 +240,7 @@ def download_audiobook(
                 output_format=output_format,
                 cancel_event=cancel_event,
                 audio_bitrate=options.audio_bitrate,
+                probe_cache=probe_cache,
             )
             if src_single not in filepaths and os.path.exists(src_single):
                 os.remove(src_single)
@@ -236,8 +257,12 @@ def download_audiobook(
                     cancel_event=cancel_event,
                     chapters=chapters_for_ffmpeg,
                     audio_bitrate=options.audio_bitrate,
+                    metadata=audiobook.metadata,
+                    cover=cover_for_ffmpeg,
+                    probe_cache=probe_cache,
                 )
             )
+            cover_embedded = cover_for_ffmpeg is not None
             current_format = output_format
             filepaths = [output_path]
         except DownloadCancelled:
@@ -248,7 +273,7 @@ def download_audiobook(
         not options.combine
         and not ebook
         and len(filepaths) > 1
-        and output.should_smart_merge_hls(filepaths, audiobook.chapters)
+        and output.should_smart_merge_hls(filepaths, audiobook.chapters, probe_cache=probe_cache)
     ):
         filepaths = output.merge_hls_segments_into_chapters(
             filepaths,
@@ -257,6 +282,7 @@ def download_audiobook(
             output_format=output_format,
             cancel_event=cancel_event,
             audio_bitrate=options.audio_bitrate,
+            probe_cache=probe_cache,
         )
         current_format = output_format
     if cancel_event is not None and cancel_event.is_set():
@@ -270,7 +296,11 @@ def download_audiobook(
                 cancel_event=cancel_event,
                 audio_bitrate=options.audio_bitrate,
                 chapters=chapters_for_ffmpeg,
+                metadata=audiobook.metadata,
+                cover=cover_for_ffmpeg,
+                probe_cache=probe_cache,
             )
+            cover_embedded = cover_for_ffmpeg is not None
             filepaths = [converted_path]
         else:
             filepaths = output.convert_output(
@@ -289,6 +319,7 @@ def download_audiobook(
             options,
             cancel_event=cancel_event,
             chapters_embedded=chapters_embedded,
+            cover_embedded=cover_embedded,
         )
     else:
         add_metadata_to_dir(audiobook, filepaths, output_dir, options)
@@ -300,6 +331,7 @@ def add_metadata_to_file(
     options: DownloadOptions,
     cancel_event: Optional[threading.Event] = None,
     chapters_embedded: bool = False,
+    cover_embedded: bool = False,
 ):
     """
     Embed metadata into a single file
@@ -309,19 +341,45 @@ def add_metadata_to_file(
     :options: Cli options
     """
     ebook_file = is_ebook_extension(os.path.splitext(filepath)[1])
-    # Chapters must be muxed before container metadata/cover because ffmpeg's remux drops unmapped MP4 atoms
-    if not ebook_file and audiobook.chapters and not options.no_chapters and not chapters_embedded:
-        logging.book_update("Adding chapters")
-        metadata.add_chapters(
-            filepath,
-            audiobook.chapters,
-            cancel_event=cancel_event,
-            audio_bitrate=options.audio_bitrate,
-        )
-    # General metadata
-    if not ebook_file:
+    needs_chapters = (
+        not ebook_file
+        and bool(audiobook.chapters)
+        and not options.no_chapters
+        and not chapters_embedded
+    )
+    needs_cover = not ebook_file and audiobook.cover is not None and not cover_embedded
+    cover_written_with_other = False
+    if id3.is_id3_file(filepath) and not ebook_file:
         logging.book_update("Adding metadata")
         metadata.add_metadata(filepath, audiobook.metadata)
+        if needs_chapters or needs_cover:
+            logging.book_update("Adding chapters" if needs_chapters else "Embedding cover")
+            cover_written_with_other = bool(
+                id3.add_id3_chapters_and_cover(
+                    filepath,
+                    chapters=audiobook.chapters if needs_chapters else None,
+                    cover=audiobook.cover if needs_cover else None,
+                )
+            )
+    else:
+        # Chapters must be muxed before container metadata/cover because ffmpeg's remux drops unmapped MP4 atoms
+        if needs_chapters:
+            logging.book_update("Adding chapters")
+            cover_written_with_other = bool(
+                metadata.add_chapters(
+                    filepath,
+                    audiobook.chapters,
+                    cancel_event=cancel_event,
+                    audio_bitrate=options.audio_bitrate,
+                )
+            )
+        # General metadata (and inline cover for MP4/Vorbis in a single Mutagen save)
+        if not ebook_file:
+            logging.book_update("Adding metadata")
+            cover_for_meta = audiobook.cover if (needs_cover and not cover_written_with_other) else None
+            cover_written_with_other = cover_written_with_other or bool(
+                metadata.add_metadata(filepath, audiobook.metadata, cover=cover_for_meta)
+            )
     stem = os.path.splitext(filepath)[0]
     cover_sidecar_name: Optional[str] = None
     if audiobook.cover and options.write_cover:
@@ -344,8 +402,8 @@ def add_metadata_to_file(
             audiobook.chapters,
             f"{stem}.cue",
         )
-    # Cover
-    if not ebook_file and audiobook.cover:
+    # Fallback cover write if container/mock did not embed it alongside metadata or chapters
+    if needs_cover and not cover_written_with_other:
         logging.book_update("Embedding cover")
         metadata.embed_cover(filepath, audiobook.cover)
 
@@ -514,6 +572,47 @@ def _get_header_ci(headers: Any, name: str) -> Optional[Any]:
     return None
 
 
+def _parse_retry_after(value: Optional[Any]) -> Optional[float]:
+    """Parse an HTTP `Retry-After` header (delta seconds or HTTP-date) clamped to `MAX_RETRY_DELAY`."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        seconds = float(text)
+    except ValueError:
+        try:
+            dt = email.utils.parsedate_to_datetime(text)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        seconds = (dt - datetime.now(timezone.utc)).total_seconds()
+    return max(0.0, min(MAX_RETRY_DELAY, seconds))
+
+
+def _compute_retry_delay(attempt: int, retry_after: Optional[Any] = None) -> float:
+    """Compute bounded exponential backoff (with jitter) or honor `Retry-After`."""
+    header_delay = _parse_retry_after(retry_after)
+    if header_delay is not None:
+        return header_delay
+    return min(MAX_RETRY_DELAY, float(2 ** attempt) + random.uniform(0.0, 0.5))
+
+
+def _sleep_or_cancel(delay: float, cancel_event: Optional[threading.Event]) -> None:
+    """Sleep for `delay` seconds while respecting `cancel_event`."""
+    if delay <= 0:
+        if cancel_event is not None and cancel_event.is_set():
+            raise DownloadCancelled
+        return
+    if cancel_event is not None:
+        if cancel_event.wait(delay):
+            raise DownloadCancelled
+    else:
+        time.sleep(delay)
+
+
 def _parse_content_length(headers: Any) -> int:
     """Parse Content-Length header safely, returning 0 when missing or invalid."""
     raw_length = _get_header_ci(headers, "Content-Length")
@@ -647,6 +746,23 @@ def download_file(
                 invalid_status_code = bool(
                     file.expected_status_code and file.expected_status_code != request.status_code
                 )
+            retryable_status = (
+                invalid_status_code
+                and (request.status_code == 429 or 500 <= request.status_code < 600)
+                and request.status_code != file.expected_status_code
+            )
+            if retryable_status and attempt + 1 < DOWNLOAD_ATTEMPTS:
+                delay = _compute_retry_delay(
+                    attempt,
+                    _get_header_ci(request.headers, "Retry-After"),
+                )
+                logging.debug(
+                    f"Download attempt {attempt + 1}/{DOWNLOAD_ATTEMPTS} received HTTP "
+                    f"{request.status_code} for {file.url}; retrying in {delay:.2f}s"
+                )
+                _sleep_or_cancel(delay, cancel_event)
+                attempt += 1
+                continue
             if invalid_content_type or invalid_status_code:
                 # Failed-download bodies can be raw audio bytes: truncate + escape before rich print
                 from rich.markup import escape as _escape
@@ -784,16 +900,12 @@ def download_file(
             update_progress(-advanced)
             if attempt + 1 >= DOWNLOAD_ATTEMPTS:
                 raise
-            delay = 2 ** attempt
+            delay = _compute_retry_delay(attempt)
             logging.debug(
                 f"Download attempt {attempt + 1}/{DOWNLOAD_ATTEMPTS} failed for "
-                f"{file.url} ({error}); retrying in {delay}s"
+                f"{file.url} ({error}); retrying in {delay:.2f}s"
             )
-            if cancel_event is not None:
-                if cancel_event.wait(delay):
-                    raise DownloadCancelled
-            else:
-                time.sleep(delay)
+            _sleep_or_cancel(delay, cancel_event)
             attempt += 1
         except DownloadCancelled:
             if not resume and os.path.exists(filepath_tmp):
@@ -850,7 +962,11 @@ def download_files(
     if timeout is not None:
         worker_kwargs["timeout"] = timeout
     worker_fn = partial(download_file, **worker_kwargs) if worker_kwargs else download_file
-    workers = min(MAX_DOWNLOAD_WORKERS, max_workers) if max_workers else MAX_DOWNLOAD_WORKERS
+    workers = (
+        min(MAX_DOWNLOAD_WORKERS, max(1, max_workers))
+        if max_workers
+        else min(DEFAULT_DOWNLOAD_WORKERS, MAX_DOWNLOAD_WORKERS)
+    )
     if file_count == 1:
         return [worker_fn(arguments[0])]
     return run_cancellable_pool(

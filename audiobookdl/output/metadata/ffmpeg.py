@@ -1,4 +1,4 @@
-from audiobookdl import Chapter, utils, logging
+from audiobookdl import AudiobookMetadata, Chapter, utils, logging
 from audiobookdl.utils.concurrency import run_cancellable_subprocess
 from ._chapters import build_bounded_chapters
 from mutagen import File as MutagenFile
@@ -20,6 +20,29 @@ def _escape_ffmetadata(text: str) -> str:
         .replace("#", "\\#")
         .replace("\n", "\\\n")
     )
+
+
+def create_metadata_text(metadata: Optional[AudiobookMetadata]) -> str:
+    """Render global FFMETADATA1 tag lines (`key=value\\n`) for `metadata`."""
+    if metadata is None:
+        return ""
+    lines: List[str] = []
+    if metadata.title:
+        lines.append(f"title={_escape_ffmetadata(metadata.title)}")
+    if metadata.authors:
+        lines.append(f"artist={_escape_ffmetadata(', '.join(metadata.authors))}")
+    album = metadata.series or metadata.title
+    if album:
+        lines.append(f"album={_escape_ffmetadata(album)}")
+    if metadata.narrators:
+        lines.append(f"composer={_escape_ffmetadata(', '.join(metadata.narrators))}")
+    if metadata.genres:
+        lines.append(f"genre={_escape_ffmetadata(', '.join(metadata.genres))}")
+    if metadata.release_date is not None:
+        lines.append(f"date={_escape_ffmetadata(metadata.release_date.strftime('%Y-%m-%d'))}")
+    if metadata.description:
+        lines.append(f"comment={_escape_ffmetadata(metadata.description)}")
+    return "".join(f"{line}\n" for line in lines)
 
 
 def create_chapter_text(title: str, start: int, end: int) -> str:

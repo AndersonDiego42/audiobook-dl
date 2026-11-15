@@ -1,4 +1,5 @@
 import sys
+import requests
 
 from audiobookdl import __version__, args, logging
 from audiobookdl.config import load_config
@@ -28,7 +29,12 @@ def main() -> None:
     logging.ffmpeg_output = ctx.ffmpeg_output
 
     if getattr(options, "check_updates", False):
-        info = check_for_updates(proxy=options.proxy, respect_opt_out=False)
+        with requests.Session() as update_session:
+            info = check_for_updates(
+                proxy=options.proxy,
+                session=update_session,
+                respect_opt_out=False,
+            )
         if info is None:
             print(f"Could not check for updates (current version: v{__version__}).", file=sys.stderr)
             sys.exit(1)

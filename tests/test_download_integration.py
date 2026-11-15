@@ -280,8 +280,8 @@ def test_downloader_hls_aes_combine_and_metadata_integration(tmp_path, monkeypat
     log_messages = [ev.data["message"] for ev in events if ev.kind == "log"]
     chapters_idx = next(i for i, m in enumerate(log_messages) if "Adding chapters" in m)
     metadata_idx = next(i for i, m in enumerate(log_messages) if "Adding metadata" in m)
-    cover_idx = next(i for i, m in enumerate(log_messages) if "Embedding cover" in m)
-    assert chapters_idx < metadata_idx < cover_idx
+    assert chapters_idx < metadata_idx
+    assert not any("Embedding cover" in m for m in log_messages)
 
     # Verify HTTP cookies and stream auth headers were transmitted to every endpoint
     requested_paths = {path for path, _, _ in recorded_requests}

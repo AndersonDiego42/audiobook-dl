@@ -410,13 +410,14 @@ def test_audiobooksdotcom_source_book_and_library_series(tmp_path):
         side_effect=[
             page_resp,
             MagicMock(status_code=200, content=b"ab-cover"),
-            page_resp,
         ]
     )
     book = src.download("https://www.audiobooks.com/audiobook/title/12345")
     assert isinstance(book, Audiobook)
     assert book.metadata.title == "AB Book"
     assert book.files[0].url == "https://cdn.audiobooks.com/book.mp3"
+    # Cached _get_page avoids refetching scrape_url in extract_file (page + cover = 2 GETs)
+    assert src._session.get.call_count == 2
 
     lib_html = (
         b'<div class="book"><a class="no-decoration" href="/audiobook/a/111">A</a></div>'

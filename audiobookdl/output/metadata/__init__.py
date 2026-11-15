@@ -6,16 +6,25 @@ import os
 import threading
 from typing import Optional, Sequence
 
-def add_metadata(filepath: str, metadata: AudiobookMetadata):
-    """Adds metadata to the given audio file"""
+def add_metadata(
+    filepath: str,
+    metadata: AudiobookMetadata,
+    cover: Optional[Cover] = None,
+) -> bool:
+    """Adds metadata (and optional cover art where supported inline) to `filepath`.
+
+    Returns ``True`` if ``cover`` was embedded in the same save pass.
+    """
     if id3.is_id3_file(filepath):
         id3.add_id3_metadata(filepath, metadata)
+        return False
     elif mp4.is_mp4_file(filepath):
-        mp4.add_mp4_metadata(filepath, metadata)
+        return mp4.add_mp4_metadata(filepath, metadata, cover=cover)
     elif vorbis.is_vorbis_file(filepath):
-        vorbis.add_vorbis_metadata(filepath, metadata)
+        return vorbis.add_vorbis_metadata(filepath, metadata, cover=cover)
     else:
         logging.debug("Could not add any metadata")
+        return False
 
 
 def embed_cover(filepath: str, cover: Cover):
@@ -35,10 +44,14 @@ def add_chapters(
     chapters: Sequence[Chapter],
     cancel_event: Optional[threading.Event] = None,
     audio_bitrate: Optional[str] = None,
-):
-    """Adds chapters to the given audio file"""
+    cover: Optional[Cover] = None,
+) -> bool:
+    """Adds chapters (and optional ID3 cover art in one save) to `filepath`.
+
+    Returns ``True`` if ``cover`` was embedded in the same pass.
+    """
     if id3.is_id3_file(filepath):
-        id3.add_id3_chapters(filepath, chapters)
+        return id3.add_id3_chapters_and_cover(filepath, chapters=chapters, cover=cover)
     elif program_in_path("ffmpeg"):
         ffmpeg.add_chapters_ffmpeg(
             filepath,
@@ -46,9 +59,11 @@ def add_chapters(
             cancel_event=cancel_event,
             audio_bitrate=audio_bitrate,
         )
+        return False
     else:
         if logging.is_debug_mode():
             logging.debug("Could not add chapters")
         else:
             filetype = os.path.splitext(filepath)[1][1:]
             logging.print_error_file("chapters_add", filetype=filetype)
+        return False

@@ -152,10 +152,15 @@ def test_download_files_sizes_thread_pool_dynamically(tmp_path):
     ):
         paths_4 = download_files(make_book(4), str(tmp_path), lambda _: None)
         paths_25 = download_files(make_book(25), str(tmp_path), lambda _: None)
+        paths_25_override = download_files(make_book(25), str(tmp_path), lambda _: None, max_workers=99)
 
     assert paths_4 == [f"p{i}.mp3" for i in range(4)]
     assert paths_25 == [f"p{i}.mp3" for i in range(25)]
-    assert pool_sizes == [4, MAX_DOWNLOAD_WORKERS]
+    assert paths_25_override == [f"p{i}.mp3" for i in range(25)]
+    from audiobookdl.output.download import DEFAULT_DOWNLOAD_WORKERS
+
+    assert pool_sizes == [4, DEFAULT_DOWNLOAD_WORKERS, MAX_DOWNLOAD_WORKERS]
+    assert DEFAULT_DOWNLOAD_WORKERS == 6
     assert MAX_DOWNLOAD_WORKERS == 20
 
 
@@ -619,7 +624,7 @@ def test_single_file_conversion_prompts_once_on_target_even_when_intermediate_ex
     )
     accept = RecordingInteraction(confirm_value=True)
 
-    def fake_convert(src, target_format, cancel_event=None, audio_bitrate=None, chapters=None):
+    def fake_convert(src, target_format, cancel_event=None, audio_bitrate=None, chapters=None, **_kw):
         dst = f"{src.rsplit('.', 1)[0]}.{target_format}"
         with open(dst, "wb") as f:
             f.write(b"new-m4b")
@@ -704,7 +709,7 @@ def test_single_file_conversion_resume_honors_existing_target_and_intermediate(t
     intermediate_mp3.write_bytes(b"cached-mp3")
     session_cached_mp3 = MagicMock()
 
-    def fake_convert(src, target_format, cancel_event=None, audio_bitrate=None, chapters=None):
+    def fake_convert(src, target_format, cancel_event=None, audio_bitrate=None, chapters=None, **_kw):
         assert src == str(intermediate_mp3)
         dst = str(final_m4b)
         final_m4b.write_bytes(b"converted-from-cached")
@@ -735,7 +740,7 @@ def test_single_file_conversion_resume_honors_existing_target_and_intermediate(t
         chunks=[b"fresh-mp3"],
     )
 
-    def fake_convert_fresh(src, target_format, cancel_event=None, audio_bitrate=None, chapters=None):
+    def fake_convert_fresh(src, target_format, cancel_event=None, audio_bitrate=None, chapters=None, **_kw):
         final_m4b.write_bytes(b"rebuilt-m4b")
         return str(final_m4b), False
 
@@ -814,7 +819,7 @@ def test_combined_multifile_overwrite_prompts_once_and_resume_skips_completed(tm
     )
     accept = RecordingInteraction(confirm_value=True)
 
-    def fake_combine(filepaths, tmp_dir, output_path, cancel_event=None, chapters=None, audio_bitrate=None):
+    def fake_combine(filepaths, tmp_dir, output_path, cancel_event=None, chapters=None, audio_bitrate=None, **_kw):
         with open(output_path, "wb") as f:
             f.write(b"new-combined-m4b")
         return False
@@ -1009,4 +1014,48 @@ def test_download_ebook_preserves_epub_skips_audio_conversion_and_writes_sidecar
     session.get.reset_mock()
     download_audiobook(book, output_dir, opts)
     session.get.assert_not_called()
+
+
+def test_download_file_retries_on_429_and_5xx_with_retry_after(tmp_path, monkeypatch):
+    from audiobookdl.exceptions import DownloadError
+    from audiobookdl.output.download import DOWNLOAD_ATTEMPTS, download_file
+
+    resp_429 = _mock_response(status_code=429, headers={"Retry-After": "3"}, chunks=[])
+    resp_503 = _mock_response(status_code=503, headers={}, chunks=[])
+    resp_ok = _mock_response(status_code=200, headers={"Content-Length": "4"}, chunks=[b"data"])
+    session = MagicMock()
+    session.get.side_effect = [resp_429, resp_503, resp_ok]
+
+    book = Audiobook(
+        session=session,
+        metadata=AudiobookMetadata(title="Retry Book"),
+        files=[AudiobookFile(url="https://cdn.example.com/part.mp3", ext="mp3", expected_status_code=200)],
+    )
+    delays: list[float] = []
+    monkeypatch.setattr("audiobookdl.output.download.time.sleep", delays.append)
+
+    out_file = download_file((book, str(tmp_path / "retry"), 0, lambda _d: None, None))
+    assert out_file.endswith(".mp3")
+    assert session.get.call_count == 3
+    assert resp_429.close.call_count == 1
+    assert resp_503.close.call_count == 1
+    assert delays[0] == pytest.approx(3.0)
+    assert delays[1] >= 2.0
+
+    # Exhausting retries on persistent 502 raises DownloadError
+    fail_session = MagicMock()
+    fail_resps = []
+    for _ in range(DOWNLOAD_ATTEMPTS):
+        r = _mock_response(status_code=502, headers={}, chunks=[])
+        r.content = b"Bad Gateway"
+        fail_resps.append(r)
+    fail_session.get.side_effect = fail_resps
+    fail_book = Audiobook(
+        session=fail_session,
+        metadata=AudiobookMetadata(title="Fail Book"),
+        files=[AudiobookFile(url="https://cdn.example.com/fail.mp3", ext="mp3", expected_status_code=200)],
+    )
+    with pytest.raises(DownloadError):
+        download_file((fail_book, str(tmp_path / "fail"), 0, lambda _d: None, None))
+    assert fail_session.get.call_count == DOWNLOAD_ATTEMPTS
 
