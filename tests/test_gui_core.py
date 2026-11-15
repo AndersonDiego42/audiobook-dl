@@ -20,6 +20,7 @@ from audiobookdl.gui.app import (
     describe_series_book,
     format_audiobook_preview,
     format_duration,
+    format_failed_job_detail,
     format_speed,
     is_valid_geometry,
     parse_url_text,
@@ -1477,4 +1478,65 @@ def test_gui_media_type_option_persistence_and_ffmpeg_bypass(tmp_path, monkeypat
         assert app2.build_options().media_type == "ebook"
     finally:
         root2.destroy()
+
+
+def test_format_failed_job_detail_handles_tuples_and_truncation():
+    assert format_failed_job_detail([]) == "Download failed"
+    assert format_failed_job_detail([("Book A", "HTTP 403")]) == "Book A: HTTP 403"
+    assert format_failed_job_detail([("", "Timed out\nretrying")]) == "Timed out retrying"
+    assert format_failed_job_detail([("Book B", "")]) == "Book B"
+    assert format_failed_job_detail([("   ", "   ")]) == "Download failed"
+
+    long_detail = format_failed_job_detail([("https://example.com/book", "x" * 200)])
+    assert len(long_detail) == 120
+    assert long_detail.startswith("https://example.com/book: ")
+
+
+def test_gui_failed_job_formats_book_error_tuple_as_string(tmp_path, monkeypatch):
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+
+    try:
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+        app.output_dir_var.set(str(tmp_path))
+        app.urls_text.insert("1.0", "https://example.com/broken-book\n")
+
+        def fake_run_downloads(urls, options, config, interaction=None, cancel_event=None, sink=None):
+            return DownloadSummary(
+                completed=0,
+                failed=1,
+                cancelled=False,
+                books_failed=1,
+                book_errors=[("https://example.com/broken-book", "Authentication failed")],
+            )
+
+        monkeypatch.setattr("audiobookdl.gui.app.find_executable", lambda name: name)
+        monkeypatch.setattr("audiobookdl.gui.app.run_downloads", fake_run_downloads)
+
+        app.start_download()
+        for _ in range(100):
+            root.update()
+            if not app.is_running:
+                break
+            threading.Event().wait(0.02)
+
+        assert not app.is_running
+        assert app.status_var.get() == "Failed"
+        children = app.queue_tree.get_children()
+        assert len(children) == 1
+        job_id = children[0]
+        rec = app._queue_records[job_id]
+        expected_detail = "https://example.com/broken-book: Authentication failed"
+        assert rec["status"] == "Failed"
+        assert isinstance(rec["detail"], str)
+        assert rec["detail"] == expected_detail
+        values = app.queue_tree.item(job_id, "values")
+        assert isinstance(values, (tuple, list))
+        assert values[2] == "Failed"
+        assert values[3] == expected_detail
+    finally:
+        root.destroy()
 

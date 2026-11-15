@@ -122,6 +122,23 @@ def format_duration(seconds: Optional[float]) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def format_failed_job_detail(
+    book_errors: Sequence[Tuple[str, str]],
+    max_length: int = 120,
+) -> str:
+    """Format the first `(label, message)` error tuple into a single-line status string."""
+    if not book_errors:
+        return "Download failed"[:max_length]
+    label, message = book_errors[0]
+    label_text = " ".join(str(label).split())
+    message_text = " ".join(str(message).split())
+    if label_text and message_text:
+        detail = f"{label_text}: {message_text}"
+    else:
+        detail = message_text or label_text or "Download failed"
+    return detail[:max_length]
+
+
 def describe_series_book(index: int, book: Union[BookId[Any], Audiobook]) -> str:
     """Return a readable display label for an entry inside a `Series`."""
     if isinstance(book, Audiobook):
@@ -2837,8 +2854,8 @@ class AudiobookDLApp:
                         saw_sentinel = self._drain_pending_jobs("Cancelled")
                         break
                     if summary.failed > 0 or summary.books_failed > 0:
-                        detail = summary.book_errors[0] if summary.book_errors else "Download failed"
-                        self._queue.put(("job_status", current_job.job_id, "Failed", detail[:120]))
+                        detail = format_failed_job_detail(summary.book_errors)
+                        self._queue.put(("job_status", current_job.job_id, "Failed", detail))
                     else:
                         detail = (
                             f"{summary.books_completed} ok"

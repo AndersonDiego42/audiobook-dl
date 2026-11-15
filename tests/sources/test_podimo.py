@@ -6,7 +6,7 @@ import pytest
 
 from audiobookdl import Audiobook, BookId, Series
 from audiobookdl.args import build_default_options
-from audiobookdl.exceptions import DataNotPresent, NoSourceFound
+from audiobookdl.exceptions import DataNotPresent, NoSourceFound, RequestError
 from audiobookdl.sources import find_compatible_source
 from audiobookdl.sources.podimo import PodimoSource
 from audiobookdl.utils.http import DEFAULT_HTTP_TIMEOUT
@@ -158,9 +158,19 @@ def test_download_podcast_and_episodes_with_hls_and_mp3_streams(tmp_path):
         ]
     )
 
+    master_bytes = (
+        b"#EXTM3U\n"
+        b"#EXT-X-STREAM-INF:BANDWIDTH=64000\n"
+        b"stream_audio_low/stream.m3u8\n"
+        b"#EXT-X-STREAM-INF:BANDWIDTH=192000\n"
+        b"stream_audio_high/stream.m3u8\n"
+    )
     playlist_bytes = b"#EXTM3U\n#EXTINF:10.0,\nseg0.ts\n#EXTINF:10.0,\nseg1.ts\n#EXT-X-ENDLIST\n"
     src._session.get = MagicMock(
-        return_value=MagicMock(status_code=200, content=playlist_bytes)
+        side_effect=[
+            MagicMock(status_code=200, content=master_bytes),
+            MagicMock(status_code=200, content=playlist_bytes),
+        ]
     )
 
     series = src.download("https://open.podimo.com/podcast/pod-1")
@@ -175,12 +185,11 @@ def test_download_podcast_and_episodes_with_hls_and_mp3_streams(tmp_path):
         book1 = src.download_from_id(series.books[0].id)  # type: ignore[union-attr]
         book2 = src.download_from_id(series.books[1].id)  # type: ignore[union-attr]
 
-    # HLS episode rewrites main.m3u8 -> stream_audio_high/stream.m3u8
-    src._session.get.assert_called_once_with(
+    # HLS episode resolves master playlist to highest-bandwidth variant via get_stream_files
+    assert [c.args[0] for c in src._session.get.call_args_list] == [
+        "https://cdn.podimo.com/ep1/main.m3u8",
         "https://cdn.podimo.com/ep1/stream_audio_high/stream.m3u8",
-        timeout=DEFAULT_HTTP_TIMEOUT,
-        headers={},
-    )
+    ]
     assert [f.url for f in book1.files] == [
         "https://cdn.podimo.com/ep1/stream_audio_high/seg0.ts",
         "https://cdn.podimo.com/ep1/stream_audio_high/seg1.ts",
@@ -289,3 +298,21 @@ def test_podimo_pagination_and_redacted_token_logs(tmp_path, monkeypatch):
     episodes = src.download_podcast_episode_ids("pod-1")
     assert len(episodes) == 101
     assert episodes[-1].id["id"] == "ep-100"
+
+
+def test_podimo_download_cover_returns_none_on_404_and_raises_on_500(tmp_path):
+    src = _make_source(tmp_path)
+    assert src.download_cover(None) is None
+
+    unauth_404 = MagicMock()
+    unauth_404.get.return_value = MagicMock(status_code=404, content=b"")
+    with patch.object(src, "create_unauthenticated_session", return_value=unauth_404):
+        assert src.download_cover("https://cdn.podimo.com/missing.png") is None
+    unauth_404.close.assert_called_once()
+
+    unauth_500 = MagicMock()
+    unauth_500.get.return_value = MagicMock(status_code=500, content=b"")
+    with patch.object(src, "create_unauthenticated_session", return_value=unauth_500):
+        with pytest.raises(RequestError):
+            src.download_cover("https://cdn.podimo.com/error.png")
+    unauth_500.close.assert_called_once()

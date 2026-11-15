@@ -86,8 +86,8 @@ class AudiobookMetadata:
     def add_genres(self, genres: Sequence[str]):
         self.genres.extend(genres)
 
-    def all_properties(self, allow_duplicate_keys = False) -> List[Tuple[str, Any]]:
-        result: List[Tuple[str, str]] = []
+    def all_properties(self, allow_duplicate_keys: Optional[bool] = False) -> List[Tuple[str, Any]]:
+        result: List[Tuple[str, Any]] = []
         add = add_if_value_exists(self, result)
         add("title")
         add("scrape_url")
@@ -99,11 +99,11 @@ class AudiobookMetadata:
         add("publisher")
         add("release_date")
         add("source")
-        if allow_duplicate_keys == None: # return original lists
+        if allow_duplicate_keys is None: # return original lists
             add("authors")
             add("narrators")
             add("genres")
-        elif allow_duplicate_keys == True: # return lists as multiple keys
+        elif allow_duplicate_keys is True: # return lists as multiple keys
             for author in self.authors:
                 result.append(("author", author))
             for narrator in self.narrators:
@@ -116,8 +116,8 @@ class AudiobookMetadata:
             result.append(("genre", self.genre))
         return result
 
-    def all_properties_dict(self) -> Dict[str, str]:
-        result = {}
+    def all_properties_dict(self) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
         for (key, value) in self.all_properties(allow_duplicate_keys=False):
             result[key] = value
         return result
@@ -204,7 +204,7 @@ class AudiobookMetadata:
         return json.dumps(self.as_dict(chapters=chapters), cls=AudiobookMetadataJSONEncoder, ensure_ascii=False)
 
 
-def add_if_value_exists(metadata: AudiobookMetadata, l: List[Tuple[str, str]]):
+def add_if_value_exists(metadata: AudiobookMetadata, l: List[Tuple[str, Any]]):
     def add(key: str):
         value = getattr(metadata, key, None)
         if value:

@@ -5,6 +5,7 @@ import pytest
 import requests
 
 from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
 
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, DownloadOptions
 from audiobookdl.exceptions import DownloadCancelled, DownloadError
@@ -517,8 +518,8 @@ def test_download_file_allows_content_encoding_compressed_length_mismatch(tmp_pa
 def test_download_file_encrypted_resume_preserves_ciphertext_across_decrypt_failure(tmp_path):
     key = b"0123456789abcdef"
     iv = b"fedcba9876543210"
-    plaintext = b"0123456789abcdef" * 4
-    ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(plaintext)
+    plaintext = b"0123456789abcdef" * 4 + b"xyz"
+    ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(pad(plaintext, AES.block_size))
     enc = AESEncryption(key=key, iv=iv)
 
     output_dir = str(tmp_path / "enc_book")
@@ -861,13 +862,12 @@ def test_write_json_metadata_uses_utf8_and_preserves_unicode(tmp_path):
 
 
 def test_download_file_streams_inline_aes_cbc_without_resume(tmp_path):
-    from Crypto.Cipher import AES
     from audiobookdl.utils.audiobook import AESEncryption
 
     key = b"0123456789abcdef"
     iv = b"fedcba9876543210"
-    plaintext = b"0123456789abcdef" * 100
-    ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(plaintext)
+    plaintext = b"0123456789abcdef" * 100 + b"tail-bytes"
+    ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(pad(plaintext, AES.block_size))
     # Split ciphertext across odd chunk boundaries (not aligned to 16-byte AES blocks)
     chunks = [ciphertext[i : i + 17] for i in range(0, len(ciphertext), 17)]
 

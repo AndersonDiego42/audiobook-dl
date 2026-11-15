@@ -557,3 +557,51 @@ def test_sidecars_opf_cue_and_enriched_as_json(tmp_path):
     assert 'FILE "Book.mp3" MP3' in cue_text
     assert "TRACK 02 AUDIO" in cue_text
     assert "INDEX 01 01:05:30" in cue_text
+
+
+def test_id3_metadata_persists_source_and_isbn_txxx_frames(tmp_path):
+    mp3_path = tmp_path / "tagged.mp3"
+    _create_silent_audio(mp3_path, ["-c:a", "libmp3lame"])
+
+    metadata = AudiobookMetadata(
+        title="Tagged Book",
+        authors=["Author A"],
+        isbn="9781234567890",
+        source="storytel",
+    )
+    id3.add_id3_metadata(str(mp3_path), metadata)
+
+    tags = ID3(str(mp3_path))
+    assert list(tags["TXXX:ISBN"].text) == ["9781234567890"]
+    assert list(tags["TXXX:Source"].text) == ["storytel"]
+
+
+def test_audiobook_metadata_all_properties_and_dict_value_types():
+    lang = pycountry.languages.get(alpha_2="en")
+    meta = AudiobookMetadata(
+        title="Dune",
+        authors=["Frank Herbert", "Co-Author"],
+        narrators=["Scott Brick"],
+        genres=["Sci-Fi"],
+        series="Dune Chronicles",
+        series_order=1,
+        language=lang,
+        release_date=date(1965, 8, 1),
+        source="storytel",
+    )
+
+    props_dict = meta.all_properties_dict()
+    assert props_dict["series_order"] == 1
+    assert isinstance(props_dict["series_order"], int)
+    assert props_dict["release_date"] == date(1965, 8, 1)
+    assert isinstance(props_dict["language"], pycountry.db.Data)
+    assert props_dict["source"] == "storytel"
+    assert props_dict["author"] == "Frank Herbert; Co-Author"
+
+    grouped = dict(meta.all_properties(allow_duplicate_keys=None))
+    assert grouped["authors"] == ["Frank Herbert", "Co-Author"]
+    assert grouped["narrators"] == ["Scott Brick"]
+    assert grouped["genres"] == ["Sci-Fi"]
+
+    multi = meta.all_properties(allow_duplicate_keys=True)
+    assert [v for k, v in multi if k == "author"] == ["Frank Herbert", "Co-Author"]

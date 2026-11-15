@@ -1,8 +1,14 @@
 from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
 import os
 import pytest
 
-from audiobookdl.output.encryption import DECRYPT_CHUNK_SIZE, decrypt_file, decrypt_file_aes
+from audiobookdl.output.encryption import (
+    AESStreamDecryptor,
+    DECRYPT_CHUNK_SIZE,
+    decrypt_file,
+    decrypt_file_aes,
+)
 from audiobookdl.utils.audiobook import AESEncryption
 
 
@@ -12,9 +18,9 @@ def test_decrypt_file_streams_across_multiple_64k_chunks(tmp_path):
 
     key = b"0123456789abcdef"
     iv = b"fedcba9876543210"
-    # Span multiple 64 KiB chunks plus a non-aligned-to-64K trailing AES block
-    plaintext = os.urandom(DECRYPT_CHUNK_SIZE * 2 + 16 * 5)
-    ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(plaintext)
+    # Span multiple 64 KiB chunks plus a non-block-aligned payload padded with PKCS7
+    plaintext = os.urandom(DECRYPT_CHUNK_SIZE * 2 + 73)
+    ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(pad(plaintext, AES.block_size))
 
     target = tmp_path / "segment.ts.tmp"
     target.write_bytes(ciphertext)
@@ -56,7 +62,7 @@ def test_decrypt_file_with_output_path_preserves_source_ciphertext(tmp_path):
     key = b"0123456789abcdef"
     iv = b"fedcba9876543210"
     plaintext = os.urandom(16 * 10)
-    ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(plaintext)
+    ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(pad(plaintext, AES.block_size))
 
     src_tmp = tmp_path / "segment.ts.tmp"
     dst_file = tmp_path / "segment.ts"
@@ -67,3 +73,55 @@ def test_decrypt_file_with_output_path_preserves_source_ciphertext(tmp_path):
     assert dst_file.read_bytes() == plaintext
     assert src_tmp.read_bytes() == ciphertext
     assert not (tmp_path / "segment.ts.dec.tmp").exists()
+
+
+@pytest.mark.parametrize("payload_len", [0, 1, 15, 16, 17, 32, 47])
+@pytest.mark.parametrize("chunk_size", [1, 7, 16, 17, 64])
+def test_aes_stream_decryptor_unpads_pkcs7_across_arbitrary_chunks(payload_len, chunk_size):
+    key = b"0123456789abcdef"
+    iv = b"fedcba9876543210"
+    plaintext = os.urandom(payload_len)
+    ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(pad(plaintext, AES.block_size))
+
+    decryptor = AESStreamDecryptor(key, iv)
+    out = bytearray()
+    for idx in range(0, len(ciphertext), chunk_size):
+        out.extend(decryptor.decrypt_chunk(ciphertext[idx : idx + chunk_size]))
+    out.extend(decryptor.finalize())
+
+    assert bytes(out) == plaintext
+
+
+def test_aes_stream_decryptor_rejects_unaligned_tail_and_bad_padding():
+    key = b"0123456789abcdef"
+    iv = b"fedcba9876543210"
+
+    # Unaligned stream (< 1 block and > 1 block) raises explicit ValueError in finalize()
+    for bad_len in (5, 21):
+        decryptor = AESStreamDecryptor(key, iv)
+        decryptor.decrypt_chunk(b"x" * bad_len)
+        with pytest.raises(ValueError, match="multiple of 16 bytes"):
+            decryptor.finalize()
+        assert decryptor.finalize() == b""
+
+    # Valid block alignment, invalid PKCS7 padding raises ValueError
+    unpadded = b"0123456789abcdef" * 2
+    bad_ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(unpadded)
+    decryptor = AESStreamDecryptor(key, iv)
+    decryptor.decrypt_chunk(bad_ciphertext)
+    with pytest.raises(ValueError):
+        decryptor.finalize()
+
+
+def test_decrypt_file_aes_preserves_original_on_invalid_pkcs7_padding(tmp_path):
+    key = b"0123456789abcdef"
+    iv = b"fedcba9876543210"
+    bad_ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(b"0123456789abcdef")
+    target = tmp_path / "bad_padding.mp3"
+    target.write_bytes(bad_ciphertext)
+
+    with pytest.raises(ValueError):
+        decrypt_file_aes(str(target), key, iv)
+
+    assert target.read_bytes() == bad_ciphertext
+    assert not (tmp_path / "bad_padding.mp3.dec.tmp").exists()

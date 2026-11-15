@@ -15,7 +15,8 @@ from typing import Sequence
 EasyID3.RegisterTextKey("comment", "COMM")
 EasyID3.RegisterTextKey("year", "TYER")
 EasyID3.RegisterTextKey("originalreleaseyear", "TORY")
-EasyID3.RegisterTXXXKey("isbn", "ISBN")
+for _easy_key, _txxx_desc in (("isbn", "ISBN"), ("source", "Source")):
+    EasyID3.RegisterTXXXKey(_easy_key, _txxx_desc)
 
 def commercialurl_get(id3, key):
     urls = [frame.url for frame in id3.getall("WCOM")]

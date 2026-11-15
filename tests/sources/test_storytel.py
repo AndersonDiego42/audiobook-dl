@@ -510,6 +510,7 @@ def test_download_lists_api_paginates_filters_and_persists_json(tmp_path):
     src_audio = _make_source(tmp_path, skip_downloaded=True, media_type="audiobook")
     src_audio._session.get = MagicMock(side_effect=fake_get_audio)
     series_audio = src_audio.download("https://www.storytel.com/se/sv/series/cool-series-42")
+    assert isinstance(series_audio, Series)
     assert [b.id for b in series_audio.books if isinstance(b, BookId)] == ["201", "205"]
     assert captured_params_audio[0]["includeFormats"] == "abook"
     assert Path(src_audio._get_lists_path("ser-42", "se", "abook")).exists()
@@ -541,6 +542,7 @@ def test_download_books_from_website_filters_by_headphone_icon_and_skip(tmp_path
     src_audio = _make_source(tmp_path, skip_downloaded=True, media_type="audiobook")
     src_audio._session.get = MagicMock(return_value=_mock_resp(200, content=html))
     series_audio = src_audio.download("https://www.storytel.com/se/sv/categories/sci-fi-10")
+    assert isinstance(series_audio, Series)
     assert [b.id for b in series_audio.books if isinstance(b, BookId)] == ["301"]
 
 
@@ -577,6 +579,7 @@ def test_storytel_skips_playback_metadata_and_streams_on_print_output(tmp_path):
         )
     )
     audiobook = src.download_book_from_book_id("999")
+    assert isinstance(audiobook, Audiobook)
     assert audiobook.files == []
     assert audiobook.cover is None
     assert audiobook.chapters == []
@@ -695,10 +698,13 @@ def test_dual_format_ebook_and_both_modes_with_skip_and_cache(tmp_path):
     both_src._session.get = MagicMock(side_effect=_make_get(details))
     result = both_src.download_book_from_book_id("888")
     assert isinstance(result, Series)
-    assert [b.files[0].ext for b in result.books] == ["mp3", "epub"]
+    assert len(result.books) == 2
+    b0, b1 = result.books
+    assert isinstance(b0, Audiobook) and isinstance(b1, Audiobook)
+    assert [b0.files[0].ext, b1.files[0].ext] == ["mp3", "epub"]
 
-    both_src.on_download_complete(result.books[0])
-    both_src.on_download_complete(result.books[1])
+    both_src.on_download_complete(b0)
+    both_src.on_download_complete(b1)
     assert Path(both_src._get_book_path("888", "abook")).exists()
     assert Path(both_src._get_book_path("888", "ebook")).exists()
 
@@ -744,7 +750,19 @@ def test_bookshelf_both_mode_skips_only_when_both_formats_exist(tmp_path):
 
     src._session.post = MagicMock(return_value=_mock_resp(200, json_data=shelf_payload))
     series = src.download_bookshelf_wtr()
-    assert [b.id for b in series.books] == ["10"]
+    assert len(series.books) == 1
+    assert [b.id for b in series.books if isinstance(b, BookId)] == ["10"]
+
+
+def test_storytel_download_counter_is_instance_attribute(tmp_path):
+    assert not hasattr(StorytelSource, "_download_counter")
+    src1 = _make_source(tmp_path)
+    src2 = _make_source(tmp_path)
+    assert src1._download_counter == 0
+    assert src2._download_counter == 0
+    src1._download_counter += 1
+    assert src1._download_counter == 1
+    assert src2._download_counter == 0
 
 
 

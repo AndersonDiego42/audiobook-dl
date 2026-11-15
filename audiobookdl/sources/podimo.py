@@ -8,7 +8,7 @@ from audiobookdl.utils.http import DEFAULT_HTTP_TIMEOUT
 
 import re
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 from urllib3.util import parse_url
 
 class PodimoSource(Source[dict]):
@@ -164,7 +164,7 @@ class PodimoSource(Source[dict]):
             session = self.create_unauthenticated_session(),
             files = self.get_podcast_file(episode_id, podcast_id),
             metadata = self.format_podcast_metadata(episode_info),
-            cover = self.download_cover(episode_info["imageUrl"])
+            cover = self.download_cover(episode_info.get("imageUrl"))
         )
 
 
@@ -186,8 +186,7 @@ class PodimoSource(Source[dict]):
         )
         file_url = data["data"]["podcastEpisodeAudioById"]["url"]
         if "m3u8" in file_url:
-            audio_url = file_url.replace("main.m3u8", "stream_audio_high/stream.m3u8")
-            return self.get_stream_files(audio_url)
+            return self.get_stream_files(file_url)
         else:
             return [ AudiobookFile( url = file_url, ext = "mp3" ) ]
 
@@ -222,7 +221,7 @@ class PodimoSource(Source[dict]):
             session = self.create_unauthenticated_session(),
             files = self.get_audiobook_files(audiobook_id),
             metadata = self.format_audiobook_metadata(book_info),
-            cover = self.download_cover(book_info["coverImage"]["url"])
+            cover = self.download_cover((book_info.get("coverImage") or {}).get("url"))
         )
 
 
@@ -259,10 +258,17 @@ class PodimoSource(Source[dict]):
         return metadata
 
 
-    def download_cover(self, cover_url: str) -> Cover:
+    def download_cover(self, cover_url: Optional[str]) -> Optional[Cover]:
+        if not cover_url:
+            return None
         # Will sometimes get a 'Authentication required' message if logged in
         session = self.create_unauthenticated_session()
-        response = session.get(cover_url, timeout=DEFAULT_HTTP_TIMEOUT)
-        if response.status_code != 200:
-            raise RequestError
-        return Cover(image = response.content, extension = "png")
+        try:
+            response = session.get(cover_url, timeout=DEFAULT_HTTP_TIMEOUT)
+            if response.status_code == 404:
+                return None
+            if response.status_code != 200:
+                raise RequestError
+            return Cover(image = response.content, extension = "png")
+        finally:
+            session.close()

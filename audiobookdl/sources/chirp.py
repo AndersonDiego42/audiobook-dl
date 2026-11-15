@@ -5,6 +5,7 @@ from audiobookdl.utils.concurrency import run_cancellable_pool
 from typing import List, Optional, Tuple
 import base64
 from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad
 
 LOGIN_URL = "https://www.chirpbooks.com/users/sign_in"
 
@@ -67,7 +68,7 @@ class ChirpSource(Source):
         webplayermediaurl = url_resp["data"]["audiobook"]["track"]["webPlayerMediaUrl"]
         ciphertext = base64.b64decode(webplayermediaurl)
         cipher = AES.new(key, AES.MODE_CBC, iv)
-        return cipher.decrypt(ciphertext).decode("utf8")[:-1]
+        return unpad(cipher.decrypt(ciphertext), AES.block_size).decode("utf-8")
 
 
     def get_files(self, book_id: int, key: bytes, iv: bytes, tracks) -> List[AudiobookFile]:

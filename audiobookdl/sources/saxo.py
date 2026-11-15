@@ -1,6 +1,6 @@
 from .source import Source
 from audiobookdl import logging, AudiobookFile, AudiobookMetadata, Cover, Audiobook
-from audiobookdl.exceptions import NoSourceFound
+from audiobookdl.exceptions import BookNotFound, NoSourceFound
 from audiobookdl.utils.audiobook import AESEncryption
 from audiobookdl.utils.concurrency import run_cancellable_pool
 import re
@@ -67,13 +67,15 @@ class SaxoSource(Source):
                 "App-Version": self._APP_VERSION,
             }
         )
+        items = resp.get("items") or []
+        if not items:
+            raise BookNotFound
         # Selects the first search result. There should only be one
-        book_id = resp["items"][0]["bookId"]
-        return book_id
+        return items[0]["bookId"]
 
     def _get_book_metadata(self, book_id: str) -> dict:
         """Downloads metadata about book"""
-        return self.post_json(
+        resp = self.post_json(
             f"https://api-read.saxo.com/api/v1/book/data/user/{self.user_id}/",
             headers = {
                 "Appauthorization": f"bearer {self.bearer_token}",
@@ -81,7 +83,11 @@ class SaxoSource(Source):
                 "App-Version": self._APP_VERSION,
             },
             json = [ book_id ]
-        )["items"][0]
+        )
+        items = resp.get("items") or []
+        if not items:
+            raise BookNotFound
+        return items[0]
 
 
     def get_files(self, book_info) -> List[AudiobookFile]:

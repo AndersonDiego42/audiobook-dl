@@ -112,11 +112,11 @@ class StorytelSource(Source):
     _authentication_methods = [
         "login",
     ]
-    _download_counter = 0
     create_storage_dir = True
 
     def __init__(self, options: DownloadOptions) -> None:
         super().__init__(options)
+        self._download_counter: int = 0
         self.database_directory_books = os.path.join(self.database_directory, "books")
         self.database_directory_playback_metadata = os.path.join(
             self.database_directory, "playback-metadata"

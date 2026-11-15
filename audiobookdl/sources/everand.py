@@ -1,18 +1,16 @@
 from .source import Source
 from audiobookdl import AudiobookFile, Chapter, logging, AudiobookMetadata, Cover, Audiobook, Series, Result, BookId
-from audiobookdl.exceptions import UserNotAuthorized, RequestError, DataNotPresent
-from typing import List, Optional, Sequence
+from audiobookdl.exceptions import RequestError
+from typing import List, Optional
 
-import io
 import re
-from PIL import Image
 import json
 
 class EverandSource(Source[str]):
     match = [
-        r"https?://(www.)?(scribd|everand).com/listen/\d+",
-        r"https?://(www.)?(scribd|everand).com/audiobook/\d+/",
-        r"https?://(www.)?(scribd|everand).com/series/\d+"
+        r"https?://(www\.)?(scribd|everand)\.com/listen/\d+",
+        r"https?://(www\.)?(scribd|everand)\.com/audiobook/\d+/",
+        r"https?://(www\.)?(scribd|everand)\.com/series/\d+"
     ]
     names = [ "Everand", "Scribd" ]
 
@@ -78,6 +76,7 @@ class EverandSource(Source[str]):
             files = self.get_files(book_info),
             metadata = self.format_metadata(metadata),
             cover = self.download_cover(metadata),
+            chapters = self.get_chapters(book_info),
         )
 
 
@@ -115,11 +114,13 @@ class EverandSource(Source[str]):
         """
         book_id = book_info["share_opts"]["id"]
         jwt = book_info["jwt_token"]["token"]
-        stream_url = f"https://audio.production.scribd.com/audiobooks/{book_id}/96kbps.m3u8"
-        return self.get_stream_files(
-            stream_url,
-            headers = { "Authorization": jwt }
-        )
+        headers = { "Authorization": jwt }
+        master_url = f"https://audio.production.scribd.com/audiobooks/{book_id}/master.m3u8"
+        try:
+            return self.get_stream_files(master_url, headers=headers)
+        except RequestError:
+            fallback_url = f"https://audio.production.scribd.com/audiobooks/{book_id}/96kbps.m3u8"
+            return self.get_stream_files(fallback_url, headers=headers)
 
 
     def get_external_files(self, book_info: dict) -> List[AudiobookFile]:
@@ -169,31 +170,11 @@ class EverandSource(Source[str]):
         return url
 
 
-    def download_book_id(self, url: str) -> str:
-        """
-        Download and extract book id from listening page
-
-        :param url: Url of listening page
-        """
-        try:
-            book_id = self.find_in_page(
-                url,
-                r'(?<=(external_id":"))(scribd_)?\d+',
-                force_cookies = True
-            )
-            if book_id[:7] == "scribd_":
-                return book_id[7:]
-            return book_id
-        except DataNotPresent:
-            raise UserNotAuthorized
-
-
     def download_cover(self, metadata: dict) -> Optional[Cover]:
         """
         Download and clean cover
 
-        :param cover_url: Url of cover
-        :param original: True if the book is a Scribd Original
+        :param metadata: Metadata dictionary containing `cover_url`
         :returns: Cover of book
         """
         # Downloading image from Everand
@@ -202,13 +183,6 @@ class EverandSource(Source[str]):
         if raw_cover is None:
             return None
         return Cover(raw_cover, "jpg")
-        # # Removing padding on the top and bottom if it is a normal book
-        # im = Image.open(io.BytesIO(raw_cover))
-        # width, height = im.size
-        # cropped = im.crop((0, int((height-width)/2), width, int(width+(height-width)/2)))
-        # cover = io.BytesIO()
-        # cropped.save(cover, format="jpeg")
-        # return Cover(cover.getvalue(), "jpg")
 
 
     @staticmethod
@@ -247,9 +221,12 @@ class EverandSource(Source[str]):
     @staticmethod
     def get_chapters(book_info) -> List[Chapter]:
         chapters = []
-        if "chapters" in book_info:
+        raw_chapters = book_info.get("chapters")
+        if raw_chapters is None and isinstance(book_info.get("audiobook"), dict):
+            raw_chapters = book_info["audiobook"].get("chapters")
+        if raw_chapters:
             start_time = 0
-            for chapter in book_info["chapters"]:
+            for chapter in raw_chapters:
                 title = EverandSource.get_chapter_title(chapter)
                 chapters.append(Chapter(start_time, title))
                 start_time += chapter["duration"]

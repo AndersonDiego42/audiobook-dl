@@ -4,6 +4,7 @@ import json
 from unittest.mock import MagicMock, patch
 
 from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
 
 from audiobookdl import Audiobook, BookId, DownloadOptions, Series
 from audiobookdl.sources.audiobooksdotcom import AudiobooksdotcomSource
@@ -289,6 +290,27 @@ def test_chirp_source_decrypts_track_urls_and_parses_credits(tmp_path):
     assert book.metadata.narrators == ["Bob"]
     assert book.files[0].url == short_url
     assert book.chapters[0].title == "Ch 1"
+
+
+def test_chirp_source_unpads_multi_byte_pkcs7_track_urls(tmp_path):
+    key = b"0123456789abcdef"
+    iv = base64.b64encode(b"xxxxxxx12345")
+    src = ChirpSource(_opts(tmp_path))
+
+    for url in (
+        "https://cdn.chirp.test/t.mp3",        # pad length == 4
+        "https://cdn.chirp.test/track01.mp3",  # len == 32, pad length == 16
+    ):
+        encrypted_b64 = base64.b64encode(
+            AES.new(key, AES.MODE_CBC, iv).encrypt(pad(url.encode("utf-8"), AES.block_size))
+        ).decode("ascii")
+        src._session.post = MagicMock(
+            return_value=_json_resp(
+                {"data": {"audiobook": {"track": {"webPlayerMediaUrl": encrypted_b64}}}}
+            )
+        )
+        decrypted = src.get_audio_url(77, key, iv, {"chapterNumber": 1, "partNumber": 1})
+        assert decrypted == url
 
 
 def test_saxo_source_login_search_and_download(tmp_path):
@@ -692,3 +714,101 @@ def test_librivox_missing_chapters_and_catalog_list_library_edge_cases(tmp_path)
     assert len(items) == 1
     assert items[0].title == "Valid Nextory"
     assert items[0].url == "https://www.nextory.com/book/10"
+
+
+def test_everand_wires_chapters_selects_highest_bandwidth_and_escapes_url_regex(tmp_path):
+    import pytest
+    from audiobookdl.exceptions import NoSourceFound
+    from audiobookdl.sources import find_compatible_source
+
+    assert not hasattr(EverandSource, "download_book_id")
+    assert find_compatible_source("https://www.everand.com/listen/12345") is EverandSource
+    with pytest.raises(NoSourceFound):
+        find_compatible_source("https://wwwXeverandXcom/listen/12345")
+
+    show_payload = {
+        "doc": {
+            "title": "Internal Book",
+            "author": {"name": "Author A"},
+            "narrators": [{"name": "Narrator N"}],
+            "cover_url": "https://covers.everand.com/internal.jpg",
+        },
+        "share_opts": {"id": "777"},
+        "jwt_token": {"token": "jwt-token"},
+        "chapters": [
+            {"chapter_number": 0, "duration": 5000},
+            {"chapter_number": 1, "duration": 10000},
+        ],
+    }
+    html = f"<script>ReactDOM.render(Scribd.Audiobooks.Show, {json.dumps(show_payload)});</script>".encode("utf-8")
+    master_m3u8 = (
+        b"#EXTM3U\n"
+        b"#EXT-X-STREAM-INF:BANDWIDTH=64000\n"
+        b"64kbps.m3u8\n"
+        b"#EXT-X-STREAM-INF:BANDWIDTH=192000\n"
+        b"192kbps.m3u8\n"
+    )
+    media_m3u8 = b"#EXTM3U\n#EXTINF:10.0,\nseg0.ts\n#EXT-X-ENDLIST\n"
+
+    src = EverandSource(_opts(tmp_path))
+
+    def fake_get(url, **_kwargs):
+        if "everand.com/listen/777" in url:
+            return MagicMock(status_code=200, content=html)
+        if url.endswith("/777/master.m3u8"):
+            return MagicMock(status_code=200, content=master_m3u8)
+        if url.endswith("/777/192kbps.m3u8"):
+            return MagicMock(status_code=200, content=media_m3u8)
+        if url == "https://covers.everand.com/internal.jpg":
+            return MagicMock(status_code=200, content=b"cover-bytes")
+        raise AssertionError(f"Unexpected GET {url}")
+
+    src._session.get = MagicMock(side_effect=fake_get)
+    src._session.post = MagicMock(return_value=_json_resp({"csrf_token": "tok"}))
+
+    book = src.download("https://www.everand.com/listen/777")
+    assert isinstance(book, Audiobook)
+    assert [f.url for f in book.files] == [
+        "https://audio.production.scribd.com/audiobooks/777/seg0.ts"
+    ]
+    assert [(c.start, c.title) for c in book.chapters] == [
+        (0, "Introduction"),
+        (5000, "Chapter 1"),
+    ]
+
+
+def test_yourcloudlibrary_login_raises_on_failed_auth_and_succeeds_on_valid_response(tmp_path):
+    import pytest
+    from audiobookdl.exceptions import UserNotAuthorized
+
+    src = YourCloudLibrarySource(_opts(tmp_path))
+    src._session.get = MagicMock(return_value=MagicMock(status_code=200, content=b"ok"))
+
+    for bad_resp in (
+        MagicMock(status_code=401, content=b""),
+        MagicMock(status_code=403, content=b""),
+        MagicMock(status_code=400, content=b'{"error": "Invalid"}'),
+        MagicMock(status_code=200, content=b'{"error": "Invalid barcode"}'),
+        MagicMock(status_code=200, content=b'{"success": false}'),
+        MagicMock(status_code=200, content=b'{"patron": null}'),
+    ):
+        src._session.post = MagicMock(return_value=bad_resp)
+        with pytest.raises(UserNotAuthorized):
+            src.login("https://ebook.yourcloudlibrary.com/library/lib1/detail/bk1", username="u", password="p", library="lib1")
+
+    src._session.post = MagicMock(return_value=MagicMock(status_code=200, content=b'{"ok": true, "error": null}'))
+    src.login("https://ebook.yourcloudlibrary.com/library/lib1/detail/bk1", username="u", password="p", library="lib1")
+    assert src.authenticated is True
+
+
+def test_saxo_empty_search_results_raises_book_not_found(tmp_path):
+    import pytest
+    from audiobookdl.exceptions import BookNotFound
+
+    src = SaxoSource(_opts(tmp_path))
+    src._session.post = MagicMock(return_value=_json_resp({"access_token": "tok", "id": "u1"}))
+    src._session.get = MagicMock(return_value=_json_resp({"items": []}))
+    src.login("https://www.saxo.com/dk/book_9781234567890", username="u", password="p")
+
+    with pytest.raises(BookNotFound):
+        src.download("https://www.saxo.com/dk/book_9781234567890")

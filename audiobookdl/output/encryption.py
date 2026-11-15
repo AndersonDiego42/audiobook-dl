@@ -1,35 +1,44 @@
 import os
 from typing import Optional
 from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad
 from audiobookdl.utils.audiobook import AudiobookFileEncryption, AESEncryption
 
 DECRYPT_CHUNK_SIZE = 64 * 1024  # 64 KiB, an exact multiple of AES's 16-byte block size
 
 
 class AESStreamDecryptor:
-    """Incrementally decrypts AES-CBC byte chunks of arbitrary boundaries."""
+    """Incrementally decrypts PKCS7-padded AES-CBC byte chunks of arbitrary boundaries."""
 
     def __init__(self, key: bytes, iv: bytes) -> None:
         self._cipher = AES.new(key, AES.MODE_CBC, iv)
         self._buffer = bytearray()
 
     def decrypt_chunk(self, chunk: bytes) -> bytes:
-        """Buffer `chunk` and decrypt any complete 16-byte AES blocks."""
-        self._buffer.extend(chunk)
-        usable = (len(self._buffer) // AES.block_size) * AES.block_size
-        if usable <= 0:
+        """Buffer `chunk` and decrypt complete blocks while retaining the final block for unpadding."""
+        if not chunk:
             return b""
+        self._buffer.extend(chunk)
+        # Retain at least 1 byte (up to one full block) so finalize() can validate and strip PKCS7 padding.
+        if len(self._buffer) <= AES.block_size:
+            return b""
+        usable = ((len(self._buffer) - 1) // AES.block_size) * AES.block_size
         out = self._cipher.decrypt(bytes(self._buffer[:usable]))
         del self._buffer[:usable]
         return out
 
     def finalize(self) -> bytes:
-        """Decrypt any trailing bytes at end-of-stream."""
+        """Decrypt the final buffered block(s) and strip PKCS7 padding."""
         if not self._buffer:
             return b""
         tail = bytes(self._buffer)
         self._buffer.clear()
-        return self._cipher.decrypt(tail)
+        if len(tail) % AES.block_size != 0:
+            raise ValueError(
+                f"AES-CBC stream length must be a multiple of {AES.block_size} bytes "
+                f"(got {len(tail)} trailing bytes)"
+            )
+        return unpad(self._cipher.decrypt(tail), AES.block_size)
 
 
 def decrypt_file(
@@ -55,17 +64,22 @@ def decrypt_file_aes(
     iv: bytes,
     output_path: Optional[str] = None,
 ) -> None:
-    """Stream-decrypt an AES-CBC encrypted file via a sibling temp file and replace atomically."""
+    """Stream-decrypt a PKCS7-padded AES-CBC file via a sibling temp file and replace atomically."""
     target = output_path or path
     tmp_path = f"{target}.dec.tmp"
-    cipher = AES.new(key, AES.MODE_CBC, iv)
+    decryptor = AESStreamDecryptor(key, iv)
     try:
         with open(path, "rb") as src, open(tmp_path, "wb") as dst:
             while True:
                 chunk = src.read(DECRYPT_CHUNK_SIZE)
                 if not chunk:
                     break
-                dst.write(cipher.decrypt(chunk))
+                out = decryptor.decrypt_chunk(chunk)
+                if out:
+                    dst.write(out)
+            tail = decryptor.finalize()
+            if tail:
+                dst.write(tail)
         os.replace(tmp_path, target)
     except BaseException:
         if os.path.exists(tmp_path):

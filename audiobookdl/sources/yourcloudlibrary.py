@@ -2,8 +2,7 @@ from .source import Source
 from audiobookdl import AudiobookFile, logging, AudiobookMetadata, Cover, Audiobook, Chapter
 from audiobookdl.exceptions import UserNotAuthorized, RequestError
 
-import requests.utils
-import base64
+import json
 from typing import List
 import re
 
@@ -136,9 +135,21 @@ class YourCloudLibrarySource(Source):
         )
 
 
+    @staticmethod
+    def _is_failed_login_payload(payload: dict) -> bool:
+        if any(payload.get(k) for k in ("error", "errors", "loginError", "errorMessage")):
+            return True
+        if any(payload.get(k) is False for k in ("ok", "success", "authenticated", "loggedIn", "isLoggedIn")):
+            return True
+        for key in ("user", "patron"):
+            if key in payload and payload[key] is None:
+                return True
+        return False
+
     def _login(self, url: str, username: str, password: str, library: str): # type: ignore
         self.get(f"https://ebook.yourcloudlibrary.com/library/{library}/featured")
-        resp = self.post(
+        resp = self.request(
+            "POST",
             "https://ebook.yourcloudlibrary.com/?_data=root",
             data = {
                 "action": "login",
@@ -147,3 +158,15 @@ class YourCloudLibrarySource(Source):
                 "library": library
             }
         )
+        if resp.status_code in (400, 401, 403, 422):
+            raise UserNotAuthorized
+        if resp.status_code != 200:
+            raise RequestError
+        if not resp.content:
+            return
+        try:
+            payload = json.loads(resp.content.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return
+        if isinstance(payload, dict) and self._is_failed_login_payload(payload):
+            raise UserNotAuthorized
