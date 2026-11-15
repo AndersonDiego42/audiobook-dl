@@ -12,6 +12,7 @@ from audiobookdl.output.download import (
     DOWNLOAD_ATTEMPTS,
     DOWNLOAD_CHUNK_SIZE,
     MAX_DOWNLOAD_WORKERS,
+    download,
     download_audiobook,
     download_file,
     download_files,
@@ -560,3 +561,306 @@ def test_download_file_encrypted_resume_preserves_ciphertext_across_decrypt_fail
     assert out_path == str(final_file)
     assert final_file.read_bytes() == plaintext
     assert not tmp_file.exists()
+
+
+def test_download_converts_keyboard_interrupt_to_download_cancelled(tmp_path):
+    book = _make_audiobook(MagicMock())
+    options = DownloadOptions(output_template=str(tmp_path / "{title}"))
+
+    with patch("audiobookdl.output.download.download_audiobook", side_effect=KeyboardInterrupt):
+        with pytest.raises(DownloadCancelled):
+            download(book, options)
+
+
+def test_single_file_conversion_prompts_once_on_target_even_when_intermediate_exists(tmp_path):
+    class RecordingInteraction:
+        def __init__(self, confirm_value: bool) -> None:
+            self.confirm_value = confirm_value
+            self.confirms: list[str] = []
+
+        def ask_input(self, prompt: str, hidden: bool = False) -> str:
+            return ""
+
+        def confirm(self, message: str) -> bool:
+            self.confirms.append(message)
+            return self.confirm_value
+
+    output_dir = str(tmp_path / "Converted Book")
+    final_m4b = tmp_path / "Converted Book.m4b"
+    intermediate_mp3 = tmp_path / "Converted Book.mp3"
+    final_m4b.write_bytes(b"old-m4b")
+    intermediate_mp3.write_bytes(b"stale-mp3")
+
+    options = DownloadOptions(
+        skip_downloaded=False,
+        resume=False,
+        combine=False,
+        output_format="m4b",
+        write_json_metadata=False,
+        no_chapters=True,
+    )
+
+    # 1. Declining prompts once for the final .m4b target and makes no HTTP calls
+    session_decline = MagicMock()
+    decline = RecordingInteraction(confirm_value=False)
+    with pytest.raises(DownloadCancelled):
+        download_audiobook(_make_audiobook(session_decline), output_dir, options, interaction=decline)
+    assert len(decline.confirms) == 1
+    assert "Converted Book.m4b" in decline.confirms[0]
+    assert final_m4b.read_bytes() == b"old-m4b"
+    session_decline.get.assert_not_called()
+
+    # 2. Accepting prompts ONLY once (never a second prompt for intermediate .mp3)
+    session_accept = MagicMock()
+    session_accept.get.return_value = _mock_response(
+        headers={"Content-Length": "7"},
+        chunks=[b"new-mp3"],
+    )
+    accept = RecordingInteraction(confirm_value=True)
+
+    def fake_convert(filenames, target_format, cancel_event=None, audio_bitrate=None):
+        src = filenames[0]
+        dst = f"{src.rsplit('.', 1)[0]}.{target_format}"
+        with open(dst, "wb") as f:
+            f.write(b"new-m4b")
+        return [dst]
+
+    with (
+        patch("audiobookdl.output.download.output.convert_output", side_effect=fake_convert),
+        patch("audiobookdl.output.download.metadata.add_metadata"),
+    ):
+        download_audiobook(_make_audiobook(session_accept), output_dir, options, interaction=accept)
+
+    assert len(accept.confirms) == 1
+    assert "Converted Book.m4b" in accept.confirms[0]
+    assert final_m4b.read_bytes() == b"new-m4b"
+
+    # 3. When only intermediate .mp3 exists and final .m4b does not, no overwrite prompt is shown
+    final_m4b.unlink()
+    intermediate_mp3.write_bytes(b"stale-mp3")
+    session_no_target = MagicMock()
+    session_no_target.get.return_value = _mock_response(
+        headers={"Content-Length": "7"},
+        chunks=[b"new-mp3"],
+    )
+    only_intermediate = RecordingInteraction(confirm_value=False)
+    with (
+        patch("audiobookdl.output.download.output.convert_output", side_effect=fake_convert),
+        patch("audiobookdl.output.download.metadata.add_metadata"),
+    ):
+        download_audiobook(
+            _make_audiobook(session_no_target),
+            output_dir,
+            options,
+            interaction=only_intermediate,
+        )
+    assert only_intermediate.confirms == []
+    assert final_m4b.read_bytes() == b"new-m4b"
+
+
+def test_single_file_conversion_resume_honors_existing_target_and_intermediate(tmp_path):
+    class FailingInteraction:
+        def ask_input(self, prompt: str, hidden: bool = False) -> str:
+            raise AssertionError("Should not prompt on resume")
+
+        def confirm(self, message: str) -> bool:
+            raise AssertionError(f"Should not prompt on resume: {message}")
+
+    output_dir = str(tmp_path / "Resumed Convert")
+    final_m4b = tmp_path / "Resumed Convert.m4b"
+    intermediate_mp3 = tmp_path / "Resumed Convert.mp3"
+
+    options_resume = DownloadOptions(
+        skip_downloaded=False,
+        resume=True,
+        combine=False,
+        output_format="m4b",
+        write_json_metadata=False,
+        no_chapters=True,
+    )
+
+    # 1. Final .m4b already exists (non-empty) and intermediate .mp3 was deleted after conversion:
+    #    --resume without --skip-downloaded must NOT prompt, re-download, or reconvert.
+    final_m4b.write_bytes(b"existing-m4b")
+    session_done = MagicMock()
+    with (
+        patch("audiobookdl.output.download.output.convert_output") as mock_convert,
+        patch("audiobookdl.output.download.metadata.add_metadata") as mock_meta,
+    ):
+        download_audiobook(
+            _make_audiobook(session_done),
+            output_dir,
+            options_resume,
+            interaction=FailingInteraction(),
+        )
+    session_done.get.assert_not_called()
+    mock_convert.assert_not_called()
+    mock_meta.assert_not_called()
+    assert final_m4b.read_bytes() == b"existing-m4b"
+
+    # 2. Final .m4b does not exist, intermediate .mp3 already finished downloading:
+    #    --resume skips HTTP download and converts existing .mp3 -> .m4b without prompts.
+    final_m4b.unlink()
+    intermediate_mp3.write_bytes(b"cached-mp3")
+    session_cached_mp3 = MagicMock()
+
+    def fake_convert(filenames, target_format, cancel_event=None, audio_bitrate=None):
+        assert filenames == [str(intermediate_mp3)]
+        dst = str(final_m4b)
+        final_m4b.write_bytes(b"converted-from-cached")
+        intermediate_mp3.unlink()
+        return [dst]
+
+    with (
+        patch("audiobookdl.output.download.output.convert_output", side_effect=fake_convert) as mock_convert,
+        patch("audiobookdl.output.download.metadata.add_metadata") as mock_meta,
+    ):
+        download_audiobook(
+            _make_audiobook(session_cached_mp3),
+            output_dir,
+            options_resume,
+            interaction=FailingInteraction(),
+        )
+    session_cached_mp3.get.assert_not_called()
+    mock_convert.assert_called_once()
+    mock_meta.assert_called_once()
+    assert final_m4b.read_bytes() == b"converted-from-cached"
+    assert not intermediate_mp3.exists()
+
+    # 3. Empty (0-byte) final .m4b is NOT treated as complete under --resume
+    final_m4b.write_bytes(b"")
+    session_empty = MagicMock()
+    session_empty.get.return_value = _mock_response(
+        headers={"Content-Length": "9"},
+        chunks=[b"fresh-mp3"],
+    )
+
+    def fake_convert_fresh(filenames, target_format, cancel_event=None, audio_bitrate=None):
+        final_m4b.write_bytes(b"rebuilt-m4b")
+        return [str(final_m4b)]
+
+    with (
+        patch("audiobookdl.output.download.output.convert_output", side_effect=fake_convert_fresh),
+        patch("audiobookdl.output.download.metadata.add_metadata"),
+    ):
+        download_audiobook(
+            _make_audiobook(session_empty),
+            output_dir,
+            options_resume,
+            interaction=FailingInteraction(),
+        )
+    session_empty.get.assert_called_once()
+    assert final_m4b.read_bytes() == b"rebuilt-m4b"
+
+
+def test_combined_multifile_overwrite_prompts_once_and_resume_skips_completed(tmp_path):
+    class RecordingInteraction:
+        def __init__(self, confirm_value: bool) -> None:
+            self.confirm_value = confirm_value
+            self.confirms: list[str] = []
+
+        def ask_input(self, prompt: str, hidden: bool = False) -> str:
+            return ""
+
+        def confirm(self, message: str) -> bool:
+            self.confirms.append(message)
+            return self.confirm_value
+
+    book_dir = tmp_path / "Combined Book"
+    book_dir.mkdir()
+    (book_dir / "Part 0.mp3").write_bytes(b"old0")
+    final_m4b = tmp_path / "Combined Book.m4b"
+    final_m4b.write_bytes(b"old-combined")
+
+    files = [
+        AudiobookFile(url="https://example.com/0.mp3", ext="mp3"),
+        AudiobookFile(url="https://example.com/1.mp3", ext="mp3"),
+    ]
+
+    # 1. Resume=True skips when Combined Book.m4b already exists
+    session_resume = MagicMock()
+    book_resume = Audiobook(session=session_resume, metadata=AudiobookMetadata(title="Combined Book"), files=files)
+    opts_resume = DownloadOptions(
+        skip_downloaded=False,
+        resume=True,
+        combine=True,
+        output_format="m4b",
+        write_json_metadata=False,
+        no_chapters=True,
+    )
+    interaction_none = RecordingInteraction(confirm_value=False)
+    download_audiobook(book_resume, str(book_dir), opts_resume, interaction=interaction_none)
+    assert interaction_none.confirms == []
+    session_resume.get.assert_not_called()
+
+    # 2. Resume=False prompts only once for Combined Book.m4b even when intermediate dir exists
+    session_overwrite = MagicMock()
+    session_overwrite.get.side_effect = [
+        _mock_response({"Content-Length": "4"}, [b"new0"]),
+        _mock_response({"Content-Length": "4"}, [b"new1"]),
+    ]
+    book_overwrite = Audiobook(
+        session=session_overwrite,
+        metadata=AudiobookMetadata(title="Combined Book"),
+        files=files,
+    )
+    opts_overwrite = DownloadOptions(
+        skip_downloaded=False,
+        resume=False,
+        combine=True,
+        output_format="m4b",
+        write_json_metadata=False,
+        no_chapters=True,
+    )
+    accept = RecordingInteraction(confirm_value=True)
+
+    def fake_combine(filepaths, tmp_dir, output_path, cancel_event=None):
+        with open(output_path, "wb") as f:
+            f.write(b"combined-mp3")
+
+    def fake_convert(filenames, target_format, cancel_event=None, audio_bitrate=None):
+        final_m4b.write_bytes(b"new-combined-m4b")
+        return [str(final_m4b)]
+
+    with (
+        patch("audiobookdl.output.download.output.combine_supports_direct_output", return_value=False),
+        patch("audiobookdl.output.download.output.combine_audiofiles", side_effect=fake_combine),
+        patch("audiobookdl.output.download.output.convert_output", side_effect=fake_convert),
+        patch("audiobookdl.output.download.metadata.add_metadata"),
+    ):
+        download_audiobook(book_overwrite, str(book_dir), opts_overwrite, interaction=accept)
+
+    assert len(accept.confirms) == 1
+    assert "Combined Book.m4b" in accept.confirms[0]
+    assert final_m4b.read_bytes() == b"new-combined-m4b"
+
+
+def test_write_json_metadata_uses_utf8_and_preserves_unicode(tmp_path):
+    import json
+    from audiobookdl.output.download import add_metadata_to_dir, add_metadata_to_file
+
+    title = "日本語・Книга — Test"
+    book = Audiobook(
+        session=MagicMock(),
+        metadata=AudiobookMetadata(title=title, authors=["Алексей"]),
+        files=[],
+    )
+    opts = DownloadOptions(write_json_metadata=True, no_chapters=True)
+
+    single_file = tmp_path / "book.mp3"
+    single_file.write_bytes(b"audio")
+    with patch("audiobookdl.output.download.metadata.add_metadata"):
+        add_metadata_to_file(book, str(single_file), opts)
+    raw_single = (tmp_path / "book.mp3.json").read_text(encoding="utf-8")
+    assert title in raw_single
+    assert json.loads(raw_single)["title"] == title
+
+    book_dir = tmp_path / "multi"
+    book_dir.mkdir()
+    part_file = book_dir / "Part 0.mp3"
+    part_file.write_bytes(b"audio")
+    with patch("audiobookdl.output.download.metadata.add_metadata"):
+        add_metadata_to_dir(book, [str(part_file)], str(book_dir), opts)
+    raw_dir = (book_dir / "metadata.json").read_text(encoding="utf-8")
+    assert title in raw_dir
+    assert json.loads(raw_dir)["title"] == title

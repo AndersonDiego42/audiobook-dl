@@ -1,9 +1,13 @@
 from audiobookdl import Chapter, utils, logging
 from audiobookdl.utils.concurrency import run_cancellable_subprocess
+from ._chapters import build_bounded_chapters
 from mutagen import File as MutagenFile
 import os
 import threading
-from typing import Optional, Sequence
+from typing import List, Optional, Sequence
+
+
+LOSSLESS_CONTAINERS = ("flac", "wav", "aiff", "alac", "wv")
 
 def _escape_ffmetadata(text: str) -> str:
     """Escape special FFMETADATA1 characters (=, ;, #, \\, and newlines)."""
@@ -31,23 +35,38 @@ def create_tmp_chapter_file(filepath: str, chapters: Sequence[Chapter]) -> str:
     result = ";FFMETADATA1\n"
     if not chapters:
         return result
-    for i in range(len(chapters)-1):
-        chapter = chapters[i]
-        result += create_chapter_text(chapter.title, chapter.start, chapters[i+1].start)
-    length = MutagenFile(filepath).info.length*1000
-    last_chapter = chapters[-1]
-    result += create_chapter_text(
-        title = last_chapter.title,
-        start = last_chapter.start,
-        end = int(length)
-    )
+    for start, end, title in build_bounded_chapters(
+        filepath,
+        chapters,
+        mutagen_opener=MutagenFile,
+    ):
+        result += create_chapter_text(title=title, start=start, end=end)
     return result
+
+def _build_fallback_codec_args(
+    filepath: str,
+    audio_bitrate: Optional[str] = None,
+) -> List[str]:
+    """Return FFmpeg audio encoding flags matching `filepath`'s container and `audio_bitrate`."""
+    ext = os.path.splitext(filepath)[1].lstrip(".").lower()
+    if not ext or ext in utils.MP4_CONTAINERS:
+        bitrate = utils.resolve_audio_bitrate(filepath, audio_bitrate)
+        return ["-c:a", "aac", "-b:a", bitrate]
+    explicit_bitrate = utils.normalize_audio_bitrate(audio_bitrate)
+    if explicit_bitrate is not None and ext not in LOSSLESS_CONTAINERS:
+        return ["-b:a", explicit_bitrate]
+    return []
+
 
 def add_chapters_ffmpeg(
     filepath: str,
     chapters: Sequence[Chapter],
     cancel_event: Optional[threading.Event] = None,
+    audio_bitrate: Optional[str] = None,
 ):
+    if not chapters:
+        return
+    utils.normalize_audio_bitrate(audio_bitrate)
     ffmpeg = utils.find_executable("ffmpeg")
     if ffmpeg is None:
         logging.log("ffmpeg not found; skipping chapter embedding")
@@ -71,32 +90,37 @@ def add_chapters_ffmpeg(
             capture_output=capture,
             cancel_event=cancel_event,
         )
-        produced_output = (
-            os.path.exists(tmp_media_file) and os.path.getsize(tmp_media_file) > 0
+        succeeded = (
+            result.returncode == 0
+            and os.path.exists(tmp_media_file)
+            and os.path.getsize(tmp_media_file) > 0
         )
-        if result.returncode != 0 or not produced_output:
+        if not succeeded:
             logging.debug("add_chapters_ffmpeg copy mode failed, retrying with re-encode")
             if os.path.exists(tmp_media_file):
                 os.remove(tmp_media_file)
-            run_cancellable_subprocess(
+            fallback_result = run_cancellable_subprocess(
                 [ffmpeg, "-y",
                  "-i", filepath,
                  "-i", tmp_chapter_file,
                  "-map_chapters", "1",
-                 "-c:a", "aac",
-                 "-b:a", "128k",
+                 *_build_fallback_codec_args(filepath, audio_bitrate),
                  "-map", "0",
                  "-metadata:s:a:0", "title=",
                  tmp_media_file],
                 capture_output=capture,
                 cancel_event=cancel_event,
             )
-        # ffmpeg produced no output: keep the chapterless original instead of crashing the run
-        if not (os.path.exists(tmp_media_file) and os.path.getsize(tmp_media_file) > 0):
+            succeeded = (
+                fallback_result.returncode == 0
+                and os.path.exists(tmp_media_file)
+                and os.path.getsize(tmp_media_file) > 0
+            )
+        # ffmpeg produced no valid output: keep the chapterless original instead of crashing the run
+        if not succeeded:
             logging.log("Could not embed chapters; leaving file as-is")
             return
-        os.remove(filepath)
-        os.rename(tmp_media_file, filepath)
+        os.replace(tmp_media_file, filepath)
     finally:
         if os.path.exists(tmp_chapter_file):
             os.remove(tmp_chapter_file)

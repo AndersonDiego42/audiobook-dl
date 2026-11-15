@@ -53,3 +53,15 @@ def test_parse_arguments_resume_and_audio_bitrate():
 
     with pytest.raises(SystemExit):
         args.parse_arguments(["--audio-bitrate", "invalid"])
+
+
+def test_input_file_reads_utf8_with_or_without_bom(tmp_path):
+    input_file = tmp_path / "utf8_urls.txt"
+    input_file.write_bytes(
+        "\ufeffhttps://example.com/日本語\nhttps://example.com/Книга\n".encode("utf-8")
+    )
+    options = args.build_default_options(urls=[], input_file=str(input_file))
+    assert args.get_urls(options) == [
+        "https://example.com/日本語",
+        "https://example.com/Книга",
+    ]

@@ -30,12 +30,18 @@ def add_chapters(
     filepath: str,
     chapters: Sequence[Chapter],
     cancel_event: Optional[threading.Event] = None,
+    audio_bitrate: Optional[str] = None,
 ):
     """Adds chapters to the given audio file"""
     if id3.is_id3_file(filepath):
         id3.add_id3_chapters(filepath, chapters)
     elif program_in_path("ffmpeg"):
-        ffmpeg.add_chapters_ffmpeg(filepath, chapters, cancel_event=cancel_event)
+        ffmpeg.add_chapters_ffmpeg(
+            filepath,
+            chapters,
+            cancel_event=cancel_event,
+            audio_bitrate=audio_bitrate,
+        )
     else:
         if logging.is_debug_mode():
             logging.debug("Could not add chapters")

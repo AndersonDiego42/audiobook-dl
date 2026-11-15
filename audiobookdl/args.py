@@ -218,7 +218,7 @@ def get_urls(options: DownloadOptions) -> List[str]:
     # File
     if options.input_file:
         try:
-            with open(options.input_file, "r") as f:
+            with open(options.input_file, "r", encoding="utf-8-sig") as f:
                 urls.extend(f.read().split())
         except OSError as error:
             raise SystemExit(

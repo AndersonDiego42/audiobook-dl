@@ -182,7 +182,7 @@ class AudiobookMetadata:
                     return z.alpha_3
                 else:
                     return super().default(z)
-        return json.dumps(self.as_dict(), cls=AudiobookMetadataJSONEncoder)
+        return json.dumps(self.as_dict(), cls=AudiobookMetadataJSONEncoder, ensure_ascii=False)
 
 
 def add_if_value_exists(metadata: AudiobookMetadata, l: List[Tuple[str, str]]):

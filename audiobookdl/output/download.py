@@ -61,7 +61,7 @@ def download(
             cancel_event=cancel_event,
         )
     except KeyboardInterrupt:
-        return
+        raise DownloadCancelled from None
 
 
 def _all_output_parts_exist(
@@ -95,28 +95,40 @@ def download_audiobook(
     """Download, convert, combine, and add metadata to files from `Audiobook` object"""
     # Check if file/dir exists and should be skipped or confirmed before overwriting
     is_single_file = len(audiobook.files) == 1 or options.combine
-    raw_single_path = ""
     target_path = ""
     if audiobook.files:
         initial_ext = audiobook.files[0].ext.lstrip(".").lower()
         output_format = (options.output_format or initial_ext).lstrip(".").lower()
         target_path = f"{output_dir}.{output_format}"
-        if len(audiobook.files) == 1:
-            raw_single_path, _ = create_filepath(audiobook, output_dir, 0)
 
-    if options.skip_downloaded:
+    confirmed_target_overwrite = False
+    if options.skip_downloaded or options.resume:
         if is_single_file:
-            if target_path and os.path.exists(target_path):
-                logging.log(f"Skipping [blue]{audiobook.title}[/], file already exists.")
+            if target_path and os.path.exists(target_path) and (
+                (options.skip_downloaded and not options.resume)
+                or os.path.getsize(target_path) > 0
+            ):
+                msg = (
+                    f"Resuming: skipping already downloaded [blue]{audiobook.title}[/], file already exists."
+                    if options.resume and not options.skip_downloaded
+                    else f"Skipping [blue]{audiobook.title}[/], file already exists."
+                )
+                logging.log(msg)
                 return
         elif options.resume:
             if _all_output_parts_exist(audiobook, output_dir, options.output_format):
-                logging.log(f"Skipping [blue]{audiobook.title}[/], all files already exist.")
+                msg = (
+                    f"Resuming: skipping already downloaded [blue]{audiobook.title}[/], all files already exist."
+                    if not options.skip_downloaded
+                    else f"Skipping [blue]{audiobook.title}[/], all files already exist."
+                )
+                logging.log(msg)
                 return
-        elif os.path.isdir(output_dir):  # multiple files, check for directory
+        elif os.path.isdir(output_dir):  # multiple files, skip_downloaded without resume
             logging.log(f"Skipping [blue]{audiobook.title}[/], directory already exists.")
             return
-    elif is_single_file and target_path and target_path != raw_single_path:
+    elif is_single_file and target_path:
+        confirmed_target_overwrite = os.path.exists(target_path)
         confirm_overwrite_file(target_path, interaction=interaction)
 
     # Downloading files
@@ -126,6 +138,7 @@ def download_audiobook(
         interaction=interaction,
         cancel_event=cancel_event,
         resume=options.resume,
+        confirm_overwrite=(not is_single_file) or (len(audiobook.files) > 1 and not confirmed_target_overwrite),
     )
     if cancel_event is not None and cancel_event.is_set():
         raise DownloadCancelled
@@ -183,12 +196,17 @@ def add_metadata_to_file(
     logging.book_update("Adding metadata")
     metadata.add_metadata(filepath, audiobook.metadata)
     if options.write_json_metadata:
-        with open(f"{filepath}.json", "w") as f:
+        with open(f"{filepath}.json", "w", encoding="utf-8") as f:
             f.write(audiobook.metadata.as_json())
     # Chapters
     if audiobook.chapters and not options.no_chapters:
         logging.book_update("Adding chapters")
-        metadata.add_chapters(filepath, audiobook.chapters, cancel_event=cancel_event)
+        metadata.add_chapters(
+            filepath,
+            audiobook.chapters,
+            cancel_event=cancel_event,
+            audio_bitrate=options.audio_bitrate,
+        )
     # Cover
     if audiobook.cover:
         logging.book_update("Embedding cover")
@@ -214,7 +232,7 @@ def add_metadata_to_dir(
         metadata.add_metadata(filepath, audiobook.metadata)
     if options.write_json_metadata:
         metadata_file_path = os.path.join(output_dir, "metadata.json")
-        with open(metadata_file_path, "w") as f:
+        with open(metadata_file_path, "w", encoding="utf-8") as f:
             f.write(audiobook.metadata.as_json())
     if audiobook.cover:
         logging.book_update("Adding cover")
@@ -229,6 +247,7 @@ def download_files_with_cli_output(
     interaction: Optional[logging.InteractionHandler] = None,
     cancel_event: Optional[threading.Event] = None,
     resume: bool = False,
+    confirm_overwrite: bool = True,
 ) -> List[str]:
     """
     Download `audiobook` with cli progress bar
@@ -236,6 +255,7 @@ def download_files_with_cli_output(
     :param audiobook: Audiobook to download
     :param output_dir: Output directory where files are downloaded to
     :param resume: Reuse completed parts and resume partial `.tmp` files via HTTP Range
+    :param confirm_overwrite: Prompt before replacing existing output targets
     :returns: A list of paths of the downloaded files
     """
     if len(audiobook.files) > 1:
@@ -245,16 +265,21 @@ def download_files_with_cli_output(
             else:
                 logging.book_update("Creating output dir")
                 os.makedirs(output_dir, exist_ok=True)
-        else:
+        elif confirm_overwrite:
             setup_download_dir(output_dir, interaction=interaction)
+        else:
+            logging.book_update("Creating output dir")
+            if os.path.isdir(output_dir):
+                shutil.rmtree(output_dir)
+            os.makedirs(output_dir)
     else:
-        if len(audiobook.files) == 1:
+        if confirm_overwrite and len(audiobook.files) == 1:
             filepath, _ = create_filepath(audiobook, output_dir, 0)
             if not (resume and os.path.exists(filepath) and os.path.getsize(filepath) > 0):
                 confirm_overwrite_file(filepath, interaction=interaction)
         parent = Path(output_dir).parent
         if not parent.exists():
-            os.makedirs(parent)
+            os.makedirs(parent, exist_ok=True)
     try:
         with logging.progress(DOWNLOAD_PROGRESS) as progress:
             task = progress.add_task(

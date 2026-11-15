@@ -233,3 +233,109 @@ def test_apply_runtime_options_merges_resume_and_audio_bitrate():
     opts_auto = args.build_default_options(audio_bitrate="auto")
     apply_runtime_options(opts_auto, cfg)
     assert opts_auto.audio_bitrate == "auto"
+
+
+def test_downloader_keyboard_interrupt_marks_cancelled_and_stops_batch(monkeypatch):
+    processed: list[str] = []
+
+    def fake_process_url(url, options, config, **_kwargs):
+        processed.append(url)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("audiobookdl.pipeline.process_url", fake_process_url)
+    cfg = Config(sources={}, output_template=None, database_directory=None, skip_downloaded=None)
+    downloader = Downloader(cfg, args.build_default_options())
+
+    summary = downloader.download(["https://example.com/one", "https://example.com/two"])
+
+    assert processed == ["https://example.com/one"]
+    assert summary == DownloadSummary(completed=0, failed=0, cancelled=True)
+
+
+@pytest.mark.parametrize(
+    ("summary", "expected_code"),
+    [
+        (DownloadSummary(completed=0, failed=0, cancelled=True), 130),
+        (DownloadSummary(completed=1, failed=1, cancelled=False), 1),
+    ],
+)
+def test_cli_main_exit_codes(monkeypatch, summary, expected_code):
+    class _FakeDownloader:
+        def __init__(self, config, options) -> None:
+            pass
+
+        def download(self, urls):
+            return summary
+
+    cfg = Config(sources={}, output_template=None, database_directory=None, skip_downloaded=None)
+    monkeypatch.setattr("sys.argv", ["audiobook-dl", "https://example.com/one"])
+    monkeypatch.setattr("audiobookdl.__main__.load_config", lambda _loc: cfg)
+    monkeypatch.setattr("audiobookdl.__main__.Downloader", _FakeDownloader)
+
+    from audiobookdl.__main__ import main
+
+    try:
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+        assert exc_info.value.code == expected_code
+    finally:
+        logging.debug_mode = False
+        logging.quiet_mode = False
+        logging.ffmpeg_output = False
+
+
+def test_download_cover_respects_output_template_and_creates_parents(tmp_path, monkeypatch):
+    from audiobookdl import Cover
+    from audiobookdl.pipeline import download_cover, process_audiobook
+
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+
+    book = Audiobook(
+        session=requests.Session(),
+        metadata=AudiobookMetadata(title="My Book", authors=["Jane Doe"]),
+        files=[],
+        cover=Cover(image=b"img-bytes", extension="jpg"),
+    )
+
+    # 1. Nested output template creates parent directories and avoids writing to CWD
+    opts_nested = args.build_default_options(
+        cover=True,
+        output_template=str(tmp_path / "library" / "{author}" / "{title}"),
+    )
+    process_audiobook(None, book, opts_nested)  # type: ignore[arg-type]
+    expected_nested = tmp_path / "library" / "Jane Doe" / "My Book.jpg"
+    assert expected_nested.read_bytes() == b"img-bytes"
+    assert not (cwd / "cover.jpg").exists()
+
+    # 2. Trailing slash or existing book directory places cover.<ext> inside that directory
+    opts_dir_slash = args.build_default_options(
+        cover=True,
+        output_template=str(tmp_path / "covers") + "/",
+    )
+    download_cover(book, opts_dir_slash)
+    assert (tmp_path / "covers" / "cover.jpg").read_bytes() == b"img-bytes"
+
+    existing_book_dir = tmp_path / "existing_dir" / "My Book"
+    existing_book_dir.mkdir(parents=True)
+    opts_existing_dir = args.build_default_options(
+        cover=True,
+        output_template=str(tmp_path / "existing_dir" / "{title}"),
+    )
+    download_cover(book, opts_existing_dir)
+    assert (existing_book_dir / "cover.jpg").read_bytes() == b"img-bytes"
+
+    # 3. Missing cover is a clean no-op
+    book_no_cover = Audiobook(
+        session=requests.Session(),
+        metadata=AudiobookMetadata(title="No Cover"),
+        files=[],
+        cover=None,
+    )
+    opts_none = args.build_default_options(
+        cover=True,
+        output_template=str(tmp_path / "missing" / "{title}"),
+    )
+    download_cover(book_no_cover, opts_none)
+    assert not (tmp_path / "missing").exists()

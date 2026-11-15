@@ -444,3 +444,56 @@ def test_real_ffprobe_and_m4b_bitrate_conversion(tmp_path):
     assert converted == [str(tmp_path / "speech_64k.m4b")]
     assert output._ffmpeg_audio_codec(converted[0]) == "aac"
 
+
+def test_gen_output_location_missing_optional_metadata_and_collapsed_segments():
+    standalone = AudiobookMetadata(title="Standalone Book", authors=["Jane Author"])
+    assert gen_output_location("{author}/{series}/{title}", standalone, "") == "Jane Author/Standalone Book"
+    assert gen_output_location("{series}/{title}", standalone, "") == "Standalone Book"
+    assert (
+        gen_output_location("/downloads/{series}/{publisher}/{isbn}/{release_date}/{language}/{title}", standalone, "")
+        == "/downloads/Standalone Book"
+    )
+
+    minimal = AudiobookMetadata(title="Only Title")
+    assert gen_output_location("{author}/{series}/{unknown_key}/{title}", minimal, "") == "Only Title"
+    assert gen_output_location("{author}/{series}", minimal, "") == "_"
+
+    with patch("audiobookdl.output.output.platform.system", return_value="Windows"):
+        assert (
+            gen_output_location(r"C:\Books\{series}\{author}\{title}", minimal, "")
+            == r"C:\Books\Only Title"
+        )
+        assert (
+            gen_output_location(r"C:\Books\{series}\{author}\{title}", standalone, "")
+            == r"C:\Books\Jane Author\Standalone Book"
+        )
+
+
+def test_gen_output_location_sanitizes_windows_reserved_names_and_reserves_temp_suffixes():
+    reserved_cases = [
+        ("CON", "CON_"),
+        ("prn", "prn_"),
+        ("Aux", "Aux_"),
+        ("nul. ", "nul_"),
+        ("COM1", "COM1_"),
+        ("com9.extra", "com9_.extra"),
+        ("LPT1", "LPT1_"),
+        ("lpt9", "lpt9_"),
+        ("C\x00ON", "CON_"),
+    ]
+    with patch("audiobookdl.output.output.platform.system", return_value="Windows"):
+        for raw, expected in reserved_cases:
+            meta = AudiobookMetadata(title=raw, authors=[raw])
+            assert gen_output_location(r"C:\Books\{author}\{title}", meta, "") == rf"C:\Books\{expected}\{expected}"
+
+        # Combined template segments that form a reserved name are also sanitized
+        split_meta = AudiobookMetadata(title="ul", series="N")
+        assert gen_output_location(r"C:\Books\{series}{title}", split_meta, "") == r"C:\Books\Nul_"
+
+        # Non-reserved words starting with reserved prefixes remain untouched
+        normal_meta = AudiobookMetadata(title="Console", authors=["Nullify"])
+        assert gen_output_location(r"C:\Books\{author}\{title}", normal_meta, "") == r"C:\Books\Nullify\Console"
+
+    assert output.OUTPUT_PATH_EXT_RESERVE >= len(".work/ts_parts/0000.ts")
+    assert output.OUTPUT_PATH_EXT_RESERVE >= len(".m4b.chapters.tmp.txt")
+

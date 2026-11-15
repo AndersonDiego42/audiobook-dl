@@ -18,7 +18,11 @@ def main() -> None:
         with logging.job_context(ctx):
             logging.simple_help()
         sys.exit()
-    Downloader(config, options).download(urls)
+    summary = Downloader(config, options).download(urls)
+    if summary.cancelled:
+        sys.exit(130)
+    if summary.failed > 0:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

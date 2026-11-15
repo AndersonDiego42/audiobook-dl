@@ -6,11 +6,12 @@ from audiobookdl.exceptions import (
     MissingDependency,
 )
 from audiobookdl.utils import (
-    DEFAULT_M4B_BITRATE,
-    MAX_AUTO_M4B_BITRATE_KBPS,
-    MIN_AUTO_M4B_BITRATE_KBPS,
+    MP4_CONTAINERS,
+    ffprobe_audio_bitrate,
+    ffprobe_duration,
     find_executable,
     normalize_audio_bitrate,
+    resolve_audio_bitrate,
     subprocess_kwargs,
 )
 from audiobookdl.utils.concurrency import run_cancellable_pool, run_cancellable_subprocess
@@ -26,12 +27,29 @@ from typing import Any, Dict, List, Optional, Sequence, Mapping
 LOCATION_DEFAULTS = {
     'album': 'NA',
     'artist': 'NA',
+    'title': '',
+    'scrape_url': '',
+    'series': '',
+    'series_order': '',
+    'author': '',
+    'narrator': '',
+    'genre': '',
+    'language': '',
+    'description': '',
+    'isbn': '',
+    'publisher': '',
+    'release_date': '',
 }
+
+
+class _SafeFormatDict(dict):
+    """Mapping for `str.format_map` that substitutes `""` for missing keys."""
+
+    def __missing__(self, key: str) -> str:
+        return ""
 
 # Number of parallel ffmpeg remux processes when preparing files for combining
 COMBINE_REMUX_THREADS = 16
-# Containers that need the ADTS-to-ASC bitstream filter for raw AAC streams
-MP4_CONTAINERS = ("mp4", "m4a", "m4b", "mov")
 
 def gen_output_filename(booktitle: str, file: Mapping[str, str], template: str) -> str:
     """Generates an output filename based on different attributes of the
@@ -68,55 +86,12 @@ def _ffmpeg_audio_codec(path: str) -> str:
 
 def _ffprobe_duration(path: str) -> float:
     """Returns the duration of `path` in seconds (0.0 on failure)"""
-    ffprobe = find_executable("ffprobe") or "ffprobe"
-    result = subprocess.run(
-        [ffprobe, "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", path],
-        capture_output=True, text=True,
-        **subprocess_kwargs(capture_output=True),
-    )
-    try:
-        return float(result.stdout.strip())
-    except ValueError:
-        return 0.0
+    return ffprobe_duration(path)
 
 
 def _ffprobe_audio_bitrate(path: str) -> Optional[int]:
     """Return the bitrate of `path` in bits/sec via `ffprobe`, or `None` if unavailable."""
-    ffprobe = find_executable("ffprobe")
-    if ffprobe is None:
-        return None
-    queries = (
-        [
-            ffprobe, "-v", "error",
-            "-select_streams", "a:0",
-            "-show_entries", "stream=bit_rate",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            path,
-        ],
-        [
-            ffprobe, "-v", "error",
-            "-show_entries", "format=bit_rate",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            path,
-        ],
-    )
-    for cmd in queries:
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                **subprocess_kwargs(capture_output=True),
-            )
-        except OSError:
-            return None
-        raw = result.stdout.strip()
-        if raw.isdigit():
-            bps = int(raw)
-            if bps > 0:
-                return bps
-    return None
+    return ffprobe_audio_bitrate(path)
 
 
 def resolve_aac_bitrate(source_path: str, audio_bitrate: Optional[str] = None) -> str:
@@ -127,14 +102,7 @@ def resolve_aac_bitrate(source_path: str, audio_bitrate: Optional[str] = None) -
     via `ffprobe` in `"auto"`/`None` mode and clamps to `[64k, 192k]` (falling back
     to `128k` if probing fails).
     """
-    explicit = normalize_audio_bitrate(audio_bitrate)
-    if explicit is not None:
-        return explicit
-    bps = _ffprobe_audio_bitrate(source_path)
-    if bps is None or bps <= 0:
-        return DEFAULT_M4B_BITRATE
-    kbps = max(MIN_AUTO_M4B_BITRATE_KBPS, min(round(bps / 1000), MAX_AUTO_M4B_BITRATE_KBPS))
-    return f"{kbps}k"
+    return resolve_audio_bitrate(source_path, audio_bitrate, probe_bps=_ffprobe_audio_bitrate)
 
 
 def _remux_to_mpegts(
@@ -377,9 +345,24 @@ def get_max_name_length() -> int:
         # default
         return 255
 
-# Extra length reserved on output_dir/filename for extensions, sidecar json, and temp/ts paths
-OUTPUT_PATH_EXT_RESERVE = 20
+# Extra length reserved on output_dir/filename for extensions, sidecar json, and
+# temp paths such as `.work/ts_parts/0000.ts` (22) or `.m4b.chapters.tmp.txt` (21)
+OUTPUT_PATH_EXT_RESERVE = 32
 WINDOWS_MAX_PATH = 260
+_WINDOWS_RESERVED_NAMES = frozenset({
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+})
+
+
+def _sanitize_windows_reserved_name(name: str) -> str:
+    """Append `_` to the stem when `name` matches a Windows reserved device name."""
+    stripped = name.rstrip(". ")
+    stem, dot, rest = stripped.partition(".")
+    if stem.upper() in _WINDOWS_RESERVED_NAMES:
+        return f"{stem}_{dot}{rest}"
+    return name
 
 
 def _truncate_utf8(text: str, max_bytes: int) -> str:
@@ -425,7 +408,7 @@ def _sanitize_metadata_dict(
             sanitized[key] = cleaned
         else:
             sanitized[key] = value
-    return sanitized
+    return _SafeFormatDict(sanitized)
 
 
 def _join_segments(segments: Sequence[str], seps: Sequence[str]) -> str:
@@ -459,28 +442,36 @@ def gen_output_location(
     raw_segments = tokens[0::2]
     seps = tokens[1::2]
     segments: List[str] = []
+    kept_seps: List[str] = []
     dynamic_indices: List[int] = []
+    last_idx = len(raw_segments) - 1
 
     for idx, raw_seg in enumerate(raw_segments):
         if "{" in raw_seg:
-            seg = raw_seg.format(**metadata_dict)
+            seg = raw_seg.format_map(metadata_dict)
             if is_windows:
                 seg = seg.rstrip(". ")
+            if seg == "" and idx < last_idx:
+                continue
             if seg in ("", ".", ".."):
                 seg = "_"
-            reserve = OUTPUT_PATH_EXT_RESERVE if idx == len(raw_segments) - 1 else 0
+            if is_windows:
+                seg = _sanitize_windows_reserved_name(seg)
+            reserve = OUTPUT_PATH_EXT_RESERVE if idx == last_idx else 0
             seg_limit = max(1, component_cap - reserve)
             seg = _truncate_utf8(seg, seg_limit)
             if is_windows:
-                seg = seg.rstrip(". ") or "_"
-            dynamic_indices.append(idx)
+                seg = _sanitize_windows_reserved_name(seg.rstrip(". ") or "_")
+            dynamic_indices.append(len(segments))
         else:
             seg = raw_seg
         segments.append(seg)
+        if idx < len(seps):
+            kept_seps.append(seps[idx])
 
     truncated_for_length = False
     if is_windows and dynamic_indices:
-        abs_path = os.path.abspath(_join_segments(segments, seps))
+        abs_path = os.path.abspath(_join_segments(segments, kept_seps))
         max_total_units = WINDOWS_MAX_PATH - 1 - OUTPUT_PATH_EXT_RESERVE
         excess = _utf16_len(abs_path) - max_total_units
         if excess > 0:
@@ -496,12 +487,14 @@ def gen_output_location(
                 reducible = max(0, cur_units - min_keep)
                 trim = min(excess, reducible)
                 if trim > 0:
-                    new_seg = _truncate_utf16_units(seg, cur_units - trim).rstrip(". ") or "_"
+                    new_seg = _sanitize_windows_reserved_name(
+                        _truncate_utf16_units(seg, cur_units - trim).rstrip(". ") or "_"
+                    )
                     excess -= cur_units - _utf16_len(new_seg)
                     segments[seg_idx] = new_seg
                     truncated_for_length = True
 
-    formatted = _join_segments(segments, seps)
+    formatted = _join_segments(segments, kept_seps)
     if truncated_for_length:
         logging.log(f"output path too long, using [blue]{segments[-1]}[/blue] as filename base")
     return formatted
@@ -510,9 +503,10 @@ def gen_output_location(
 def _fix_output(value: str) -> str:
     """Returns `value` without characters or segments the filesystem can't handle safely"""
     value = value.replace("/", "-").replace("\\", "-")
+    value = "".join(ch for ch in value if ord(ch) >= 0x20)
     if platform.system() == "Windows":
         value = _remove_chars(value, ':*?<>|"\'’')
-    value = "".join(ch for ch in value if ord(ch) >= 0x20)
+        value = _sanitize_windows_reserved_name(value)
     if value in (".", ".."):
         value = "-" * len(value)
     return value

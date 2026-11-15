@@ -216,7 +216,7 @@ class Downloader:
                         **extra_kwargs,
                     )
                     summary.completed += 1
-                except DownloadCancelled:
+                except (DownloadCancelled, KeyboardInterrupt):
                     summary.cancelled = True
                     logging.log("Download cancelled")
                     break
@@ -473,7 +473,7 @@ def process_audiobook(
     if options.print_output:
         print_output(audiobook, options)
     elif options.cover:
-        download_cover(audiobook)
+        download_cover(audiobook, options)
     else:
         download(audiobook, options, interaction=interaction, cancel_event=cancel_event)
         source.on_download_complete(audiobook)
@@ -486,9 +486,25 @@ def print_output(audiobook: Audiobook, options: DownloadOptions) -> None:
     print(location)
 
 
-def download_cover(audiobook: Audiobook) -> None:
-    """Download audiobook cover to `cover.<ext>`."""
+def download_cover(audiobook: Audiobook, options: DownloadOptions) -> None:
+    """Download audiobook cover to the resolved output location."""
     cover = audiobook.cover
-    if cover:
-        with open(f"cover.{cover.extension}", "wb") as f:
-            f.write(cover.image)
+    if not cover:
+        return
+    location = output.gen_output_location(
+        options.output_template,
+        audiobook.metadata,
+        options.remove_chars,
+    )
+    ext = cover.extension.lstrip(".")
+    if not location:
+        cover_path = f"cover.{ext}"
+    elif location.endswith(("/", "\\")) or os.path.isdir(location):
+        cover_path = os.path.join(location, f"cover.{ext}")
+    else:
+        cover_path = f"{location}.{ext}"
+    parent = os.path.dirname(cover_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(cover_path, "wb") as f:
+        f.write(cover.image)

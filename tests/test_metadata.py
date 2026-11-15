@@ -1,15 +1,23 @@
+from datetime import date
 from io import BytesIO
+from pathlib import Path
 import shutil
 import subprocess
+from types import SimpleNamespace
+from typing import Sequence
 from unittest.mock import MagicMock
 
 from PIL import Image
+from mutagen import MutagenError
+from mutagen.easymp4 import EasyMP4Tags
 from mutagen.id3 import ID3, CTOCFlags
-from mutagen.mp4 import MP4, MP4Cover
+from mutagen.mp4 import MP4, MP4Cover, MP4FreeForm
+import pycountry
 import pytest
 
 from audiobookdl import AudiobookMetadata, Chapter, Cover
-from audiobookdl.output.metadata import ffmpeg as ffmeta
+from audiobookdl.output import metadata as output_metadata
+from audiobookdl.output.metadata import _chapters, ffmpeg as ffmeta
 from audiobookdl.output.metadata import id3, mp4
 
 
@@ -20,10 +28,11 @@ def _make_image_bytes(fmt: str, mode: str = "RGB") -> bytes:
     return buf.getvalue()
 
 
-def _create_silent_audio(path, codec_args):
+def _create_silent_audio(path: Path, codec_args: Sequence[str]) -> None:
     ffmpeg_bin = shutil.which("ffmpeg")
     if not ffmpeg_bin:
         pytest.skip("ffmpeg not available")
+    assert ffmpeg_bin is not None
     subprocess.run(
         [
             ffmpeg_bin,
@@ -106,6 +115,52 @@ def test_mp4_metadata_publisher_and_webp_cover(tmp_path):
     assert tags["covr"][0].imageformat == MP4Cover.FORMAT_JPEG
 
 
+def test_mp4_metadata_standard_atoms_and_no_runtime_class_mutation(tmp_path):
+    m4b_path = tmp_path / "full.m4b"
+    _create_silent_audio(m4b_path, ["-c:a", "aac"])
+
+    before_get = set(EasyMP4Tags.Get.keys())
+    before_set = set(EasyMP4Tags.Set.keys())
+
+    metadata = AudiobookMetadata(
+        title="Book One",
+        scrape_url="https://example.com/book/1",
+        series="Epic Saga",
+        series_order=3,
+        authors=["Author A"],
+        narrators=["Narrator B"],
+        genres=["Fantasy"],
+        language=pycountry.languages.get(alpha_3="eng"),
+        description="A long description of the audiobook.",
+        isbn="9781234567890",
+        publisher="Acme Publishing",
+        release_date=date(2024, 6, 15),
+    )
+    mp4.add_mp4_metadata(str(m4b_path), metadata)
+
+    assert set(EasyMP4Tags.Get.keys()) == before_get
+    assert set(EasyMP4Tags.Set.keys()) == before_set
+
+    tags = MP4(str(m4b_path)).tags
+    assert tags is not None
+    assert tags["stik"] == [2]
+    assert tags["\xa9nam"] == ["Book One"]
+    assert tags["\xa9alb"] == ["Epic Saga"]
+    assert tags["\xa9ART"] == ["Author A"]
+    assert tags["\xa9nrt"] == ["Narrator B"]
+    assert tags["\xa9pub"] == ["Acme Publishing"]
+    assert tags["\xa9gen"] == ["Fantasy"]
+    assert tags["\xa9day"] == ["2024-06-15"]
+    assert tags["yrrc"] == ["2024"]
+    assert tags["desc"] == ["A long description of the audiobook."]
+    assert tags["ldes"] == ["A long description of the audiobook."]
+    assert tags["trkn"] == [(3, 0)]
+    assert "\xa9trk" not in tags
+    assert tags["----:com.apple.iTunes:URL"] == [MP4FreeForm(b"https://example.com/book/1")]
+    assert tags["----:com.apple.iTunes:Language"] == [MP4FreeForm(b"eng")]
+    assert tags["----:com.apple.iTunes:ISBN"] == [MP4FreeForm(b"9781234567890")]
+
+
 def test_id3_cover_type_3_webp_conversion_and_ctoc_chap_frames(tmp_path):
     mp3_path = tmp_path / "sample.MP3"
     _create_silent_audio(mp3_path, ["-c:a", "libmp3lame"])
@@ -130,6 +185,14 @@ def test_id3_cover_type_3_webp_conversion_and_ctoc_chap_frames(tmp_path):
     assert apics[0].type == 3
     assert apics[0].mime == "image/png"
 
+    # Re-embedding a cover replaces APIC rather than duplicating it
+    new_jpeg = _make_image_bytes("JPEG")
+    id3.embed_id3_cover(str(mp3_path), Cover(image=new_jpeg, extension="jpg"))
+    apics_after = ID3(str(mp3_path)).getall("APIC")
+    assert len(apics_after) == 1
+    assert apics_after[0].mime == "image/jpeg"
+    assert apics_after[0].data == new_jpeg
+
     ctocs = tags.getall("CTOC")
     assert len(ctocs) == 1
     assert ctocs[0].flags == (CTOCFlags.TOP_LEVEL | CTOCFlags.ORDERED)
@@ -139,3 +202,266 @@ def test_id3_cover_type_3_webp_conversion_and_ctoc_chap_frames(tmp_path):
     assert [c.element_id for c in chaps] == ["chp1", "chp2"]
     assert isinstance(chaps[1].end_time, int)
     assert chaps[1].end_time >= 1000
+
+
+def test_create_tmp_chapter_file_falls_back_to_ffprobe_when_mutagen_fails(monkeypatch):
+    monkeypatch.setattr(ffmeta, "MutagenFile", lambda _: None)
+    monkeypatch.setattr(_chapters, "ffprobe_duration", lambda _: 6.0)
+
+    content = ffmeta.create_tmp_chapter_file(
+        "unknown.mka",
+        [
+            Chapter(start=0, title="Ch 1"),
+            Chapter(start=2000, title="Ch 2"),
+        ],
+    )
+    assert "START=0\nEND=2000\ntitle=Ch 1" in content
+    assert "START=2000\nEND=6000\ntitle=Ch 2" in content
+
+    # Mutagen raising MutagenError or returning info=None also falls back
+    def raising_mutagen(_):
+        raise MutagenError("bad header")
+
+    monkeypatch.setattr(ffmeta, "MutagenFile", raising_mutagen)
+    content_err = ffmeta.create_tmp_chapter_file(
+        "corrupt.m4b",
+        [Chapter(start=0, title="Only")],
+    )
+    assert "START=0\nEND=6000\ntitle=Only" in content_err
+
+    broken_info = MagicMock()
+    broken_info.info = None
+    monkeypatch.setattr(ffmeta, "MutagenFile", lambda _: broken_info)
+    content_no_info = ffmeta.create_tmp_chapter_file(
+        "noinfo.m4b",
+        [Chapter(start=0, title="Only")],
+    )
+    assert "START=0\nEND=6000\ntitle=Only" in content_no_info
+
+    # Both Mutagen and ffprobe failing returns header-only FFMETADATA1 cleanly
+    monkeypatch.setattr(ffmeta, "MutagenFile", lambda _: None)
+    monkeypatch.setattr(_chapters, "ffprobe_duration", lambda _: 0.0)
+    assert (
+        ffmeta.create_tmp_chapter_file("missing.m4b", [Chapter(start=0, title="Ch 1")])
+        == ";FFMETADATA1\n"
+    )
+
+
+def test_create_tmp_chapter_file_sorts_clamps_and_skips_invalid_bounds(monkeypatch):
+    fake_file = MagicMock()
+    fake_file.info.length = 5.0
+    monkeypatch.setattr(ffmeta, "MutagenFile", lambda _: fake_file)
+
+    content = ffmeta.create_tmp_chapter_file(
+        "ignored.m4b",
+        [
+            Chapter(start=7000, title="Too Late 2"),
+            Chapter(start=3000, title="Ch 2"),
+            Chapter(start=5000, title="Exact End"),
+            Chapter(start=-250, title="Ch 1"),
+            Chapter(start=3000, title="Zero Mid"),
+        ],
+    )
+    # Ordered by start: -250 -> 0 ("Ch 1"), 3000 ("Ch 2"), 3000 ("Zero Mid"), 5000, 7000
+    assert "START=0\nEND=3000\ntitle=Ch 1" in content
+    assert "Zero Mid" in content
+    assert "Ch 2" not in content
+    assert "START=3000\nEND=5000\ntitle=Zero Mid" in content
+    assert "Exact End" not in content
+    assert "Too Late 2" not in content
+
+
+def test_id3_chapters_mutagen_none_fallback_and_bounds(tmp_path, monkeypatch):
+    mp3_path = tmp_path / "bounded.mp3"
+    _create_silent_audio(mp3_path, ["-c:a", "libmp3lame"])
+
+    monkeypatch.setattr(id3, "MutagenFile", lambda _: None)
+    monkeypatch.setattr(_chapters, "ffprobe_duration", lambda _: 2.0)
+
+    id3.add_id3_chapters(
+        str(mp3_path),
+        [
+            Chapter(start=5000, title="Out of range"),
+            Chapter(start=1000, title="Second"),
+            Chapter(start=-100, title="First"),
+        ],
+    )
+
+    tags = ID3(str(mp3_path))
+    ctocs = tags.getall("CTOC")
+    assert len(ctocs) == 1
+    assert ctocs[0].child_element_ids == ["chp1", "chp2"]
+
+    chaps = tags.getall("CHAP")
+    assert [(c.element_id, c.start_time, c.end_time) for c in chaps] == [
+        ("chp1", 0, 1000),
+        ("chp2", 1000, 2000),
+    ]
+
+    # When both Mutagen and ffprobe fail, add_id3_chapters skips without crashing
+    monkeypatch.setattr(_chapters, "ffprobe_duration", lambda _: 0.0)
+    id3.add_id3_chapters(str(mp3_path), [Chapter(start=0, title="Ignored")])
+    tags_after = ID3(str(mp3_path))
+    assert len(tags_after.getall("CHAP")) == 2
+
+
+def test_add_chapters_ffmpeg_succeeds_with_ffprobe_fallback_and_clamped_chapters(
+    tmp_path, monkeypatch
+):
+    m4b_path = tmp_path / "chapters.m4b"
+    _create_silent_audio(m4b_path, ["-c:a", "aac"])
+
+    monkeypatch.setattr(ffmeta, "MutagenFile", lambda _: None)
+    ffmeta.add_chapters_ffmpeg(
+        str(m4b_path),
+        [
+            Chapter(start=99999, title="Out Of Range"),
+            Chapter(start=1000, title="Second"),
+            Chapter(start=0, title="First"),
+        ],
+    )
+
+    mp4_file = MP4(str(m4b_path))
+    assert mp4_file.chapters is not None
+    assert [c.title for c in mp4_file.chapters] == ["First", "Second"]
+    assert mp4_file.chapters[0].start == pytest.approx(0.0, abs=0.05)
+    assert mp4_file.chapters[1].start == pytest.approx(1.0, abs=0.05)
+
+
+def test_add_chapters_ffmpeg_fallback_respects_container_bitrate_and_os_replace(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(ffmeta.utils, "find_executable", lambda name: name)
+    monkeypatch.setattr(ffmeta, "create_tmp_chapter_file", lambda fp, ch: ";FFMETADATA1\n")
+
+    def run_fallback_test(filename: str, audio_bitrate, probed_bps=None):
+        target = tmp_path / filename
+        target.write_bytes(b"original-audio")
+        cmds = []
+
+        def fake_subprocess(cmd, **kwargs):
+            cmds.append(cmd)
+            if "-c" in cmd and "copy" in cmd:
+                return SimpleNamespace(returncode=1)
+            Path(cmd[-1]).write_bytes(b"reencoded-audio")
+            return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr(ffmeta, "run_cancellable_subprocess", fake_subprocess)
+        monkeypatch.setattr(ffmeta.utils, "ffprobe_audio_bitrate", lambda _p: probed_bps)
+
+        replace_calls = []
+        real_replace = ffmeta.os.replace
+
+        def spy_replace(src, dst):
+            replace_calls.append((src, dst))
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(ffmeta.os, "replace", spy_replace)
+
+        ffmeta.add_chapters_ffmpeg(
+            str(target),
+            [Chapter(0, "Ch 1")],
+            audio_bitrate=audio_bitrate,
+        )
+        assert target.read_bytes() == b"reencoded-audio"
+        assert len(replace_calls) == 1
+        assert len(cmds) == 2
+        return cmds[1]
+
+    # MP4 container with explicit bitrate
+    m4b_explicit = run_fallback_test("book.m4b", "192k", probed_bps=64000)
+    assert m4b_explicit[m4b_explicit.index("-c:a") + 1] == "aac"
+    assert m4b_explicit[m4b_explicit.index("-b:a") + 1] == "192k"
+
+    # MP4 container in auto mode probes source bitrate
+    m4b_auto = run_fallback_test("auto.m4b", None, probed_bps=96000)
+    assert m4b_auto[m4b_auto.index("-c:a") + 1] == "aac"
+    assert m4b_auto[m4b_auto.index("-b:a") + 1] == "96k"
+
+    # Non-MP4 lossy container omits -c:a aac and applies explicit bitrate when provided
+    opus_explicit = run_fallback_test("book.opus", "192k")
+    assert "-c:a" not in opus_explicit
+    assert opus_explicit[opus_explicit.index("-b:a") + 1] == "192k"
+
+    # Non-MP4 lossy container in auto mode omits -c:a and -b:a
+    mka_auto = run_fallback_test("book.mka", None)
+    assert "-c:a" not in mka_auto
+    assert "-b:a" not in mka_auto
+
+    # Lossless container omits both -c:a and -b:a even if bitrate was configured
+    flac_cmd = run_fallback_test("book.flac", "192k")
+    assert "-c:a" not in flac_cmd
+    assert "-b:a" not in flac_cmd
+
+
+def test_add_chapters_ffmpeg_preserves_original_when_fallback_nonzero(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "keep.m4b"
+    target.write_bytes(b"intact-original")
+    monkeypatch.setattr(ffmeta.utils, "find_executable", lambda name: name)
+    monkeypatch.setattr(ffmeta, "create_tmp_chapter_file", lambda fp, ch: ";FFMETADATA1\n")
+
+    def failing_both(cmd, **kwargs):
+        # Even if ffmpeg wrote partial bytes before returning non-zero, do not replace original
+        Path(cmd[-1]).write_bytes(b"corrupt-partial")
+        return SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr(ffmeta, "run_cancellable_subprocess", failing_both)
+    ffmeta.add_chapters_ffmpeg(str(target), [Chapter(0, "Ch 1")], audio_bitrate="128k")
+    assert target.read_bytes() == b"intact-original"
+
+
+def test_add_id3_metadata_sets_4_digit_tyer_and_full_iso_tdrc_tdor(
+    tmp_path, monkeypatch
+):
+    mp3_path = tmp_path / "release_date.mp3"
+    _create_silent_audio(mp3_path, ["-c:a", "libmp3lame"])
+
+    recorded_easy_keys = {}
+    real_mp3 = id3.MP3
+
+    def spy_mp3(path, **kwargs):
+        audio = real_mp3(path, **kwargs)
+        orig_save = audio.save
+
+        def capture_save(*args, **save_kwargs):
+            recorded_easy_keys["year"] = list(audio["year"])
+            recorded_easy_keys["date"] = list(audio["date"])
+            recorded_easy_keys["originaldate"] = list(audio["originaldate"])
+            return orig_save(*args, **save_kwargs)
+
+        audio.save = capture_save
+        return audio
+
+    monkeypatch.setattr(id3, "MP3", spy_mp3)
+
+    metadata = AudiobookMetadata(
+        title="Dated Book",
+        authors=["Author"],
+        release_date=date(2024, 6, 15),
+    )
+    id3.add_id3_metadata(str(mp3_path), metadata)
+
+    assert recorded_easy_keys == {
+        "year": ["2024"],
+        "date": ["2024-06-15"],
+        "originaldate": ["2024-06-15"],
+    }
+    tags = ID3(str(mp3_path))
+    assert str(tags["TDRC"]) == "2024-06-15"
+    assert str(tags["TDOR"]) == "2024-06-15"
+
+
+def test_add_chapters_forwards_audio_bitrate_to_ffmpeg(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(output_metadata.id3, "is_id3_file", lambda _p: False)
+    monkeypatch.setattr(output_metadata, "program_in_path", lambda _name: True)
+
+    def fake_add_chapters_ffmpeg(filepath, chapters, cancel_event=None, audio_bitrate=None):
+        seen["filepath"] = filepath
+        seen["audio_bitrate"] = audio_bitrate
+
+    monkeypatch.setattr(output_metadata.ffmpeg, "add_chapters_ffmpeg", fake_add_chapters_ffmpeg)
+    output_metadata.add_chapters("book.m4b", [Chapter(0, "Ch 1")], audio_bitrate="192k")
+    assert seen == {"filepath": "book.m4b", "audio_bitrate": "192k"}

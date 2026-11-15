@@ -371,10 +371,8 @@ class StorytelSource(Source):
             raise UserNotAuthorized
         data: Dict[str, Any] = resp.json()
 
-        bookshelf_path = os.path.join(self.database_directory_lists, f"bookshelf.json")
-        with open(bookshelf_path, "w") as json_file:
-            json_data = json.dumps(data, indent=2)
-            json_file.write(json_data)
+        bookshelf_path = os.path.join(self.database_directory_lists, "bookshelf.json")
+        self._write_json(bookshelf_path, data)
 
         return data
 
@@ -448,9 +446,7 @@ class StorytelSource(Source):
                 result["nextPageToken"] = data["nextPageToken"]
 
         lists_path = self._get_lists_path(result["id"], languages, formats)
-        with open(lists_path, "w") as json_file:
-            json_data = json.dumps(result, indent=2)
-            json_file.write(json_data)
+        self._write_json(lists_path, result)
 
         return result
 
@@ -555,9 +551,7 @@ class StorytelSource(Source):
         url = f"https://api.storytel.net/playback-metadata/consumable/{consumableId}"
         playback_metadata = self._session.get(url).json()
         playback_metadata_path = self._get_playback_metadata_path(consumableId)
-        with open(playback_metadata_path, "w") as json_file:
-            json_data = json.dumps(playback_metadata, indent=2)
-            json_file.write(json_data)
+        self._write_json(playback_metadata_path, playback_metadata)
         if not "formats" in playback_metadata:
             raise DataNotPresent
         for format in playback_metadata["formats"]:
@@ -590,9 +584,13 @@ class StorytelSource(Source):
         cover_data = self.get(cover_url)
         return Cover(cover_data, "jpg")
 
+    @staticmethod
+    def _write_json(path: str, payload: Any) -> None:
+        """Write `payload` as UTF-8 JSON to `path`."""
+        with open(path, "w", encoding="utf-8") as json_file:
+            json.dump(payload, json_file, indent=2, ensure_ascii=False)
+
     def on_download_complete(self, audiobook: Audiobook) -> None:
         consumableId = audiobook.source_data["consumableId"]
         book_path = self._get_book_path(consumableId)
-        with open(book_path, "w") as json_file:
-            json_data = json.dumps(audiobook.source_data, indent=2)
-            json_file.write(json_data)
+        self._write_json(book_path, audiobook.source_data)

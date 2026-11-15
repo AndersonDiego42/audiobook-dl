@@ -1,9 +1,10 @@
 import importlib.resources
+import math
 import os
 import re
 import subprocess
 import sys
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 import shutil
 from urllib3.poolmanager import PoolManager
 from requests.adapters import HTTPAdapter
@@ -14,6 +15,7 @@ DEFAULT_M4B_BITRATE = "128k"
 MIN_AUTO_M4B_BITRATE_KBPS = 64
 MAX_AUTO_M4B_BITRATE_KBPS = 192
 AUDIO_BITRATE_PRESETS = ("Auto", "64k", "96k", "128k", "192k", "256k")
+MP4_CONTAINERS = ("mp4", "m4a", "m4b", "mov")
 _BITRATE_RE = re.compile(r"^(\d+)k?$", re.IGNORECASE)
 
 
@@ -120,6 +122,106 @@ def find_executable(program: str) -> Optional[str]:
 def program_in_path(program: str) -> bool:
     """Checks whether `program` is available locally or in PATH"""
     return find_executable(program) is not None
+
+
+def ffprobe_duration(path: str) -> float:
+    """Return the duration of `path` in seconds via `ffprobe`, or `0.0` on failure."""
+    ffprobe = find_executable("ffprobe")
+    if ffprobe is None:
+        return 0.0
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            **subprocess_kwargs(capture_output=True),
+        )
+    except OSError:
+        return 0.0
+    try:
+        duration = float(result.stdout.strip())
+    except ValueError:
+        return 0.0
+    return duration if math.isfinite(duration) and duration > 0 else 0.0
+
+
+def ffprobe_audio_bitrate(path: str) -> Optional[int]:
+    """Return the bitrate of `path` in bits/sec via `ffprobe`, or `None` if unavailable."""
+    ffprobe = find_executable("ffprobe")
+    if ffprobe is None:
+        return None
+    queries = (
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=bit_rate",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            path,
+        ],
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=bit_rate",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            path,
+        ],
+    )
+    for cmd in queries:
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                **subprocess_kwargs(capture_output=True),
+            )
+        except OSError:
+            return None
+        raw = result.stdout.strip()
+        if raw.isdigit():
+            bps = int(raw)
+            if bps > 0:
+                return bps
+    return None
+
+
+def resolve_audio_bitrate(
+    source_path: str,
+    audio_bitrate: Optional[str] = None,
+    probe_bps: Optional[Callable[[str], Optional[int]]] = None,
+) -> str:
+    """
+    Determine the target AAC bitrate when transcoding `source_path` to an MP4 container.
+
+    Uses `audio_bitrate` directly when set (e.g. `"192k"`), or probes `source_path`
+    via `ffprobe` in `"auto"`/`None` mode and clamps to `[64k, 192k]` (falling back
+    to `128k` if probing fails).
+    """
+    explicit = normalize_audio_bitrate(audio_bitrate)
+    if explicit is not None:
+        return explicit
+    probe = ffprobe_audio_bitrate if probe_bps is None else probe_bps
+    bps = probe(source_path)
+    if bps is None or bps <= 0:
+        return DEFAULT_M4B_BITRATE
+    kbps = max(MIN_AUTO_M4B_BITRATE_KBPS, min(round(bps / 1000), MAX_AUTO_M4B_BITRATE_KBPS))
+    return f"{kbps}k"
 
 
 def subprocess_kwargs(capture_output: bool = True) -> Dict[str, Any]:
