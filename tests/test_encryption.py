@@ -50,3 +50,20 @@ def test_decrypt_file_aes_preserves_original_and_cleans_tmp_on_error(tmp_path):
 
     assert target.read_bytes() == bad_payload
     assert not (tmp_path / "broken.mp3.dec.tmp").exists()
+
+
+def test_decrypt_file_with_output_path_preserves_source_ciphertext(tmp_path):
+    key = b"0123456789abcdef"
+    iv = b"fedcba9876543210"
+    plaintext = os.urandom(16 * 10)
+    ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(plaintext)
+
+    src_tmp = tmp_path / "segment.ts.tmp"
+    dst_file = tmp_path / "segment.ts"
+    src_tmp.write_bytes(ciphertext)
+
+    decrypt_file(str(src_tmp), AESEncryption(key=key, iv=iv), output_path=str(dst_file))
+
+    assert dst_file.read_bytes() == plaintext
+    assert src_tmp.read_bytes() == ciphertext
+    assert not (tmp_path / "segment.ts.dec.tmp").exists()

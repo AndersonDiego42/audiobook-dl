@@ -4,6 +4,7 @@
 |:-----------------|:-------:|:-----------------:|:-----------------------------------------------------------------------------------------------|
 | audiobooks.com   |    ✓    |         ✗         | Can download all books from library                                                            |
 | Blinkist         |    ✓    |         ✗         |                                                                                                |
+| BookBeat         |    ✗    |         ✓         | Books must be saved to your library                                                            |
 | Chirp            |    ✓    |         ✗         |                                                                                                |
 | eReolen          |    ✓    |         ✓         |                                                                                                |
 | Everand          |    ✓    |         ✗         | Used to be called Scribd                                                                       |

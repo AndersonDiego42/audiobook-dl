@@ -6,14 +6,17 @@ import argparse
 import importlib.metadata
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ENTRY_POINT = REPO_ROOT / "audiobookdl" / "gui" / "app.py"
 ASSETS_DIR = REPO_ROOT / "audiobookdl" / "assets"
+ICON_PATH = ASSETS_DIR / "icon.ico"
 BUILD_DIR = REPO_ROOT / "build"
 DIST_DIR = REPO_ROOT / "dist"
 
@@ -36,14 +39,65 @@ EXCLUDED_MODULES = (
     # On Python 3.12+, `distutils` is aliased from `setuptools._distutils` by PyInstaller's
     # pre-safe-import hook; excluding `distutils` directly triggers an alias conflict.
     *(("distutils",) if sys.version_info < (3, 12) else ()),
+    # Python 3.11+ uses stdlib `tomllib`, so `tomli` (and its mypyc binary) is unneeded.
+    *(("tomli",) if sys.version_info >= (3, 11) else ()),
     "setuptools",
     "_distutils_hack",
     "pkg_resources",
 )
 
 
+def _read_version() -> str:
+    init_py = REPO_ROOT / "audiobookdl" / "__init__.py"
+    match = re.search(r'^__version__\s*=\s*"([^"]+)"', init_py.read_text(encoding="utf-8"), re.M)
+    return match.group(1) if match else "0.0.0"
+
+
+def _write_windows_version_file(target_path: Path, version_str: str) -> Path:
+    parts = [int(p) for p in re.findall(r"\d+", version_str)[:4]]
+    while len(parts) < 4:
+        parts.append(0)
+    ver_tuple = tuple(parts)
+    content = (
+        "VSVersionInfo(\n"
+        "  ffi=FixedFileInfo(\n"
+        f"    filevers={ver_tuple},\n"
+        f"    prodvers={ver_tuple},\n"
+        "    mask=0x3f,\n"
+        "    flags=0x0,\n"
+        "    OS=0x40004,\n"
+        "    fileType=0x1,\n"
+        "    subtype=0x0,\n"
+        "    date=(0, 0)\n"
+        "  ),\n"
+        "  kids=[\n"
+        "    StringFileInfo([\n"
+        "      StringTable(\n"
+        "        '040904B0',\n"
+        "        [\n"
+        "          StringStruct('CompanyName', 'jo1gi'),\n"
+        "          StringStruct('FileDescription', 'audiobook-dl Desktop Downloader'),\n"
+        f"          StringStruct('FileVersion', '{version_str}'),\n"
+        "          StringStruct('InternalName', 'audiobook-dl'),\n"
+        "          StringStruct('OriginalFilename', 'audiobook-dl.exe'),\n"
+        "          StringStruct('ProductName', 'audiobook-dl'),\n"
+        f"          StringStruct('ProductVersion', '{version_str}'),\n"
+        "        ]\n"
+        "      )\n"
+        "    ]),\n"
+        "    VarFileInfo([VarStruct('Translation', [1033, 1200])])\n"
+        "  ]\n"
+        ")\n"
+    )
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text(content, encoding="utf-8")
+    return target_path
+
+
 def _collect_mypyc_binaries() -> list[Path]:
-    """Return compiled mypyc runtime extensions referenced by `tomli`."""
+    """Return compiled mypyc runtime extensions referenced by `tomli` on Python < 3.11."""
+    if sys.version_info >= (3, 11):
+        return []
     found: list[Path] = []
     try:
         dist_files = importlib.metadata.files("tomli") or []
@@ -95,6 +149,16 @@ def build(
     for mypyc_bin in _collect_mypyc_binaries():
         cmd.extend(["--add-binary", f"{mypyc_bin}{sep}."])
 
+    if ICON_PATH.is_file():
+        cmd.extend(["--icon", str(ICON_PATH)])
+
+    if os.name == "nt":
+        version_file = _write_windows_version_file(
+            BUILD_DIR / "version_info.txt",
+            _read_version(),
+        )
+        cmd.extend(["--version-file", str(version_file)])
+
     binaries: list[Path] = []
     if bundle_ffmpeg or copy_ffmpeg:
         for tool in ("ffmpeg", "ffprobe"):
@@ -120,6 +184,17 @@ def build(
     return exe_path
 
 
+def verify_executable(exe_path: Path, timeout: int = 60) -> None:
+    """Launch the built executable with `--self-test` in an isolated temp directory."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        subprocess.run(
+            [str(exe_path), "--self-test"],
+            cwd=tmpdir,
+            check=True,
+            timeout=timeout,
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build portable audiobook-dl executable")
     mode_group = parser.add_mutually_exclusive_group()
@@ -143,6 +218,12 @@ def main() -> None:
         action="store_true",
         help="Copy ffmpeg and ffprobe beside the built executable",
     )
+    parser.add_argument(
+        "--verify",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run `--self-test` smoke verification on the built executable (default: enabled)",
+    )
     args = parser.parse_args()
     exe_path = build(
         bundle_ffmpeg=args.bundle_ffmpeg,
@@ -150,6 +231,9 @@ def main() -> None:
         onedir=args.onedir,
     )
     print(f"Built portable executable: {exe_path}")
+    if args.verify:
+        verify_executable(exe_path)
+        print(f"Verified executable self-test: {exe_path}")
 
 
 if __name__ == "__main__":

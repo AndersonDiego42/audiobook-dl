@@ -5,7 +5,14 @@ from audiobookdl.exceptions import (
     GenericAudiobookDLException,
     MissingDependency,
 )
-from audiobookdl.utils import find_executable, subprocess_kwargs
+from audiobookdl.utils import (
+    DEFAULT_M4B_BITRATE,
+    MAX_AUTO_M4B_BITRATE_KBPS,
+    MIN_AUTO_M4B_BITRATE_KBPS,
+    find_executable,
+    normalize_audio_bitrate,
+    subprocess_kwargs,
+)
 from audiobookdl.utils.concurrency import run_cancellable_pool, run_cancellable_subprocess
 
 import os
@@ -74,6 +81,62 @@ def _ffprobe_duration(path: str) -> float:
         return 0.0
 
 
+def _ffprobe_audio_bitrate(path: str) -> Optional[int]:
+    """Return the bitrate of `path` in bits/sec via `ffprobe`, or `None` if unavailable."""
+    ffprobe = find_executable("ffprobe")
+    if ffprobe is None:
+        return None
+    queries = (
+        [
+            ffprobe, "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries", "stream=bit_rate",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path,
+        ],
+        [
+            ffprobe, "-v", "error",
+            "-show_entries", "format=bit_rate",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path,
+        ],
+    )
+    for cmd in queries:
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                **subprocess_kwargs(capture_output=True),
+            )
+        except OSError:
+            return None
+        raw = result.stdout.strip()
+        if raw.isdigit():
+            bps = int(raw)
+            if bps > 0:
+                return bps
+    return None
+
+
+def resolve_aac_bitrate(source_path: str, audio_bitrate: Optional[str] = None) -> str:
+    """
+    Determine the target AAC bitrate when transcoding `source_path` to an MP4 container.
+
+    Uses `audio_bitrate` directly when set (e.g. `"192k"`), or probes `source_path`
+    via `ffprobe` in `"auto"`/`None` mode and clamps to `[64k, 192k]` (falling back
+    to `128k` if probing fails).
+    """
+    explicit = normalize_audio_bitrate(audio_bitrate)
+    if explicit is not None:
+        return explicit
+    bps = _ffprobe_audio_bitrate(source_path)
+    if bps is None or bps <= 0:
+        return DEFAULT_M4B_BITRATE
+    kbps = max(MIN_AUTO_M4B_BITRATE_KBPS, min(round(bps / 1000), MAX_AUTO_M4B_BITRATE_KBPS))
+    return f"{kbps}k"
+
+
 def _remux_to_mpegts(
     source: str,
     ts_path: str,
@@ -90,7 +153,7 @@ def _remux_to_mpegts(
     :returns: `True` if a non-empty file was produced
     """
     ffmpeg = _require_executable("ffmpeg")
-    capture = not logging.ffmpeg_output
+    capture = not logging.is_ffmpeg_output()
     try:
         result = run_cancellable_subprocess(
             [ffmpeg, "-y", "-i", source, "-vn", "-c:a", "copy", "-f", "mpegts", ts_path],
@@ -170,7 +233,7 @@ def combine_audiofiles(
                 command += ["-bsf:a", "aac_adtstoasc"]
             command += ["-movflags", "+faststart"]
         command.append(output_path)
-        capture = not logging.ffmpeg_output
+        capture = not logging.is_ffmpeg_output()
         result = run_cancellable_subprocess(
             command,
             capture_output=capture,
@@ -241,11 +304,13 @@ def convert_output(
     filenames: Sequence[str],
     output_format: str,
     cancel_event: Optional[threading.Event] = None,
+    audio_bitrate: Optional[str] = None,
 ):
     """Converts a list of audio files into another format and return new
     files"""
+    explicit_bitrate = normalize_audio_bitrate(audio_bitrate)
     ffmpeg = _require_executable("ffmpeg")
-    capture = not logging.ffmpeg_output
+    capture = not logging.is_ffmpeg_output()
     target_format = output_format.lstrip(".").lower()
     new_paths = []
     for old_path in filenames:
@@ -262,7 +327,8 @@ def convert_output(
                     if old_ext in ("ts", "aac"):
                         command += ["-bsf:a", "aac_adtstoasc"]
                 else:
-                    command += ["-c:a", "aac", "-b:a", "128k"]
+                    target_bitrate = explicit_bitrate or resolve_aac_bitrate(old_path)
+                    command += ["-c:a", "aac", "-b:a", target_bitrate]
                 command += ["-movflags", "+faststart"]
             elif can_copy_codec(old_ext, target_format):
                 command += ["-c:a", "copy"]
@@ -296,17 +362,20 @@ def get_max_name_length() -> int:
 
     :returns: max length for file names
     """
-    try:
-        # should work on Linux/MacOS
-        return os.pathconf(".", "PC_NAME_MAX")
-    except:
+    pathconf = getattr(os, "pathconf", None)
+    if callable(pathconf):
         try:
-            # Windows
-            from ctypes.wintypes import MAX_PATH
-            return MAX_PATH
-        except:
-            # default
-            return 255
+            # should work on Linux/MacOS
+            return int(pathconf(".", "PC_NAME_MAX"))
+        except OSError:
+            pass
+    try:
+        # Windows
+        from ctypes.wintypes import MAX_PATH
+        return MAX_PATH
+    except Exception:
+        # default
+        return 255
 
 # Extra length reserved on output_dir/filename for extensions, sidecar json, and temp/ts paths
 OUTPUT_PATH_EXT_RESERVE = 20

@@ -1,4 +1,5 @@
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+import contextvars
 import subprocess
 import tempfile
 import threading
@@ -110,7 +111,10 @@ def run_cancellable_pool(
             raise DownloadCancelled
         return fn(item)
 
-    futures = [executor.submit(_run_item, item) for item in items]
+    futures = [
+        executor.submit(contextvars.copy_context().run, _run_item, item)
+        for item in items
+    ]
     future_to_idx = {fut: idx for idx, fut in enumerate(futures)}
     ordered: List[Optional[T_out]] = [None] * count
     pending = set(futures)

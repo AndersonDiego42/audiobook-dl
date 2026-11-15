@@ -1,4 +1,9 @@
+from __future__ import annotations
 from requests.models import Response
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from audiobookdl.args import DownloadOptions
 from .source import Source
 from audiobookdl import (
     AudiobookFile,
@@ -107,7 +112,7 @@ class StorytelSource(Source):
     _download_counter = 0
     create_storage_dir = True
 
-    def __init__(self, options) -> None:
+    def __init__(self, options: DownloadOptions) -> None:
         super().__init__(options)
         self.database_directory_books = os.path.join(self.database_directory, "books")
         self.database_directory_playback_metadata = os.path.join(
@@ -529,7 +534,7 @@ class StorytelSource(Source):
                 f"found multiple abook formats, please report this audiobook for bugfixing",
             )
 
-        format = book_details["formats"][0]
+        format = abook_formats[0]
         if "isReleased" in format:
             if not format["isReleased"]:
                 raise BookNotReleased

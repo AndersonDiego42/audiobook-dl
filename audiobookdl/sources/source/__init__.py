@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # Internal imports
 from . import networking
 from audiobookdl import logging, AudiobookFile, Chapter, AudiobookMetadata, Cover, Result, Audiobook, BookId
@@ -12,9 +14,12 @@ from lxml.cssselect import CSSSelector
 import re
 import os
 from http.cookiejar import MozillaCookieJar
-from typing import Any, Dict, List, Optional, TypeVar, Generic
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, TypeVar, Generic
 from ssl import SSLContext
 import urllib3
+
+if TYPE_CHECKING:
+    from audiobookdl.args import DownloadOptions
 
 T = TypeVar("T")
 
@@ -33,7 +38,7 @@ class Source(Generic[T]):
     # Create database directory for source
     create_storage_dir: bool = False
 
-    def __init__(self, options: Any):
+    def __init__(self, options: DownloadOptions):
         self.__authenticated: bool = False
         self.__pages: Dict[str, bytes] = {}
         self.database_directory = os.path.join(options.database_directory, self.name)
@@ -175,7 +180,7 @@ class Source(Generic[T]):
     get_json = networking.get_json
     get_stream_files = networking.get_stream_files
 
-    def create_ssl_context(self, options: Any) -> SSLContext:
+    def create_ssl_context(self, options: DownloadOptions) -> SSLContext:
         try:
             ssl_context: SSLContext = urllib3.util.create_urllib3_context()  # type: ignore[attr-defined]
 
@@ -191,7 +196,7 @@ class Source(Generic[T]):
         except AttributeError: # AttributeError: module 'urllib3.util' has no attribute 'create_urllib3_context'
             raise GenericAudiobookDLException(f"Please update urllib3 to version >= 2 using the command 'pip install -U urllib3'")
 
-    def create_session(self, options: Any) -> requests.Session:
+    def create_session(self, options: DownloadOptions) -> requests.Session:
         session = requests.Session()
         ssl_context: SSLContext = self.create_ssl_context(options)
         session.mount(

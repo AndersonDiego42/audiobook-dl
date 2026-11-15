@@ -1,10 +1,14 @@
+from collections import deque
+from contextlib import contextmanager
+import contextvars
+from dataclasses import dataclass
 from rich.text import Text
 from rich.style import Style
 from rich.markup import render
 from rich.console import Console
 from rich.progress import Progress, ProgressColumn
 from rich.prompt import Confirm, Prompt
-from typing import Any, List, Optional, Protocol, Tuple, Union
+from typing import Any, Deque, Iterator, List, Optional, Protocol, Tuple, Union
 from audiobookdl.utils import read_asset_file
 import io
 import sys
@@ -49,8 +53,79 @@ class CliInteractionHandler:
 _ui_sink: Optional[LogSink] = None
 
 
+@dataclass
+class JobContext:
+    """Per-job logging, UI sink, interaction, and cancellation context."""
+
+    debug: bool = False
+    quiet: bool = False
+    ffmpeg_output: bool = False
+    sink: Optional[LogSink] = None
+    interaction: Optional[InteractionHandler] = None
+    cancel_event: Optional[threading.Event] = None
+
+
+_job_context: contextvars.ContextVar[Optional[JobContext]] = contextvars.ContextVar(
+    "audiobookdl_job_context",
+    default=None,
+)
+
+
+def get_job_context() -> Optional[JobContext]:
+    """Return the active `JobContext` for the current task/thread, if any."""
+    return _job_context.get()
+
+
+def set_job_context(
+    ctx: Optional[JobContext],
+) -> contextvars.Token[Optional[JobContext]]:
+    """Bind `ctx` to the current task/thread and return the reset token."""
+    return _job_context.set(ctx)
+
+
+def reset_job_context(token: contextvars.Token[Optional[JobContext]]) -> None:
+    """Restore the previous `JobContext` using `token`."""
+    _job_context.reset(token)
+
+
+@contextmanager
+def job_context(ctx: JobContext) -> Iterator[JobContext]:
+    """Context manager binding `ctx` for the duration of a download job."""
+    token = _job_context.set(ctx)
+    try:
+        yield ctx
+    finally:
+        _job_context.reset(token)
+
+
+def is_debug_mode() -> bool:
+    """Return whether debug logging is enabled in the active job or globally."""
+    ctx = _job_context.get()
+    return ctx.debug if ctx is not None else debug_mode
+
+
+def is_quiet_mode() -> bool:
+    """Return whether quiet mode is enabled in the active job or globally."""
+    ctx = _job_context.get()
+    return ctx.quiet if ctx is not None else quiet_mode
+
+
+def is_ffmpeg_output() -> bool:
+    """Return whether verbose FFmpeg output is enabled in the active job or globally."""
+    ctx = _job_context.get()
+    return ctx.ffmpeg_output if ctx is not None else ffmpeg_output
+
+
+def get_ui_sink() -> Optional[LogSink]:
+    """Return the active `LogSink` for the current job, or the global sink."""
+    ctx = _job_context.get()
+    if ctx is not None and ctx.sink is not None:
+        return ctx.sink
+    return _ui_sink
+
+
 def set_ui_sink(sink: Optional[LogSink]) -> None:
-    """Register or clear the active UI sink for logs and progress."""
+    """Register or clear the global fallback UI sink for logs and progress."""
     global _ui_sink
     _ui_sink = sink
 
@@ -65,16 +140,33 @@ def strip_markup(msg: str) -> str:
 
 _PROGRESS_EMIT_INTERVAL = 0.05  # 20 Hz max UI progress emission rate
 _PROGRESS_EMIT_MIN_DELTA = 0.005  # 0.5% progress delta threshold
+_SPEED_WINDOW_SECONDS = 3.0
+_METRICS_EMIT_INTERVAL = 0.25
+
+
+def emit_item_progress(current: int, total: int, title: str = "") -> None:
+    """Notify active UI sink of item/book position within a URL or series."""
+    sink = get_ui_sink()
+    if sink is None:
+        return
+    handler = getattr(sink, "on_item_progress", None)
+    if callable(handler):
+        handler(current, total, strip_markup(title))
 
 
 class _SinkTask:
     """Minimal task representation mirroring Rich Task's `remaining` attribute."""
 
     def __init__(self, total: float) -> None:
+        now = time.monotonic()
         self.total = total
         self.completed = 0.0
         self.last_emitted_completed = 0.0
-        self.last_emitted_time = time.monotonic()
+        self.last_emitted_time = now
+        self.start_time = now
+        self.bytes_downloaded = 0
+        self.byte_samples: Deque[Tuple[float, int]] = deque()
+        self.last_metrics_time = 0.0
 
     @property
     def remaining(self) -> float:
@@ -103,8 +195,70 @@ class _SinkProgressAdapter:
         self._sink.on_progress_start(strip_markup(description), float(total))
         return task_id
 
+    def _build_metrics_locked(
+        self,
+        task: _SinkTask,
+        now: float,
+    ) -> Tuple[float, float, int, float, float, Optional[float]]:
+        cutoff = now - _SPEED_WINDOW_SECONDS
+        while task.byte_samples and task.byte_samples[0][0] < cutoff:
+            task.byte_samples.popleft()
+        elapsed = max(0.0, now - task.start_time)
+        window_bytes = sum(sample_bytes for _, sample_bytes in task.byte_samples)
+        if task.byte_samples:
+            span = max(0.25, now - task.byte_samples[0][0])
+            effective_span = max(span, min(elapsed, 1.0)) if elapsed > 0 else span
+            speed_bps = window_bytes / effective_span
+        else:
+            speed_bps = 0.0
+        eta_seconds: Optional[float] = None
+        if task.total > 0 and task.completed > 0:
+            if task.completed >= task.total:
+                eta_seconds = 0.0
+            elif elapsed >= 0.5 and (task.completed / task.total) >= 0.002:
+                eta_seconds = elapsed * ((task.total - task.completed) / task.completed)
+        return (
+            task.completed,
+            task.total,
+            task.bytes_downloaded,
+            speed_bps,
+            elapsed,
+            eta_seconds,
+        )
+
+    def _emit_metrics(
+        self,
+        metrics: Optional[Tuple[float, float, int, float, float, Optional[float]]],
+    ) -> None:
+        if metrics is None:
+            return
+        handler = getattr(self._sink, "on_progress_metrics", None)
+        if callable(handler):
+            handler(*metrics)
+
+    def record_bytes(self, task_id: int, num_bytes: int) -> None:
+        """Record downloaded bytes for rolling speed and ETA calculation."""
+        if num_bytes <= 0:
+            return
+        metrics = None
+        with self._lock:
+            if not (0 <= task_id < len(self.tasks)):
+                return
+            task = self.tasks[task_id]
+            now = time.monotonic()
+            task.bytes_downloaded += int(num_bytes)
+            task.byte_samples.append((now, int(num_bytes)))
+            cutoff = now - _SPEED_WINDOW_SECONDS
+            while task.byte_samples and task.byte_samples[0][0] < cutoff:
+                task.byte_samples.popleft()
+            if (now - task.last_metrics_time) >= _METRICS_EMIT_INTERVAL:
+                task.last_metrics_time = now
+                metrics = self._build_metrics_locked(task, now)
+        self._emit_metrics(metrics)
+
     def advance(self, task_id: int, advance: float = 1.0) -> None:
         emit_values: Optional[Tuple[float, float]] = None
+        metrics = None
         with self._lock:
             task = self.tasks[task_id]
             task.completed = max(0.0, min(task.total, task.completed + float(advance)))
@@ -125,21 +279,25 @@ class _SinkProgressAdapter:
                 ):
                     task.last_emitted_completed = completed
                     task.last_emitted_time = now
+                    task.last_metrics_time = now
                     emit_values = (completed, total)
+                    metrics = self._build_metrics_locked(task, now)
         if emit_values is not None:
             self._sink.on_progress_advance(*emit_values)
+            self._emit_metrics(metrics)
 
 
 def _emit_to_sink(level: str, msg: str) -> bool:
-    if _ui_sink is None:
+    sink = get_ui_sink()
+    if sink is None:
         return False
-    _ui_sink.on_log(level, strip_markup(msg))
+    sink.on_log(level, strip_markup(msg))
     return True
 
 
 def debug(msg: str, remove_styling=False):
     """Print debug msg"""
-    if debug_mode:
+    if is_debug_mode():
         if _emit_to_sink("DEBUG", msg):
             return
         if remove_styling:
@@ -151,10 +309,10 @@ def debug(msg: str, remove_styling=False):
 
 def log(msg: str):
     """Display msg in log"""
-    if not quiet_mode:
+    if not is_quiet_mode():
         if _emit_to_sink("INFO", msg):
             return
-        if debug_mode:
+        if is_debug_mode():
             console.print(INFO_PREFIX, msg)
         else:
             console.print(msg)
@@ -162,7 +320,7 @@ def log(msg: str):
 
 def book_update(msg: str):
     """Display indented msg in log"""
-    if debug_mode:
+    if is_debug_mode():
         log(msg)
     else:
         log(f"  {msg}")
@@ -195,15 +353,17 @@ def simple_help() -> None:
 
 
 def progress(progress_format: List[Union[str, ProgressColumn]]) -> Any:
-    if _ui_sink is not None:
-        return _SinkProgressAdapter(_ui_sink)
+    sink = get_ui_sink()
+    if sink is not None:
+        return _SinkProgressAdapter(sink)
     return Progress(*progress_format, console=console)
 
 
 def print_traceback() -> None:
     """Print traceback"""
-    if _ui_sink is not None:
-        _ui_sink.on_log("ERROR", traceback.format_exc().strip())
+    sink = get_ui_sink()
+    if sink is not None:
+        sink.on_log("ERROR", traceback.format_exc().strip())
         return
     console.print()
     console.print("[underline white bold]Traceback[/]")

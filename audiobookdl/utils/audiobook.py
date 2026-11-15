@@ -211,6 +211,7 @@ T = TypeVar("T")
 @define
 class BookId(Generic[T]):
     id: T
+    title: Optional[str] = None
 
 @define
 class Series(Generic[T]):

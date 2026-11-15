@@ -13,9 +13,15 @@ from audiobookdl import AudiobookMetadata, Chapter
 from audiobookdl.exceptions import DownloadCancelled, FailedCombining, GenericAudiobookDLException
 from audiobookdl.output import output
 from audiobookdl.output.metadata import ffmpeg as ffmpeg_metadata
-from audiobookdl.output.output import combine_audiofiles, convert_output, gen_output_location, get_extension
+from audiobookdl.output.output import (
+    combine_audiofiles,
+    convert_output,
+    gen_output_location,
+    get_extension,
+    resolve_aac_bitrate,
+)
 from audiobookdl.output.download import get_output_audio_format
-from audiobookdl.utils import find_executable
+from audiobookdl.utils import find_executable, normalize_audio_bitrate
 from audiobookdl.utils.concurrency import run_cancellable_subprocess
 
 class _OutputTestCase(TypedDict):
@@ -344,4 +350,97 @@ def test_combine_audiofiles_isolates_work_dir_and_cleans_on_failure(tmp_path, mo
     assert not (tmp_path / "Book.work").exists()
     assert not (parts_dir / "ts_parts").exists()
     assert part0.read_bytes() == b"part0"
+
+
+def test_normalize_and_resolve_aac_bitrate(monkeypatch):
+    assert normalize_audio_bitrate(None) is None
+    assert normalize_audio_bitrate("") is None
+    assert normalize_audio_bitrate("auto") is None
+    assert normalize_audio_bitrate("Auto") is None
+    assert normalize_audio_bitrate("64k") == "64k"
+    assert normalize_audio_bitrate("128K") == "128k"
+    assert normalize_audio_bitrate("192") == "192k"
+
+    for bad in ("fast", "0k", "2000k", "-64k"):
+        with pytest.raises(ValueError):
+            normalize_audio_bitrate(bad)
+
+    # Explicit bitrate bypasses ffprobe
+    monkeypatch.setattr(output, "_ffprobe_audio_bitrate", lambda _p: 32000)
+    assert resolve_aac_bitrate("dummy.mp3", "192k") == "192k"
+
+    # Auto mode probes and clamps to [64k, 192k]
+    monkeypatch.setattr(output, "_ffprobe_audio_bitrate", lambda _p: 32000)
+    assert resolve_aac_bitrate("dummy.mp3", "auto") == "64k"
+
+    monkeypatch.setattr(output, "_ffprobe_audio_bitrate", lambda _p: 96000)
+    assert resolve_aac_bitrate("dummy.mp3", None) == "96k"
+
+    monkeypatch.setattr(output, "_ffprobe_audio_bitrate", lambda _p: 320000)
+    assert resolve_aac_bitrate("dummy.mp3", None) == "192k"
+
+    monkeypatch.setattr(output, "_ffprobe_audio_bitrate", lambda _p: None)
+    assert resolve_aac_bitrate("dummy.mp3", None) == "128k"
+
+
+def test_convert_output_passes_auto_and_explicit_aac_bitrate(tmp_path):
+    mp3 = tmp_path / "book.mp3"
+    mp3.write_bytes(b"mp3-bytes")
+    captured_cmds = []
+
+    def fake_run(cmd, **kwargs):
+        captured_cmds.append(cmd)
+        open(cmd[-1], "wb").write(b"m4b-bytes")
+        return SimpleNamespace(returncode=0, stderr=b"")
+
+    # Auto mode uses probed bitrate (e.g., 96k)
+    with patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"), \
+         patch("audiobookdl.output.output._ffmpeg_audio_codec", return_value="mp3"), \
+         patch("audiobookdl.output.output._ffprobe_audio_bitrate", return_value=96000), \
+         patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run):
+        convert_output([str(mp3)], "m4b")
+
+    auto_cmd = captured_cmds[-1]
+    assert auto_cmd[auto_cmd.index("-b:a") + 1] == "96k"
+
+    # Explicit bitrate overrides probe
+    mp3.write_bytes(b"mp3-bytes")
+    (tmp_path / "book.m4b").unlink()
+    with patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"), \
+         patch("audiobookdl.output.output._ffmpeg_audio_codec", return_value="mp3"), \
+         patch("audiobookdl.output.output._ffprobe_audio_bitrate", return_value=64000), \
+         patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run):
+        convert_output([str(mp3)], "m4b", audio_bitrate="192k")
+
+    explicit_cmd = captured_cmds[-1]
+    assert explicit_cmd[explicit_cmd.index("-b:a") + 1] == "192k"
+
+    # Invalid bitrate fails fast before running ffmpeg
+    mp3.write_bytes(b"mp3-bytes")
+    with pytest.raises(ValueError):
+        convert_output([str(mp3)], "m4b", audio_bitrate="invalid")
+
+
+def test_real_ffprobe_and_m4b_bitrate_conversion(tmp_path):
+    ffmpeg = find_executable("ffmpeg")
+    ffprobe = find_executable("ffprobe")
+    if not ffmpeg or not ffprobe:
+        pytest.skip("ffmpeg/ffprobe not available")
+    assert ffmpeg is not None
+    assert ffprobe is not None
+
+    mp3 = tmp_path / "speech_64k.mp3"
+    subprocess.run(
+        [ffmpeg, "-y", "-f", "lavfi", "-i", "anullsrc=r=22050:cl=mono", "-t", "1.0", "-b:a", "64k", str(mp3)],
+        check=True,
+        capture_output=True,
+    )
+    probed_bps = output._ffprobe_audio_bitrate(str(mp3))
+    assert probed_bps is not None
+    assert 48000 <= probed_bps <= 80000
+    assert resolve_aac_bitrate(str(mp3)) == "64k"
+
+    converted = convert_output([str(mp3)], "m4b", audio_bitrate="192k")
+    assert converted == [str(tmp_path / "speech_64k.m4b")]
+    assert output._ffmpeg_audio_codec(converted[0]) == "aac"
 

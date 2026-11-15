@@ -5,14 +5,21 @@ from audiobookdl.credentials import (
     get_credential_store,
 )
 from audiobookdl.exceptions import ConfigNotFound
-from attrs import define
+from audiobookdl.utils import normalize_audio_bitrate
+from attrs import Factory, define
 
 from typing import Any, Dict, Optional
 
-import re
-import tomli
-import appdirs
 import os
+import re
+import sys
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    import tomli as tomllib  # type: ignore[no-redef]
+
+import appdirs
 
 
 @define
@@ -25,6 +32,14 @@ class SourceConfig:
 
 
 @define
+class GuiConfig:
+    """Stores desktop GUI layout and output preferences"""
+    window_geometry: Optional[str] = None
+    output_dir: Optional[str] = None
+    output_template: Optional[str] = None
+
+
+@define
 class Config:
     """audiobook-dl config"""
     sources: Dict[str, SourceConfig]
@@ -33,6 +48,10 @@ class Config:
     skip_downloaded: Optional[bool]
     output_format: Optional[str] = None
     combine: Optional[bool] = None
+    ffmpeg_dir: Optional[str] = None
+    resume: Optional[bool] = None
+    audio_bitrate: Optional[str] = None
+    gui: GuiConfig = Factory(GuiConfig)
 
 
 def load_config(
@@ -54,12 +73,40 @@ def load_config(
     return structure_config(config_location, config_dict, credential_store=store)
 
 
+def _frozen_executable_dir() -> Optional[str]:
+    """Return the directory containing the frozen executable, or `None`."""
+    if not getattr(sys, "frozen", False):
+        return None
+    return os.path.dirname(os.path.abspath(sys.executable))
+
+
+def is_portable_mode() -> bool:
+    """
+    Return `True` when running as a frozen executable in USB-portable mode.
+
+    Portable mode activates when a `.portable` marker file or `audiobook-dl.toml`
+    exists beside the frozen executable so config, credentials, and `db/` stay
+    with the executable rather than writing to the host user's AppData folder.
+    """
+    exe_dir = _frozen_executable_dir()
+    if exe_dir is None:
+        return False
+    return any(
+        os.path.exists(os.path.join(exe_dir, marker))
+        for marker in (".portable", "audiobook-dl.toml")
+    )
+
+
 def config_dir() -> str:
     """
     Get path of configuration directory
 
     :returns: Path of configuration directory
     """
+    if is_portable_mode():
+        exe_dir = _frozen_executable_dir()
+        if exe_dir is not None:
+            return exe_dir
     return appdirs.user_config_dir("audiobook-dl", "jo1gi")
 
 
@@ -87,7 +134,7 @@ def read_config(config_file: str) -> dict:
     """
     if os.path.exists(config_file):
         with open(config_file, "rb") as f:
-            config_dict = tomli.load(f)
+            config_dict = tomllib.load(f)
     else:
         config_dict = {}
     return config_dict
@@ -178,6 +225,18 @@ def structure_config(
                         library=None,
                         cookie_file=None,
                     )
+    gui_section = config_dict.get("gui")
+    gui_config = GuiConfig()
+    if isinstance(gui_section, dict):
+        gui_config = GuiConfig(
+            window_geometry=gui_section.get("window_geometry"),
+            output_dir=gui_section.get("output_dir"),
+            output_template=gui_section.get("output_template"),
+        )
+    raw_resume = config_dict.get("resume")
+    resume_val = raw_resume if isinstance(raw_resume, bool) else None
+    raw_bitrate = config_dict.get("audio_bitrate")
+    audio_bitrate = normalize_audio_bitrate(raw_bitrate) if isinstance(raw_bitrate, str) else None
     # Create config object
     return Config(
         sources = sources,
@@ -186,6 +245,10 @@ def structure_config(
         skip_downloaded = config_dict.get("skip_downloaded"),
         output_format = config_dict.get("output_format"),
         combine = config_dict.get("combine"),
+        ffmpeg_dir = config_dict.get("ffmpeg_dir"),
+        resume = resume_val,
+        audio_bitrate = audio_bitrate,
+        gui = gui_config,
     )
 
 
@@ -225,12 +288,22 @@ def _format_toml_value(value: Any) -> str:
 
 
 def _dump_toml(data: Dict[str, Any]) -> str:
-    """Serialize config dictionary (top-level scalars + [sources.<name>] tables) to TOML."""
+    """Serialize config dictionary (top-level scalars + [gui] + [sources.<name>] tables) to TOML."""
     lines = []
     for key, value in data.items():
-        if key == "sources" or isinstance(value, dict) or value is None:
+        if isinstance(value, dict) or value is None:
             continue
         lines.append(f"{_format_toml_key(key)} = {_format_toml_value(value)}")
+
+    gui = data.get("gui")
+    if isinstance(gui, dict):
+        entries = [(k, v) for k, v in gui.items() if v is not None and v != ""]
+        if entries:
+            if lines:
+                lines.append("")
+            lines.append("[gui]")
+            for k, v in entries:
+                lines.append(f"{_format_toml_key(k)} = {_format_toml_value(v)}")
 
     sources = data.get("sources")
     if isinstance(sources, dict):
@@ -319,12 +392,18 @@ def save_source_credentials(
     return _write_config_dict(config_location, config_dict)
 
 
+_UNSET: Any = object()
+
+
 def save_output_preferences(
     output_format: Optional[str],
     combine: bool,
     overwrite: Optional[str] = None,
+    *,
+    audio_bitrate: Any = _UNSET,
+    resume: Any = _UNSET,
 ) -> str:
-    """Persist GUI output format and combine preference in `audiobook-dl.toml`."""
+    """Persist GUI output format, combine, bitrate, and resume preferences in `audiobook-dl.toml`."""
     config_location = overwrite or get_config_location(None)
     config_dict = read_config(config_location)
     if output_format:
@@ -332,4 +411,57 @@ def save_output_preferences(
     else:
         config_dict.pop("output_format", None)
     config_dict["combine"] = bool(combine)
+    if audio_bitrate is not _UNSET:
+        normalized_bitrate = normalize_audio_bitrate(audio_bitrate)
+        if normalized_bitrate:
+            config_dict["audio_bitrate"] = normalized_bitrate
+        else:
+            config_dict.pop("audio_bitrate", None)
+    if resume is not _UNSET:
+        config_dict["resume"] = bool(resume)
+    return _write_config_dict(config_location, config_dict)
+
+
+def save_gui_preferences(
+    window_geometry: Optional[str] = None,
+    output_dir: Optional[str] = None,
+    output_template: Optional[str] = None,
+    overwrite: Optional[str] = None,
+) -> str:
+    """Persist GUI window geometry, last output folder, and filename template in `audiobook-dl.toml`."""
+    config_location = overwrite or get_config_location(None)
+    config_dict = read_config(config_location)
+    gui_dict = dict(config_dict.get("gui") or {})
+    updates = {
+        "window_geometry": window_geometry,
+        "output_dir": output_dir,
+        "output_template": output_template,
+    }
+    for key, val in updates.items():
+        if val is None:
+            continue
+        cleaned = val.strip()
+        if cleaned:
+            gui_dict[key] = cleaned
+        else:
+            gui_dict.pop(key, None)
+    if gui_dict:
+        config_dict["gui"] = gui_dict
+    else:
+        config_dict.pop("gui", None)
+    return _write_config_dict(config_location, config_dict)
+
+
+def save_ffmpeg_dir(
+    ffmpeg_dir: Optional[str],
+    overwrite: Optional[str] = None,
+) -> str:
+    """Persist or clear custom `ffmpeg_dir` in `audiobook-dl.toml`."""
+    config_location = overwrite or get_config_location(None)
+    config_dict = read_config(config_location)
+    cleaned = ffmpeg_dir.strip() if ffmpeg_dir else ""
+    if cleaned:
+        config_dict["ffmpeg_dir"] = cleaned
+    else:
+        config_dict.pop("ffmpeg_dir", None)
     return _write_config_dict(config_location, config_dict)

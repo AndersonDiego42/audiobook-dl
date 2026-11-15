@@ -3,7 +3,7 @@
 ![GitHub top language](https://img.shields.io/github/languages/top/jo1gi/audiobook-dl)
 ![License](https://img.shields.io/github/license/jo1gi/audiobook-dl)
 
-CLI tool for downloading audiobooks from online sources.
+CLI tool, Python library, and desktop GUI for downloading audiobooks from online sources.
 
 ## Maintainers
 I'm currently looking for maintainers to support the different services. I
@@ -17,12 +17,13 @@ If you are interested, please contact me on:
 audiobook-dl currently supports downloading from the following sources:
 - [audiobooks.com](https://audiobooks.com)
 - [Blinkist](https://www.blinkist.com)
+- [BookBeat](https://www.bookbeat.com/)
 - [Chirp](https://www.chirpbooks.com/)
 - [eReolen](https://ereolen.dk)
 - [Everand (previously Scribd)](https://everand.com)
 - [Librivox](https://librivox.org)
 - [Nextory](https://nextory.com)
-- [Overdrive](https://www.overdrive.com/)
+- [Overdrive](https://www.overdrive.com/) / [Libby](https://libbyapp.com/)
 - [Podimo](https://podimo.com)
 - [Saxo](https://saxo.com)
 - [Storytel](https://www.storytel.com/) / [Mofibo](https://mofibo.com)
@@ -31,102 +32,163 @@ audiobook-dl currently supports downloading from the following sources:
 [More info](./supported_sites.md)
 
 ## Installation
-audiobook-dl can be installed from the repo itself or through pip.
+audiobook-dl can be installed from PyPI, directly from the repository, or run as a portable Windows executable.
 
-To get the newest stable version with pip run:
+To install the newest stable version with pip:
 ```shell
 pip install audiobook-dl
 ```
 
-If you want to use the newest version (can be unstable) run:
+To install the latest development version from Git:
 ```shell
 pip install "git+https://github.com/jo1gi/audiobook-dl.git"
 ```
-or
+or from a local clone:
 ```shell
 git clone https://github.com/jo1gi/audiobook-dl.git
 cd audiobook-dl
-python3 setup.py install
+pip install .
 ```
 
-Some features require [ffmpeg](https://ffmpeg.org/) which can be installed
-through most package managers or from [ffmpeg.org/download.html](https://ffmpeg.org/download.html).
+Combining parts, format conversion (e.g. `.m4b`), and chapter embedding require [ffmpeg](https://ffmpeg.org/) (`ffmpeg` and `ffprobe`), which can be installed through most package managers or from [ffmpeg.org/download.html](https://ffmpeg.org/download.html).
+
+## Desktop GUI
+audiobook-dl includes a Tkinter desktop interface (`audiobook-dl-gui`):
+```shell
+audiobook-dl-gui
+# or
+python -m audiobookdl.gui
+```
+
+Key GUI features:
+- **URL auto-detection & queueing**: Paste, drag, or load `.txt` URL lists; add extra URLs to the active queue with **Add to Queue**.
+- **Preview & Series selection**: Click **Preview** to inspect cover art, metadata, and part/chapter counts before downloading, or select specific books from a series.
+- **One-click `.m4b` & quality control**: Check **Download as .m4b** to automatically combine parts and convert to `.m4b` in a single pass, and choose **M4B Quality** (`Auto`, `64k`, `96k`, `128k`, `192k`, `256k`). In `Auto` mode, source bitrate is probed via `ffprobe` and matched within `64k`–`192k`.
+- **Resumable downloads**: Enable **Resume partial** to keep downloaded segments and resume partial files via HTTP `Range` requests after interruption.
+- **Credential management**: Save per-service logins/cookie paths in `audiobook-dl.toml` with passwords stored in the OS credential store.
+- **FFmpeg folder picker**: Click **Locate FFmpeg...** if `ffmpeg`/`ffprobe` is not on your `PATH`; the path is saved in `audiobook-dl.toml`.
 
 ## Authentication
 
 ### Cookies
-audiobook-dl uses Netscape cookie files for authentication in most cases. I use
-[this](https://github.com/rotemdan/ExportCookies) extension to export my cookies
-from the browser.
+audiobook-dl uses Netscape cookie files for authentication on several services. You can use [this](https://github.com/rotemdan/ExportCookies) browser extension to export cookies.
 
-Cookies can be placed in current dir as `cookies.txt` or be given with the
-`--cookie` argument.
+Cookies can be placed in the current directory as `cookies.txt` or passed with `-c` / `--cookies`.
 
 ### Login
-[Some sources](./supported_sites.md) support authentication through login with
-username and password (and sometimes library). Use the `--username` and
-`--password` arguments or enter them through an interactive prompt.
+[Some sources](./supported_sites.md) support authentication through username and password (and sometimes library). Use `--username`, `--password`, and `--library`, enter them interactively when prompted, or save them via the GUI / configuration file.
 
-## Downloading audiobooks
+## Downloading audiobooks (CLI)
 ```shell
 audiobook-dl -c <cookie file> <url>
 ```
-**Most sites require you to provide the listening page not not just the
-information page**
+To combine multi-part streams into a single chaptered `.m4b`:
+```shell
+audiobook-dl --combine -f m4b <url>
+```
+**Most sites require you to provide the listening page, not just the book information page.**
 
 ## Arguments
 
-| Argument          | Value                                                             |
-|-------------------|-------------------------------------------------------------------|
-| url               | The url of the page where you listen to the audiobook             |
-| -c/--cookie       | Path to a Netscape cookie file                                    |
-| --combine         | Combine all output files into a single file (requires ffmpeg)     |
-| --cover           | Only download cover                                               |
-| -d/--debug        | Print debug information                                           |
-| -o/--output       | Output location                                                   |
-| --remove-chars    | List of characters that will be removed from output path          |
-| --no-chapters     | Don't include chapters in output file                             |
-| --output-format   | Output file format                                                |
-| --verbose-ffmpeg | Show ffmpeg output in terminal                                    |
-| --username        | Username to source (Required when using login)                    |
-| --password        | Password to source (Required when using login)                    |
-| --library         | Specific library on service (Sometimes required when using login) |
+| Argument | Description |
+|---|---|
+| `urls` | One or more book or series URLs to download |
+| `-v`, `--version` | Show program version and exit |
+| `-c`, `--cookies` | Path to a Netscape cookie file |
+| `--combine` | Combine output files into a single file (requires `ffmpeg`) |
+| `-o`, `--output` | Output path template (default: `{title}`) |
+| `--remove-chars` | List of characters to remove from metadata values in output paths |
+| `-f`, `--output-format` | Output file format (e.g. `m4b`, `mp3`, `m4a`, `flac`, `opus`) |
+| `--audio-bitrate`, `--m4b-bitrate` | Target AAC bitrate when converting to `.m4b`/`.m4a` (`auto`, `64k`, `128k`, `192k`, etc.) |
+| `--resume` | Resume interrupted downloads using existing parts and HTTP `Range` requests |
+| `--skip-downloaded` | Skip books whose output file or directory already exists |
+| `--no-chapters` | Don't include chapters in output file |
+| `--cover` | Download only the cover image |
+| `--write-json-metadata` | Write metadata to a separate `.json` file |
+| `--print-output` | Print resolved output locations instead of downloading |
+| `--input-file` | File containing one URL per line |
+| `--username` | Username for source (when using login) |
+| `--password` | Password for source (when using login) |
+| `--library` | Specific library on service (when required by login) |
+| `--database_directory` | Directory for sources to store database state |
+| `--config` | Alternative location of `audiobook-dl.toml` |
+| `-d`, `--debug` | Enable debug logging |
+| `-q`, `--quiet` | Suppress non-essential output |
+| `--verbose-ffmpeg` | Show `ffmpeg` output in terminal |
 
 ## Output
-By default, audiobook-dl saves all audiobooks to `{title}` relative to the
-current path. This can be changed with the `--output` argument. Path can be
-customized by audiobook with the following fields:
+By default, audiobook-dl saves audiobooks to `{title}` relative to the current directory. This can be customized with `-o` / `--output` using metadata fields:
 - `title`
 - `author`
 - `series`
+- `series_order`
 - `narrator`
+- `genre`
+- `publisher`
+- `isbn`
+- `release_date`
 
-Not all fields are available for all audiobooks.
+Not all fields are available for every audiobook. Metadata values are sanitized for filesystem safety (removing invalid characters and preventing path traversal).
 
-The file extension can be changed with the `--output-format` argument.
+The output container can be changed with `-f` / `--output-format` (for example `-f m4b`). When converting non-AAC audio to `.m4b`/`.m4a`, `--audio-bitrate` defaults to `auto` (probing source bitrate with `ffprobe`, clamped to `64k`–`192k`).
 
 ## Configuration
-audiobook-dl can be configured using a configuration file, which should be placed at:
-- Windows: `C:\\Users\\$user\\AppData\\Local\\jo1gi\\audiobook-dl\\audiobook-dl.toml`
-- Mac: `/Users/$user/Library/Application Support/audiobook-dl/audiobook-dl.toml`
-- Linux `$XDG_CONFIG_DIR/audiobook-dl/audiobook-dl.toml`
+audiobook-dl can be configured via `audiobook-dl.toml` at:
+- Windows: `%LOCALAPPDATA%\jo1gi\audiobook-dl\audiobook-dl.toml`
+- macOS: `~/Library/Application Support/audiobook-dl/audiobook-dl.toml`
+- Linux: `$XDG_CONFIG_DIR/audiobook-dl/audiobook-dl.toml` (defaults to `~/.config/audiobook-dl/audiobook-dl.toml`)
 
-### Authentications
-Source credentials can be provided in the configuration file:
+In portable Windows `.exe` mode, placing a `.portable` marker file or `audiobook-dl.toml` beside `audiobook-dl.exe` keeps `audiobook-dl.toml` and `db/` in that same folder instead of `%LOCALAPPDATA%`.
+
+### Global Options
+```toml
+output_template = "{author}/{title}"
+output_format = "m4b"
+combine = true
+audio_bitrate = "128k"
+resume = true
+skip_downloaded = true
+ffmpeg_dir = "C:/ffmpeg/bin"
+```
+
+### Authentication
+Non-secret source settings can be stored in `audiobook-dl.toml`:
 ```toml
 [sources.yourcloudlibrary]
 username = "yourusername"
-password = "supersecretpassword"
 library = "hometown"
 ```
 
-Cookie files can be specified in a similar way:
+Cookie files can be specified per source (relative paths are resolved against the configuration directory):
 ```toml
 [sources.everand]
 cookie_file = "./everand_cookies.txt"
 ```
-Paths are relative to the configuration directory.
+
+Passwords saved from the GUI are stored in the OS credential store (Windows DPAPI / system keyring) rather than plaintext in `audiobook-dl.toml`. Legacy `password = "..."` entries in `audiobook-dl.toml` are automatically migrated to the OS keystore and scrubbed from the file on load.
+
+## Python Library API
+`audiobookdl` also exposes a programmatic client (`Downloader`, `DownloadOptions`, `DownloadSummary`, `DownloadEvent`):
+```python
+from audiobookdl import Downloader, DownloadOptions
+
+options = DownloadOptions(combine=True, output_format="m4b", resume=True)
+downloader = Downloader(options=options, on_event=lambda ev: print(ev.kind, ev.data))
+summary = downloader.download("https://librivox.org/...")
+```
+
+## Portable Windows Executable
+You can build a standalone Windows executable (`dist/audiobook-dl.exe`) using PyInstaller:
+```shell
+pip install ".[build]"
+python scripts/build_exe.py
+```
+
+Useful build flags:
+- `--onedir`: Build a fast-startup portable folder (`dist/audiobook-dl/`) instead of a single-file `--onefile` binary.
+- `--copy-ffmpeg`: Copy `ffmpeg` and `ffprobe` from `PATH` alongside the built executable.
+- `--bundle-ffmpeg`: Embed `ffmpeg` and `ffprobe` inside the executable bundle.
+- `--no-verify`: Skip the post-build `--self-test` smoke check (enabled by default).
 
 ## Contributions
-Issues, bug-reports, pull requests or ideas for features and improvements are
-**very welcome**.
+Issues, bug-reports, pull requests, or ideas for features and improvements are **very welcome**.

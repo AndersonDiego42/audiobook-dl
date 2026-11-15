@@ -1,44 +1,63 @@
 import argparse
+from dataclasses import dataclass, field
 import os
-import appdirs
+from typing import Any, List, Optional, Sequence
+
 from audiobookdl import __version__
-from typing import Any, List
+from audiobookdl.config import config_dir
+from audiobookdl.utils import normalize_audio_bitrate
 
 
 def default_database_directory() -> str:
     """Return the default directory for sources to store data."""
-    return os.path.join(appdirs.user_config_dir("audiobook-dl", "jo1gi"), "db")
+    return os.path.join(config_dir(), "db")
 
 
-def build_default_options(**overrides: Any) -> argparse.Namespace:
-    """Build an options Namespace matching CLI defaults with optional overrides."""
-    defaults = {
-        "urls": [],
-        "cookie_file": None,
-        "combine": False,
-        "output_template": "{title}",
-        "remove_chars": "",
-        "debug": False,
-        "quiet": False,
-        "print_output": False,
-        "cover": False,
-        "no_chapters": False,
-        "output_format": None,
-        "ffmpeg_output": False,
-        "input_file": None,
-        "username": None,
-        "password": None,
-        "library": None,
-        "skip_downloaded": False,
-        "database_directory": default_database_directory(),
-        "write_json_metadata": False,
-        "config_location": None,
-    }
-    defaults.update(overrides)
-    return argparse.Namespace(**defaults)
+def _parse_audio_bitrate_arg(value: str) -> str:
+    """Validate `--audio-bitrate` CLI argument, preserving explicit `'auto'` override."""
+    if value.strip().lower() == "auto":
+        return "auto"
+    try:
+        normalized = normalize_audio_bitrate(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return normalized or "auto"
 
 
-def parse_arguments() -> Any:
+@dataclass
+class DownloadOptions:
+    """Typed runtime options shared across CLI, GUI, pipeline, and sources."""
+
+    urls: List[str] = field(default_factory=list)
+    cookie_file: Optional[str] = None
+    combine: bool = False
+    output_template: str = "{title}"
+    remove_chars: str = ""
+    debug: bool = False
+    quiet: bool = False
+    print_output: bool = False
+    cover: bool = False
+    no_chapters: bool = False
+    output_format: Optional[str] = None
+    ffmpeg_output: bool = False
+    input_file: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    library: Optional[str] = None
+    skip_downloaded: bool = False
+    database_directory: str = field(default_factory=default_database_directory)
+    write_json_metadata: bool = False
+    config_location: Optional[str] = None
+    resume: bool = False
+    audio_bitrate: Optional[str] = None
+
+
+def build_default_options(**overrides: Any) -> DownloadOptions:
+    """Build a `DownloadOptions` instance matching CLI defaults with optional overrides."""
+    return DownloadOptions(**overrides)
+
+
+def parse_arguments(argv: Optional[Sequence[str]] = None) -> DownloadOptions:
     parser = argparse.ArgumentParser(
         prog="audiobook-dl",
         description="Download audiobooks from websites",
@@ -166,10 +185,25 @@ def parse_arguments() -> Any:
         dest = "config_location",
         help = "Alternative location of config file"
     )
-    return parser.parse_args()
+    parser.add_argument(
+        '--resume',
+        dest="resume",
+        help="Resume interrupted downloads using existing parts and HTTP Range requests",
+        action="store_true",
+    )
+    parser.add_argument(
+        '--audio-bitrate',
+        '--m4b-bitrate',
+        dest="audio_bitrate",
+        type=_parse_audio_bitrate_arg,
+        default=None,
+        help="Target AAC bitrate when converting to .m4b/.m4a (auto, 64k, 128k, 192k, etc.)",
+    )
+    parsed = parser.parse_args(argv)
+    return DownloadOptions(**vars(parsed))
 
 
-def get_urls(options) -> List[str]:
+def get_urls(options: DownloadOptions) -> List[str]:
     """
     Creates a list of all urls in cli options.
     Urls a found in `options.urls` and read from `options.input_file` if the

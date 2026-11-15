@@ -37,7 +37,7 @@ def add_chapters(
     elif program_in_path("ffmpeg"):
         ffmpeg.add_chapters_ffmpeg(filepath, chapters, cancel_event=cancel_event)
     else:
-        if logging.debug_mode:
+        if logging.is_debug_mode():
             logging.debug("Could not add chapters")
         else:
             filetype = os.path.splitext(filepath)[1][1:]

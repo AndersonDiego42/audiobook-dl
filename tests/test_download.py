@@ -1,19 +1,22 @@
-from types import SimpleNamespace
 import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
 
-from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata
-from audiobookdl.exceptions import DownloadCancelled
+from Crypto.Cipher import AES
+
+from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, DownloadOptions
+from audiobookdl.exceptions import DownloadCancelled, DownloadError
 from audiobookdl.output.download import (
+    DOWNLOAD_ATTEMPTS,
     DOWNLOAD_CHUNK_SIZE,
     MAX_DOWNLOAD_WORKERS,
     download_audiobook,
     download_file,
     download_files,
 )
+from audiobookdl.utils.audiobook import AESEncryption
 from audiobookdl.utils.http import DEFAULT_HTTP_TIMEOUT
 
 
@@ -203,7 +206,7 @@ def test_single_file_overwrite_guard_respects_confirmation(tmp_path):
     existing = tmp_path / "Single Book.mp3"
     existing.write_bytes(b"original-audio")
     output_dir = str(tmp_path / "Single Book")
-    options = SimpleNamespace(
+    options = DownloadOptions(
         skip_downloaded=False,
         combine=False,
         output_format=None,
@@ -231,3 +234,329 @@ def test_single_file_overwrite_guard_respects_confirmation(tmp_path):
         download_audiobook(_make_audiobook(session_accept), output_dir, options, interaction=accept)
     assert existing.read_bytes() == b"replacement"
     assert len(accept.confirms) == 1
+
+
+def test_download_file_midstream_cancel_cleans_tmp_and_raises(tmp_path):
+    cancel_event = threading.Event()
+    session = MagicMock()
+
+    def chunk_stream():
+        yield b"part-1"
+        cancel_event.set()
+        yield b"part-2"
+
+    resp = MagicMock(status_code=200, headers={"Content-Length": "12"})
+    resp.iter_content.return_value = chunk_stream()
+    session.get.return_value = resp
+
+    audiobook = _make_audiobook(session)
+    output_dir = str(tmp_path / "cancelled_book")
+
+    with pytest.raises(DownloadCancelled):
+        download_file((audiobook, output_dir, 0, lambda _: None, cancel_event))
+
+    assert not (tmp_path / "cancelled_book.mp3").exists()
+    assert not (tmp_path / "cancelled_book.mp3.tmp").exists()
+    resp.close.assert_called_once()
+
+
+def test_download_file_raises_download_error_on_non_200_with_escaped_markup(tmp_path):
+    session = MagicMock()
+    resp = MagicMock(
+        status_code=403,
+        headers={},
+        content=b"[red]Forbidden[/red]",
+    )
+    session.get.return_value = resp
+    audiobook = _make_audiobook(session)
+
+    with pytest.raises(DownloadError) as exc_info:
+        download_file((audiobook, str(tmp_path / "err"), 0, lambda _: None, None))
+
+    assert r"\[red]Forbidden\[/red]" in exc_info.value.data["body"]
+    resp.close.assert_called_once()
+
+
+def test_download_file_exhausts_retries_and_reraises_request_exception(tmp_path, monkeypatch):
+    monkeypatch.setattr("audiobookdl.output.download.time.sleep", lambda _: None)
+    session = MagicMock()
+    session.get.side_effect = requests.exceptions.ConnectionError("reset")
+    audiobook = _make_audiobook(session)
+
+    with pytest.raises(requests.exceptions.ConnectionError):
+        download_file((audiobook, str(tmp_path / "fail"), 0, lambda _: None, None))
+
+    assert session.get.call_count == DOWNLOAD_ATTEMPTS
+
+
+def test_download_file_resumes_partial_tmp_with_http_range_206(tmp_path):
+    output_dir = str(tmp_path / "resumed_book")
+    tmp_file = tmp_path / "resumed_book.mp3.tmp"
+    tmp_file.write_bytes(b"hello-")
+
+    session = MagicMock()
+    session.get.return_value = _mock_response(
+        headers={
+            "Content-Length": "5",
+            "Content-Range": "bytes 6-10/11",
+            "Accept-Ranges": "bytes",
+        },
+        chunks=[b"world"],
+        status_code=206,
+    )
+    audiobook = _make_audiobook(session)
+    progress = []
+    byte_counts = []
+
+    out_path = download_file(
+        (audiobook, output_dir, 0, progress.append, None, byte_counts.append),
+        resume=True,
+    )
+
+    assert out_path == str(tmp_path / "resumed_book.mp3")
+    with open(out_path, "rb") as f:
+        assert f.read() == b"hello-world"
+    assert not tmp_file.exists()
+    session.get.assert_called_once_with(
+        "https://example.com/part.mp3",
+        headers={"Range": "bytes=6-"},
+        stream=True,
+        timeout=DEFAULT_HTTP_TIMEOUT,
+    )
+    assert sum(progress) == pytest.approx(1.0)
+    assert byte_counts == [5]
+
+
+def test_download_file_resume_handles_200_full_restart_and_416(tmp_path):
+    # 1. Server ignores Range and replies 200 OK -> restarts cleanly without duplicating bytes
+    output_dir = str(tmp_path / "no_range")
+    (tmp_path / "no_range.mp3.tmp").write_bytes(b"stale-")
+    session_200 = MagicMock()
+    session_200.get.return_value = _mock_response(
+        headers={"Content-Length": "9"},
+        chunks=[b"freshdata"],
+        status_code=200,
+    )
+    out_200 = download_file(
+        (_make_audiobook(session_200), output_dir, 0, lambda _: None, None),
+        resume=True,
+    )
+    assert open(out_200, "rb").read() == b"freshdata"
+
+    # 2. Server replies 416 with matching Content-Range total -> promotes completed .tmp
+    done_dir = str(tmp_path / "already_done")
+    (tmp_path / "already_done.mp3.tmp").write_bytes(b"complete")
+    session_416_done = MagicMock()
+    session_416_done.get.return_value = _mock_response(
+        headers={"Content-Range": "bytes */8"},
+        chunks=[],
+        status_code=416,
+    )
+    progress = []
+    out_done = download_file(
+        (_make_audiobook(session_416_done), done_dir, 0, progress.append, None),
+        resume=True,
+    )
+    assert open(out_done, "rb").read() == b"complete"
+    assert progress == [1.0]
+
+    # 3. Server replies 416 with smaller total (stale oversized .tmp) -> discards .tmp and retries
+    stale_dir = str(tmp_path / "stale_oversized")
+    (tmp_path / "stale_oversized.mp3.tmp").write_bytes(b"oversized-stale-bytes")
+    session_416_stale = MagicMock()
+    session_416_stale.get.side_effect = [
+        _mock_response(headers={"Content-Range": "bytes */4"}, chunks=[], status_code=416),
+        _mock_response(headers={"Content-Length": "4"}, chunks=[b"good"], status_code=200),
+    ]
+    out_stale = download_file(
+        (_make_audiobook(session_416_stale), stale_dir, 0, lambda _: None, None),
+        resume=True,
+    )
+    assert open(out_stale, "rb").read() == b"good"
+    assert session_416_stale.get.call_count == 2
+
+
+def test_download_audiobook_multipart_resume_preserves_parts_on_cancel_and_resumes(tmp_path):
+    book_dir = tmp_path / "Multi Book"
+    options_resume = DownloadOptions(
+        resume=True,
+        combine=False,
+        output_format=None,
+        skip_downloaded=False,
+        write_json_metadata=False,
+        no_chapters=True,
+    )
+
+    # First run: part 0 completes, part 1 writes partial bytes and cancels mid-stream
+    cancel_ev = threading.Event()
+    session1 = MagicMock()
+
+    def get_run1(url, headers=None, stream=True, timeout=None):
+        if url.endswith("/0.mp3"):
+            return _mock_response({"Content-Length": "5"}, [b"part0"])
+        if url.endswith("/1.mp3"):
+            def stream_part1():
+                yield b"par"
+                cancel_ev.set()
+                yield b"t1"
+            resp = MagicMock(status_code=200, headers={"Content-Length": "5"})
+            resp.iter_content.return_value = stream_part1()
+            return resp
+        return _mock_response({"Content-Length": "5"}, [b"part2"])
+
+    session1.get.side_effect = get_run1
+    book1 = Audiobook(
+        session=session1,
+        metadata=AudiobookMetadata(title="Multi Book"),
+        files=[
+            AudiobookFile(url="https://example.com/0.mp3", ext="mp3"),
+            AudiobookFile(url="https://example.com/1.mp3", ext="mp3"),
+            AudiobookFile(url="https://example.com/2.mp3", ext="mp3"),
+        ],
+    )
+
+    with pytest.raises(DownloadCancelled):
+        download_audiobook(book1, str(book_dir), options_resume, cancel_event=cancel_ev)
+
+    assert (book_dir / "Part 0.mp3").read_bytes() == b"part0"
+    assert (book_dir / "Part 1.mp3.tmp").read_bytes() == b"par"
+
+    # Second run with resume=True + skip_downloaded=True:
+    # must NOT skip incomplete directory; skips part 0 HTTP, resumes part 1 via Range, downloads part 2
+    session2 = MagicMock()
+    requested_urls = []
+
+    def get_run2(url, headers=None, stream=True, timeout=None):
+        requested_urls.append((url, dict(headers or {})))
+        if url.endswith("/1.mp3"):
+            assert headers == {"Range": "bytes=3-"}
+            return _mock_response(
+                {"Content-Length": "2", "Content-Range": "bytes 3-4/5"},
+                [b"t1"],
+                status_code=206,
+            )
+        if url.endswith("/2.mp3"):
+            return _mock_response({"Content-Length": "5"}, [b"part2"])
+        raise AssertionError(f"Unexpected request for {url}")
+
+    session2.get.side_effect = get_run2
+    book2 = Audiobook(
+        session=session2,
+        metadata=AudiobookMetadata(title="Multi Book"),
+        files=book1.files,
+    )
+    options_resume_skip = DownloadOptions(
+        resume=True,
+        skip_downloaded=True,
+        combine=False,
+        output_format=None,
+        write_json_metadata=False,
+        no_chapters=True,
+    )
+
+    with patch("audiobookdl.output.download.metadata.add_metadata"):
+        download_audiobook(book2, str(book_dir), options_resume_skip)
+
+    assert (book_dir / "Part 0.mp3").read_bytes() == b"part0"
+    assert (book_dir / "Part 1.mp3").read_bytes() == b"part1"
+    assert (book_dir / "Part 2.mp3").read_bytes() == b"part2"
+    assert {url for url, _ in requested_urls} == {
+        "https://example.com/1.mp3",
+        "https://example.com/2.mp3",
+    }
+
+    # Third run with skip_downloaded=True & resume=True skips completely without HTTP calls
+    session3 = MagicMock()
+    book3 = Audiobook(session=session3, metadata=book2.metadata, files=book2.files)
+    download_audiobook(book3, str(book_dir), options_resume_skip)
+    session3.get.assert_not_called()
+
+
+def test_download_file_retries_and_fails_on_truncated_stream(tmp_path, monkeypatch):
+    monkeypatch.setattr("audiobookdl.output.download.time.sleep", lambda _: None)
+
+    # 1. Truncated first attempt retries and succeeds when second delivers full length
+    session_recover = MagicMock()
+    session_recover.get.side_effect = [
+        _mock_response(headers={"Content-Length": "10"}, chunks=[b"1234"]),
+        _mock_response(headers={"Content-Length": "10"}, chunks=[b"1234567890"]),
+    ]
+    progress = []
+    out_path = download_file(
+        (_make_audiobook(session_recover), str(tmp_path / "recover"), 0, progress.append, None)
+    )
+    assert open(out_path, "rb").read() == b"1234567890"
+    assert session_recover.get.call_count == 2
+    assert sum(progress) == pytest.approx(1.0)
+
+    # 2. Persistent truncation exhausts retries and does NOT promote truncated .tmp
+    session_trunc = MagicMock()
+    session_trunc.get.side_effect = [
+        _mock_response(headers={"Content-Length": "10"}, chunks=[b"1234"])
+        for _ in range(DOWNLOAD_ATTEMPTS)
+    ]
+    with pytest.raises(requests.exceptions.ChunkedEncodingError, match="Incomplete download"):
+        download_file((_make_audiobook(session_trunc), str(tmp_path / "trunc"), 0, lambda _: None, None))
+    assert session_trunc.get.call_count == DOWNLOAD_ATTEMPTS
+    assert not (tmp_path / "trunc.mp3").exists()
+
+
+def test_download_file_allows_content_encoding_compressed_length_mismatch(tmp_path):
+    session = MagicMock()
+    session.get.return_value = _mock_response(
+        headers={"Content-Length": "20", "Content-Encoding": "gzip"},
+        chunks=[b"short"],
+    )
+    out_path = download_file(
+        (_make_audiobook(session), str(tmp_path / "gzipped"), 0, lambda _: None, None)
+    )
+    assert open(out_path, "rb").read() == b"short"
+
+
+def test_download_file_encrypted_resume_preserves_ciphertext_across_decrypt_failure(tmp_path):
+    key = b"0123456789abcdef"
+    iv = b"fedcba9876543210"
+    plaintext = b"0123456789abcdef" * 4
+    ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(plaintext)
+    enc = AESEncryption(key=key, iv=iv)
+
+    output_dir = str(tmp_path / "enc_book")
+    tmp_file = tmp_path / "enc_book.mp3.tmp"
+    final_file = tmp_path / "enc_book.mp3"
+
+    # First run: download completes to .tmp, but os.replace fails during decryption output
+    session1 = MagicMock()
+    session1.get.return_value = _mock_response(
+        headers={"Content-Length": str(len(ciphertext))},
+        chunks=[ciphertext],
+    )
+    book1 = Audiobook(
+        session=session1,
+        metadata=AudiobookMetadata(title="Enc Book"),
+        files=[AudiobookFile(url="https://example.com/enc.mp3", ext="mp3", encryption_method=enc)],
+    )
+
+    with patch("audiobookdl.output.encryption.os.replace", side_effect=OSError("disk error")):
+        with pytest.raises(OSError, match="disk error"):
+            download_file((book1, output_dir, 0, lambda _: None, None), resume=True)
+
+    assert not final_file.exists()
+    assert tmp_file.read_bytes() == ciphertext
+
+    # Second run with resume=True: server returns 416 matching complete ciphertext,
+    # decrypts intact ciphertext once into final_file, and cleans up .tmp
+    session2 = MagicMock()
+    session2.get.return_value = _mock_response(
+        headers={"Content-Range": f"bytes */{len(ciphertext)}"},
+        chunks=[],
+        status_code=416,
+    )
+    book2 = Audiobook(
+        session=session2,
+        metadata=book1.metadata,
+        files=book1.files,
+    )
+    out_path = download_file((book2, output_dir, 0, lambda _: None, None), resume=True)
+    assert out_path == str(final_file)
+    assert final_file.read_bytes() == plaintext
+    assert not tmp_file.exists()

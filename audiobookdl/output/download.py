@@ -1,16 +1,18 @@
 from audiobookdl import AudiobookFile, Source, logging, Audiobook
+from audiobookdl.args import DownloadOptions
 from audiobookdl.exceptions import UserNotAuthorized, NoFilesFound, DownloadError, DownloadCancelled
 from audiobookdl.utils.concurrency import run_cancellable_pool
 from audiobookdl.utils.http import DEFAULT_HTTP_TIMEOUT
 from . import metadata, output, encryption
 
 import os
+import re
 import shutil
 import threading
 import time
 import requests
 from functools import partial
-from typing import Any, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple, Union
 from rich.progress import Progress, BarColumn, ProgressColumn, SpinnerColumn
 from pathlib import Path
 from math import log10
@@ -33,7 +35,7 @@ MAX_DOWNLOAD_WORKERS = 20
 
 def download(
     audiobook: Audiobook,
-    options,
+    options: DownloadOptions,
     interaction: Optional[logging.InteractionHandler] = None,
     cancel_event: Optional[threading.Event] = None,
 ):
@@ -62,10 +64,31 @@ def download(
         return
 
 
+def _all_output_parts_exist(
+    audiobook: Audiobook,
+    output_dir: str,
+    output_format: Optional[str],
+) -> bool:
+    """Return True when every expected multi-part output file already exists on disk."""
+    if not os.path.isdir(output_dir) or not audiobook.files:
+        return False
+    target_ext = output_format.lstrip(".").lower() if output_format else None
+    for idx in range(len(audiobook.files)):
+        raw_path, _ = create_filepath(audiobook, output_dir, idx)
+        if target_ext:
+            base, _ = os.path.splitext(raw_path)
+            expected_path = f"{base}.{target_ext}"
+        else:
+            expected_path = raw_path
+        if not (os.path.exists(expected_path) and os.path.getsize(expected_path) > 0):
+            return False
+    return True
+
+
 def download_audiobook(
     audiobook: Audiobook,
     output_dir: str,
-    options,
+    options: DownloadOptions,
     interaction: Optional[logging.InteractionHandler] = None,
     cancel_event: Optional[threading.Event] = None,
 ):
@@ -86,6 +109,10 @@ def download_audiobook(
             if target_path and os.path.exists(target_path):
                 logging.log(f"Skipping [blue]{audiobook.title}[/], file already exists.")
                 return
+        elif options.resume:
+            if _all_output_parts_exist(audiobook, output_dir, options.output_format):
+                logging.log(f"Skipping [blue]{audiobook.title}[/], all files already exist.")
+                return
         elif os.path.isdir(output_dir):  # multiple files, check for directory
             logging.log(f"Skipping [blue]{audiobook.title}[/], directory already exists.")
             return
@@ -98,6 +125,7 @@ def download_audiobook(
         output_dir,
         interaction=interaction,
         cancel_event=cancel_event,
+        resume=options.resume,
     )
     if cancel_event is not None and cancel_event.is_set():
         raise DownloadCancelled
@@ -116,14 +144,19 @@ def download_audiobook(
                 output.combine_audiofiles(filepaths, output_dir, output_path, cancel_event=cancel_event)
             filepaths = [output_path]
         except DownloadCancelled:
-            if os.path.isdir(output_dir):
+            if os.path.isdir(output_dir) and not options.resume:
                 shutil.rmtree(output_dir, ignore_errors=True)
             raise
     if cancel_event is not None and cancel_event.is_set():
         raise DownloadCancelled
     if current_format != output_format:
         logging.book_update("Converting files")
-        filepaths = output.convert_output(filepaths, output_format, cancel_event=cancel_event)
+        filepaths = output.convert_output(
+            filepaths,
+            output_format,
+            cancel_event=cancel_event,
+            audio_bitrate=options.audio_bitrate,
+        )
     if cancel_event is not None and cancel_event.is_set():
         raise DownloadCancelled
     # Add metadata
@@ -136,7 +169,7 @@ def download_audiobook(
 def add_metadata_to_file(
     audiobook: Audiobook,
     filepath: str,
-    options,
+    options: DownloadOptions,
     cancel_event: Optional[threading.Event] = None,
 ):
     """
@@ -162,7 +195,12 @@ def add_metadata_to_file(
         metadata.embed_cover(filepath, audiobook.cover)
 
 
-def add_metadata_to_dir(audiobook: Audiobook, filepaths: Iterable[str], output_dir: str, options):
+def add_metadata_to_dir(
+    audiobook: Audiobook,
+    filepaths: Iterable[str],
+    output_dir: str,
+    options: DownloadOptions,
+):
     """
     Add metadata to a directory with audio files
 
@@ -190,20 +228,30 @@ def download_files_with_cli_output(
     output_dir: str,
     interaction: Optional[logging.InteractionHandler] = None,
     cancel_event: Optional[threading.Event] = None,
+    resume: bool = False,
 ) -> List[str]:
     """
     Download `audiobook` with cli progress bar
 
     :param audiobook: Audiobook to download
     :param output_dir: Output directory where files are downloaded to
+    :param resume: Reuse completed parts and resume partial `.tmp` files via HTTP Range
     :returns: A list of paths of the downloaded files
     """
     if len(audiobook.files) > 1:
-        setup_download_dir(output_dir, interaction=interaction)
+        if resume:
+            if os.path.isdir(output_dir):
+                logging.book_update("Resuming in existing output dir")
+            else:
+                logging.book_update("Creating output dir")
+                os.makedirs(output_dir, exist_ok=True)
+        else:
+            setup_download_dir(output_dir, interaction=interaction)
     else:
         if len(audiobook.files) == 1:
             filepath, _ = create_filepath(audiobook, output_dir, 0)
-            confirm_overwrite_file(filepath, interaction=interaction)
+            if not (resume and os.path.exists(filepath) and os.path.getsize(filepath) > 0):
+                confirm_overwrite_file(filepath, interaction=interaction)
         parent = Path(output_dir).parent
         if not parent.exists():
             os.makedirs(parent)
@@ -214,11 +262,19 @@ def download_files_with_cli_output(
                 total = len(audiobook.files)
             )
             update_progress = partial(progress.advance, task)
+            record_bytes_fn = getattr(progress, "record_bytes", None)
+            record_bytes = (
+                partial(record_bytes_fn, task)
+                if callable(record_bytes_fn)
+                else None
+            )
             filepaths = download_files(
                 audiobook,
                 output_dir,
                 update_progress,
                 cancel_event=cancel_event,
+                record_bytes=record_bytes,
+                resume=resume,
             )
             # Make sure progress bar is at 100%
             remaining_progress: float = progress.tasks[0].remaining or 0
@@ -227,13 +283,16 @@ def download_files_with_cli_output(
             return filepaths
     except (KeyboardInterrupt, DownloadCancelled):
         logging.book_update("Stopped download")
-        logging.book_update("Cleaning up files")
-        if len(audiobook.files) == 1:
-            _, filepath_tmp = create_filepath(audiobook, output_dir, 0)
-            if os.path.exists(filepath_tmp):
-                os.remove(filepath_tmp)
-        elif os.path.exists(output_dir):
-            shutil.rmtree(output_dir, ignore_errors=True)
+        if resume:
+            logging.book_update("Keeping partial files for resume")
+        else:
+            logging.book_update("Cleaning up files")
+            if len(audiobook.files) == 1:
+                _, filepath_tmp = create_filepath(audiobook, output_dir, 0)
+                if os.path.exists(filepath_tmp):
+                    os.remove(filepath_tmp)
+            elif os.path.exists(output_dir):
+                shutil.rmtree(output_dir, ignore_errors=True)
         raise
 
 
@@ -281,28 +340,100 @@ def _parse_content_length(headers: Any) -> int:
     return 0
 
 
-def download_file(args: Tuple[Audiobook, str, int, Any, Optional[threading.Event]]) -> str:
+_CONTENT_RANGE_RANGE_RE = re.compile(r"^bytes\s+(\d+)-(\d+)/(\d+|\*)$", re.IGNORECASE)
+_CONTENT_RANGE_TOTAL_RE = re.compile(r"^bytes\s+\*/(\d+)$", re.IGNORECASE)
+
+
+def _parse_content_range(
+    header_val: Optional[Any],
+) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """Parse HTTP `Content-Range` into `(start, end, total)` byte offsets."""
+    if not isinstance(header_val, str):
+        return None, None, None
+    text = header_val.strip()
+    match = _CONTENT_RANGE_RANGE_RE.fullmatch(text)
+    if match:
+        start = int(match.group(1))
+        end = int(match.group(2))
+        total_raw = match.group(3)
+        total = int(total_raw) if total_raw != "*" else None
+        return start, end, total
+    total_match = _CONTENT_RANGE_TOTAL_RE.fullmatch(text)
+    if total_match:
+        return None, None, int(total_match.group(1))
+    return None, None, None
+
+
+def download_file(
+    args: Union[
+        Tuple[Audiobook, str, int, Any, Optional[threading.Event]],
+        Tuple[Audiobook, str, int, Any, Optional[threading.Event], Optional[Callable[[int], None]]],
+    ],
+    *,
+    resume: bool = False,
+) -> str:
     # Prepare download
-    audiobook, output_dir, index, update_progress, cancel_event = args
+    if len(args) == 6:
+        audiobook, output_dir, index, update_progress, cancel_event, record_bytes = args
+    else:
+        audiobook, output_dir, index, update_progress, cancel_event = args
+        record_bytes = None
     if cancel_event is not None and cancel_event.is_set():
         raise DownloadCancelled
     file = audiobook.files[index]
     filepath, filepath_tmp = create_filepath(audiobook, output_dir, index)
+    if resume and os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+        logging.debug(f"Resuming: skipping already downloaded file {filepath}")
+        update_progress(1.0)
+        return filepath
     logging.debug(f"Starting downloading file: {file.url}")
     # Retry transient network failures (e.g. a dropped TLS connection) so one
     # flaky segment does not crash the whole batch via the thread pool.
-    for attempt in range(DOWNLOAD_ATTEMPTS):
+    attempt = 0
+    reset_stale_tmp = False
+    while attempt < DOWNLOAD_ATTEMPTS:
         if cancel_event is not None and cancel_event.is_set():
             raise DownloadCancelled
         advanced = 0.0
         request = None
+        request_headers = dict(file.headers) if file.headers else {}
+        has_custom_range = any(str(k).lower() == "range" for k in request_headers)
+        existing_bytes = 0
+        sent_range = False
+        if resume and not has_custom_range and os.path.exists(filepath_tmp):
+            existing_bytes = os.path.getsize(filepath_tmp)
+            if existing_bytes > 0:
+                request_headers["Range"] = f"bytes={existing_bytes}-"
+                sent_range = True
         try:
             request = audiobook.session.get(
                 file.url,
-                headers=file.headers,
+                headers=request_headers,
                 stream=True,
                 timeout=DEFAULT_HTTP_TIMEOUT,
             )
+            if sent_range and request.status_code == 416:
+                _, _, total_from_range = _parse_content_range(
+                    _get_header_ci(request.headers, "Content-Range")
+                )
+                if (
+                    total_from_range is not None
+                    and total_from_range == existing_bytes
+                    and existing_bytes > 0
+                ):
+                    logging.debug(f"Resumed file already complete in tmp: {filepath_tmp}")
+                    update_progress(1.0)
+                    advanced = 1.0
+                    break
+                if os.path.exists(filepath_tmp):
+                    try:
+                        os.remove(filepath_tmp)
+                    except OSError:
+                        pass
+                if not reset_stale_tmp:
+                    reset_stale_tmp = True
+                    continue
+
             content_type: Optional[str] = _get_header_ci(request.headers, "Content-Type")
 
             expected = file.expected_content_type
@@ -310,7 +441,12 @@ def download_file(args: Tuple[Audiobook, str, int, Any, Optional[threading.Event
                 invalid_content_type = content_type not in expected
             else:
                 invalid_content_type = expected and expected != content_type
-            invalid_status_code = file.expected_status_code and file.expected_status_code != request.status_code
+            if sent_range and file.expected_status_code == 200:
+                invalid_status_code = request.status_code not in (200, 206)
+            else:
+                invalid_status_code = bool(
+                    file.expected_status_code and file.expected_status_code != request.status_code
+                )
             if invalid_content_type or invalid_status_code:
                 # Failed-download bodies can be raw audio bytes: truncate + escape before rich print
                 from rich.markup import escape as _escape
@@ -329,20 +465,73 @@ def download_file(args: Tuple[Audiobook, str, int, Any, Optional[threading.Event
                     url = file.url
                 )
 
+            open_mode = "wb"
             total_filesize = _parse_content_length(request.headers)
+            if sent_range and request.status_code == 206:
+                range_start, _, range_total = _parse_content_range(
+                    _get_header_ci(request.headers, "Content-Range")
+                )
+                if range_start is not None and range_start != existing_bytes:
+                    if range_start == 0:
+                        open_mode = "wb"
+                        if range_total is not None and range_total > 0:
+                            total_filesize = range_total
+                    else:
+                        if os.path.exists(filepath_tmp):
+                            try:
+                                os.remove(filepath_tmp)
+                            except OSError:
+                                pass
+                        if not reset_stale_tmp:
+                            reset_stale_tmp = True
+                            continue
+                        raise DownloadError(
+                            status_code=request.status_code,
+                            content_type=content_type,
+                            expected_status_code=file.expected_status_code,
+                            expected_content_type=file.expected_content_type,
+                            body=f"Unexpected Content-Range start {range_start} (expected {existing_bytes})",
+                            url=file.url,
+                        )
+                else:
+                    open_mode = "ab"
+                    if range_total is not None and range_total > 0:
+                        total_filesize = range_total
+                    elif total_filesize > 0:
+                        total_filesize = existing_bytes + total_filesize
+                    if total_filesize > 0:
+                        initial_progress = min(1.0, existing_bytes / total_filesize)
+                        update_progress(initial_progress)
+                        advanced += initial_progress
 
             # Download file to tmp file
-            with open(filepath_tmp, "wb") as f:
+            bytes_written = 0
+            with open(filepath_tmp, open_mode) as f:
                 for chunk in request.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
                     if cancel_event is not None and cancel_event.is_set():
                         raise DownloadCancelled
                     if not chunk:
                         continue
                     f.write(chunk)
+                    bytes_written += len(chunk)
+                    if record_bytes is not None:
+                        record_bytes(len(chunk))
                     if total_filesize > 0:
                         download_progress = len(chunk) / total_filesize
                         update_progress(download_progress)
                         advanced += download_progress
+            final_size = (existing_bytes + bytes_written) if open_mode == "ab" else bytes_written
+            content_encoding = _get_header_ci(request.headers, "Content-Encoding")
+            is_identity = not (
+                isinstance(content_encoding, str)
+                and content_encoding.strip()
+                and content_encoding.strip().lower() != "identity"
+            )
+            if is_identity and total_filesize > 0 and final_size < total_filesize:
+                raise requests.exceptions.ChunkedEncodingError(
+                    f"Incomplete download for {file.url}: "
+                    f"received {final_size} of {total_filesize} bytes"
+                )
             if total_filesize == 0:
                 update_progress(1.0)
                 advanced = 1.0
@@ -362,8 +551,9 @@ def download_file(args: Tuple[Audiobook, str, int, Any, Optional[threading.Event
                     raise DownloadCancelled
             else:
                 time.sleep(delay)
+            attempt += 1
         except DownloadCancelled:
-            if os.path.exists(filepath_tmp):
+            if not resume and os.path.exists(filepath_tmp):
                 try:
                     os.remove(filepath_tmp)
                 except OSError:
@@ -372,11 +562,17 @@ def download_file(args: Tuple[Audiobook, str, int, Any, Optional[threading.Event
         finally:
             if request is not None:
                 request.close()
-    # Decrypt file if necessary
+    # Decrypt file if necessary, keeping ciphertext in filepath_tmp intact until
+    # the decrypted target file is atomically in place.
     if file.encryption_method:
-        encryption.decrypt_file(filepath_tmp, file.encryption_method)
-    # Atomically move into place (overwrites confirmed existing single-file outputs on Windows)
-    os.replace(filepath_tmp, filepath)
+        encryption.decrypt_file(filepath_tmp, file.encryption_method, output_path=filepath)
+        try:
+            os.remove(filepath_tmp)
+        except OSError:
+            pass
+    else:
+        # Atomically move into place (overwrites confirmed existing single-file outputs on Windows)
+        os.replace(filepath_tmp, filepath)
     # Return filepath
     return filepath
 
@@ -386,19 +582,28 @@ def download_files(
     output_dir: str,
     update_progress,
     cancel_event: Optional[threading.Event] = None,
+    record_bytes: Optional[Callable[[int], None]] = None,
+    resume: bool = False,
 ) -> List[str]:
     """Download files from audiobook and return paths of the downloaded files"""
     file_count = len(audiobook.files)
     if file_count == 0:
         return []
-    arguments = [
-        (audiobook, output_dir, index, update_progress, cancel_event)
-        for index in range(file_count)
-    ]
+    if record_bytes is not None:
+        arguments: List[Any] = [
+            (audiobook, output_dir, index, update_progress, cancel_event, record_bytes)
+            for index in range(file_count)
+        ]
+    else:
+        arguments = [
+            (audiobook, output_dir, index, update_progress, cancel_event)
+            for index in range(file_count)
+        ]
+    worker_fn = partial(download_file, resume=resume) if resume else download_file
     if file_count == 1:
-        return [download_file(arguments[0])]
+        return [worker_fn(arguments[0])]
     return run_cancellable_pool(
-        download_file,
+        worker_fn,
         arguments,
         max_workers=MAX_DOWNLOAD_WORKERS,
         cancel_event=cancel_event,

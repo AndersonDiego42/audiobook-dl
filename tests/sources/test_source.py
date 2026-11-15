@@ -1,6 +1,9 @@
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+from audiobookdl import DownloadOptions
+from audiobookdl.exceptions import RequestError
 from audiobookdl.sources.source import Source
 from audiobookdl.utils.http import DEFAULT_HTTP_TIMEOUT
 
@@ -10,7 +13,7 @@ class _DummySource(Source):
 
 
 def _make_source(tmp_path, responses=None):
-    options = SimpleNamespace(
+    options = DownloadOptions(
         database_directory=str(tmp_path),
         skip_downloaded=False,
     )
@@ -109,4 +112,42 @@ def test_source_create_session_configures_20_connection_pool(tmp_path):
         assert adapter._pool_connections == 20
         assert adapter._pool_maxsize == 20
         assert adapter.poolmanager.connection_pool_kw["maxsize"] == 20
+
+
+def test_source_get_and_post_json_and_request_error(tmp_path):
+    source = _make_source(tmp_path)
+    source._session.get = MagicMock(
+        return_value=MagicMock(status_code=200, content=b'{"ok": true}')
+    )
+    source._session.post = MagicMock(
+        return_value=MagicMock(status_code=200, content=b'{"posted": 1}')
+    )
+    assert source.get_json("https://example.com/a.json") == {"ok": True}
+    assert source.post_json("https://example.com/b.json") == {"posted": 1}
+
+    source._session.get = MagicMock(
+        return_value=MagicMock(status_code=500, content=b"server error")
+    )
+    with pytest.raises(RequestError):
+        source.get("https://example.com/fail")
+
+    source._session.post = MagicMock(
+        return_value=MagicMock(status_code=401, content=b"unauthorized")
+    )
+    with pytest.raises(RequestError):
+        source.post("https://example.com/fail")
+
+
+def test_source_load_cookie_file_authenticates_session(tmp_path):
+    cookie_file = tmp_path / "cookies.txt"
+    cookie_file.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".example.com\tTRUE\t/\tFALSE\t2147483647\tsession_id\tabc123\n",
+        encoding="utf-8",
+    )
+    source = _make_source(tmp_path)
+    assert source.authenticated is False
+    source.load_cookie_file(str(cookie_file))
+    assert source.authenticated is True
+    assert source._session.cookies.get("session_id") == "abc123"
 

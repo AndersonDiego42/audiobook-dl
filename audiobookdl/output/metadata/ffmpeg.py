@@ -55,7 +55,7 @@ def add_chapters_ffmpeg(
     stem, ext = os.path.splitext(filepath)
     tmp_chapter_file = f"{filepath}.chapters.tmp.txt"
     tmp_media_file = f"{stem}.tmp{ext or '.mp4'}"
-    capture = not logging.ffmpeg_output
+    capture = not logging.is_ffmpeg_output()
     try:
         with open(tmp_chapter_file, "w", encoding="utf-8", newline="\n") as f:
             f.write(create_tmp_chapter_file(filepath, chapters))

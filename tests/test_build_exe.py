@@ -1,3 +1,5 @@
+import os
+import sys
 import importlib.util
 from pathlib import Path
 from unittest.mock import patch
@@ -35,6 +37,36 @@ def test_build_exe_onedir_and_exclusions(tmp_path, monkeypatch):
         assert excluded in build_exe.EXCLUDED_MODULES
         idx = cmd.index(excluded)
         assert cmd[idx - 1] == "--exclude-module"
+    if sys.version_info >= (3, 11):
+        assert "tomli" in build_exe.EXCLUDED_MODULES
+        assert build_exe._collect_mypyc_binaries() == []
+    if build_exe.ICON_PATH.is_file():
+        assert "--icon" in cmd
+    if os.name == "nt":
+        assert "--version-file" in cmd
+        version_file = Path(cmd[cmd.index("--version-file") + 1])
+        assert version_file.is_file()
+        assert "audiobook-dl.exe" in version_file.read_text(encoding="utf-8")
+
+
+def test_verify_executable_invokes_self_test_in_temp_dir(tmp_path):
+    build_exe = _load_build_exe()
+    exe_path = tmp_path / "audiobook-dl.exe"
+    exe_path.write_text("stub")
+
+    calls = []
+
+    def fake_run(cmd, cwd, check, timeout):
+        calls.append((cmd, cwd, check, timeout))
+
+    with patch.object(build_exe.subprocess, "run", side_effect=fake_run):
+        build_exe.verify_executable(exe_path)
+
+    assert len(calls) == 1
+    cmd, cwd, check, _timeout = calls[0]
+    assert cmd == [str(exe_path), "--self-test"]
+    assert check is True
+    assert Path(cwd) != tmp_path
 
 
 def test_build_exe_copy_ffmpeg_targets_exe_directory(tmp_path, monkeypatch):
