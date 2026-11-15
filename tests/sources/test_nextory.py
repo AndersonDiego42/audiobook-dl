@@ -93,10 +93,15 @@ def test_login_completes_session_and_profile_handshake(tmp_path):
         password="secret",
     )
 
+    import uuid
+
     assert src.authenticated is True
     assert src._session.headers["X-Application-Id"] == NextorySource.APP_ID
     assert src._session.headers["X-Os-Info"] == "ios"
-    assert src._session.headers["X-Device-Id"] == NextorySource.create_device_id()
+    device_uuid = uuid.UUID(src._session.headers["X-Device-Id"])
+    assert device_uuid.version == 4
+    # Device ID is persisted per database_directory across source instances
+    assert _make_source(tmp_path)._get_or_create_device_id() == src._session.headers["X-Device-Id"]
     assert src._session.headers["token"] == "tok-123"
     assert src._session.headers["X-Login-Token"] == "tok-123"
     assert src._session.headers["X-Country-Code"] == "SE"
@@ -155,6 +160,9 @@ def test_want_to_read_series_filters_ebooks_and_caches_wantlist(tmp_path):
             return _json_resp({"products": wantlist})
         if url.endswith("/packages/audio"):
             return _json_resp(audio_data)
+        if url.endswith("master.m3u8"):
+            master = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=64000\nmedia.m3u8\n"
+            return MagicMock(status_code=200, content=master)
         if url.endswith("media.m3u8"):
             return MagicMock(status_code=200, content=playlist)
         if url.endswith("101.jpg"):
@@ -276,3 +284,51 @@ def test_wantlist_pagination_and_secret_redaction(tmp_path, monkeypatch):
     items = src.download_want_to_read_list()
     assert len(items) == 101
     assert items[-1]["id"] == 100
+
+
+def test_nextory_profile_selection_locale_search_and_chapters(tmp_path):
+    from audiobookdl import DownloadOptions
+
+    opts = DownloadOptions(database_directory=str(tmp_path), skip_downloaded=False, library="Kids")
+    src = NextorySource(opts)
+    src._session.post = MagicMock(
+        side_effect=[
+            _json_resp({"login_token": "tok", "country": "DE"}),
+            _json_resp({"profile_token": "kids-prof-tok"}),
+        ]
+    )
+    src._session.get = MagicMock(
+        return_value=_json_resp(
+            {
+                "profiles": [
+                    {"id": "p1", "name": "Adult", "login_key": "adult-key"},
+                    {"id": "p2", "name": "Kids", "login_key": "kids-key"},
+                ]
+            }
+        )
+    )
+    src.login("https://www.nextory.de/buch/demo-55", username="u", password="p")
+    assert src._session.headers["X-Locale"] == "de_DE"
+    assert src._session.post.call_args_list[1].kwargs["json"] == {"login_key": "kids-key"}
+
+    chapters = NextorySource.get_chapters(
+        {
+            "files": [{"uri": "u", "start_at": 0, "title": "Opening Scene"}],
+            "chapters": [
+                {"title": "Prologue", "start_at": 0},
+                {"title": "Chapter One", "start_at": 12000},
+            ],
+        }
+    )
+    assert [(c.start, c.title) for c in chapters] == [(0, "Prologue"), (12000, "Chapter One")]
+
+    src._session.get = MagicMock(
+        return_value=_json_resp(
+            {"products": [{"id": 77, "title": "Search Hit", "authors": [{"name": "A. Writer"}]}]}
+        )
+    )
+    hits = src.search("Search Hit")
+    assert len(hits) == 1
+    assert hits[0].title == "Search Hit"
+    assert hits[0].author == "A. Writer"
+    assert hits[0].url == "https://www.nextory.com/book/77"

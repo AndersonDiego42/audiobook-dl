@@ -52,6 +52,7 @@ LOCATION_DEFAULTS = {
     'language': '',
     'description': '',
     'isbn': '',
+    'asin': '',
     'publisher': '',
     'release_date': '',
     'year': '',

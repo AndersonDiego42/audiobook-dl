@@ -1234,7 +1234,9 @@ def test_gui_series_preview_filter_and_shift_range(tmp_path):
             dialog._check_vars[2].set(False)
             dialog._toggle_series_item(2, shift_held=True)
             assert [v.get() for v in dialog._check_vars] == [False, False, False]
-            assert dialog._tree.item("1", "values")[0] == "[ ]"
+            row_values = dialog._tree.item("1", "values")
+            assert isinstance(row_values, (tuple, list))
+            assert row_values[0] == "[ ]"
 
             # Filter entry detaches non-matching rows in Treeview cleanly
             dialog._filter_var.set("beta")
@@ -1691,6 +1693,8 @@ def test_gui_persists_all_toggles_on_close_and_run_start(tmp_path):
     app.skip_downloaded_var.set(True)
     app.write_json_var.set(True)
     app.enrich_metadata_var.set(True)
+    app.enrich_providers_var.set("itunes,google")
+    app.enrich_interactive_var.set(True)
     app.no_chapters_var.set(True)
     app.debug_var.set(True)
     app.split_chapters_var.set(True)
@@ -1726,6 +1730,8 @@ def test_gui_persists_all_toggles_on_close_and_run_start(tmp_path):
         assert app2.skip_downloaded_var.get() is True
         assert app2.write_json_var.get() is True
         assert app2.enrich_metadata_var.get() is True
+        assert app2.enrich_providers_var.get() == "itunes,google"
+        assert app2.enrich_interactive_var.get() is True
         assert app2.no_chapters_var.get() is True
         assert app2.debug_var.get() is True
         assert app2.split_chapters_var.get() is True
@@ -1788,5 +1794,492 @@ def test_gui_close_persists_valid_toggles_despite_invalid_numeric_input(tmp_path
         assert app2.max_workers_var.get() == ""
     finally:
         root2.destroy()
+
+
+def test_preview_dialog_inline_metadata_and_cover_editing(tmp_path, monkeypatch):
+    from PIL import Image
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+
+    try:
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+        original_cover = Cover(image=_make_sample_png_bytes(), extension="png")
+        audiobook = Audiobook(
+            session=requests.Session(),
+            metadata=AudiobookMetadata(
+                title="Original Title",
+                authors=["First Author"],
+                narrators=["First Narrator"],
+                series="Original Series",
+                series_order=1,
+                description="Book summary.",
+            ),
+            files=[AudiobookFile(url="https://example.com/1.m4b", ext="m4b")],
+            chapters=[Chapter(start=0, title="Ch 1")],
+            cover=original_cover,
+        )
+        fake_source = SimpleNamespace(name="FakeSource")
+
+        # 1. Cancelling via Close/destroy leaves audiobook untouched
+        confirmed: list[tuple] = []
+        dialog_cancel = app._show_preview_dialog("https://example.com/1", fake_source, audiobook)  # type: ignore[arg-type]
+        dialog_cancel._title_var.set("Unsaved Change")
+        dialog_cancel._series_var.set("Unsaved Series")
+        dialog_cancel.destroy()
+        assert audiobook.metadata.title == "Original Title"
+        assert audiobook.metadata.series == "Original Series"
+        assert confirmed == []
+
+        # 2. Inline validation, cover replace/clear, and confirm apply edits
+        from audiobookdl.gui.preview_dialog import PreviewDialog
+
+        dialog = PreviewDialog(
+            root,
+            "https://example.com/1",
+            fake_source,  # type: ignore[arg-type]
+            audiobook,
+            is_running=False,
+            skip_downloaded=False,
+            series_book_exists=lambda _b: False,
+            on_confirm=lambda url, prefetched, indices: confirmed.append((url, prefetched, indices)),
+            palette=app._palette,
+        )
+        assert dialog._title_var.get() == "Original Title"
+        assert dialog._authors_var.get() == "First Author"
+        assert dialog._narrators_var.get() == "First Narrator"
+        assert dialog._series_var.get() == "Original Series"
+        assert dialog._series_order_var.get() == "1"
+        assert dialog._cover_photo is not None
+
+        warnings: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            "audiobookdl.gui.preview_dialog.messagebox.showwarning",
+            lambda title, msg, parent=None: warnings.append((title, msg)),
+        )
+
+        # Empty title fails validation without closing
+        dialog._title_var.set("   ")
+        assert dialog._apply_audiobook_edits(audiobook) is False
+        assert warnings and "Title" in warnings[-1][1]
+
+        # Non-integer series order fails validation
+        dialog._title_var.set("Edited Title")
+        dialog._series_order_var.set("two")
+        assert dialog._apply_audiobook_edits(audiobook) is False
+        assert "whole number" in warnings[-1][1]
+
+        # Clear cover, then replace cover from disk
+        dialog._clear_cover()
+        assert dialog._pending_cover is None
+        assert dialog._cover_photo is None
+        assert str(dialog._clear_cover_btn.cget("state")) == "disabled"  # type: ignore[union-attr]
+
+        new_cover_path = tmp_path / "new_cover.jpg"
+        Image.new("RGB", (96, 96), color=(200, 50, 50)).save(new_cover_path, format="JPEG")
+        monkeypatch.setattr(
+            "audiobookdl.gui.preview_dialog.filedialog.askopenfilename",
+            lambda **_kw: str(new_cover_path),
+        )
+        dialog._choose_cover_file()
+        assert dialog._pending_cover is not None
+        assert dialog._pending_cover.extension == "jpg"
+        assert dialog._cover_photo is not None
+        assert str(dialog._clear_cover_btn.cget("state")) == "normal"  # type: ignore[union-attr]
+
+        # Apply valid edits and confirm via the Download button
+        dialog._authors_var.set("Author A; Author B")
+        dialog._narrators_var.set("Narrator X; Narrator Y")
+        dialog._series_var.set("Edited Series")
+        dialog._series_order_var.set("4")
+        from tkinter import ttk as _ttk
+
+        action_btns = [
+            w for w in dialog.winfo_children()[0].winfo_children()[-1].winfo_children()
+            if isinstance(w, _ttk.Button) and str(w.cget("text")) in ("Download", "Add to Queue")
+        ]
+        assert len(action_btns) == 1
+        action_btns[0].invoke()
+
+        assert len(confirmed) == 1
+        confirmed_url, (confirmed_src, confirmed_book), confirmed_indices = confirmed[0]
+        assert confirmed_url == "https://example.com/1"
+        assert confirmed_src is fake_source
+        assert confirmed_indices is None
+        assert confirmed_book is audiobook
+        assert audiobook.metadata.title == "Edited Title"
+        assert audiobook.metadata.authors == ["Author A", "Author B"]
+        assert audiobook.metadata.narrators == ["Narrator X", "Narrator Y"]
+        assert audiobook.metadata.series == "Edited Series"
+        assert audiobook.metadata.series_order == 4
+        assert audiobook.cover is not None
+        assert audiobook.cover.extension == "jpg"
+        assert audiobook.cover.image == new_cover_path.read_bytes()
+    finally:
+        root.destroy()
+
+
+def test_gui_theme_switching_live_and_persistence(tmp_path, monkeypatch):
+    from audiobookdl.gui.theme import DARK_PALETTE, LIGHT_PALETTE, resolve_palette
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    try:
+        app = AudiobookDLApp(root, config_location=str(cfg_path))
+
+        # Switch to dark theme live
+        dark = app.set_theme("dark")
+        assert dark == DARK_PALETTE
+        assert app.theme_mode == "dark"
+        assert app._style.theme_use() == "clam"
+        assert app._style.lookup("Muted.TLabel", "foreground") == DARK_PALETTE.fg_muted
+        assert app._style.lookup("Success.TLabel", "foreground") == DARK_PALETTE.success
+        assert app.log_text.cget("background") == DARK_PALETTE.text_bg
+        assert app.urls_text.cget("foreground") == DARK_PALETTE.text_fg
+        assert app._scroll_frame.canvas.cget("background") == DARK_PALETTE.bg
+
+        root.update_idletasks()
+        assert app._scroll_frame.content_frame.winfo_reqwidth() <= 650
+
+        # Open a child dialog in dark mode, then switch live to light mode
+        book = Audiobook(
+            session=requests.Session(),
+            metadata=AudiobookMetadata(title="Themed Book"),
+            files=[AudiobookFile(url="https://example.com/1.mp3", ext="mp3")],
+        )
+        dialog = app._show_preview_dialog(
+            "https://example.com/1",
+            SimpleNamespace(name="FakeSource"),  # type: ignore[arg-type]
+            book,
+        )
+        assert dialog.cget("background") == DARK_PALETTE.bg
+
+        light = app.set_theme("light")
+        assert light == LIGHT_PALETTE
+        assert dialog.cget("background") == LIGHT_PALETTE.bg
+        assert app._style.lookup("Muted.TLabel", "foreground") == LIGHT_PALETTE.fg_muted
+        dialog.destroy()
+
+        # Persist dark theme on close and restore on next launch
+        app.set_theme("dark")
+        app._on_close()
+    except tk.TclError:
+        root.destroy()
+        raise
+
+    root2 = tk.Tk()
+    root2.withdraw()
+    try:
+        app2 = AudiobookDLApp(root2, config_location=str(cfg_path))
+        assert app2.theme_mode == "dark"
+        assert app2._palette == DARK_PALETTE
+    finally:
+        root2.destroy()
+
+    # System mode delegates to detect_system_theme
+    monkeypatch.setattr("audiobookdl.gui.theme.detect_system_theme", lambda: "dark")
+    assert resolve_palette("system") == DARK_PALETTE
+    monkeypatch.setattr("audiobookdl.gui.theme.detect_system_theme", lambda: "light")
+    assert resolve_palette("system") == LIGHT_PALETTE
+
+
+def test_gui_hidpi_scaling_helpers():
+    from tkinter import ttk
+    from audiobookdl.gui.theme import configure_hidpi_scaling, get_dpi_scale, scale_px
+
+    class _FakeWidget:
+        def __init__(self, dpi: float) -> None:
+            self._dpi = dpi
+
+        def winfo_fpixels(self, _spec: str) -> float:
+            return self._dpi
+
+    assert get_dpi_scale(None) == pytest.approx(1.0)
+    assert get_dpi_scale(_FakeWidget(96.5)) == pytest.approx(1.0)  # type: ignore[arg-type]
+    assert get_dpi_scale(_FakeWidget(144.0)) == pytest.approx(1.5)  # type: ignore[arg-type]
+    assert scale_px(_FakeWidget(144.0), 180) == 270  # type: ignore[arg-type]
+    assert scale_px(_FakeWidget(96.0), 180) == 180  # type: ignore[arg-type]
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        style = ttk.Style()
+        scale = configure_hidpi_scaling(root, style)
+        assert scale >= 1.0
+        row_h = int(float(style.lookup("Treeview", "rowheight")))
+        assert row_h >= 22
+    finally:
+        root.destroy()
+
+
+def test_gui_cookie_import_dialog_states_and_apply(tmp_path):
+    import http.cookiejar
+    from audiobookdl.gui.cookie_dialog import CookieImportDialog
+    from audiobookdl.utils.browser_cookies import (
+        BrowserCookieError,
+        CookieImportResult,
+        _build_cookie,
+    )
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    try:
+        app = AudiobookDLApp(root, config_location=str(cfg_path))
+        app.remember_login_var.set(True)
+
+        applied_paths = []
+        cookie = _build_cookie(
+            domain=".everand.com",
+            name="scribd_session",
+            value="abc_token",
+            path="/",
+            expires=1999999999,
+            secure=True,
+            http_only=True,
+        )
+
+        dialog = CookieImportDialog(
+            root,
+            app._services,
+            initial_service_key="overdrive",
+            on_apply=lambda key, path, count: (
+                applied_paths.append((key, path, count)),
+                app._on_cookies_imported(key, path, count),
+            ),
+            palette=app._palette,
+            browser_detector=lambda: {"firefox": True, "edge": False, "chrome": False, "brave": False, "chromium": False, "opera": False},
+        )
+        root.update_idletasks()
+        try:
+            assert "overdrive.com" in dialog._domains_var.get()
+            assert "(Detected)" in dialog._browser_var.get()
+
+            # Switch service updates default domains and target path
+            dialog._service_var.set("Everand / Scribd")
+            dialog._on_service_changed()
+            assert "everand.com" in dialog._domains_var.get()
+            custom_out = tmp_path / "imported_everand.txt"
+            dialog._output_var.set(str(custom_out))
+
+            # Empty scan result shows inline guidance and keeps Save & Apply disabled
+            dialog._on_scan_finished(
+                CookieImportResult(
+                    browser="firefox",
+                    domains=("everand.com",),
+                    cookies=[],
+                    total_scanned=20,
+                    profile_used="default",
+                ),
+                None,
+            )
+            assert "No cookies matched" in dialog._status_var.get()
+            assert str(dialog._save_btn.cget("state")) == "disabled"
+
+            # Error state surfaces message cleanly
+            dialog._on_scan_finished(None, BrowserCookieError("Browser DB locked"))
+            assert "Browser DB locked" in dialog._status_var.get()
+            assert str(dialog._save_btn.cget("state")) == "disabled"
+
+            # Success result populates Treeview and enables Save & Apply
+            dialog._on_scan_finished(
+                CookieImportResult(
+                    browser="firefox",
+                    domains=("everand.com",),
+                    cookies=[cookie],
+                    total_scanned=20,
+                    profile_used="default-release",
+                ),
+                None,
+            )
+            assert len(dialog._tree.get_children()) == 1
+            assert str(dialog._save_btn.cget("state")) == "normal"
+
+            dialog.apply_and_close()
+            assert applied_paths == [("everand", str(custom_out), 1)]
+            assert app.cookie_file_var.get() == str(custom_out)
+            assert custom_out.is_file()
+            jar = http.cookiejar.MozillaCookieJar()
+            jar.load(str(custom_out), ignore_discard=True, ignore_expires=True)
+            assert [c.value for c in jar] == ["abc_token"]
+            assert app.controller.config.sources["everand"].cookie_file == str(custom_out)
+        finally:
+            if dialog.winfo_exists():
+                dialog.destroy()
+
+        # Launching through app._show_cookie_import_dialog reuses singleton & wires palette
+        app._show_cookie_import_dialog()
+        assert app._cookie_dialog is not None
+        assert app._cookie_dialog.winfo_exists()
+        first_dlg = app._cookie_dialog
+        app._show_cookie_import_dialog()
+        assert app._cookie_dialog is first_dlg
+        first_dlg.destroy()
+    finally:
+        root.destroy()
+
+
+def test_gui_completion_notifications_and_toggle_persistence(tmp_path, monkeypatch):
+    import subprocess
+    from audiobookdl.gui.notifications import format_completion_notification, send_os_notification
+    from audiobookdl.pipeline import DownloadSummary
+
+    # 1. Payload formatting
+    assert format_completion_notification(DownloadSummary(completed=1, failed=0), None) == (
+        "audiobook-dl: Download Complete",
+        "Finished downloading 1 audiobook.",
+    )
+    assert format_completion_notification(DownloadSummary(completed=2, failed=1), None) == (
+        "audiobook-dl: Batch Finished",
+        "Completed 2, failed 1.",
+    )
+    assert format_completion_notification(DownloadSummary(completed=0, failed=2), None) == (
+        "audiobook-dl: Download Failed",
+        "2 audiobooks failed to download.",
+    )
+    assert format_completion_notification(DownloadSummary(completed=1, cancelled=True), None) is None
+    assert format_completion_notification(None, RuntimeError("Network timeout")) == (
+        "audiobook-dl: Download Failed",
+        "Network timeout",
+    )
+
+    # 2. Cross-platform dispatch helpers
+    commands = []
+
+    def fake_run(cmd, **_kwargs):
+        commands.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr("audiobookdl.gui.notifications.subprocess.run", fake_run)
+    monkeypatch.setattr("audiobookdl.gui.notifications.shutil.which", lambda name: f"/bin/{name}")
+
+    assert send_os_notification("Done", "1 book", platform_name="win32") is True
+    assert send_os_notification("Done", "1 book", platform_name="darwin") is True
+    assert send_os_notification("Done", "1 book", platform_name="linux") is True
+    assert any("osascript" in c[0] for c in commands)
+    assert any("notify-send" in c[0] for c in commands)
+
+    monkeypatch.setattr("audiobookdl.gui.notifications.shutil.which", lambda _name: None)
+    assert send_os_notification("Done", "1 book", platform_name="linux") is False
+
+    # 3. GUI trigger + config persistence across close/reopen
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    sent_notifs = []
+    monkeypatch.setattr(
+        "audiobookdl.gui.app.send_os_notification_async",
+        lambda title, msg, **_kw: sent_notifs.append((title, msg)),
+    )
+    try:
+        app = AudiobookDLApp(root, config_location=str(cfg_path))
+        assert app.notify_on_complete_var.get() is True
+
+        app._finish_run(DownloadSummary(completed=2, failed=0), None)
+        assert sent_notifs == [
+            ("audiobook-dl: Download Complete", "Finished downloading 2 audiobooks.")
+        ]
+
+        # Cancelled runs do not notify
+        sent_notifs.clear()
+        app._finish_run(DownloadSummary(completed=0, cancelled=True), None)
+        assert sent_notifs == []
+
+        # Disabled toggle suppresses notifications and persists on close
+        app.notify_on_complete_var.set(False)
+        app._finish_run(DownloadSummary(completed=1, failed=0), None)
+        assert sent_notifs == []
+
+        app._on_close()
+    except tk.TclError:
+        root.destroy()
+        raise
+
+    root2 = tk.Tk()
+    root2.withdraw()
+    try:
+        app2 = AudiobookDLApp(root2, config_location=str(cfg_path))
+        assert app2.notify_on_complete_var.get() is False
+    finally:
+        root2.destroy()
+
+
+def test_gui_preview_dialog_enrichment_updates_fields_and_cover(tmp_path):
+    from io import BytesIO
+    from PIL import Image
+    from audiobookdl.gui.preview_dialog import PreviewDialog
+    from audiobookdl.utils.audiobook import Chapter, Cover
+    from audiobookdl.utils.enrichment import EnrichmentCandidate
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        buf = BytesIO()
+        Image.new("RGB", (8, 8), (10, 20, 30)).save(buf, format="JPEG")
+        cover = Cover(image=buf.getvalue(), extension="jpg")
+
+        book = Audiobook(
+            session=requests.Session(),
+            metadata=AudiobookMetadata(title="Dune", authors=["Frank Herbert"]),
+            files=[AudiobookFile(url="https://example.com/1.m4b", ext="m4b")],
+        )
+        candidate = EnrichmentCandidate(
+            provider="audnexus",
+            score=0.98,
+            title="Dune",
+            authors=["Frank Herbert"],
+            narrators=["Scott Brick"],
+            asin="B002V5B16O",
+        )
+
+        def fake_apply(target: Audiobook, _cand: EnrichmentCandidate):
+            target.metadata.narrators = ["Scott Brick"]
+            target.metadata.asin = "B002V5B16O"
+            target.cover = cover
+            target.chapters = [Chapter(start=0, title="Book 1")]
+            return ["narrators", "asin"], True, True
+
+        dialog = PreviewDialog(
+            root,
+            "https://example.com/dune",
+            MagicMock(name="storytel"),
+            book,
+            is_running=False,
+            skip_downloaded=False,
+            series_book_exists=lambda _b: False,
+            on_confirm=lambda *_args: None,
+            on_search_enrichment=lambda _b: [candidate],
+            on_apply_enrichment=fake_apply,
+        )
+        fields, cover_updated, chapters_updated = fake_apply(book, candidate)
+        dialog._on_enrichment_applied(book, fields, cover_updated, chapters_updated, None)
+        assert dialog._narrators_var.get() == "Scott Brick"
+        assert dialog._pending_cover is cover
+        assert dialog._cover_modified is True
+        assert "narrators" in dialog._enrich_status_var.get()
+        dialog.destroy()
+    finally:
+        root.destroy()
+
 
 

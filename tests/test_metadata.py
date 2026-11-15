@@ -653,3 +653,37 @@ def test_single_save_pass_for_mp4_metadata_and_id3_chapters_cover(tmp_path):
     tags = ID3(str(mp3_path))
     assert len(tags.getall("APIC")) == 1
     assert len(tags.getall("CHAP")) == 2
+
+
+def test_asin_metadata_across_mp4_id3_vorbis_opf_json_and_template(tmp_path):
+    import json
+    from mutagen.flac import FLAC
+    from audiobookdl.output import output as out_mod
+
+    meta = AudiobookMetadata(
+        title="ASIN Book",
+        authors=["Jane Doe"],
+        asin="B08G9PRS1K",
+    )
+    assert meta.all_properties_dict()["asin"] == "B08G9PRS1K"
+    assert json.loads(meta.as_json())["asin"] == "B08G9PRS1K"
+    assert out_mod.gen_output_location("{title} [{asin}]", meta, "") == "ASIN Book [B08G9PRS1K]"
+
+    opf_path = tmp_path / "metadata.opf"
+    sidecars.write_sidecar_opf(meta, str(opf_path))
+    assert '<dc:identifier opf:scheme="ASIN">B08G9PRS1K</dc:identifier>' in opf_path.read_text(encoding="utf-8")
+
+    mp4_path = tmp_path / "asin.m4b"
+    _create_silent_audio(mp4_path, ["-c:a", "aac", "-f", "mp4"])
+    mp4.add_mp4_metadata(str(mp4_path), meta)
+    assert bytes(MP4(str(mp4_path))["----:com.apple.iTunes:ASIN"][0]) == b"B08G9PRS1K"
+
+    mp3_path = tmp_path / "asin.mp3"
+    _create_silent_audio(mp3_path, ["-c:a", "libmp3lame"])
+    id3.add_id3_metadata(str(mp3_path), meta)
+    assert list(ID3(str(mp3_path))["TXXX:ASIN"].text) == ["B08G9PRS1K"]
+
+    flac_path = tmp_path / "asin.flac"
+    _create_silent_audio(flac_path, ["-c:a", "flac"])
+    vorbis.add_vorbis_metadata(str(flac_path), meta)
+    assert FLAC(str(flac_path))["asin"] == ["B08G9PRS1K"]

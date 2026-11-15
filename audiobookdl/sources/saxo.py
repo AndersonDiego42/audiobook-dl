@@ -1,39 +1,50 @@
 from .source import Source
-from audiobookdl import logging, AudiobookFile, AudiobookMetadata, Cover, Audiobook
+from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, logging
 from audiobookdl.exceptions import BookNotFound, NoSourceFound
 from audiobookdl.utils.audiobook import AESEncryption
 from audiobookdl.utils.concurrency import run_cancellable_pool
+
+from datetime import datetime
+import os
+import pycountry
 import re
-from typing import List
+from typing import Any, Dict, List, Optional
+
 
 class SaxoSource(Source):
-    _authentication_methods = [
-        "login"
-    ]
-    names = [ "Saxo" ]
+    _authentication_methods = ["login"]
+    names = ["Saxo"]
     match = [
-        r"https?://(www.)?saxo.(com|dk)/[^/]+/.+"
+        r"https?://(www.)?saxo.(com|dk)/[^/]+/.+",
     ]
-    _APP_OS = "android"
-    _APP_VERSION = "6.2.4"
+    DEFAULT_APP_OS = "android"
+    DEFAULT_APP_VERSION = "6.2.4"
+
+    def _app_headers(self) -> Dict[str, str]:
+        app_os = os.environ.get("AUDIOBOOK_DL_SAXO_APP_OS") or self.DEFAULT_APP_OS
+        app_version = os.environ.get("AUDIOBOOK_DL_SAXO_APP_VERSION") or self.DEFAULT_APP_VERSION
+        return {
+            "Appauthorization": f"bearer {self.bearer_token}",
+            "App-Os": app_os,
+            "App-Version": app_version,
+        }
 
     def _login(self, url: str, username: str, password: str) -> None:
         resp = self.post_json(
             "https://auth-read.saxo.com/auth/token",
-            data = {
+            data={
                 "username": username,
                 "password": password,
                 "grant_type": "password",
             },
-            headers = {
-                "Content-Type": "application/x-www-form-urlencoded"
-            }
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
         )
         self.bearer_token = resp["access_token"]
         self.user_id = resp["id"]
         logging.debug(f"bearer_token={logging.mask_secret(self.bearer_token)}")
         logging.debug(f"{self.user_id=}")
-
 
     def download(self, url: str) -> Audiobook:
         isbn = self._extract_isbn(url)
@@ -41,54 +52,43 @@ class SaxoSource(Source):
         logging.debug(f"{book_id=}")
         book_info = self._get_book_metadata(book_id)
         return Audiobook(
-            session = self._session,
-            files = self.get_files(book_info),
-            metadata = self.get_metadata(book_info),
-            cover = self.get_cover(book_info),
+            session=self._session,
+            files=self.get_files(book_info),
+            metadata=self.get_metadata(book_info, isbn=isbn, url=url),
+            cover=self.get_cover(book_info),
+            chapters=self.get_chapters(book_info),
         )
-
 
     def _extract_isbn(self, url: str) -> str:
         """Extract isbn of book from url"""
-        isbn_match = re.search(r"\d+$", url)
-        if isbn_match and isbn_match.group():
-            return isbn_match.group()
-        else:
-            raise NoSourceFound
+        isbn_match = re.search(r"(\d+)(?:[/?#].*)?$", url)
+        if isbn_match and isbn_match.group(1):
+            return isbn_match.group(1)
+        raise NoSourceFound
 
     def _search_for_book(self, isbn: str) -> str:
         """Search for internal book id by isbn number"""
         logging.debug(f"Searching for book with isbn: {isbn}")
         resp = self.get_json(
             f"https://api-read.saxo.com/api/v2/search/user/{self.user_id}/premium/books/{isbn}?booktypefilter=Audiobook",
-            headers = {
-                "Appauthorization": f"bearer {self.bearer_token}",
-                "App-Os": self._APP_OS,
-                "App-Version": self._APP_VERSION,
-            }
+            headers=self._app_headers(),
         )
         items = resp.get("items") or []
         if not items:
             raise BookNotFound
-        # Selects the first search result. There should only be one
         return items[0]["bookId"]
 
     def _get_book_metadata(self, book_id: str) -> dict:
         """Downloads metadata about book"""
         resp = self.post_json(
             f"https://api-read.saxo.com/api/v1/book/data/user/{self.user_id}/",
-            headers = {
-                "Appauthorization": f"bearer {self.bearer_token}",
-                "App-Os": self._APP_OS,
-                "App-Version": self._APP_VERSION,
-            },
-            json = [ book_id ]
+            headers=self._app_headers(),
+            json=[book_id],
         )
         items = resp.get("items") or []
         if not items:
             raise BookNotFound
         return items[0]
-
 
     def get_files(self, book_info) -> List[AudiobookFile]:
         book_id = book_info["bookId"]
@@ -98,37 +98,89 @@ class SaxoSource(Source):
             filename = file["fileName"]
             link = self.get_json(
                 f"https://api-read.saxo.com/api/v1/book/{book_id}/content/encryptedstream/{filename}",
-                headers = {
-                    "Appauthorization": f"bearer {self.bearer_token}",
-                    "App-Os": self._APP_OS,
-                    "App-Version": self._APP_VERSION,
-                },
+                headers=self._app_headers(),
             )["link"]
             return AudiobookFile(
-                url = link,
-                ext = "mp3",
-                # Encryption keys extracted from app
-                encryption_method = AESEncryption(
+                url=link,
+                ext="mp3",
+                encryption_method=AESEncryption(
                     b"CD3E9D141D8EFC0886912E7A8F3652C4",
                     b"78CB354D377772F1",
-                )
+                ),
             )
 
         if len(chapters) <= 1:
             return [_fetch_file(f) for f in chapters]
         return run_cancellable_pool(_fetch_file, chapters, max_workers=8)
 
-    def get_metadata(self, book_info) -> AudiobookMetadata:
+    @staticmethod
+    def get_chapters(book_info: Dict[str, Any]) -> List[Chapter]:
+        """Build chapters from `techInfo.chapters` when titles or timings are supplied."""
+        tech_chapters = (book_info.get("techInfo") or {}).get("chapters") or []
+        chapters: List[Chapter] = []
+        offset_ms = 0
+        for idx, ch in enumerate(tech_chapters, start=1):
+            if not isinstance(ch, dict):
+                continue
+            ch_title = str(ch.get("title") or ch.get("chapterTitle") or f"Chapter {idx}").strip()
+            start_val = ch.get("startTime")
+            start_ms = round(float(start_val) * 1000) if isinstance(start_val, (int, float)) else offset_ms
+            if ch.get("title") or ch.get("chapterTitle") or ch.get("duration") or ch.get("startTime") is not None:
+                chapters.append(Chapter(start=start_ms, title=ch_title))
+            dur = ch.get("duration") or ch.get("durationSeconds")
+            if isinstance(dur, (int, float)) and dur > 0:
+                offset_ms += round(float(dur) * 1000)
+        return chapters
+
+    def get_metadata(
+        self,
+        book_info: Dict[str, Any],
+        *,
+        isbn: Optional[str] = None,
+        url: Optional[str] = None,
+    ) -> AudiobookMetadata:
         metadata: dict = book_info["bookMetadata"]
         title = metadata["title"]
-        result = AudiobookMetadata(title)
-        result.add_authors(metadata["authors"])
-        result.add_narrators(metadata["readBy"])
+        result = AudiobookMetadata(title, source="saxo", scrape_url=url)
+        result.add_authors(metadata.get("authors") or [])
+        result.add_narrators(metadata.get("readBy") or [])
         result.series = metadata.get("seriesName")
-        return result
 
+        resolved_isbn = isbn or metadata.get("isbn") or metadata.get("isbn13")
+        if resolved_isbn:
+            result.isbn = str(resolved_isbn).strip()
+
+        raw_desc = metadata.get("description") or metadata.get("summary")
+        if isinstance(raw_desc, str) and raw_desc.strip():
+            result.description = " ".join(re.sub(r"<[^>]+>", " ", raw_desc).split()) or None
+
+        publisher = metadata.get("publisherName") or metadata.get("publisher")
+        if isinstance(publisher, dict):
+            publisher = publisher.get("name")
+        if isinstance(publisher, str) and publisher.strip():
+            result.publisher = publisher.strip()
+
+        lang_raw = metadata.get("language")
+        if isinstance(lang_raw, str) and lang_raw.strip():
+            code = lang_raw.strip()
+            lang_obj = (
+                pycountry.languages.get(alpha_2=code.lower())
+                or pycountry.languages.get(name=code)
+            )
+            result.language = lang_obj if lang_obj is not None else code
+
+        release_raw = metadata.get("publishingDate") or metadata.get("releaseDate")
+        if isinstance(release_raw, str) and release_raw.strip():
+            cleaned_date = release_raw.strip()
+            try:
+                result.release_date = datetime.fromisoformat(
+                    cleaned_date.replace("Z", "+00:00")
+                ).date()
+            except ValueError:
+                pass
+        return result
 
     def get_cover(self, book_info) -> Cover:
         cover_url = book_info["bookMetadata"]["image"]["highQualityImageUrl"]
-        bytes = self.get(cover_url)
-        return Cover(bytes, "jpg")
+        data = self.get(cover_url)
+        return Cover(data, "jpg")

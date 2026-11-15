@@ -6,6 +6,8 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
+from audiobookdl.gui.theme import scale_px
+
 
 @dataclass(frozen=True)
 class TreeColumnSpec:
@@ -46,7 +48,7 @@ class ScrolledTreeview(ttk.Frame):
             self.tree.heading(spec.key, text=spec.heading)
             self.tree.column(
                 spec.key,
-                width=spec.width,
+                width=scale_px(self, spec.width),
                 stretch=spec.stretch,
                 anchor=spec.anchor,  # type: ignore[arg-type]
             )
@@ -97,6 +99,11 @@ class ScrollableFrame(ttk.Frame):
         toplevel.bind("<FocusIn>", self.ensure_focus_visible)
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
             toplevel.bind(seq, self.on_mousewheel)
+
+    def apply_theme(self, background: str) -> None:
+        """Update the underlying canvas background to match the active theme."""
+        if background:
+            self.canvas.configure(background=background)
 
     def sync_layout(self, event: Optional[Any] = None) -> None:
         """Synchronize embedded content dimensions and scrollbar visibility with canvas size."""

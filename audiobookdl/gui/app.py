@@ -1,7 +1,6 @@
 """Main Tkinter desktop window view and launcher entry point for audiobook-dl."""
 
 import argparse
-import ctypes
 import importlib.resources
 import os
 import subprocess
@@ -19,6 +18,7 @@ from audiobookdl.exceptions import DownloadCancelled
 from audiobookdl.gui.archive_dialog import ArchiveLedgerDialog
 from audiobookdl.gui.catalog_dialog import CatalogBrowserDialog
 from audiobookdl.gui.controller import GuiController, QueuedJob
+from audiobookdl.gui.cookie_dialog import CookieImportDialog
 from audiobookdl.gui.formatting import (
     MEDIA_TYPE_OPTIONS,
     OUTPUT_FORMATS,
@@ -33,7 +33,19 @@ from audiobookdl.gui.formatting import (
     is_valid_geometry,
     parse_url_text,
 )
-from audiobookdl.gui.preview_dialog import PreviewDialog
+from audiobookdl.gui.notifications import format_completion_notification, send_os_notification_async
+from audiobookdl.gui.preview_dialog import ChoiceDialog, PreviewDialog
+from audiobookdl.gui.theme import (
+    THEME_LABELS,
+    THEME_MODES,
+    ThemePalette,
+    apply_theme,
+    apply_theme_to_widget_tree,
+    apply_theme_to_window,
+    enable_high_dpi_awareness,
+    normalize_theme_mode,
+    scale_px,
+)
 from audiobookdl.gui.widgets import (
     ScrollableFrame,
     ScrolledTreeview,
@@ -84,6 +96,8 @@ class AudiobookDLApp:
     proxy_var: tk.StringVar
     timeout_var: tk.StringVar
     enrich_metadata_var: tk.BooleanVar
+    enrich_providers_var: tk.StringVar
+    enrich_interactive_var: tk.BooleanVar
 
     def __init__(self, root: tk.Tk, config_location: Optional[str] = None) -> None:
         self.root = root
@@ -94,17 +108,20 @@ class AudiobookDLApp:
         if saved_geometry and is_valid_geometry(saved_geometry):
             self.root.geometry(saved_geometry)
         else:
-            screen_w = max(660, self.root.winfo_screenwidth())
-            screen_h = max(480, self.root.winfo_screenheight())
-            default_w = min(780, max(660, screen_w - 40))
-            default_h = min(780, max(480, screen_h - 80))
+            min_w = scale_px(self.root, 660)
+            min_h = scale_px(self.root, 480)
+            screen_w = max(min_w, self.root.winfo_screenwidth())
+            screen_h = max(min_h, self.root.winfo_screenheight())
+            default_w = min(scale_px(self.root, 780), max(min_w, screen_w - 40))
+            default_h = min(scale_px(self.root, 780), max(min_h, screen_h - 80))
             self.root.geometry(f"{default_w}x{default_h}")
-        self.root.minsize(660, 480)
+        self.root.minsize(scale_px(self.root, 660), scale_px(self.root, 480))
         self._apply_window_icon()
 
         self._style = ttk.Style()
-        if "vista" in self._style.theme_names():
-            self._style.theme_use("vista")
+        self._theme_mode = normalize_theme_mode(self._controller.config.gui.theme)
+        self._theme_var = tk.StringVar(value=self._theme_mode)
+        self._palette: ThemePalette = apply_theme(self.root, self._style, self._theme_mode)
 
         self._services: List[ServiceInfo] = get_available_services()
         self._services_by_label = {s.label: s for s in self._services}
@@ -125,6 +142,7 @@ class AudiobookDLApp:
         self._is_previewing = False
         self._is_verifying_auth = False
         self._preview_dialog: Optional[PreviewDialog] = None
+        self._cookie_dialog: Optional[CookieImportDialog] = None
         self._interactive_widgets: List[
             Union[ttk.Entry, ttk.Button, ttk.Checkbutton, ttk.Combobox, ttk.Spinbox]
         ] = []
@@ -132,12 +150,28 @@ class AudiobookDLApp:
         self._init_variables()
         self._build_menu_bar()
         self._build_ui()
+        apply_theme_to_widget_tree(self.root, self._palette)
         self._load_service_into_form()
         self._update_ffmpeg_status()
         self._set_running_state(False)
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(50, self._poll_queue)
+
+    @property
+    def theme_mode(self) -> str:
+        return self._theme_mode
+
+    def set_theme(self, mode: str) -> ThemePalette:
+        """Switch between `'system'`, `'light'`, and `'dark'` themes live."""
+        self._theme_mode = normalize_theme_mode(mode)
+        self._theme_var.set(self._theme_mode)
+        self._palette = apply_theme(self.root, self._style, self._theme_mode)
+        for child in self.root.winfo_children():
+            if isinstance(child, tk.Toplevel):
+                apply_theme_to_window(child, self._palette)
+        self._update_ffmpeg_status()
+        return self._palette
 
     @property
     def controller(self) -> GuiController:
@@ -189,6 +223,8 @@ class AudiobookDLApp:
         if cfg.gui.use_download_archive is not None:
             self.download_archive_var.set(bool(cfg.gui.use_download_archive))
         self.m4b_var = tk.BooleanVar(value=(self.output_format_var.get() == "m4b"))
+        notify_default = True if cfg.gui.notify_on_complete is None else bool(cfg.gui.notify_on_complete)
+        self.notify_on_complete_var = tk.BooleanVar(value=notify_default)
 
         self.status_var = tk.StringVar(value="Ready")
         self.batch_var = tk.StringVar(value="")
@@ -199,7 +235,7 @@ class AudiobookDLApp:
         self._scroll_frame = ScrollableFrame(
             self.root,
             style=self._style,
-            content_padding=(12, 8),
+            content_padding=(scale_px(self.root, 12), scale_px(self.root, 8)),
             inner_scrollables=lambda: (self.urls_text, self.log_text, self.queue_tree),
         )
         self._scroll_frame.pack(fill=tk.BOTH, expand=True)
@@ -263,7 +299,7 @@ class AudiobookDLApp:
         ttk.Label(
             url_footer,
             text="One URL per line \u2022 Right-click: Paste & Queue \u2022 Ctrl+Enter to start",
-            foreground="#555555",
+            style="Muted.TLabel",
         ).grid(row=0, column=0, sticky="w")
         url_btn_row = ttk.Frame(url_footer)
         url_btn_row.grid(row=0, column=1, sticky="e")
@@ -303,7 +339,7 @@ class AudiobookDLApp:
         self.preset_combo.bind("<<ComboboxSelected>>", self._on_preset_selected)
 
         ttk.Label(out_frame, text="Preview:").grid(row=2, column=0, sticky="w", padx=(0, 8))
-        ttk.Label(out_frame, textvariable=self.template_preview_var, foreground="#555555").grid(
+        ttk.Label(out_frame, textvariable=self.template_preview_var, style="Muted.TLabel").grid(
             row=2, column=1, columnspan=2, sticky="w"
         )
         for var in (
@@ -340,18 +376,26 @@ class AudiobookDLApp:
         self.service_combo.grid(row=0, column=0, sticky="w", padx=(0, 10))
         self.service_combo.bind("<<ComboboxSelected>>", self._on_service_selected)
 
-        ttk.Label(service_row, textvariable=self.service_hint_var, foreground="#555555").grid(
+        ttk.Label(service_row, textvariable=self.service_hint_var, style="Muted.TLabel").grid(
             row=0, column=1, sticky="w"
         )
-        ttk.Label(service_row, textvariable=self.saved_badge_var, foreground="#1f6f3d").grid(
+        ttk.Label(service_row, textvariable=self.saved_badge_var, style="Success.TLabel").grid(
             row=0, column=2, sticky="e", padx=(8, 0)
         )
 
         ttk.Label(auth_frame, text="Cookies File:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
         self.cookie_entry = ttk.Entry(auth_frame, textvariable=self.cookie_file_var)
-        self.cookie_entry.grid(row=1, column=1, columnspan=3, sticky="ew", pady=(0, 4))
-        self.cookie_browse = ttk.Button(auth_frame, text="Browse...", command=self._browse_cookie_file)
-        self.cookie_browse.grid(row=1, column=4, padx=(8, 0), pady=(0, 4))
+        self.cookie_entry.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(0, 8), pady=(0, 4))
+        cookie_btn_frame = ttk.Frame(auth_frame)
+        cookie_btn_frame.grid(row=1, column=3, columnspan=2, sticky="e", pady=(0, 4))
+        self.cookie_browse = ttk.Button(cookie_btn_frame, text="Browse...", command=self._browse_cookie_file)
+        self.cookie_browse.pack(side=tk.LEFT)
+        self.cookie_import_btn = ttk.Button(
+            cookie_btn_frame,
+            text="Import...",
+            command=self._show_cookie_import_dialog,
+        )
+        self.cookie_import_btn.pack(side=tk.LEFT, padx=(4, 0))
 
         ttk.Label(auth_frame, text="Username:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
         self.user_entry = ttk.Entry(auth_frame, textvariable=self.username_var)
@@ -483,6 +527,35 @@ class AudiobookDLApp:
         cb_debug = ttk.Checkbutton(general_tab, text="Debug logs", variable=self.debug_var)
         cb_debug.grid(row=2, column=5, sticky="w", pady=(4, 0))
 
+        self.notify_cb = ttk.Checkbutton(
+            general_tab,
+            text="Notify on finish",
+            variable=self.notify_on_complete_var,
+        )
+        self.notify_cb.grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        cb_enrich_interactive = ttk.Checkbutton(
+            general_tab,
+            text="Interactive enrich",
+            variable=self.enrich_interactive_var,
+        )
+        cb_enrich_interactive.grid(row=3, column=2, columnspan=2, sticky="w", padx=(0, 12), pady=(4, 0))
+
+        enrich_row = ttk.Frame(general_tab)
+        enrich_row.grid(row=4, column=0, columnspan=6, sticky="ew", pady=(4, 0))
+        ttk.Label(enrich_row, text="Enrich providers:").pack(side=tk.LEFT, padx=(0, 6))
+        enrich_providers_entry = ttk.Entry(
+            enrich_row,
+            textvariable=self.enrich_providers_var,
+            width=26,
+        )
+        enrich_providers_entry.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(
+            enrich_row,
+            text="audnexus, itunes, google, openlibrary",
+            style="Muted.TLabel",
+        ).pack(side=tk.LEFT)
+
         sidecars_tab = ttk.Frame(self.options_notebook, padding=(8, 6))
         sidecars_tab.columnconfigure(3, weight=1)
         self.options_notebook.add(sidecars_tab, text="Chapters & Sidecars")
@@ -517,7 +590,7 @@ class AudiobookDLApp:
         ttk.Label(
             remove_row,
             text="Characters stripped from output paths",
-            foreground="#555555",
+            style="Muted.TLabel",
         ).pack(side=tk.LEFT)
 
         network_tab = ttk.Frame(self.options_notebook, padding=(8, 6))
@@ -563,7 +636,7 @@ class AudiobookDLApp:
         ttk.Label(
             network_tab,
             text="Leave Max workers / Timeout / Proxy blank for defaults (6 workers, e.g. http://127.0.0.1:8080)",
-            foreground="#555555",
+            style="Muted.TLabel",
         ).grid(row=2, column=0, columnspan=6, sticky="w", pady=(4, 0))
 
         # Actions, Progress & Log
@@ -597,10 +670,10 @@ class AudiobookDLApp:
         meta_bar.grid(row=1, column=0, sticky="ew", pady=(0, 2))
         meta_bar.columnconfigure(1, weight=1)
 
-        self.batch_label = ttk.Label(meta_bar, textvariable=self.batch_var, foreground="#333333")
+        self.batch_label = ttk.Label(meta_bar, textvariable=self.batch_var, style="Secondary.TLabel")
         self.batch_label.grid(row=0, column=0, sticky="w")
 
-        self.metrics_label = ttk.Label(meta_bar, textvariable=self.metrics_var, foreground="#555555", anchor="e")
+        self.metrics_label = ttk.Label(meta_bar, textvariable=self.metrics_var, style="Muted.TLabel", anchor="e")
         self.metrics_label.grid(row=0, column=1, sticky="e")
 
         self.progressbar = ttk.Progressbar(log_frame, mode="determinate", maximum=100)
@@ -660,6 +733,7 @@ class AudiobookDLApp:
             self.service_combo,
             self.cookie_entry,
             self.cookie_browse,
+            self.cookie_import_btn,
             self.user_entry,
             self.password_entry,
             self.show_pw_btn,
@@ -690,6 +764,8 @@ class AudiobookDLApp:
             timeout_spin,
             proxy_entry,
             cb_enrich,
+            cb_enrich_interactive,
+            enrich_providers_entry,
             cb_debug,
         ]
 
@@ -703,9 +779,30 @@ class AudiobookDLApp:
         file_menu.add_command(label="Exit", command=self._on_close, accelerator="Ctrl+Q")
         menubar.add_cascade(label="File", menu=file_menu)
 
+        view_menu = tk.Menu(menubar, tearoff=0)
+        theme_menu = tk.Menu(view_menu, tearoff=0)
+        for mode in THEME_MODES:
+            theme_menu.add_radiobutton(
+                label=THEME_LABELS[mode],
+                variable=self._theme_var,
+                value=mode,
+                command=lambda m=mode: self.set_theme(m),
+            )
+        view_menu.add_cascade(label="Theme", menu=theme_menu)
+        view_menu.add_separator()
+        view_menu.add_checkbutton(
+            label="Notify on Download Finish",
+            variable=self.notify_on_complete_var,
+        )
+        menubar.add_cascade(label="View", menu=view_menu)
+
         tools_menu = tk.Menu(menubar, tearoff=0)
         tools_menu.add_command(label="Save Credentials", command=self.save_current_credentials)
         tools_menu.add_command(label="Test Login", command=self.verify_current_auth)
+        tools_menu.add_command(
+            label="Import Browser Cookies...",
+            command=self._show_cookie_import_dialog,
+        )
         tools_menu.add_command(label="Browse Library / Search...", command=self._show_catalog_browser_dialog)
         tools_menu.add_command(label="Locate FFmpeg Folder...", command=self.browse_ffmpeg_dir)
         tools_menu.add_command(label="Download History Ledger...", command=self._show_archive_ledger_dialog)
@@ -762,6 +859,9 @@ class AudiobookDLApp:
                 getattr(self, binding.var_attr).set(binding.init_value(cfg_val))
             if cfg.gui.use_download_archive is not None:
                 self.download_archive_var.set(bool(cfg.gui.use_download_archive))
+            if cfg.gui.notify_on_complete is not None:
+                self.notify_on_complete_var.set(bool(cfg.gui.notify_on_complete))
+            self.set_theme(cfg.gui.theme or "system")
             self.m4b_var.set(self.output_format_var.get() == "m4b")
             self._load_service_into_form()
             self._update_service_field_states()
@@ -788,7 +888,11 @@ class AudiobookDLApp:
         return default_archive_path(db_dir)
 
     def _show_archive_ledger_dialog(self) -> ArchiveLedgerDialog:
-        return ArchiveLedgerDialog(self.root, self._archive_ledger_path())
+        return ArchiveLedgerDialog(
+            self.root,
+            self._archive_ledger_path(),
+            palette=self._palette,
+        )
 
     def _show_catalog_browser_dialog(self) -> CatalogBrowserDialog:
         def _on_fetch(mode: str, svc: ServiceInfo, query_text: str, dialog: CatalogBrowserDialog) -> None:
@@ -808,6 +912,7 @@ class AudiobookDLApp:
             self._selected_service(),
             on_fetch=_on_fetch,
             on_add_urls=_on_add_urls,
+            palette=self._palette,
         )
 
     def _apply_window_icon(self) -> None:
@@ -824,15 +929,15 @@ class AudiobookDLApp:
         has_ffprobe = find_executable("ffprobe") is not None
         if has_ffmpeg and has_ffprobe:
             self.ffmpeg_status_var.set("FFmpeg: Ready")
-            self._ffmpeg_label.configure(foreground="#1f6f3d", cursor="")
+            self._ffmpeg_label.configure(style="Success.TLabel", cursor="")
             self.ffmpeg_locate_btn.configure(text="FFmpeg Folder...")
         elif has_ffmpeg:
             self.ffmpeg_status_var.set("FFmpeg: Ready (ffprobe missing - click for help)")
-            self._ffmpeg_label.configure(foreground="#9a6700", cursor="hand2")
+            self._ffmpeg_label.configure(style="Warning.TLabel", cursor="hand2")
             self.ffmpeg_locate_btn.configure(text="Locate FFmpeg...")
         else:
             self.ffmpeg_status_var.set("FFmpeg: Not found (click for setup help)")
-            self._ffmpeg_label.configure(foreground="#b42318", cursor="hand2")
+            self._ffmpeg_label.configure(style="Error.TLabel", cursor="hand2")
             self.ffmpeg_locate_btn.configure(text="Locate FFmpeg...")
 
     def browse_ffmpeg_dir(self) -> bool:
@@ -1025,6 +1130,7 @@ class AudiobookDLApp:
 
         self.cookie_entry.configure(state=cookie_state)
         self.cookie_browse.configure(state=cookie_state)
+        self.cookie_import_btn.configure(state=cookie_state)
         self.user_entry.configure(state=login_state)
         self.password_entry.configure(state=login_state)
         self.show_pw_btn.configure(state=login_state)
@@ -1223,6 +1329,37 @@ class AudiobookDLApp:
         )
         if chosen:
             self.cookie_file_var.set(chosen)
+
+    def _show_cookie_import_dialog(self) -> None:
+        """Open the interactive browser-cookie importer dialog."""
+        if self._cookie_dialog is not None and self._cookie_dialog.winfo_exists():
+            self._cookie_dialog.lift()
+            self._cookie_dialog.focus_set()
+            return
+        selected = self._selected_service()
+        initial_key = selected.key if (selected and "cookies" in selected.auth_methods) else ""
+        initial_path = self.cookie_file_var.get().strip() if initial_key else ""
+        self._cookie_dialog = CookieImportDialog(
+            self.root,
+            self._services,
+            initial_service_key=initial_key,
+            initial_cookie_path=initial_path,
+            on_apply=self._on_cookies_imported,
+            palette=self._palette,
+        )
+
+    def _on_cookies_imported(self, service_key: str, cookie_path: str, count: int) -> None:
+        """Apply an imported Netscape cookie file to the selected service form."""
+        service = self._services_by_key.get(service_key)
+        if service is not None and self.service_label_var.get() != service.label:
+            self.service_label_var.set(service.label)
+            self._load_service_into_form()
+            self._update_service_field_states()
+        self.cookie_file_var.set(cookie_path)
+        if self.remember_login_var.get() and service is not None and "cookies" in service.auth_methods:
+            self.save_current_credentials(quiet=True)
+        self.status_var.set(f"Imported {count} cookies to {os.path.basename(cookie_path)}")
+        self._append_log(f"Imported {count} browser cookie(s) to {cookie_path}")
 
     def _open_output_folder(self) -> None:
         folder = self.output_dir_var.get().strip() or default_output_dir()
@@ -1711,6 +1848,14 @@ class AudiobookDLApp:
         if self._preview_dialog is not None and self._preview_dialog.winfo_exists():
             self._preview_dialog.destroy()
 
+        def _search_enrichment(book: Audiobook):
+            opts = self.build_options(urls_override=[url])
+            return self._controller.search_enrichment_for_audiobook(book, opts)
+
+        def _apply_enrichment(book: Audiobook, candidate):
+            opts = self.build_options(urls_override=[url])
+            return self._controller.apply_enrichment_candidate(book, candidate, opts)
+
         dialog = PreviewDialog(
             self.root,
             url,
@@ -1720,6 +1865,9 @@ class AudiobookDLApp:
             skip_downloaded=self.skip_downloaded_var.get(),
             series_book_exists=self._series_book_exists,
             on_confirm=self._enqueue_from_preview,
+            palette=self._palette,
+            on_search_enrichment=_search_enrichment,
+            on_apply_enrichment=_apply_enrichment,
         )
         self._preview_dialog = dialog
         return dialog
@@ -1855,6 +2003,18 @@ class AudiobookDLApp:
             _, message, holder, done = item
             holder["value"] = messagebox.askyesno("Confirm", message, parent=self.root)
             done.set()
+        elif kind == "prompt_choice":
+            _, choice_title, choices, default_idx, holder, done = item
+            dlg = ChoiceDialog(
+                self.root,
+                choice_title,
+                choices,
+                default=default_idx,
+                palette=self._palette,
+            )
+            self.root.wait_window(dlg)
+            holder["value"] = dlg.selected_index
+            done.set()
         elif kind == "preview_done":
             _, preview_url, prepared, preview_exc = item
             self._handle_preview_done(preview_url, prepared, preview_exc)
@@ -1935,6 +2095,13 @@ class AudiobookDLApp:
                 parent=self.root,
             )
 
+    def _notify_run_finished(self, summary: Optional[DownloadSummary], exc: Optional[Exception]) -> None:
+        if not self.notify_on_complete_var.get():
+            return
+        payload = format_completion_notification(summary, exc)
+        if payload is not None:
+            send_os_notification_async(payload[0], payload[1])
+
     def _finish_run(self, summary: Optional[DownloadSummary], exc: Optional[Exception]) -> None:
         self._set_running_state(False)
         self.progressbar.stop()
@@ -1951,6 +2118,7 @@ class AudiobookDLApp:
             self.metrics_var.set("")
             self.status_var.set("Error")
             self._append_log(f"[ERROR] {exc}")
+            self._notify_run_finished(summary, exc)
             messagebox.showerror("Download Failed", str(exc), parent=self.root)
             return
 
@@ -1973,6 +2141,7 @@ class AudiobookDLApp:
             self.metrics_var.set(f"Elapsed {final_elapsed}" if final_elapsed else "")
             self.status_var.set("Completed")
             self._append_log("--- Completed ---")
+        self._notify_run_finished(summary, None)
 
     def _on_close(self) -> None:
         try:
@@ -1982,6 +2151,8 @@ class AudiobookDLApp:
                 output_dir=self.output_dir_var.get().strip() or None,
                 output_template=self.template_var.get().strip() or None,
                 use_download_archive=self.download_archive_var.get(),
+                theme=self._theme_mode,
+                notify_on_complete=self.notify_on_complete_var.get(),
                 output_prefs=self._read_persisted_gui_preferences(),
             )
         except OSError:
@@ -1995,18 +2166,7 @@ class AudiobookDLApp:
 
 def _enable_high_dpi_awareness() -> None:
     """Enable per-monitor DPI awareness on Windows when supported by the OS."""
-    if not sys.platform.startswith("win"):
-        return
-    try:
-        shcore = ctypes.windll.shcore  # type: ignore[attr-defined]
-        shcore.SetProcessDpiAwareness(2)
-        return
-    except Exception:
-        pass
-    try:
-        ctypes.windll.user32.SetProcessDPIAware()  # type: ignore[attr-defined]
-    except Exception:
-        pass
+    enable_high_dpi_awareness()
 
 
 def parse_gui_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:

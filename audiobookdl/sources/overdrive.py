@@ -1,44 +1,147 @@
-from .source import Source
-from audiobookdl import AudiobookFile, Chapter, AudiobookMetadata, Cover, Audiobook
-from audiobookdl.exceptions import DataNotPresent, UserNotAuthorized
+from .source import CatalogBook, Source
+from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover
+from audiobookdl.exceptions import DataNotPresent, RequestError, UserNotAuthorized
 
-import re
 import json
+import re
+from typing import Any, Dict, List, Optional
+from urllib.parse import urljoin
 from urllib3.util import parse_url
-from typing import List
 
 
 class OverdriveSource(Source):
     match = [
-        r"https://.+\.listen\.overdrive\.com"
+        r"https?://.+\.listen\.overdrive\.com.*",
+        r"https?://(www\.)?libbyapp\.com/(open/loan|shelf)/.*",
     ]
-    names = [ "Overdrive", "Libby" ]
+    names = ["Overdrive", "Libby"]
+    supports_library = True
 
+    def _validate_auth_state(self, url: str) -> None:
+        if "libbyapp.com" in url and not self._session.cookies:
+            raise UserNotAuthorized(
+                message="Libby requires valid browser cookies exported from libbyapp.com."
+            )
+
+    def verify_auth(self, url: str = "") -> bool:
+        if not self._session.cookies and not self.authenticated:
+            return False
+        try:
+            chip = self.get_json("https://sentry-read.svc.overdrive.com/chip")
+            return bool(isinstance(chip, dict) and (chip.get("identity") or chip.get("loans") is not None))
+        except (RequestError, UserNotAuthorized, ValueError):
+            return self.authenticated
+
+    def _resolve_libby_open_url(self, url: str) -> str:
+        """Resolve a `libbyapp.com/open/loan/<id>` URL via Libby's chip API to its listen URL."""
+        loan_match = re.search(r"/open/loan/([^/?#]+)", url)
+        loan_id = loan_match.group(1) if loan_match else ""
+        chip = self.get_json("https://sentry-read.svc.overdrive.com/chip")
+        loans = chip.get("loans") or []
+        for loan in loans:
+            if not isinstance(loan, dict):
+                continue
+            if loan_id and str(loan.get("id")) != loan_id and str(loan.get("titleId")) != loan_id:
+                continue
+            open_url = loan.get("openUrl") or loan.get("listenUrl") or loan.get("webUrl")
+            if isinstance(open_url, str) and "overdrive.com" in open_url:
+                return open_url
+            card_id = loan.get("cardId")
+            title_id = loan.get("id") or loan.get("titleId") or loan_id
+            if card_id and title_id:
+                open_resp = self.get_json(
+                    f"https://sentry-read.svc.overdrive.com/open/audiobook/card/{card_id}/title/{title_id}"
+                )
+                resolved = open_resp.get("url") or open_resp.get("listenUrl")
+                if isinstance(resolved, str) and resolved:
+                    return resolved
+        raise UserNotAuthorized(
+            message="Could not find an active Libby loan matching this URL in your session."
+        )
 
     def download(self, url: str) -> Audiobook:
-        # Parse url
+        self._validate_auth_state(url)
+        if "libbyapp.com" in url:
+            url = self._resolve_libby_open_url(url)
+
         parsed_url = parse_url(url)
         hostname = parsed_url.hostname
         prefix = f"https://{hostname}"
-        # Extract json from javascript
-        raw = self.find_in_page(url, 'window.bData = {.+;')
-        if raw is None:
+        page_html = self._get_page(url).decode("utf-8", errors="replace")
+        if re.search(r"(?:signin|Authentication required|loginForm)", page_html, re.IGNORECASE) and "window.bData" not in page_html:
+            raise UserNotAuthorized(
+                message="OverDrive/Libby session cookies are missing or expired."
+            )
+        match = re.search(r"window\.bData = (.+?);", page_html)
+        if match is None:
             raise UserNotAuthorized
-        raw_trimmed = raw[15:-1]
-        book_info = json.loads(raw_trimmed)
+        book_info = json.loads(match.group(1))
         return Audiobook(
-            session = self._session,
-            files = self.get_files(prefix, book_info),
-            metadata = self.get_metadata(book_info),
-            cover = self.get_cover(prefix, book_info),
-            chapters = self.get_chapters(book_info)
+            session=self._session,
+            files=self.get_files(prefix, book_info),
+            metadata=self.get_metadata(book_info, url=url),
+            cover=self.get_cover(prefix, book_info),
+            chapters=self.get_chapters(book_info),
         )
 
+    @staticmethod
+    def _extract_isbn(book_info: Dict[str, Any]) -> Optional[str]:
+        if isinstance(book_info.get("isbn"), str) and book_info["isbn"].strip():
+            return book_info["isbn"].strip()
+        for ident in book_info.get("identifiers") or []:
+            if isinstance(ident, dict):
+                if "isbn" in str(ident.get("type") or "").lower() and ident.get("value"):
+                    return str(ident["value"]).strip()
+        return None
 
-    def get_metadata(self, book_info) -> AudiobookMetadata:
+    def get_metadata(self, book_info: Dict[str, Any], url: Optional[str] = None) -> AudiobookMetadata:
         title = book_info["title"]["main"]
-        metadata = AudiobookMetadata(title)
-        for creator in book_info["creator"]:
+
+        desc_raw = book_info.get("description")
+        if isinstance(desc_raw, dict):
+            description = str(desc_raw.get("full") or desc_raw.get("short") or "").strip() or None
+        elif isinstance(desc_raw, str):
+            description = desc_raw.strip() or None
+        else:
+            description = None
+        if description:
+            description = " ".join(re.sub(r"<[^>]+>", " ", description).split()) or None
+
+        pub_raw = book_info.get("publisher")
+        if isinstance(pub_raw, dict):
+            publisher = str(pub_raw.get("name") or "").strip() or None
+        elif isinstance(pub_raw, str):
+            publisher = pub_raw.strip() or None
+        else:
+            publisher = None
+
+        series_name: Optional[str] = None
+        series_order: Optional[int] = None
+        series_raw = book_info.get("series")
+        if isinstance(series_raw, dict):
+            series_name = str(series_raw.get("name") or series_raw.get("title") or "").strip() or None
+            pos = series_raw.get("position") or series_raw.get("number")
+            if pos is not None:
+                try:
+                    series_order = int(float(pos))
+                except (TypeError, ValueError):
+                    series_order = None
+        elif isinstance(series_raw, str) and series_raw.strip():
+            series_name = series_raw.strip()
+        if not series_name and isinstance(book_info.get("edition"), str) and book_info["edition"].strip():
+            series_name = book_info["edition"].strip()
+
+        metadata = AudiobookMetadata(
+            title=title,
+            description=description,
+            publisher=publisher,
+            isbn=self._extract_isbn(book_info),
+            series=series_name,
+            series_order=series_order,
+            source="overdrive",
+            scrape_url=url,
+        )
+        for creator in book_info.get("creator") or []:
             if creator["role"] == "author":
                 metadata.add_author(creator["name"])
             if creator["role"] == "narrator":
@@ -46,7 +149,8 @@ class OverdriveSource(Source):
         return metadata
 
     def get_cover(self, prefix: str, book_info) -> Cover:
-        cover_url = f"{prefix}/{book_info['-odread-furbish-uri']}"
+        cover_uri = book_info["-odread-furbish-uri"]
+        cover_url = urljoin(f"{prefix}/", cover_uri)
         cover_data = self.get(cover_url)
         return Cover(cover_data, "jpg")
 
@@ -63,18 +167,17 @@ class OverdriveSource(Source):
         part_offsets = self._compute_part_offsets(book_info)
         chapters = []
         for chapter in book_info["nav"]["toc"]:
-            timepoint = 0.
-            if '#' in chapter["path"]:
+            timepoint = 0.0
+            if "#" in chapter["path"]:
                 timepoint = float(chapter["path"].split("#")[1])
             part_result = re.search(r"(?<=(Part))\d+", chapter["path"])
             if part_result is None:
                 continue
-            part = int(part_result.group(0))-1
+            part = int(part_result.group(0)) - 1
             base_offset = part_offsets[part] if 0 <= part < len(part_offsets) else 0.0
             start = int((base_offset + timepoint) * 1000)
             chapters.append(Chapter(start, chapter["title"]))
         return chapters
-
 
     def get_files(self, prefix: str, book_info) -> List[AudiobookFile]:
         toc: List[str] = []
@@ -84,14 +187,41 @@ class OverdriveSource(Source):
                 for _ in range(len(book_info["spine"])):
                     toc.append(book_info["nav"]["toc"][0]["title"])
                 break
-            else:
-                toc.append(part["title"])
+            toc.append(part["title"])
         files = []
         for num, part in enumerate(book_info["spine"]):
             title = toc[num] if num < len(toc) else f"Part {num + 1}"
-            files.append(AudiobookFile(
-                url = f"{prefix}/{part['path']}",
-                title = title,
-                ext = "mp3"
-            ))
+            files.append(
+                AudiobookFile(
+                    url=f"{prefix}/{part['path']}",
+                    title=title,
+                    ext="mp3",
+                )
+            )
         return files
+
+    def list_library(self) -> List[CatalogBook]:
+        """List active OverDrive/Libby audiobook loans from Sentry chip API."""
+        chip = self.get_json("https://sentry-read.svc.overdrive.com/chip")
+        results: List[CatalogBook] = []
+        for loan in chip.get("loans") or []:
+            if not isinstance(loan, dict):
+                continue
+            loan_id = loan.get("id") or loan.get("titleId")
+            title = str(loan.get("title") or "").strip()
+            if not loan_id or not title:
+                continue
+            url = (
+                loan.get("openUrl")
+                or loan.get("listenUrl")
+                or f"https://libbyapp.com/open/loan/{loan_id}"
+            )
+            results.append(
+                CatalogBook(
+                    title=title,
+                    author=str(loan.get("firstCreatorName") or loan.get("author") or "").strip(),
+                    url=str(url),
+                    source="overdrive",
+                )
+            )
+        return results

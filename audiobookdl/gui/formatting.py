@@ -21,6 +21,7 @@ from audiobookdl.utils.audiobook import (
     Cover,
     is_ebook,
 )
+from audiobookdl.utils.enrichment import EnrichmentCandidate
 
 
 OUTPUT_FORMATS = GUI_OUTPUT_FORMATS
@@ -138,6 +139,8 @@ def format_audiobook_preview(audiobook: Audiobook) -> List[Tuple[str, str]]:
         rows.append(("Released", str(meta.release_date)))
     if meta.isbn:
         rows.append(("ISBN", meta.isbn))
+    if meta.asin:
+        rows.append(("ASIN", meta.asin))
     file_count = len(audiobook.files)
     exts = sorted({f.ext.lstrip(".").lower() for f in audiobook.files if f.ext})
     ext_suffix = f" ({', '.join(exts)})" if exts else ""
@@ -146,6 +149,69 @@ def format_audiobook_preview(audiobook: Audiobook) -> List[Tuple[str, str]]:
     if not (is_ebook(audiobook) and chap_count == 0):
         rows.append(("Chapters", f"{chap_count} chapter{'s' if chap_count != 1 else ''}"))
     return rows
+
+
+def format_multi_metadata_values(values: Sequence[str]) -> str:
+    """Format a sequence of metadata strings (authors/narrators) as semicolon-separated text."""
+    return "; ".join(v.strip() for v in values if v and v.strip())
+
+
+def parse_multi_metadata_values(raw: str) -> List[str]:
+    """Parse semicolon-separated metadata text into trimmed non-empty values."""
+    return [part.strip() for part in raw.split(";") if part.strip()]
+
+
+def apply_audiobook_metadata_edits(
+    audiobook: Audiobook,
+    *,
+    title: str,
+    authors_text: str,
+    narrators_text: str,
+    series_text: str,
+    series_order_text: str,
+    cover: Optional[Cover] = None,
+    update_cover: bool = False,
+) -> None:
+    """Validate and apply inline metadata/cover edits onto `audiobook`."""
+    cleaned_title = title.strip()
+    if not cleaned_title:
+        raise ValueError("Title cannot be empty.")
+
+    order_raw = series_order_text.strip()
+    parsed_order: Optional[int]
+    if not order_raw:
+        parsed_order = None
+    else:
+        try:
+            parsed_order = int(order_raw)
+        except ValueError as exc:
+            raise ValueError(f"Series order must be a whole number, got '{order_raw}'.") from exc
+
+    audiobook.metadata.title = cleaned_title
+    audiobook.metadata.authors = parse_multi_metadata_values(authors_text)
+    audiobook.metadata.narrators = parse_multi_metadata_values(narrators_text)
+    audiobook.metadata.series = series_text.strip() or None
+    audiobook.metadata.series_order = parsed_order
+    if update_cover:
+        audiobook.cover = cover
+
+
+def load_cover_from_file(path: str) -> Cover:
+    """Read and validate an image file from disk into a `Cover` object."""
+    from PIL import Image
+
+    with open(path, "rb") as handle:
+        raw_bytes = handle.read()
+    with Image.open(io.BytesIO(raw_bytes)) as img:
+        img.verify()
+        fmt = (img.format or "").lower()
+    if fmt == "jpeg":
+        ext = "jpg"
+    elif fmt:
+        ext = fmt
+    else:
+        ext = Path(path).suffix.lstrip(".").lower() or "jpg"
+    return Cover(image=raw_bytes, extension=ext)
 
 
 def render_cover_thumbnail(
@@ -172,6 +238,25 @@ def default_output_dir() -> str:
     if downloads.is_dir():
         return str(downloads)
     return os.getcwd()
+
+
+def format_enrichment_candidate(candidate: EnrichmentCandidate) -> str:
+    """Format an `EnrichmentCandidate` summary for GUI and interactive pickers."""
+    pct = round(candidate.score * 100)
+    authors = ", ".join(candidate.authors) or "Unknown author"
+    extras: List[str] = []
+    if candidate.narrators:
+        extras.append(f"Narr: {', '.join(candidate.narrators)}")
+    if candidate.release_date:
+        extras.append(str(candidate.release_date.year))
+    if candidate.asin:
+        extras.append(f"ASIN:{candidate.asin}")
+    if candidate.isbn:
+        extras.append(f"ISBN:{candidate.isbn}")
+    if candidate.cover_url:
+        extras.append("cover")
+    suffix = f" ({'; '.join(extras)})" if extras else ""
+    return f"[{candidate.provider} {pct}%] {candidate.title} — {authors}{suffix}"
 
 
 def parse_url_text(raw: str) -> List[str]:

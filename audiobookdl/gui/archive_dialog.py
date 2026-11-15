@@ -5,6 +5,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Optional
 
+from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, apply_theme_to_window, scale_px
 from audiobookdl.gui.widgets import ScrolledTreeview, TreeColumnSpec
 from audiobookdl.utils.archive import DownloadArchive
 
@@ -20,18 +21,25 @@ class ArchiveLedgerDialog(tk.Toplevel):
         TreeColumnSpec("output_path", "Output Path", width=180, stretch=True),
     )
 
-    def __init__(self, parent: tk.Misc, archive_path: str) -> None:
+    def __init__(
+        self,
+        parent: tk.Misc,
+        archive_path: str,
+        *,
+        palette: Optional[ThemePalette] = None,
+    ) -> None:
         super().__init__(parent)
         self._archive_path = archive_path
         self._ledger: Optional[DownloadArchive] = None
         self._debounce_after_id: Optional[str] = None
+        self._palette = palette or LIGHT_PALETTE
 
         self.title("Download History Ledger")
         self.transient(parent)  # type: ignore[arg-type]
-        self.geometry("760x440")
-        self.minsize(560, 320)
+        self.geometry(f"{scale_px(self, 760)}x{scale_px(self, 440)}")
+        self.minsize(scale_px(self, 560), scale_px(self, 320))
 
-        body = ttk.Frame(self, padding=12)
+        body = ttk.Frame(self, padding=scale_px(self, 12))
         body.pack(fill=tk.BOTH, expand=True)
         body.columnconfigure(0, weight=1)
         body.rowconfigure(1, weight=1)
@@ -59,6 +67,7 @@ class ArchiveLedgerDialog(tk.Toplevel):
         self.bind("<Destroy>", self._on_destroy)
         self._search_var.trace_add("write", self._schedule_refresh)
         self._refresh()
+        apply_theme_to_window(self, self._palette)
 
     def _get_ledger(self) -> Optional[DownloadArchive]:
         if self._ledger is None:

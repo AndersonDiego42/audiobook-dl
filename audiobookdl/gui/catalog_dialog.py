@@ -4,6 +4,7 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Callable, Dict, List, Optional, Sequence
 
+from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, apply_theme_to_window, scale_px
 from audiobookdl.gui.widgets import ScrolledTreeview, TreeColumnSpec
 from audiobookdl.sources import ServiceInfo
 from audiobookdl.sources.source import CatalogBook
@@ -27,19 +28,21 @@ class CatalogBrowserDialog(tk.Toplevel):
         *,
         on_fetch: Callable[[str, ServiceInfo, str, "CatalogBrowserDialog"], None],
         on_add_urls: Callable[[List[str]], None],
+        palette: Optional[ThemePalette] = None,
     ) -> None:
         super().__init__(parent)
         browseable = [svc for svc in services if svc.supports_search or svc.supports_library]
         self._services_by_label: Dict[str, ServiceInfo] = {svc.label: svc for svc in browseable}
         self._on_fetch = on_fetch
         self._on_add_urls = on_add_urls
+        self._palette = palette or LIGHT_PALETTE
 
         self.title("Browse Library / Search")
         self.transient(parent)  # type: ignore[arg-type]
-        self.geometry("760x460")
-        self.minsize(560, 340)
+        self.geometry(f"{scale_px(self, 760)}x{scale_px(self, 460)}")
+        self.minsize(scale_px(self, 560), scale_px(self, 340))
 
-        body = ttk.Frame(self, padding=12)
+        body = ttk.Frame(self, padding=scale_px(self, 12))
         body.pack(fill=tk.BOTH, expand=True)
         body.columnconfigure(0, weight=1)
         body.rowconfigure(1, weight=1)
@@ -81,7 +84,7 @@ class CatalogBrowserDialog(tk.Toplevel):
 
         btn_bar = ttk.Frame(body)
         btn_bar.grid(row=2, column=0, sticky="ew", pady=(8, 0))
-        ttk.Label(btn_bar, textvariable=self._status_var, foreground="#555555").pack(side=tk.LEFT)
+        ttk.Label(btn_bar, textvariable=self._status_var, style="Muted.TLabel").pack(side=tk.LEFT)
         ttk.Button(btn_bar, text="Close", command=self.destroy).pack(side=tk.RIGHT)
         ttk.Button(btn_bar, text="Add Selected to URLs", command=self.add_selected).pack(
             side=tk.RIGHT, padx=(0, 6)
@@ -90,6 +93,7 @@ class CatalogBrowserDialog(tk.Toplevel):
         self._query_entry.bind("<Return>", lambda _e: self.run_fetch("search"))
         svc_combo.bind("<<ComboboxSelected>>", self.sync_buttons)
         self.sync_buttons()
+        apply_theme_to_window(self, self._palette)
 
     def sync_buttons(self, *_args: object) -> None:
         svc = self._services_by_label.get(self._service_var.get())

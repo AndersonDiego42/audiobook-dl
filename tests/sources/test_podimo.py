@@ -220,56 +220,47 @@ def test_share_link_follows_two_redirects_to_podcast_and_handles_failures(tmp_pa
         ]
     )
 
-    with patch(
-        "audiobookdl.utils.http.requests.get",
+    src._session.get = MagicMock(
         side_effect=[
             MagicMock(status_code=302, headers={"location": "https://podimo.com/landing/xyz"}),
             MagicMock(status_code=301, headers={"location": "https://open.podimo.com/podcast/pod-77"}),
-        ],
-    ) as mock_http_get:
-        result = src.download("https://share.podimo.com/s/short")
+        ]
+    )
+    result = src.download("https://share.podimo.com/s/short")
 
     assert isinstance(result, Series)
     assert result.title == "Shared Pod"
-    assert mock_http_get.call_count == 2
+    assert src._session.get.call_count == 2
 
     # Non-redirect response in redirect_of -> DataNotPresent
-    with patch(
-        "audiobookdl.utils.http.requests.get",
-        return_value=MagicMock(status_code=200, headers={}),
-    ):
-        with pytest.raises(DataNotPresent):
-            src.download("https://share.podimo.com/s/broken")
+    src._session.get = MagicMock(return_value=MagicMock(status_code=200, headers={}))
+    with pytest.raises(DataNotPresent):
+        src.download("https://share.podimo.com/s/broken")
 
     # Redirect missing Location header -> DataNotPresent
-    with patch(
-        "audiobookdl.utils.http.requests.get",
-        return_value=MagicMock(status_code=302, headers={}),
-    ):
-        with pytest.raises(DataNotPresent):
-            src.download("https://share.podimo.com/s/no-loc")
+    src._session.get = MagicMock(return_value=MagicMock(status_code=302, headers={}))
+    with pytest.raises(DataNotPresent):
+        src.download("https://share.podimo.com/s/no-loc")
 
     # Redirect to pathless host -> DataNotPresent
-    with patch(
-        "audiobookdl.utils.http.requests.get",
+    src._session.get = MagicMock(
         side_effect=[
             MagicMock(status_code=302, headers={"location": "https://open.podimo.com"}),
             MagicMock(status_code=302, headers={"location": "https://open.podimo.com"}),
-        ],
-    ):
-        with pytest.raises(DataNotPresent):
-            src.download("https://share.podimo.com/s/no-path")
+        ]
+    )
+    with pytest.raises(DataNotPresent):
+        src.download("https://share.podimo.com/s/no-path")
 
     # Redirect to unsupported kind (neither audiobook nor podcast) -> DataNotPresent
-    with patch(
-        "audiobookdl.utils.http.requests.get",
+    src._session.get = MagicMock(
         side_effect=[
             MagicMock(status_code=302, headers={"location": "https://open.podimo.com/user/123"}),
             MagicMock(status_code=302, headers={"location": "https://open.podimo.com/user/123"}),
-        ],
-    ):
-        with pytest.raises(DataNotPresent):
-            src.download("https://share.podimo.com/s/wrong-kind")
+        ]
+    )
+    with pytest.raises(DataNotPresent):
+        src.download("https://share.podimo.com/s/wrong-kind")
 
 
 def test_podimo_pagination_and_redacted_token_logs(tmp_path, monkeypatch):
@@ -316,3 +307,65 @@ def test_podimo_download_cover_returns_none_on_404_and_raises_on_500(tmp_path):
         with pytest.raises(RequestError):
             src.download_cover("https://cdn.podimo.com/error.png")
     unauth_500.close.assert_called_once()
+
+
+def test_podimo_main_m3u8_chapters_search_and_library(tmp_path):
+    src = _make_source(tmp_path)
+    src._session.post = MagicMock(
+        return_value=_json_resp(
+            {
+                "data": {
+                    "audiobookAudioById": {
+                        "url": "https://cdn.podimo.com/ab-1/main.m3u8"
+                    }
+                }
+            }
+        )
+    )
+    src._session.get = MagicMock(
+        return_value=MagicMock(
+            status_code=200,
+            content=b"#EXTM3U\n#EXTINF:5.0,\nseg0.ts\n#EXT-X-ENDLIST\n",
+        )
+    )
+    files = src.get_audiobook_files("ab-1")
+    assert [f.url for f in files] == ["https://cdn.podimo.com/ab-1/seg0.ts"]
+
+    chapters = src.get_chapters(
+        {"chapters": [{"title": "Intro", "startMs": 0}, {"title": "Ch 1", "startMs": 5000}]}
+    )
+    assert [(c.start, c.title) for c in chapters] == [(0, "Intro"), (5000, "Ch 1")]
+
+    src._session.post = MagicMock(
+        return_value=_json_resp(
+            {
+                "data": {
+                    "search": {
+                        "audiobooks": [{"id": "ab1", "title": "Pod Book", "authors": [{"name": "Auth"}]}],
+                        "podcasts": [{"id": "pod1", "title": "Pod Show", "authorName": "Host"}],
+                    }
+                }
+            }
+        )
+    )
+    hits = src.search("Pod")
+    assert [(h.title, h.url) for h in hits] == [
+        ("Pod Book", "https://open.podimo.com/audiobook/ab1"),
+        ("Pod Show", "https://open.podimo.com/podcast/pod1"),
+    ]
+
+    src._session.post = MagicMock(
+        return_value=_json_resp(
+            {
+                "data": {
+                    "userLibrary": {
+                        "audiobooks": [{"id": "ab2", "title": "Saved Audio", "authors": []}],
+                        "podcasts": [],
+                    }
+                }
+            }
+        )
+    )
+    lib = src.list_library()
+    assert len(lib) == 1
+    assert lib[0].url == "https://open.podimo.com/audiobook/ab2"

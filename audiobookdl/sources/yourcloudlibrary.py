@@ -1,22 +1,27 @@
-from .source import Source
-from audiobookdl import AudiobookFile, logging, AudiobookMetadata, Cover, Audiobook, Chapter
-from audiobookdl.exceptions import UserNotAuthorized, RequestError
+from .source import CatalogBook, Source
+from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, logging
+from audiobookdl.exceptions import RequestError, UserNotAuthorized
 
 import json
-from typing import List
+import lxml.html
 import re
+from typing import List, Optional
+from urllib.parse import urljoin
+
 
 class YourCloudLibrarySource(Source):
     match = [
-        r"https?://audio.yourcloudlibrary.com/listen/.+",
-        r"https://ebook.yourcloudlibrary.com/library/[^/]+/detail/.+",
+        r"https?://audio\.yourcloudlibrary\.com/listen/.+",
+        r"https?://ebook\.yourcloudlibrary\.com/library/[^/]+/detail/.+",
+        r"https?://ebook\.yourcloudlibrary\.com/library/[^/]+/(audiobook|title)/.+",
     ]
-    names = [ "YourCloudLibrary" ]
-    login_data = [ "username", "password", "library" ]
+    names = ["YourCloudLibrary"]
+    login_data = ["username", "password", "library"]
     _authentication_methods = [
         "cookies",
-        "login"
+        "login",
     ]
+    supports_library = True
 
     def download(self, url: str) -> Audiobook:
         url = self.get_listening_url(url)
@@ -31,30 +36,30 @@ class YourCloudLibrarySource(Source):
         book_info = self.download_book_info(account_id, fulfillment_id)
         playlist = self.download_playlist(fulfillment_id, license_id)
         return Audiobook(
-            session = self._session,
-            files = self.get_files(playlist),
-            metadata = self.get_metadata(book_info),
-            cover = self.download_cover(book_info),
-            chapters = self.create_chapters(book_info)
+            session=self._session,
+            files=self.get_files(playlist),
+            metadata=self.get_metadata(book_info),
+            cover=self.download_cover(book_info),
+            chapters=self.create_chapters(book_info),
         )
-
 
     @staticmethod
     def get_listening_url(url: str) -> str:
         """
-        Get url for listening page
+        Get url for listening page.
 
         :param url: Url to information or listening page
         :return: Url to listening page
         """
         if re.match(YourCloudLibrarySource.match[0], url):
             return url
-        book_id = url.split("/")[-1]
+        clean_path = url.rstrip("/").split("?")[0].split("#")[0]
+        book_id = clean_path.split("/")[-1]
         return f"https://audio.yourcloudlibrary.com/listen/{book_id}"
 
     def extract_json_string(self, url: str, key: str) -> str:
         """
-        Extracts string from json in web page
+        Extracts string from json in web page.
 
         :param url: Url of page to extract from
         :param key: Key of value to extract
@@ -62,78 +67,73 @@ class YourCloudLibrarySource(Source):
         """
         return self.find_in_page(
             url,
-            fr"(?<=(\"{key}\":\"))[^\"]+",
-            force_cookies = True,
+            fr'(?<=("{key}":"))[^"]+',
+            force_cookies=True,
         )
-
 
     @staticmethod
     def get_files(playlist: dict) -> List[AudiobookFile]:
         files = []
         for f in playlist["playlist"]:
-            files.append(AudiobookFile(
-                url = f["url"],
-                ext = "mp3"
-            ))
+            files.append(
+                AudiobookFile(
+                    url=f["url"],
+                    ext="mp3",
+                )
+            )
         return files
-
 
     @staticmethod
     def get_metadata(book_info: dict) -> AudiobookMetadata:
         metadata = AudiobookMetadata(
-            title = book_info["title"],
-            authors = book_info["authors"],
-            narrators = book_info["narrators"]
+            title=book_info["title"],
+            authors=book_info["authors"],
+            narrators=book_info["narrators"],
+            source="yourcloudlibrary",
         )
-        if book_info["series"] is not None and len(book_info["series"]) >= 1:
+        if book_info.get("series") is not None and len(book_info["series"]) >= 1:
             metadata.series = book_info["series"][0]
         return metadata
 
-
     def download_cover(self, meta) -> Cover:
-        cover_url = meta['cover_url']
+        cover_url = meta["cover_url"]
         cover_data = self.get(f"{cover_url}?aspect=1:1")
         return Cover(cover_data, "jpg")
-
 
     @staticmethod
     def create_chapters(book_info: dict) -> List[Chapter]:
         chapters = []
-        time = 0
+        elapsed = 0
         for chapter in book_info["chapters"]:
             chapters.append(
                 Chapter(
-                    start = time,
-                    title = f"Chapter {chapter['chapter_number']}"
+                    start=elapsed,
+                    title=f"Chapter {chapter['chapter_number']}",
                 )
             )
-            time += chapter["duration"]
+            elapsed += chapter["duration"]
         return chapters
 
     def download_book_info(self, account_id: str, fulfillment_id: str) -> dict:
         """
-        Download metadata about book
+        Download metadata about book.
 
-        :param url: Book url
+        :param account_id: Findaway account identifier
         :param fulfillment_id: Id used for book
         :returns: Metadata about book
         """
         return self.get_json(
             f"https://api.findawayworld.com/v4/accounts/{account_id}/audiobooks/{fulfillment_id}",
-            force_cookies = True
+            force_cookies=True,
         )["audiobook"]
 
-
     def download_playlist(self, fulfillment_id: str, license_id: str) -> dict:
-        """
-        Download list of audio files
-        """
+        """Download list of audio files."""
         license_str = f'{{"license_id":"{license_id}"}}'
         return self.post_json(
             f"https://api.findawayworld.com/v4/audiobooks/{fulfillment_id}/playlists",
-            data = license_str
+            data=license_str,
         )
-
 
     @staticmethod
     def _is_failed_login_payload(payload: dict) -> bool:
@@ -146,17 +146,18 @@ class YourCloudLibrarySource(Source):
                 return True
         return False
 
-    def _login(self, url: str, username: str, password: str, library: str): # type: ignore
+    def _login(self, url: str, username: str, password: str, library: str):  # type: ignore
+        self._library_id = library
         self.get(f"https://ebook.yourcloudlibrary.com/library/{library}/featured")
         resp = self.request(
             "POST",
             "https://ebook.yourcloudlibrary.com/?_data=root",
-            data = {
+            data={
                 "action": "login",
                 "barcode": username,
                 "pin": password,
-                "library": library
-            }
+                "library": library,
+            },
         )
         if resp.status_code in (400, 401, 403, 422):
             raise UserNotAuthorized
@@ -170,3 +171,57 @@ class YourCloudLibrarySource(Source):
             return
         if isinstance(payload, dict) and self._is_failed_login_payload(payload):
             raise UserNotAuthorized
+
+    def list_library(self) -> List[CatalogBook]:
+        """List currently borrowed audiobooks from the patron's CloudLibrary shelf."""
+        library: Optional[str] = getattr(self, "_library_id", None) or getattr(
+            self._options, "library", None
+        )
+        if not library:
+            return []
+        shelf_url = f"https://ebook.yourcloudlibrary.com/library/{library}/shelf"
+        raw = self._get_page(shelf_url, use_cache=False).decode("utf-8", errors="replace")
+        results: List[CatalogBook] = []
+        seen = set()
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            data = None
+
+        if isinstance(data, dict):
+            items = data.get("items") or data.get("checkouts") or data.get("loans") or []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                item_id = item.get("id") or item.get("isbn") or item.get("itemId")
+                title = str(item.get("title") or "").strip()
+                if not item_id or not title:
+                    continue
+                book_url = f"https://ebook.yourcloudlibrary.com/library/{library}/detail/{item_id}"
+                if book_url in seen:
+                    continue
+                seen.add(book_url)
+                results.append(
+                    CatalogBook(
+                        title=title,
+                        author=str(item.get("author") or "").strip(),
+                        url=book_url,
+                        source="yourcloudlibrary",
+                    )
+                )
+            return results
+
+        tree = lxml.html.fromstring(raw)
+        for link in tree.cssselect('a[href*="/detail/"], a[href*="/listen/"]'):
+            href = (link.get("href") or "").strip()
+            if not href:
+                continue
+            full_url = urljoin("https://ebook.yourcloudlibrary.com", href)
+            if full_url in seen:
+                continue
+            title = " ".join(link.text_content().split())
+            if not title:
+                continue
+            seen.add(full_url)
+            results.append(CatalogBook(title=title, url=full_url, source="yourcloudlibrary"))
+        return results

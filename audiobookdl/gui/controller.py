@@ -30,7 +30,14 @@ from audiobookdl.pipeline import (
 )
 from audiobookdl.sources.source import Source
 from audiobookdl.utils import set_ffmpeg_dir
-from audiobookdl.utils.audiobook import Result
+from audiobookdl.utils.audiobook import Audiobook, Result
+from audiobookdl.utils.enrichment import (
+    EnrichmentCandidate,
+    apply_candidate_to_audiobook,
+    parse_provider_list,
+    search_enrichment_candidates,
+)
+from audiobookdl.utils.enrichment_cache import EnrichmentCache, default_enrichment_cache_path
 from audiobookdl.utils.updater import check_for_updates, install_ffmpeg_via_winget
 
 
@@ -134,6 +141,26 @@ class GuiInteractionHandler:
             if done in self._pending_events:
                 self._pending_events.remove(done)
         return bool(holder["value"])
+
+    def choose_index(
+        self,
+        title: str,
+        choices: Sequence[str],
+        default: Optional[int] = None,
+    ) -> Optional[int]:
+        if self._cancel_event.is_set() or not choices:
+            return None
+        done = threading.Event()
+        holder: dict = {"value": None}
+        with self._lock:
+            self._pending_events.append(done)
+        self._queue.put(("prompt_choice", title, list(choices), default, holder, done))
+        done.wait()
+        with self._lock:
+            if done in self._pending_events:
+                self._pending_events.remove(done)
+        val = holder["value"]
+        return int(val) if isinstance(val, int) and 0 <= val < len(choices) else None
 
     def release_all(self) -> None:
         """Unblock any waiting prompt threads when the window closes or cancels."""
@@ -248,6 +275,8 @@ class GuiController:
         output_dir: Optional[str],
         output_template: Optional[str],
         use_download_archive: Optional[bool] = None,
+        theme: Optional[str] = None,
+        notify_on_complete: Optional[bool] = None,
         output_prefs: Optional[Mapping[str, Any]] = None,
     ) -> None:
         if output_prefs:
@@ -258,6 +287,8 @@ class GuiController:
             output_template=output_template,
             overwrite=self.config_location,
             use_download_archive=use_download_archive,
+            theme=theme,
+            notify_on_complete=notify_on_complete,
         )
 
     def get_http_session(self) -> Any:
@@ -675,6 +706,56 @@ class GuiController:
             self.event_queue.put(("ffmpeg_install_done", ok, detail))
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def search_enrichment_for_audiobook(
+        self,
+        audiobook: Audiobook,
+        options: args.DownloadOptions,
+    ) -> List[EnrichmentCandidate]:
+        """Query configured metadata enrichment providers for `audiobook`."""
+        raw_providers = getattr(options, "enrich_providers", None)
+        providers = parse_provider_list(raw_providers) if raw_providers else None
+        return search_enrichment_candidates(
+            audiobook.metadata,
+            providers=providers,
+            session=self.get_http_session(),
+            proxy=getattr(options, "proxy", None),
+            timeout=getattr(options, "timeout", None) or 10.0,
+            database_directory=getattr(options, "database_directory", None),
+            use_cache=not bool(getattr(options, "no_enrich_cache", False)),
+        )
+
+    def apply_enrichment_candidate(
+        self,
+        audiobook: Audiobook,
+        candidate: EnrichmentCandidate,
+        options: args.DownloadOptions,
+    ) -> Tuple[List[str], bool, bool]:
+        """Apply `candidate` onto `audiobook` using controller session and cache."""
+        db_dir = getattr(options, "database_directory", None)
+        use_cache = not bool(getattr(options, "no_enrich_cache", False))
+        include_chapters = not bool(getattr(options, "no_chapters", False))
+        if db_dir:
+            with EnrichmentCache(default_enrichment_cache_path(db_dir), persistent=True) as cache:
+                return apply_candidate_to_audiobook(
+                    audiobook,
+                    candidate,
+                    session=self.get_http_session(),
+                    proxy=getattr(options, "proxy", None),
+                    timeout=getattr(options, "timeout", None) or 10.0,
+                    cache=cache,
+                    use_cache=use_cache,
+                    include_chapters=include_chapters,
+                )
+        return apply_candidate_to_audiobook(
+            audiobook,
+            candidate,
+            session=self.get_http_session(),
+            proxy=getattr(options, "proxy", None),
+            timeout=getattr(options, "timeout", None) or 10.0,
+            use_cache=use_cache,
+            include_chapters=include_chapters,
+        )
 
     def drain_events(
         self,

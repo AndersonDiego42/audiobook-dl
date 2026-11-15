@@ -61,6 +61,7 @@ class AudiobookMetadata:
     language: Optional["pycountry.db.Language"] = None # type: ignore
     description: Optional[str] = None
     isbn: Optional[str] = None
+    asin: Optional[str] = None
     publisher: Optional[str] = None
     release_date: Optional[date] = None
     source: Optional[str] = None
@@ -96,6 +97,7 @@ class AudiobookMetadata:
         add("language")
         add("description")
         add("isbn")
+        add("asin")
         add("publisher")
         add("release_date")
         add("source")
@@ -167,6 +169,8 @@ class AudiobookMetadata:
             result["description"] = self.description
         if self.isbn:
             result["isbn"] = self.isbn
+        if self.asin:
+            result["asin"] = self.asin
         if self.publisher:
             result["publisher"] = self.publisher
         if self.release_date:

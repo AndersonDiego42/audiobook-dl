@@ -27,7 +27,13 @@ from .sources.source import CatalogBook, Source
 from .utils import set_ffmpeg_dir
 from .utils.archive import DownloadArchive, default_archive_path, make_book_key
 from .utils.audiobook import Audiobook, BookId, Result, Series, is_ebook
-from .utils.enrichment import enrich_metadata_from_openlibrary, resolve_redirect_url
+from .utils.enrichment import (
+    EnrichmentCandidate,
+    EnrichmentResult,
+    enrich_audiobook_metadata,
+    parse_provider_list,
+    resolve_redirect_url,
+)
 
 
 @dataclass
@@ -417,6 +423,10 @@ def print_result_info(
         if result.metadata.series:
             order = f" #{result.metadata.series_order}" if result.metadata.series_order else ""
             logging.log(f"  Series:   {result.metadata.series}{order}")
+        if result.metadata.isbn:
+            logging.log(f"  ISBN:     {result.metadata.isbn}")
+        if result.metadata.asin:
+            logging.log(f"  ASIN:     {result.metadata.asin}")
         logging.log(f"  Parts:    {len(result.files)} | Chapters: {len(result.chapters)} | Format: {fmt}")
         logging.log(f"  Output:   {location}")
     elif isinstance(result, Series):
@@ -458,6 +468,8 @@ def download_result(
             raise GenericAudiobookDLException(str(exc)) from exc
 
     if getattr(options, "info_only", False):
+        if isinstance(result, Audiobook) and getattr(options, "enrich_metadata", False):
+            _enrich_audiobook(source, result, options, interaction=handler)
         print_result_info(source, result, options, selected_indices=selected_indices)
         return
 
@@ -760,6 +772,81 @@ def audiobook_from_series(
     return items[0]
 
 
+def _format_candidate_choice(candidate: EnrichmentCandidate) -> str:
+    """Format an `EnrichmentCandidate` as a concise single-line selection option."""
+    pct = round(candidate.score * 100)
+    parts = [f"[{candidate.provider} {pct}%] {candidate.title}"]
+    if candidate.authors:
+        parts.append(f"by {', '.join(candidate.authors)}")
+    if candidate.narrators:
+        parts.append(f"(narr. {', '.join(candidate.narrators)})")
+    if candidate.release_date:
+        parts.append(f"[{candidate.release_date.year}]")
+    extras = []
+    if candidate.asin:
+        extras.append(f"ASIN:{candidate.asin}")
+    if candidate.isbn:
+        extras.append(f"ISBN:{candidate.isbn}")
+    if candidate.cover_url:
+        extras.append("cover")
+    if extras:
+        parts.append("{" + ", ".join(extras) + "}")
+    return " ".join(parts)
+
+
+def _enrich_audiobook(
+    source: Optional[Source],
+    audiobook: Audiobook,
+    options: DownloadOptions,
+    *,
+    interaction: Optional[logging.InteractionHandler] = None,
+) -> Optional[EnrichmentResult]:
+    """Run multi-provider metadata enrichment for `audiobook` according to `options`."""
+    raw_providers = getattr(options, "enrich_providers", None)
+    try:
+        providers = parse_provider_list(raw_providers) if raw_providers else None
+    except ValueError as exc:
+        raise GenericAudiobookDLException(str(exc)) from exc
+
+    interactive = bool(getattr(options, "enrich_interactive", False))
+    selector = None
+    if interactive:
+        handler = interaction or logging.CliInteractionHandler()
+        choose_fn = getattr(handler, "choose_index", None)
+        if choose_fn is not None:
+            def _select(provider_name: str, candidates: Sequence[EnrichmentCandidate]) -> Optional[int]:
+                labels = [_format_candidate_choice(c) for c in candidates]
+                return choose_fn(
+                    f"Select {provider_name} match for '{audiobook.title}'",
+                    labels,
+                    default=0 if candidates[0].score >= 0.65 else None,
+                )
+            selector = _select
+
+    result = enrich_audiobook_metadata(
+        audiobook,
+        providers=providers,
+        session=getattr(source, "_session", None),
+        proxy=getattr(options, "proxy", None),
+        timeout=getattr(options, "timeout", None) or 10.0,
+        database_directory=getattr(options, "database_directory", None),
+        use_cache=not bool(getattr(options, "no_enrich_cache", False)),
+        interactive=interactive,
+        selector=selector,
+        include_chapters=not bool(getattr(options, "no_chapters", False)),
+    )
+    if result.updated:
+        details = list(result.fields_updated)
+        if result.cover_updated:
+            details.append("cover")
+        if result.chapters_updated:
+            details.append(f"chapters({len(audiobook.chapters)})")
+        logging.book_update(
+            f"Enriched metadata ({', '.join(result.providers_used)}): {', '.join(details)}"
+        )
+    return result
+
+
 def process_audiobook(
     source: Source,
     audiobook: Audiobook,
@@ -799,12 +886,7 @@ def process_audiobook(
             return False
 
     if getattr(options, "enrich_metadata", False):
-        enrich_metadata_from_openlibrary(
-            audiobook.metadata,
-            session=getattr(source, "_session", None),
-            proxy=getattr(options, "proxy", None),
-            timeout=getattr(options, "timeout", None) or 10.0,
-        )
+        _enrich_audiobook(source, audiobook, options, interaction=interaction)
 
     download(audiobook, options, interaction=interaction, cancel_event=cancel_event)
     if source is not None:

@@ -1,22 +1,196 @@
-"""Modal dialog displaying audiobook metadata/cover or a selectable series checklist."""
+"""Modal dialog displaying editable audiobook metadata/cover or a selectable series checklist."""
 
+import threading
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
 
 from audiobookdl.gui.formatting import (
+    apply_audiobook_metadata_edits,
     describe_series_book,
     format_audiobook_preview,
+    format_multi_metadata_values,
+    load_cover_from_file,
     render_cover_thumbnail,
 )
+from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, apply_theme_to_window, scale_px
 from audiobookdl.gui.widgets import ScrolledTreeview, TreeColumnSpec
 from audiobookdl.sources.source import Source
-from audiobookdl.utils.audiobook import Audiobook, BookId, Result, Series
+from audiobookdl.utils.audiobook import Audiobook, BookId, Cover, Result, Series
+from audiobookdl.utils.enrichment import (
+    EnrichmentCandidate,
+    apply_candidate_to_audiobook,
+    search_enrichment_candidates,
+)
+
+
+_EDITABLE_PREVIEW_LABELS = frozenset({"Title", "Author(s)", "Narrator(s)", "Series"})
+
+
+class ChoiceDialog(tk.Toplevel):
+    """Modal selection dialog returning a 0-based index or `None` when skipped/cancelled."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        title: str,
+        choices: Sequence[str],
+        *,
+        default: Optional[int] = None,
+        palette: Optional[ThemePalette] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.selected_index: Optional[int] = None
+        self._palette = palette or LIGHT_PALETTE
+        self.title(title)
+        self.transient(parent)  # type: ignore[arg-type]
+        self.grab_set()
+        self.minsize(scale_px(self, 520), scale_px(self, 280))
+        self.bind("<Escape>", lambda _e: self.destroy())
+
+        body = ttk.Frame(self, padding=scale_px(self, 12))
+        body.pack(fill=tk.BOTH, expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(1, weight=1)
+
+        ttk.Label(body, text=title, font=("Segoe UI", 10, "bold")).grid(
+            row=0, column=0, sticky="w", pady=(0, 8)
+        )
+
+        list_frame = ttk.Frame(body)
+        list_frame.grid(row=1, column=0, sticky="nsew")
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+
+        self._listbox = tk.Listbox(list_frame, activestyle="none", exportselection=False)
+        scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self._listbox.yview)
+        self._listbox.configure(yscrollcommand=scroll.set)
+        self._listbox.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+
+        for item in choices:
+            self._listbox.insert(tk.END, item)
+        if choices:
+            initial = default if (default is not None and 0 <= default < len(choices)) else 0
+            self._listbox.selection_set(initial)
+            self._listbox.activate(initial)
+            self._listbox.see(initial)
+
+        self._listbox.bind("<Double-Button-1>", lambda _e: self._confirm())
+        self._listbox.bind("<Return>", lambda _e: self._confirm())
+
+        btns = ttk.Frame(body)
+        btns.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        ttk.Button(btns, text="Select", command=self._confirm).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Skip", command=self.destroy).pack(side=tk.RIGHT, padx=(0, 6))
+
+        apply_theme_to_window(self, self._palette)
+        self._listbox.focus_set()
+
+    def _confirm(self) -> None:
+        sel = self._listbox.curselection()
+        if sel:
+            self.selected_index = int(sel[0])
+        self.destroy()
+
+
+class _EnrichmentPickerDialog(tk.Toplevel):
+    """Modal table allowing the user to inspect and select an `EnrichmentCandidate`."""
+
+    _COLUMNS = (
+        TreeColumnSpec("provider", "Provider", width=90, stretch=False, anchor="w"),
+        TreeColumnSpec("score", "Match", width=64, stretch=False, anchor="center"),
+        TreeColumnSpec("title", "Title", width=200, stretch=True, anchor="w"),
+        TreeColumnSpec("authors", "Author(s)", width=150, stretch=True, anchor="w"),
+        TreeColumnSpec("narrators", "Narrator(s)", width=140, stretch=True, anchor="w"),
+        TreeColumnSpec("extras", "Details", width=160, stretch=True, anchor="w"),
+    )
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        candidates: Sequence[EnrichmentCandidate],
+        *,
+        palette: Optional[ThemePalette] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.selected_candidate: Optional[EnrichmentCandidate] = None
+        self._candidates = list(candidates)
+        self._palette = palette or LIGHT_PALETTE
+
+        self.title("Select Enrichment Match")
+        self.transient(parent)  # type: ignore[arg-type]
+        self.grab_set()
+        self.minsize(scale_px(self, 760), scale_px(self, 340))
+        self.bind("<Escape>", lambda _e: self.destroy())
+
+        body = ttk.Frame(self, padding=scale_px(self, 12))
+        body.pack(fill=tk.BOTH, expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            body,
+            text="Choose a metadata match (only missing fields, cover, and chapters will be filled):",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        table = ScrolledTreeview(body, self._COLUMNS, selectmode="browse", height=10)
+        table.grid(row=1, column=0, sticky="nsew")
+        self._tree = table.tree
+
+        for idx, cand in enumerate(self._candidates):
+            extras: List[str] = []
+            if cand.release_date:
+                extras.append(str(cand.release_date.year))
+            if cand.asin:
+                extras.append(f"ASIN:{cand.asin}")
+            elif cand.isbn:
+                extras.append(f"ISBN:{cand.isbn}")
+            if cand.cover_url:
+                extras.append("Cover")
+            if cand.provider == "audnexus" and cand.asin:
+                extras.append("Chapters")
+            self._tree.insert(
+                "",
+                tk.END,
+                iid=str(idx),
+                values=(
+                    cand.provider,
+                    f"{round(cand.score * 100)}%",
+                    cand.title,
+                    ", ".join(cand.authors),
+                    ", ".join(cand.narrators),
+                    " | ".join(extras),
+                ),
+            )
+        if self._candidates:
+            self._tree.selection_set("0")
+            self._tree.focus("0")
+
+        self._tree.bind("<Double-1>", lambda _e: self._apply_selected())
+        self._tree.bind("<Return>", lambda _e: self._apply_selected())
+
+        btns = ttk.Frame(body)
+        btns.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        ttk.Button(btns, text="Apply Selected", command=self._apply_selected).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side=tk.RIGHT, padx=(0, 6))
+
+        apply_theme_to_window(self, self._palette)
+        self._tree.focus_set()
+
+    def _apply_selected(self) -> None:
+        sel = self._tree.selection()
+        if not sel:
+            return
+        idx = int(sel[0])
+        if 0 <= idx < len(self._candidates):
+            self.selected_candidate = self._candidates[idx]
+        self.destroy()
 
 
 class PreviewDialog(tk.Toplevel):
-    """Modal `Toplevel` window hosting book metadata or a series selection checklist."""
+    """Modal `Toplevel` window hosting editable book metadata or a series selection checklist."""
 
     _SERIES_COLUMNS = (
         TreeColumnSpec("selected", "Download", width=72, stretch=False, anchor="center"),
@@ -34,6 +208,9 @@ class PreviewDialog(tk.Toplevel):
         skip_downloaded: bool,
         series_book_exists: Callable[[Union[BookId[Any], Audiobook]], bool],
         on_confirm: Callable[[str, Tuple[Source, Result], Optional[List[int]]], None],
+        palette: Optional[ThemePalette] = None,
+        on_search_enrichment: Optional[Callable[[Audiobook], List[EnrichmentCandidate]]] = None,
+        on_apply_enrichment: Optional[Callable[[Audiobook, EnrichmentCandidate], Tuple[List[str], bool, bool]]] = None,
     ) -> None:
         super().__init__(parent)
         self._url = url
@@ -43,8 +220,25 @@ class PreviewDialog(tk.Toplevel):
         self._skip_downloaded = skip_downloaded
         self._series_book_exists = series_book_exists
         self._on_confirm = on_confirm
+        self._palette = palette or LIGHT_PALETTE
+        self._on_search_enrichment = on_search_enrichment
+        self._on_apply_enrichment = on_apply_enrichment
 
         self._cover_photo: Optional[Any] = None
+        self._pending_cover: Optional[Cover] = result.cover if isinstance(result, Audiobook) else None
+        self._cover_modified = False
+        self._cover_label: Optional[ttk.Label] = None
+        self._clear_cover_btn: Optional[ttk.Button] = None
+        self._readonly_frame: Optional[ttk.Frame] = None
+        self._enrich_btn: Optional[ttk.Button] = None
+        self._enrich_status_var = tk.StringVar(value="")
+
+        self._title_var = tk.StringVar()
+        self._authors_var = tk.StringVar()
+        self._narrators_var = tk.StringVar()
+        self._series_var = tk.StringVar()
+        self._series_order_var = tk.StringVar()
+
         self._check_vars: List[tk.BooleanVar] = []
         self._filter_var = tk.StringVar()
         self._item_labels: List[str] = []
@@ -53,10 +247,10 @@ class PreviewDialog(tk.Toplevel):
 
         self.title(f"Preview \u2014 {result.title}")
         self.transient(parent)  # type: ignore[arg-type]
-        self.minsize(520, 360)
+        self.minsize(scale_px(self, 560), scale_px(self, 420))
         self.bind("<Escape>", lambda _e: self.destroy())
 
-        body = ttk.Frame(self, padding=14)
+        body = ttk.Frame(self, padding=scale_px(self, 14))
         body.pack(fill=tk.BOTH, expand=True)
         body.columnconfigure(0, weight=1)
 
@@ -65,68 +259,347 @@ class PreviewDialog(tk.Toplevel):
         else:
             self._build_series_view(body, result)
 
+        apply_theme_to_window(self, self._palette)
+
+    def _refresh_cover_preview(self) -> None:
+        if self._cover_label is None:
+            return
+        max_size = scale_px(self, 180)
+        photo = render_cover_thumbnail(self._pending_cover, self, max_size=max_size)
+        if photo is not None:
+            self._cover_photo = photo
+            self._cover_label.configure(
+                image=photo,
+                text="",
+                width=0,
+                relief="flat",
+                padding=0,
+            )
+        else:
+            self._cover_photo = None
+            self._cover_label.configure(
+                image="",
+                text="No Cover",
+                width=20,
+                relief="groove",
+                padding=scale_px(self, 24),
+            )
+        if self._clear_cover_btn is not None:
+            self._clear_cover_btn.configure(
+                state="normal" if self._pending_cover is not None else "disabled"
+            )
+
+    def _choose_cover_file(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self,
+            title="Select Cover Image",
+            filetypes=[
+                ("Image files", "*.jpg *.jpeg *.png *.webp *.bmp *.gif"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        try:
+            cover = load_cover_from_file(path)
+        except Exception as exc:
+            messagebox.showerror(
+                "Invalid Cover Image",
+                f"Could not load image:\n{exc}",
+                parent=self,
+            )
+            return
+        self._pending_cover = cover
+        self._cover_modified = True
+        self._refresh_cover_preview()
+
+    def _clear_cover(self) -> None:
+        self._pending_cover = None
+        self._cover_modified = True
+        self._refresh_cover_preview()
+
+    def _apply_audiobook_edits(self, audiobook: Audiobook) -> bool:
+        try:
+            apply_audiobook_metadata_edits(
+                audiobook,
+                title=self._title_var.get(),
+                authors_text=self._authors_var.get(),
+                narrators_text=self._narrators_var.get(),
+                series_text=self._series_var.get(),
+                series_order_text=self._series_order_var.get(),
+                cover=self._pending_cover,
+                update_cover=self._cover_modified,
+            )
+            return True
+        except ValueError as exc:
+            messagebox.showwarning("Invalid Metadata", str(exc), parent=self)
+            return False
+
     def _build_audiobook_view(self, body: ttk.Frame, audiobook: Audiobook) -> None:
         top = ttk.Frame(body)
         top.grid(row=0, column=0, sticky="nsew")
         top.columnconfigure(1, weight=1)
         body.rowconfigure(0, weight=1)
 
-        cover_frame = ttk.Frame(top, width=190, height=190)
-        cover_frame.grid(row=0, column=0, sticky="nw", padx=(0, 14))
-        photo = render_cover_thumbnail(audiobook.cover, self, max_size=180)
-        if photo is not None:
-            self._cover_photo = photo
-            ttk.Label(cover_frame, image=photo).pack()
-        else:
-            ttk.Label(
-                cover_frame,
-                text="No Cover",
-                width=20,
-                anchor="center",
-                relief="groove",
-                padding=24,
-            ).pack()
+        cover_frame = ttk.Frame(top)
+        cover_frame.grid(row=0, column=0, sticky="nw", padx=(0, scale_px(self, 14)))
+        self._cover_label = ttk.Label(cover_frame, anchor="center")
+        self._cover_label.pack()
+
+        cover_btns = ttk.Frame(cover_frame)
+        cover_btns.pack(fill=tk.X, pady=(scale_px(self, 8), 0))
+        self._change_cover_btn = ttk.Button(
+            cover_btns,
+            text="Change Cover...",
+            command=self._choose_cover_file,
+        )
+        self._change_cover_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self._clear_cover_btn = ttk.Button(
+            cover_btns,
+            text="Clear Cover",
+            command=self._clear_cover,
+        )
+        self._clear_cover_btn.pack(side=tk.LEFT)
+        self._refresh_cover_preview()
+
+        meta = audiobook.metadata
+        self._title_var.set(meta.title)
+        self._authors_var.set(format_multi_metadata_values(meta.authors))
+        self._narrators_var.set(format_multi_metadata_values(meta.narrators))
+        self._series_var.set(meta.series or "")
+        self._series_order_var.set("" if meta.series_order is None else str(meta.series_order))
 
         meta_frame = ttk.Frame(top)
         meta_frame.grid(row=0, column=1, sticky="nsew")
         meta_frame.columnconfigure(1, weight=1)
-        rows = format_audiobook_preview(audiobook)
-        for row_idx, (label, value) in enumerate(rows):
+
+        editable_rows: Tuple[Tuple[str, tk.StringVar, Optional[int]], ...] = (
+            ("Title", self._title_var, None),
+            ("Author(s)", self._authors_var, None),
+            ("Narrator(s)", self._narrators_var, None),
+            ("Series", self._series_var, None),
+            ("Order", self._series_order_var, 10),
+        )
+        row_idx = 0
+        for label, var, entry_width in editable_rows:
             ttk.Label(
                 meta_frame,
                 text=f"{label}:",
                 font=("Segoe UI", 9, "bold"),
-            ).grid(row=row_idx, column=0, sticky="nw", padx=(0, 8), pady=2)
-            ttk.Label(
-                meta_frame,
-                text=value,
-                wraplength=320,
-                justify="left",
-            ).grid(row=row_idx, column=1, sticky="nw", pady=2)
+            ).grid(row=row_idx, column=0, sticky="w", padx=(0, 8), pady=3)
+            if entry_width is not None:
+                entry = ttk.Entry(meta_frame, textvariable=var, width=entry_width)
+                entry.grid(row=row_idx, column=1, sticky="w", pady=3)
+            else:
+                entry = ttk.Entry(meta_frame, textvariable=var)
+                entry.grid(row=row_idx, column=1, sticky="ew", pady=3)
+            row_idx += 1
 
-        if audiobook.metadata.description:
-            desc_row = len(rows)
-            ttk.Label(
-                meta_frame,
-                text="Description:",
-                font=("Segoe UI", 9, "bold"),
-            ).grid(row=desc_row, column=0, sticky="nw", padx=(0, 8), pady=(6, 2))
-            desc_box = ScrolledText(meta_frame, height=4, width=40, wrap="word")
-            desc_box.grid(row=desc_row, column=1, sticky="nsew", pady=(6, 2))
-            desc_box.insert("1.0", audiobook.metadata.description.strip())
-            desc_box.configure(state="disabled")
-            meta_frame.rowconfigure(desc_row, weight=1)
+        ttk.Label(
+            meta_frame,
+            text="Separate multiple authors or narrators with ';'",
+            style="Muted.TLabel",
+        ).grid(row=row_idx, column=1, sticky="w", pady=(0, 6))
+        row_idx += 1
+
+        self._readonly_frame = ttk.Frame(meta_frame)
+        self._readonly_frame.grid(row=row_idx, column=0, columnspan=2, sticky="nsew")
+        self._readonly_frame.columnconfigure(1, weight=1)
+        meta_frame.rowconfigure(row_idx, weight=1)
+        self._render_readonly_metadata(audiobook)
 
         btn_bar = ttk.Frame(body)
         btn_bar.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        self._enrich_btn = ttk.Button(
+            btn_bar,
+            text="Enrich Metadata...",
+            command=lambda: self._start_enrichment(audiobook),
+        )
+        self._enrich_btn.pack(side=tk.LEFT)
+        ttk.Label(
+            btn_bar,
+            textvariable=self._enrich_status_var,
+            style="Muted.TLabel",
+        ).pack(side=tk.LEFT, padx=(8, 0))
         action_text = "Add to Queue" if self._is_running else "Download"
 
         def _confirm_book() -> None:
+            if not self._apply_audiobook_edits(audiobook):
+                return
             self.destroy()
             self._on_confirm(self._url, (self._source, audiobook), None)
 
         ttk.Button(btn_bar, text=action_text, command=_confirm_book).pack(side=tk.RIGHT)
         ttk.Button(btn_bar, text="Close", command=self.destroy).pack(side=tk.RIGHT, padx=(0, 6))
+
+    def _render_readonly_metadata(self, audiobook: Audiobook) -> None:
+        if self._readonly_frame is None:
+            return
+        for child in self._readonly_frame.winfo_children():
+            child.destroy()
+
+        meta = audiobook.metadata
+        readonly_rows = [
+            (label, value)
+            for label, value in format_audiobook_preview(audiobook)
+            if label not in _EDITABLE_PREVIEW_LABELS
+        ]
+        row_idx = 0
+        for label, value in readonly_rows:
+            ttk.Label(
+                self._readonly_frame,
+                text=f"{label}:",
+                font=("Segoe UI", 9, "bold"),
+            ).grid(row=row_idx, column=0, sticky="nw", padx=(0, 8), pady=2)
+            ttk.Label(
+                self._readonly_frame,
+                text=value,
+                wraplength=scale_px(self, 320),
+                justify="left",
+            ).grid(row=row_idx, column=1, sticky="nw", pady=2)
+            row_idx += 1
+
+        if meta.description:
+            ttk.Label(
+                self._readonly_frame,
+                text="Description:",
+                font=("Segoe UI", 9, "bold"),
+            ).grid(row=row_idx, column=0, sticky="nw", padx=(0, 8), pady=(6, 2))
+            desc_box = ScrolledText(self._readonly_frame, height=4, width=40, wrap="word")
+            desc_box.grid(row=row_idx, column=1, sticky="nsew", pady=(6, 2))
+            desc_box.insert("1.0", meta.description.strip())
+            desc_box.configure(state="disabled")
+            self._readonly_frame.rowconfigure(row_idx, weight=1)
+        apply_theme_to_window(self._readonly_frame, self._palette)
+
+    def _sync_editable_vars_from_audiobook(self, audiobook: Audiobook) -> None:
+        meta = audiobook.metadata
+        self._title_var.set(meta.title)
+        self._authors_var.set(format_multi_metadata_values(meta.authors))
+        self._narrators_var.set(format_multi_metadata_values(meta.narrators))
+        self._series_var.set(meta.series or "")
+        self._series_order_var.set("" if meta.series_order is None else str(meta.series_order))
+
+    def _start_enrichment(self, audiobook: Audiobook) -> None:
+        if not self._apply_audiobook_edits(audiobook):
+            return
+        if self._enrich_btn is not None:
+            self._enrich_btn.configure(state="disabled")
+        self._enrich_status_var.set("Searching providers...")
+
+        search_fn = self._on_search_enrichment or (
+            lambda book: search_enrichment_candidates(
+                book.metadata,
+                session=getattr(self._source, "_session", None),
+            )
+        )
+
+        def _worker() -> None:
+            try:
+                candidates = search_fn(audiobook)
+                exc: Optional[Exception] = None
+            except Exception as err:
+                candidates = []
+                exc = err
+            try:
+                if self.winfo_exists():
+                    self.after(0, lambda: self._on_enrichment_search_done(audiobook, candidates, exc))
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_enrichment_search_done(
+        self,
+        audiobook: Audiobook,
+        candidates: List[EnrichmentCandidate],
+        exc: Optional[Exception],
+    ) -> None:
+        if self._enrich_btn is not None:
+            self._enrich_btn.configure(state="normal")
+        self._enrich_status_var.set("")
+        if exc is not None:
+            messagebox.showerror("Enrichment Failed", str(exc), parent=self)
+            return
+        if not candidates:
+            messagebox.showinfo(
+                "No Matches Found",
+                "No matching enrichment metadata was found across configured providers.",
+                parent=self,
+            )
+            return
+
+        picker = _EnrichmentPickerDialog(self, candidates, palette=self._palette)
+        self.wait_window(picker)
+        chosen = picker.selected_candidate
+        if chosen is None:
+            return
+
+        if self._enrich_btn is not None:
+            self._enrich_btn.configure(state="disabled")
+        self._enrich_status_var.set("Applying match...")
+
+        apply_fn = self._on_apply_enrichment or (
+            lambda book, cand: apply_candidate_to_audiobook(
+                book,
+                cand,
+                session=getattr(self._source, "_session", None),
+            )
+        )
+
+        def _apply_worker() -> None:
+            try:
+                fields, cover_updated, chapters_updated = apply_fn(audiobook, chosen)
+                err_exc: Optional[Exception] = None
+            except Exception as err:
+                fields, cover_updated, chapters_updated = [], False, False
+                err_exc = err
+            try:
+                if self.winfo_exists():
+                    self.after(
+                        0,
+                        lambda: self._on_enrichment_applied(
+                            audiobook,
+                            fields,
+                            cover_updated,
+                            chapters_updated,
+                            err_exc,
+                        ),
+                    )
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=_apply_worker, daemon=True).start()
+
+    def _on_enrichment_applied(
+        self,
+        audiobook: Audiobook,
+        fields: List[str],
+        cover_updated: bool,
+        chapters_updated: bool,
+        exc: Optional[Exception],
+    ) -> None:
+        if self._enrich_btn is not None:
+            self._enrich_btn.configure(state="normal")
+        if exc is not None:
+            self._enrich_status_var.set("")
+            messagebox.showerror("Enrichment Failed", str(exc), parent=self)
+            return
+        self._sync_editable_vars_from_audiobook(audiobook)
+        if cover_updated:
+            self._pending_cover = audiobook.cover
+            self._cover_modified = True
+            self._refresh_cover_preview()
+        self._render_readonly_metadata(audiobook)
+        updates = list(fields)
+        if cover_updated:
+            updates.append("cover")
+        if chapters_updated:
+            updates.append(f"chapters({len(audiobook.chapters)})")
+        if updates:
+            self._enrich_status_var.set(f"Updated: {', '.join(updates)}")
+        else:
+            self._enrich_status_var.set("No missing fields updated")
 
     def _build_series_view(self, body: ttk.Frame, series: Series[Any]) -> None:
         body.rowconfigure(2, weight=1)
@@ -140,7 +613,7 @@ class PreviewDialog(tk.Toplevel):
         ttk.Label(
             header,
             text=f"{self._source.name}  \u2022  {book_count} book{'s' if book_count != 1 else ''}",
-            foreground="#555555",
+            style="Muted.TLabel",
         ).grid(row=1, column=0, sticky="w")
 
         self._selected_count_var = tk.StringVar()
@@ -156,9 +629,11 @@ class PreviewDialog(tk.Toplevel):
         )
         ttk.Label(toolbar, text="Filter:").pack(side=tk.LEFT, padx=(0, 4))
         ttk.Entry(toolbar, textvariable=self._filter_var, width=22).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Label(toolbar, textvariable=self._selected_count_var, foreground="#333333").pack(
-            side=tk.RIGHT
-        )
+        ttk.Label(
+            toolbar,
+            textvariable=self._selected_count_var,
+            style="Secondary.TLabel",
+        ).pack(side=tk.RIGHT)
         self._update_selected_count(book_count)
 
         list_container = ttk.Frame(body, relief="sunken", borderwidth=1)

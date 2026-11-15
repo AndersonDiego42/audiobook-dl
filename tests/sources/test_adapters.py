@@ -813,3 +813,272 @@ def test_saxo_empty_search_results_raises_book_not_found(tmp_path):
 
     with pytest.raises(BookNotFound):
         src.download("https://www.saxo.com/dk/book_9781234567890")
+
+
+def test_section7_adapters_metadata_catalog_search_and_library(tmp_path):
+    import pytest
+    from audiobookdl.exceptions import UserNotAuthorized
+    from audiobookdl.sources import find_compatible_source
+    from audiobookdl.sources.storytel import StorytelSource
+
+    # 1. audiobooks.com: full metadata + chapters + preserved order list_library()
+    ab = AudiobooksdotcomSource(_opts(tmp_path))
+    ab._session.cookies.set(
+        "ci_session",
+        'a:1:{s:10:"user_agent";s:11:"TestAgent/1";}',
+        domain="www.audiobooks.com",
+    )
+    ab_html = (
+        '<h2 id="bookTitle">Rich AB</h2>'
+        '<span class="book-author"><a>Author One</a></span>'
+        '<span class="book-narrator"><a>Reader One</a></span>'
+        '<span class="book-series"><a>Galaxy Saga #3</a></span>'
+        '<div id="book-description">Long summary here.</div>'
+        '<img class="bookimage" src="https://cdn.audiobooks.com/c.jpg"/>'
+        '<ul id="chapters"><li data-start="0">Prologue</li><li data-start="15">Part One</li></ul>'
+        '<script>var cfg = {mp3: "https://cdn.audiobooks.com/ab.mp3"};</script>'
+    )
+    ab._session.get = MagicMock(
+        side_effect=[
+            MagicMock(status_code=200, content=ab_html.encode("utf-8")),
+            MagicMock(status_code=200, content=b"jpg"),
+        ]
+    )
+    book = ab.download("https://www.audiobooks.com/audiobook/rich/99")
+    assert book.metadata.authors == ["Author One"]
+    assert book.metadata.narrators == ["Reader One"]
+    assert book.metadata.series == "Galaxy Saga"
+    assert book.metadata.series_order == 3
+    assert book.metadata.description == "Long summary here."
+    assert [(c.start, c.title) for c in book.chapters] == [(0, "Prologue"), (15000, "Part One")]
+
+    lib_order_html = (
+        b'<div class="book"><a class="no-decoration" href="/audiobook/second/20">'
+        b'<span class="book-title">Zebra First</span></a><span class="book-author">Alice</span></div>'
+        b'<div class="book"><a class="no-decoration" href="/audiobook/first/10">'
+        b'<span class="book-title">Alpha Second</span></a><span class="book-author">Bob</span></div>'
+    )
+    ab._session.get = MagicMock(return_value=MagicMock(status_code=200, content=lib_order_html))
+    items = ab.list_library()
+    assert [(i.title, i.author) for i in items] == [
+        ("Zebra First", "Alice"),
+        ("Alpha Second", "Bob"),
+    ]
+
+    # 2. blinkist: non-/en/ /books/ URL, chapters/narrators/description, search & list_library
+    assert find_compatible_source("https://www.blinkist.com/de/books/atomic-habits") is BlinkistSource
+    bl = BlinkistSource(_opts(tmp_path))
+    bl_info = {
+        "book": {
+            "id": "b99",
+            "title": "Blink German",
+            "author": "Author B",
+            "narrators": [{"name": "Speaker B"}],
+            "about_the_book": "<p>Clear <b>insights</b>.</p>",
+            "language": "de",
+            "cover": {"default": {"src": "https://cdn.blinkist.com/b99.jpg"}},
+        },
+        "chapters": [
+            {"id": "c1", "title": "Intro", "duration": 10},
+            {"id": "c2", "title": "Key Idea", "duration": 25},
+        ],
+    }
+    bl._session.get = MagicMock(
+        side_effect=[
+            _json_resp(bl_info),
+            _json_resp({"signed_audio_url": "https://cdn.blinkist.com/c1.m4a"}),
+            _json_resp({"signed_audio_url": "https://cdn.blinkist.com/c2.m4a"}),
+            MagicMock(status_code=200, content=b"jpg"),
+        ]
+    )
+    bl_book = bl.download("https://www.blinkist.com/de/books/b99")
+    assert bl_book.metadata.narrators == ["Speaker B"]
+    assert bl_book.metadata.description == "Clear insights."
+    assert [(c.start, c.title) for c in bl_book.chapters] == [(0, "Intro"), (10000, "Key Idea")]
+    bl._session.get = MagicMock(return_value=_json_resp({"books": [{"slug": "s1", "title": "Hit 1", "author": "Auth"}]}))
+    assert bl.search("hit")[0].title == "Hit 1"
+
+    # 3. bookbeat: arbitrary catalog URL download without saved_books + search + persisted UUID4 device_id
+    bb = BookBeatSource(_opts(tmp_path))
+    bb._session.get = MagicMock(
+        side_effect=[
+            _json_resp({"title": "Catalog Book", "cover": "https://cdn.bookbeat.com/9.jpg", "editions": []}),
+            _json_resp({"_embedded": {"downloads": [{"format": "audioBook", "_links": {"license": {"href": "https://api.bookbeat.com/lic/9"}}}]}}),
+            _json_resp({"_links": {"download": {"href": "https://cdn.bookbeat.com/9.mp4"}}, "tracks": [{"start": 0}]}),
+            MagicMock(status_code=200, content=b"cover"),
+        ]
+    )
+    bb_book = bb.download("https://www.bookbeat.com/book/catalog-9?ref=share")
+    assert bb_book.metadata.title == "Catalog Book"
+    assert bb._get_or_create_device_id() == bb._get_or_create_device_id()
+    bb._session.get = MagicMock(return_value=_json_resp({"_embedded": {"books": [{"bookid": 5, "title": "Found", "author": "BB Auth"}]}}))
+    assert bb.search("found")[0].title == "Found"
+
+    # 4. chirp: /audiobooks/... URL support and list_library()
+    assert find_compatible_source("https://www.chirpbooks.com/audiobooks/dune") is ChirpSource
+    ch = ChirpSource(_opts(tmp_path))
+    ch._session.post = MagicMock(
+        return_value=_json_resp({"data": {"currentUser": {"libraryAudiobooks": [{"id": 77, "title": "Purchased", "authors": [{"name": "A"}]}]}}})
+    )
+    assert ch.list_library()[0].url == "https://www.chirpbooks.com/player/77"
+
+    # 5. ereolen: cover, ISBN, publisher, series, description, chapters & clear error message
+    eo = EreolenSource(_opts(tmp_path))
+    work_html = b'<div data-fbi-base-url="https://fbi-api.dbc.dk/opac/graphql"></div><meta property="og:image" content="https://covers.dbc.dk/c.jpg">'
+    graphql_rich = {
+        "data": {
+            "work": {
+                "workId": "work-of:1",
+                "titles": {"full": ["Rich Danish"]},
+                "abstract": "Great mystery.",
+                "creators": [{"display": "Author DK"}],
+                "series": [{"title": "Nordic", "members": [{"numberInSeries": 2, "work": {"workId": "work-of:1"}}]}],
+                "mainLanguages": [{"isoCode": "dan", "display": "Dansk"}],
+                "genreAndForm": ["krimi"],
+                "manifestations": {
+                    "all": [
+                        {
+                            "materialTypes": [{"materialTypeSpecific": {"display": "lydbog (online)"}}],
+                            "identifiers": [{"type": "ISBN", "value": "9788700000001"}],
+                            "publisher": ["Gyldendal"],
+                            "contents": {"entries": [{"title": {"display": "Kapitel 1"}, "playingTime": "PT10S"}, {"title": {"display": "Kapitel 2"}, "playingTime": "PT5S"}]},
+                        }
+                    ]
+                },
+            }
+        }
+    }
+    eo._session.get = MagicMock(
+        side_effect=[
+            MagicMock(status_code=200, content=work_html),
+            _json_resp({"loans": [{"libraryBook": {"identifier": "9788700000001"}, "orderId": "ord-1"}]}),
+            MagicMock(status_code=200, content=b"#EXTM3U\n#EXTINF:5.0,\np0.ts\n#EXT-X-ENDLIST\n"),
+            MagicMock(status_code=200, content=b"eo-cover"),
+        ]
+    )
+    eo._session.post = MagicMock(return_value=_json_resp(graphql_rich))
+    eo_book = eo.download("https://ereolen.dk/work/work-of:1")
+    assert eo_book.metadata.isbn == "9788700000001"
+    assert eo_book.metadata.publisher == "Gyldendal"
+    assert eo_book.metadata.series == "Nordic"
+    assert eo_book.metadata.series_order == 2
+    assert eo_book.cover is not None and eo_book.cover.image == b"eo-cover"
+    assert [(c.start, c.title) for c in eo_book.chapters] == [(0, "Kapitel 1"), (10000, "Kapitel 2")]
+
+    # 6. everand: /book/ URL support, full metadata, search(), list_library()
+    assert find_compatible_source("https://www.everand.com/book/12345/slug") is EverandSource
+    ev = EverandSource(_opts(tmp_path))
+    assert ev.create_listen_url("https://www.everand.com/book/12345/slug") == "https://www.everand.com/listen/12345"
+    ev_meta = ev.format_metadata(
+        {
+            "title": "Dune, The",
+            "author": {"name": "Frank Herbert"},
+            "narrators": [],
+            "isbn": "9780441172719",
+            "series": {"title": "Dune Chronicles", "position": 1},
+            "publisher": {"name": "Chilton"},
+            "language": "en",
+            "description": "<p>Spice.</p>",
+        }
+    )
+    assert (ev_meta.title, ev_meta.isbn, ev_meta.series, ev_meta.series_order, ev_meta.publisher, ev_meta.description) == (
+        "The Dune",
+        "9780441172719",
+        "Dune Chronicles",
+        1,
+        "Chilton",
+        "Spice.",
+    )
+    ev._session.get = MagicMock(return_value=_json_resp({"documents": [{"id": 55, "title": "Result Book", "author": {"name": "Ev Auth"}}]}))
+    assert ev.list_library()[0].title == "Result Book"
+
+    # 7. librivox: RSS id triggers /api/feed/audiobooks metadata + chapters enrichment
+    lv = LibrivoxSource(_opts(tmp_path))
+    lv_html = (
+        b'<html><body><a href="https://librivox.org/rss/44">RSS</a>'
+        b'<div class="content-wrap"><h1>Moby Dick</h1></div>'
+        b'<div class="book-page-book-cover"><img src="https://librivox.org/moby.jpg"/></div>'
+        b'<div class="chapter-download"><a class="chapter-name" href="https://archive.org/1.mp3">Ch 1</a></div>'
+        b"</body></html>"
+    )
+    lv_api = {
+        "books": [
+            {
+                "title": "Moby Dick",
+                "authors": [{"first_name": "Herman", "last_name": "Melville"}],
+                "genres": [{"name": "Fiction"}],
+                "language": "English",
+                "description": "<p>Call me Ishmael.</p>",
+                "sections": [
+                    {"title": "Loomings", "playtime": "00:02:00", "readers": [{"display_name": "Stewart Wills"}]}
+                ],
+            }
+        ]
+    }
+    lv._session.get = MagicMock(
+        side_effect=[
+            MagicMock(status_code=200, content=lv_html),
+            _json_resp(lv_api),
+            MagicMock(status_code=200, content=b"lv-cover"),
+        ]
+    )
+    lv_book = lv.download("https://librivox.org/moby-dick")
+    assert lv_book.metadata.authors == ["Herman Melville"]
+    assert lv_book.metadata.narrators == ["Stewart Wills"]
+    assert lv_book.metadata.description == "Call me Ishmael."
+    assert [(c.start, c.title) for c in lv_book.chapters] == [(0, "Loomings")]
+
+    # 8. overdrive: Libby URLs + chip validation + rich metadata
+    assert find_compatible_source("https://libbyapp.com/open/loan/999") is OverdriveSource
+    od = OverdriveSource(_opts(tmp_path))
+    with pytest.raises(UserNotAuthorized):
+        od.download("https://libbyapp.com/open/loan/999")
+    od._session.cookies.set("session", "valid", domain="libbyapp.com")
+    od._session.get = MagicMock(
+        return_value=_json_resp({"loans": [{"id": "999", "title": "Libby Book", "firstCreatorName": "L Auth", "openUrl": "https://demo.listen.overdrive.com/"}]})
+    )
+    assert od.list_library()[0].title == "Libby Book"
+
+    # 9. saxo: enriched metadata + chapters + configurable app headers
+    sx = SaxoSource(_opts(tmp_path))
+    sx_meta = sx.get_metadata(
+        {
+            "bookMetadata": {
+                "title": "Saxo Rich",
+                "authors": ["A"],
+                "readBy": ["N"],
+                "description": "<p>Plot</p>",
+                "publisherName": "PubHouse",
+                "language": "en",
+                "publishingDate": "2023-05-01T00:00:00Z",
+            }
+        },
+        isbn="9781234567890",
+    )
+    assert sx_meta.isbn == "9781234567890"
+    assert sx_meta.description == "Plot"
+    assert sx_meta.publisher == "PubHouse"
+    assert str(sx_meta.release_date) == "2023-05-01"
+
+    # 10. storytel: externalized metadata_corrections + search()
+    st = StorytelSource(_opts(tmp_path))
+    st._session.get = MagicMock(
+        return_value=_json_resp(
+            {"books": [{"book": {"id": "500", "name": "Story Hit", "authors": [{"name": "St Auth"}]}}]}
+        )
+    )
+    st_hits = st.search("Story")
+    assert st_hits[0].title == "Story Hit"
+    assert st_hits[0].url == "https://www.storytel.com/books/500"
+
+    # 11. yourcloudlibrary: broader URL support + list_library()
+    assert find_compatible_source("https://ebook.yourcloudlibrary.com/library/lib1/audiobook/bk-2") is YourCloudLibrarySource
+    ycl = YourCloudLibrarySource(_opts(tmp_path))
+    ycl._library_id = "lib1"
+    ycl._session.get = MagicMock(
+        return_value=_json_resp({"loans": [{"id": "bk-2", "title": "Cloud Book", "author": "YCL Auth"}]})
+    )
+    ycl_items = ycl.list_library()
+    assert len(ycl_items) == 1
+    assert ycl_items[0].title == "Cloud Book"
+    assert ycl_items[0].url == "https://ebook.yourcloudlibrary.com/library/lib1/detail/bk-2"

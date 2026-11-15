@@ -1,13 +1,39 @@
 from .source import CatalogBook, Source
-from audiobookdl import AudiobookFile, Chapter, AudiobookMetadata, Cover, Audiobook, BookId, Result, Series, logging
-from audiobookdl.exceptions import DataNotPresent, AudiobookDLException, BookHasNoAudiobook, UserNotAuthorized, GenericAudiobookDLException
-from typing import Any, Optional, Dict, List, Union
+from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, BookId, Chapter, Cover, Result, Series, logging
+from audiobookdl.exceptions import (
+    AudiobookDLException,
+    BookHasNoAudiobook,
+    DataNotPresent,
+    GenericAudiobookDLException,
+    RequestError,
+    UserNotAuthorized,
+)
+from audiobookdl.utils.fs import atomic_write_text
 
 import calendar
 from datetime import date, datetime
 import hashlib
-import uuid
+import os
 import pycountry
+import re
+from typing import Any, Dict, List, Optional, Union
+from urllib.parse import quote_plus, urlparse
+import uuid
+
+
+_TLD_LOCALES: Dict[str, str] = {
+    "se": "sv_SE",
+    "fi": "fi_FI",
+    "de": "de_DE",
+    "nl": "nl_NL",
+    "no": "nb_NO",
+    "dk": "da_DK",
+    "fr": "fr_FR",
+    "es": "es_ES",
+    "ch": "de_CH",
+    "at": "de_AT",
+    "com": "en_GB",
+}
 
 
 def calculate_checksum(username: str, password: str, salt: str) -> str:
@@ -22,26 +48,58 @@ def get_checksum(s: str) -> str:
     return hashlib.md5(s.encode()).digest().hex().zfill(32).upper()
 
 
-
 class NextorySource(Source):
     match = [
-        r"https?://((www|catalog-\w\w).)?nextory.+",
+        r"https?://((www|catalog-\w\w)\.)?nextory.+",
     ]
-    names = [ "Nextory" ]
-    _authentication_methods = [
-        "login",
-    ]
+    names = ["Nextory"]
+    _authentication_methods = ["login"]
     APP_ID = "200"
     LOCALE = "en_GB"
+    supports_library = True
+    supports_search = True
 
-    # Cache for the want-to-read list so we don't refetch it per book
-    # when downloading the whole list as a Series.
-    _wantlist_cache: Optional[List[dict]] = None
-
+    def __init__(self, options) -> None:
+        super().__init__(options)
+        # Keep want-to-read cache isolated per source instance.
+        self._wantlist_cache: Optional[List[dict]] = None
 
     @staticmethod
     def create_device_id() -> str:
-        return str(uuid.uuid3(uuid.NAMESPACE_DNS, "audiobook-dl"))
+        """Generate a random per-user UUIDv4 device identifier."""
+        return str(uuid.uuid4())
+
+    def _get_or_create_device_id(self) -> str:
+        """Return a persisted random device_id for this installation."""
+        device_file = os.path.join(self.database_directory, "nextory_device_id.txt")
+        if os.path.isfile(device_file):
+            try:
+                existing = open(device_file, "r", encoding="utf-8").read().strip()
+                if existing:
+                    return existing
+            except OSError:
+                pass
+        generated = self.create_device_id()
+        try:
+            atomic_write_text(device_file, generated + "\n", encoding="utf-8", private=True)
+        except OSError:
+            pass
+        return generated
+
+    def _resolve_locale(self, url: str = "") -> str:
+        configured = getattr(self._options, "locale", None)
+        if isinstance(configured, str) and configured.strip():
+            return configured.strip()
+        if url:
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower()
+            tld = host.rsplit(".", 1)[-1] if "." in host else ""
+            if tld in _TLD_LOCALES and tld != "com":
+                return _TLD_LOCALES[tld]
+            path_parts = [p for p in (parsed.path or "").split("/") if p]
+            if path_parts and len(path_parts[0]) == 2 and path_parts[0].lower() in _TLD_LOCALES:
+                return _TLD_LOCALES[path_parts[0].lower()]
+        return self.LOCALE
 
     def get_compatible_app_version(self):
         today = date.today()
@@ -50,49 +108,58 @@ class NextorySource(Source):
         month = month_zero + 1
         day = min(today.day, calendar.monthrange(year, month)[1])
         d = date(year, month, day)
-        # Nextory ios apps have changed their versioning number to 
-        # the format yyyy-mm-dd
         return f"{d.year}-{d.month}-{d.day}"
 
+    @staticmethod
+    def _select_profile(profiles: List[Dict[str, Any]], preferred: Optional[str] = None) -> Dict[str, Any]:
+        """Select a Nextory profile by name/id when `preferred` matches, otherwise `profiles[0]`."""
+        if not profiles:
+            raise UserNotAuthorized()
+        if preferred:
+            target = preferred.strip().lower()
+            for prof in profiles:
+                if not isinstance(prof, dict):
+                    continue
+                if str(prof.get("name") or "").strip().lower() == target:
+                    return prof
+                if str(prof.get("id") or "").strip().lower() == target:
+                    return prof
+        return profiles[0]
+
     def _login(self, url: str, username: str, password: str):
-        device_id = self.create_device_id()
-        logging.debug(f"{device_id=}")
+        device_id = self._get_or_create_device_id()
+        locale = self._resolve_locale(url)
+        logging.debug(f"{device_id=} {locale=}")
         self._session.headers.update(
             {
-                # New version headers
                 "X-Application-Id": self.APP_ID,
                 "X-App-Version": self.get_compatible_app_version(),
-                "X-Locale": self.LOCALE,
+                "X-Locale": locale,
                 "X-Model": "Personal Computer",
                 "X-Device-Id": device_id,
-                "X-Os-Info": "ios"            }
+                "X-Os-Info": "ios",
+            }
         )
-        # Login for account
         session_response = self.request(
             "POST",
             "https://api.nextory.com/user/v1/sessions",
-            json = {
+            json={
                 "identifier": username,
-                "password": password
+                "password": password,
             },
         )
         session_response_json = session_response.json()
         logging.debug(f"nextory login status={session_response.status_code}")
-        
-        
+
         login_token = session_response_json.get("login_token")
-        
         if login_token is None:
             error = session_response_json.get("error", {})
             reason = error.get("key", {})
-            error_details = error.get("description", "Unknown Error")    
+            error_details = error.get("description", "Unknown Error")
             if reason == "UserNotFound":
                 raise UserNotAuthorized()
-            else:
-                # 'AppDeprecateError' if "X-App-Version" is incorrect will trigger this
-                raise GenericAudiobookDLException(heading=reason, body=error_details)
-            
-       
+            raise GenericAudiobookDLException(heading=reason, body=error_details)
+
         country = session_response_json["country"]
         self._session.headers.update(
             {
@@ -101,29 +168,30 @@ class NextorySource(Source):
                 "X-Country-Code": country,
             }
         )
-        # Login for user
         profiles_response_json = self.get_json(
             "https://api.nextory.com/user/v1/me/profiles",
         )
-        profile = profiles_response_json["profiles"][0]
+        preferred_profile = getattr(self._options, "library", None)
+        profile = self._select_profile(
+            profiles_response_json.get("profiles") or [],
+            preferred=preferred_profile,
+        )
         login_key = profile["login_key"]
         authorize_response_json = self.post_json(
             "https://api.nextory.com/user/v1/profile/authorize",
-            json = {
+            json={
                 "login_key": login_key
-            }
+            },
         )
         profile_token = authorize_response_json["profile_token"]
         self._session.headers.update({"X-Profile-Token": profile_token})
         logging.debug(f"profile_token={logging.mask_secret(profile_token)}")
 
-
     def download(self, url) -> Result:
         if self._is_wantlist_url(url):
             return self._download_wantlist()
-        book_id = int(url.split("/")[-1].split("-")[-1])
+        book_id = int(url.rstrip("/").split("?")[0].split("/")[-1].split("-")[-1])
         return self.download_from_id(book_id)
-
 
     def download_from_id(self, book_id: int) -> Audiobook:
         book_info = self.find_book_info(book_id, self._get_wantlist())
@@ -133,13 +201,12 @@ class NextorySource(Source):
             logging.debug(f"nextory audio_data without 'files': {audio_data!r}")
             raise BookHasNoAudiobook
         return Audiobook(
-            session = self._session,
-            files = self.get_files(audio_data),
-            metadata = self.get_metadata(book_info),
-            cover = self.get_cover(book_info),
-            chapters = self.get_chapters(audio_data)
+            session=self._session,
+            files=self.get_files(audio_data),
+            metadata=self.get_metadata(book_info),
+            cover=self.get_cover(book_info),
+            chapters=self.get_chapters(audio_data),
         )
-
 
     @staticmethod
     def _is_wantlist_url(url: str) -> bool:
@@ -147,13 +214,11 @@ class NextorySource(Source):
         than a specific book, e.g. ``https://nextory.com/se/want-to-read``."""
         return "want-to-read" in url.lower()
 
-
     def _get_wantlist(self) -> List[dict]:
         """Return the want-to-read list, fetching it at most once per source."""
         if self._wantlist_cache is None:
             self._wantlist_cache = self.download_want_to_read_list()
         return self._wantlist_cache
-
 
     def _download_wantlist(self) -> Series[int]:
         """Build a Series of every audiobook currently on the want-to-read list."""
@@ -162,43 +227,39 @@ class NextorySource(Source):
             try:
                 self.find_format_data(book_info)
             except DataNotPresent:
-                # No audio format (ebook-only entry) — skip silently.
                 continue
             books.append(BookId(book_info["id"]))
         return Series(
-            title = "Nextory want to read",
-            books = books,
+            title="Nextory want to read",
+            books=books,
         )
 
-
     def find_book_info(self, book_id: int, want_to_read_list: list) -> dict:
-        """
-        Find metadata about book in list of active books
-
-        :param format_id: Id of audio format
-        :param want_to_read_list: List of books the user want to read
-        :returns: Book metadata
-        """
+        """Find book metadata by id, checking want-to-read first and falling back to product API."""
         for book in want_to_read_list:
             if book["id"] == book_id:
                 return book
-        raise AudiobookDLException(error_description = "nextory_want_to_read")
-
+        try:
+            product = self.get_json(f"https://api.nextory.com/library/v1/products/{book_id}")
+            if isinstance(product, dict) and product.get("id") is not None:
+                return product
+        except RequestError:
+            pass
+        raise AudiobookDLException(error_description="nextory_want_to_read")
 
     def download_want_to_read_id(self) -> str:
         """Downloads profile id for want to read list"""
         products_lists = self.get_json(
             "https://api.nextory.com/library/v1/me/product_lists",
-            params = {
+            params={
                 "page": 0,
-                "per": 50
-            }
+                "per": 50,
+            },
         )["product_lists"]
         for product_list in products_lists:
             if product_list["type"] == "want_to_read":
                 return product_list["id"]
         raise DataNotPresent
-
 
     def download_want_to_read_list(self) -> List[dict]:
         want_to_read_id = self.download_want_to_read_id()
@@ -208,11 +269,11 @@ class NextorySource(Source):
         while True:
             data = self.get_json(
                 "https://api.nextory.com/library/v1/me/product_lists/want_to_read/products",
-                params = {
+                params={
                     "page": str(page),
                     "per": str(per),
-                    "id": want_to_read_id
-                }
+                    "id": want_to_read_id,
+                },
             )
             products = data.get("products") or []
             all_products.extend(products)
@@ -223,7 +284,6 @@ class NextorySource(Source):
             page += 1
         return all_products
 
-
     def download_audio_data(self, book_info: dict) -> dict:
         format_data = self.find_format_data(book_info)
         format_id = format_data["identifier"]
@@ -231,14 +291,33 @@ class NextorySource(Source):
             f"https://api.nextory.com/reader/books/{format_id}/packages/audio"
         )
 
-
     @staticmethod
     def find_format_data(book_info: dict) -> dict:
-        for format in book_info["formats"]:
-            if format["type"] == "hls":
-                return format
+        for fmt in book_info["formats"]:
+            if fmt["type"] == "hls":
+                return fmt
         raise DataNotPresent
 
+    def _resolve_stream_uri(self, uri: str, session_headers: Dict[str, str]) -> List[AudiobookFile]:
+        """Resolve HLS playlist URI directly via session redirects, falling back cleanly."""
+        try:
+            files = self.get_stream_files(
+                uri,
+                headers=session_headers,
+                expected_content_type=("audio/aac", "audio/x-aac", "video/MP2T"),
+            )
+            if files:
+                return files
+        except RequestError:
+            if "master" not in uri:
+                raise
+        if "master" in uri:
+            return self.get_stream_files(
+                uri.replace("master", "media"),
+                headers=session_headers,
+                expected_content_type=("audio/aac", "audio/x-aac", "video/MP2T"),
+            )
+        return []
 
     def get_files(self, audio_data) -> List[AudiobookFile]:
         files = []
@@ -247,36 +326,24 @@ class NextorySource(Source):
             for k, v in self._session.headers.items()
         }
         for file in audio_data["files"]:
-            # master url redirects to media url
-            # TODO Handle redirect correctly
-            media_url = file["uri"].replace("master", "media")
-            files.extend(
-                self.get_stream_files(
-                    media_url,
-                    headers=session_headers,
-                    expected_content_type=("audio/aac", "audio/x-aac", "video/MP2T"),
-                )
-            )
+            files.extend(self._resolve_stream_uri(file["uri"], session_headers))
         return files
-
 
     def get_metadata(self, book_info) -> AudiobookMetadata:
         series_name, series_order = self._extract_series_metadata(book_info)
         metadata = AudiobookMetadata(
-            title = book_info["title"],
-            authors = [author["name"] for author in book_info["authors"]],
-            narrators = [narrator["name"] for narrator in book_info["narrators"]],
-            description = book_info["description_full"],
-            series = series_name,
-            series_order = series_order,
+            title=book_info["title"],
+            authors=[author["name"] for author in book_info["authors"]],
+            narrators=[narrator["name"] for narrator in book_info["narrators"]],
+            description=book_info["description_full"],
+            series=series_name,
+            series_order=series_order,
         )
-        # Language sits at the book level as an ISO 639-1 code (e.g. "sv").
         lang_code = book_info.get("language")
         if lang_code:
             language = pycountry.languages.get(alpha_2=lang_code)
             if language is not None:
                 metadata.language = language
-        # Publisher, ISBN, and publication date live on the audio format.
         try:
             audio_format = self.find_format_data(book_info)
         except DataNotPresent:
@@ -298,15 +365,9 @@ class NextorySource(Source):
                     pass
         return metadata
 
-
     @staticmethod
     def _extract_series_metadata(book_info: dict) -> tuple:
-        """Pull series name and position from Nextory's book payload.
-
-        The series object only carries ``name`` and an internal ``vol``
-        grouping (always 0 in observed data). The actual position within
-        the series lives on the top-level ``volume`` field of the book.
-        """
+        """Pull series name and position from Nextory's book payload."""
         series = book_info.get("series")
         if not series:
             return None, None
@@ -322,25 +383,33 @@ class NextorySource(Source):
                 pass
         return name, position
 
+    @staticmethod
+    def get_chapters(audio_data: dict) -> List[Chapter]:
+        raw_chapters = audio_data.get("chapters")
+        if isinstance(raw_chapters, list) and raw_chapters:
+            chapters: List[Chapter] = []
+            for index, ch in enumerate(raw_chapters):
+                if not isinstance(ch, dict):
+                    continue
+                start_val = ch.get("start_at", ch.get("start", 0))
+                ch_title = str(ch.get("title") or ch.get("name") or f"Chapter {index + 1}").strip()
+                chapters.append(Chapter(title=ch_title, start=int(start_val)))
+            if chapters:
+                return chapters
 
-    def get_chapters(self, audio_data: dict) -> List[Chapter]:
         chapters = []
-        for index, file in enumerate(audio_data["files"]):
-            chapters.append(
-                Chapter(title = f"Chapter {index+1}", start = file["start_at"])
-            )
+        for index, file in enumerate(audio_data.get("files") or []):
+            ch_title = str(file.get("title") or file.get("name") or f"Chapter {index + 1}").strip()
+            chapters.append(Chapter(title=ch_title, start=file["start_at"]))
         return chapters
-
 
     def get_cover(self, book_info) -> Cover:
         cover_url = self.find_format_data(book_info)["img_url"]
         cover_data = self.get(cover_url)
         return Cover(cover_data, "jpg")
 
-    supports_library = True
-
-    def list_library(self) -> List[CatalogBook]:
-        products = self.download_want_to_read_list()
+    @staticmethod
+    def _products_to_catalog(products: Any) -> List[CatalogBook]:
         results: List[CatalogBook] = []
         for product in products or ():
             if not isinstance(product, dict):
@@ -363,3 +432,19 @@ class NextorySource(Source):
                 )
             )
         return results
+
+    def list_library(self) -> List[CatalogBook]:
+        return self._products_to_catalog(self.download_want_to_read_list())
+
+    def search(self, query: str) -> List[CatalogBook]:
+        cleaned = query.strip()
+        if not cleaned:
+            return []
+        data = self.get_json(f"https://api.nextory.com/discovery/v1/search?q={quote_plus(cleaned)}")
+        raw_items = (
+            data.get("products")
+            or data.get("items")
+            or data.get("results")
+            or []
+        )
+        return self._products_to_catalog(raw_items)

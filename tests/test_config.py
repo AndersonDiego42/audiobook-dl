@@ -317,3 +317,40 @@ def test_save_output_and_gui_preferences_round_trip_all_toggles(tmp_path):
     assert cleared.skip_downloaded is True
     assert cleared.debug is True
 
+
+def test_gui_theme_config_round_trip_and_validation(tmp_path):
+    from audiobookdl import logging
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    save_gui_preferences(overwrite=str(cfg_path), theme="dark")
+    loaded = load_config(str(cfg_path))
+    assert loaded.gui.theme == "dark"
+
+    cfg_path.write_text('[gui]\ntheme = "neon"\n', encoding="utf-8")
+    sink = _RecordingSink()
+    with logging.job_context(logging.JobContext(sink=sink)):
+        invalid_loaded = load_config(str(cfg_path))
+    assert invalid_loaded.gui.theme is None
+    assert any("theme" in msg for msg in sink.messages)
+
+
+def test_gui_notify_on_complete_config_round_trip_and_validation(tmp_path):
+    from audiobookdl import logging
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    save_gui_preferences(overwrite=str(cfg_path), notify_on_complete=False)
+    loaded = load_config(str(cfg_path))
+    assert loaded.gui.notify_on_complete is False
+
+    save_gui_preferences(overwrite=str(cfg_path), notify_on_complete=True)
+    loaded_true = load_config(str(cfg_path))
+    assert loaded_true.gui.notify_on_complete is True
+
+    cfg_path.write_text('[gui]\nnotify_on_complete = "yes"\n', encoding="utf-8")
+    sink = _RecordingSink()
+    with logging.job_context(logging.JobContext(sink=sink)):
+        invalid_loaded = load_config(str(cfg_path))
+    assert invalid_loaded.gui.notify_on_complete is None
+    assert any("notify_on_complete" in msg for msg in sink.messages)
+
+

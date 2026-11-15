@@ -8,7 +8,7 @@ from rich.markup import render
 from rich.console import Console
 from rich.progress import Progress, ProgressColumn
 from rich.prompt import Confirm, Prompt
-from typing import Any, Deque, Iterator, List, Optional, Protocol, Tuple, Union
+from typing import Any, Deque, Iterator, List, Optional, Protocol, Sequence, Tuple, Union
 from audiobookdl.utils import read_asset_file
 import io
 import sys
@@ -38,6 +38,12 @@ class InteractionHandler(Protocol):
 
     def ask_input(self, prompt: str, hidden: bool = False) -> str: ...
     def confirm(self, message: str) -> bool: ...
+    def choose_index(
+        self,
+        title: str,
+        choices: Sequence[str],
+        default: Optional[int] = None,
+    ) -> Optional[int]: ...
 
 
 class CliInteractionHandler:
@@ -48,6 +54,29 @@ class CliInteractionHandler:
 
     def confirm(self, message: str) -> bool:
         return Confirm.ask(message)
+
+    def choose_index(
+        self,
+        title: str,
+        choices: Sequence[str],
+        default: Optional[int] = None,
+    ) -> Optional[int]:
+        if not choices:
+            return None
+        console.print(f"\n[bold]{title}[/]")
+        console.print("  [0] Skip")
+        for idx, label in enumerate(choices, start=1):
+            console.print(f"  [{idx}] {label}")
+        default_str = str(default + 1) if default is not None and 0 <= default < len(choices) else "0"
+        while True:
+            raw = Prompt.ask(f"Select [0-{len(choices)}]", default=default_str).strip()
+            if raw == "0" or raw == "":
+                return None
+            if raw.isdigit():
+                picked = int(raw) - 1
+                if 0 <= picked < len(choices):
+                    return picked
+            console.print(f"[red]Please enter a number between 0 and {len(choices)}.[/]")
 
 
 _ui_sink: Optional[LogSink] = None

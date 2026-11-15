@@ -16,7 +16,14 @@ GUI_MEDIA_TYPE_OPTIONS: Tuple[str, ...] = ("Auto", "Audiobook", "Ebook", "Both")
 GUI_OVERWRITE_OPTIONS: Tuple[str, ...] = ("Ask", "Overwrite", "Keep existing")
 
 GUI_CONFIG_KEYS: FrozenSet[str] = frozenset(
-    {"window_geometry", "output_dir", "output_template", "use_download_archive"}
+    {
+        "window_geometry",
+        "output_dir",
+        "output_template",
+        "use_download_archive",
+        "theme",
+        "notify_on_complete",
+    }
 )
 SOURCE_CONFIG_KEYS: FrozenSet[str] = frozenset({"username", "password", "library", "cookie_file"})
 
@@ -111,6 +118,30 @@ def _validate_audio_bitrate(key: str, raw: Any) -> Tuple[Optional[str], Optional
         return None, f"Warning: invalid '{key}' in config ('{val}'); ignoring"
 
 
+def parse_enrich_providers_arg(value: str) -> str:
+    """Validate and normalize `--enrich-providers` comma-separated provider list."""
+    from audiobookdl.utils.enrichment import parse_provider_list
+
+    try:
+        return ",".join(parse_provider_list(value))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _validate_enrich_providers(key: str, raw: Any) -> Tuple[Optional[str], Optional[str]]:
+    val, warning = _validate_str(key, raw)
+    if warning is not None or val is None:
+        return None, warning
+    if not val.strip():
+        return None, None
+    from audiobookdl.utils.enrichment import parse_provider_list
+
+    try:
+        return ",".join(parse_provider_list(val)), None
+    except ValueError:
+        return None, f"Warning: invalid '{key}' in config ('{val}'); ignoring"
+
+
 def _validate_media_type(key: str, raw: Any) -> Tuple[Optional[str], Optional[str]]:
     val, warning = _validate_str(key, raw)
     if warning is not None or val is None:
@@ -129,6 +160,7 @@ _CONFIG_VALIDATORS: Mapping[str, Callable[[str, Any], Tuple[Any, Optional[str]]]
     "positive_float": _validate_positive_float,
     "audio_bitrate": _validate_audio_bitrate,
     "media_type": _validate_media_type,
+    "enrich_providers": _validate_enrich_providers,
 }
 
 
@@ -232,6 +264,15 @@ def _gui_init_optional_str(cfg_val: Any) -> str:
 def _gui_read_optional_str(raw: Any) -> Optional[str]:
     cleaned = str(raw).strip()
     return cleaned or None
+
+
+def _gui_read_enrich_providers(raw: Any) -> Optional[str]:
+    cleaned = str(raw).strip()
+    if not cleaned:
+        return None
+    from audiobookdl.utils.enrichment import parse_provider_list
+
+    return ",".join(parse_provider_list(cleaned))
 
 
 def _gui_init_raw_str(cfg_val: Any) -> str:
@@ -1003,9 +1044,9 @@ OPTION_REGISTRY: Tuple[OptionSpec, ...] = (
         default=False,
         cli_flags=(
             CliFlag(
-                ("--enrich-metadata",),
+                ("--enrich", "--enrich-metadata"),
                 action="store_true",
-                help="Optionally fill missing metadata fields via OpenLibrary lookup",
+                help="Fill missing metadata, cover art, and chapters via Audnexus, iTunes, Google Books, and OpenLibrary",
             ),
         ),
         config_key="enrich_metadata",
@@ -1018,6 +1059,64 @@ OPTION_REGISTRY: Tuple[OptionSpec, ...] = (
             var_type="bool",
             gui_default=False,
             persisted_in_output_prefs=True,
+        ),
+    ),
+    OptionSpec(
+        name="enrich_providers",
+        default=None,
+        cli_flags=(
+            CliFlag(
+                ("--enrich-providers",),
+                arg_type=parse_enrich_providers_arg,
+                help="Comma-separated enrichment providers in priority order (audnexus,itunes,google,openlibrary)",
+            ),
+        ),
+        config_key="enrich_providers",
+        config_kind="enrich_providers",
+        toml_serializer=_serialize_non_empty_str,
+        merge_from_config=True,
+        merge_only_if_default=True,
+        merge_require_truthy=True,
+        gui=GuiBinding(
+            var_attr="enrich_providers_var",
+            var_type="str",
+            gui_default="",
+            from_config=_gui_init_optional_str,
+            to_option=_gui_read_enrich_providers,
+            persisted_in_output_prefs=True,
+        ),
+    ),
+    OptionSpec(
+        name="enrich_interactive",
+        default=False,
+        cli_flags=(
+            CliFlag(
+                ("--enrich-interactive",),
+                action="store_true",
+                help="Prompt interactively to select from ranked enrichment matches",
+            ),
+        ),
+        config_key="enrich_interactive",
+        config_kind="bool",
+        toml_serializer=_serialize_bool,
+        merge_from_config=True,
+        merge_only_if_default=True,
+        gui=GuiBinding(
+            var_attr="enrich_interactive_var",
+            var_type="bool",
+            gui_default=False,
+            persisted_in_output_prefs=True,
+        ),
+    ),
+    OptionSpec(
+        name="no_enrich_cache",
+        default=False,
+        cli_flags=(
+            CliFlag(
+                ("--no-enrich-cache",),
+                action="store_true",
+                help="Bypass reading cached enrichment responses and fetch fresh metadata",
+            ),
         ),
     ),
     OptionSpec(

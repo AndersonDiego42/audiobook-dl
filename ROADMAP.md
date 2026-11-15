@@ -129,30 +129,30 @@ This document catalogs verified bugs, performance bottlenecks, security/resilien
   Save `skip_downloaded`, `write_json_metadata`, `enrich_metadata`, `no_chapters`, and `debug` alongside output preferences in `audiobook-dl.toml`.
 - [ ] **Persistent job queue, Pause/Resume & per-phase sub-progress**  
   Persist queued/failed jobs across restarts, allow pausing/resuming queues, retry failed jobs in one click, and display multi-stage progress (Download -> Decrypt -> Remux/Combine -> Tagging).
-- [ ] **Inline metadata editor in `PreviewDialog` & dark theme**  
+- [x] **Inline metadata editor in `PreviewDialog` & dark theme**  
   Allow editing Title, Authors, Narrators, Series, Order, and Cover inside `PreviewDialog`; replace hardcoded light-mode colors (`#555555`, `#333333`, `#1f6f3d`, `#9a6700`, `#b42318`) with light/dark theme support and HiDPI scaling.
-- [ ] **Interactive browser-cookie importer & OS completion notifications**  
+- [x] **Interactive browser-cookie importer & OS completion notifications**  
   Add a cookie import helper in Settings and desktop notifications when queued downloads finish.
 
 ---
 
 ## 7. Existing Source Adapter Upgrades
 
-| Source | Planned Enhancements |
-| :--- | :--- |
-| [`audiobooksdotcom.py`](audiobookdl/sources/audiobooksdotcom.py) | Extract authors, narrators, description, series, and chapters; preserve library order and populate real titles/authors in `list_library()`; reuse `_get_page()` in `extract_file()` |
-| [`blinkist.py`](audiobookdl/sources/blinkist.py) | Support non-`/en/` locales and `/books/...` URLs; extract chapters, narrators, and descriptions; add `search()` and `list_library()` |
-| [`bookbeat.py`](audiobookdl/sources/bookbeat.py) | Expose `supports_library = True` (`list_library()`) and `search()`; allow downloading arbitrary catalog URLs without requiring books to be in `saved_books`; persist per-user random `device_id` instead of static `uuid3` |
-| [`chirp.py`](audiobookdl/sources/chirp.py) | Support `/audiobooks/...` catalog URLs alongside `/player/\d+`; implement `list_library()` for purchased titles; replace `[:-1]` hack with PKCS7 unpadding |
-| [`ereolen.py`](audiobookdl/sources/ereolen.py) | Re-enable `get_cover(meta)`; extract chapters, publisher, ISBN, series, and description; refresh `libraries.txt` dynamically; surface actionable "Not currently loaned" errors |
-| [`everand.py`](audiobookdl/sources/everand.py) | Wire unused `get_chapters()`; select best stream from master `.m3u8` instead of hardcoded `96kbps.m3u8`; support `/book/` URLs, `list_library()`, `search()`, and full metadata (ISBN, series, language, release date) |
-| [`librivox.py`](audiobookdl/sources/librivox.py) | Query `/api/feed/audiobooks` JSON API for full author, narrator, genre, language, description, and chapter metadata; implement RSS/API `search()` |
-| [`nextory.py`](audiobookdl/sources/nextory.py) | Support profile selection beyond `profiles[0]` and configurable locales; resolve HLS master/media redirects cleanly (`# TODO` at L251); add `search()`, real chapter titles, and per-user `device_id` |
-| [`overdrive.py`](audiobookdl/sources/overdrive.py) | Support modern **Libby (`libbyapp.com`)** APIs alongside `listen.overdrive.com`; extract ISBN, series, description, and publisher; validate auth cookies early |
-| [`podimo.py`](audiobookdl/sources/podimo.py) | Route `retrieve_id_from_share_link()` through `Source._session`; use `get_stream_files()` on `main.m3u8`; add `search()`, `list_library()`, and chapters |
-| [`saxo.py`](audiobookdl/sources/saxo.py) | Guard empty `_search_for_book()` results; enrich metadata via URL ISBN (description, release date, language, chapters); avoid hardcoded app version constants |
-| [`storytel.py`](audiobookdl/sources/storytel.py) | Implement `supports_search = True` (`search()`); fix `_download_counter` class attribute; gate raw JSON dumps behind debug mode; externalize `metadata_corrections` |
-| [`yourcloudlibrary.py`](audiobookdl/sources/yourcloudlibrary.py) | Check `_login()` HTTP response and raise `UserNotAuthorized` on invalid credentials; add `list_library()` and broader URL support |
+| Status | Source | Planned Enhancements |
+| :---: | :--- | :--- |
+| [x] | [`audiobooksdotcom.py`](audiobookdl/sources/audiobooksdotcom.py) | Extract authors, narrators, description, series, and chapters; preserve library order and populate real titles/authors in `list_library()`; reuse `_get_page()` in `extract_file()` |
+| [x] | [`blinkist.py`](audiobookdl/sources/blinkist.py) | Support non-`/en/` locales and `/books/...` URLs; extract chapters, narrators, and descriptions; add `search()` and `list_library()` |
+| [x] | [`bookbeat.py`](audiobookdl/sources/bookbeat.py) | Expose `supports_library = True` (`list_library()`) and `search()`; allow downloading arbitrary catalog URLs without requiring books to be in `saved_books`; persist per-user random `device_id` instead of static `uuid3` |
+| [x] | [`chirp.py`](audiobookdl/sources/chirp.py) | Support `/audiobooks/...` catalog URLs alongside `/player/\d+`; implement `list_library()` for purchased titles; replace `[:-1]` hack with PKCS7 unpadding |
+| [x] | [`ereolen.py`](audiobookdl/sources/ereolen.py) | Re-enable `get_cover(meta)`; extract chapters, publisher, ISBN, series, and description; refresh `libraries.txt` dynamically; surface actionable "Not currently loaned" errors |
+| [x] | [`everand.py`](audiobookdl/sources/everand.py) | Wire unused `get_chapters()`; select best stream from master `.m3u8` instead of hardcoded `96kbps.m3u8`; support `/book/` URLs, `list_library()`, `search()`, and full metadata (ISBN, series, language, release date) |
+| [x] | [`librivox.py`](audiobookdl/sources/librivox.py) | Query `/api/feed/audiobooks` JSON API for full author, narrator, genre, language, description, and chapter metadata; implement RSS/API `search()` |
+| [x] | [`nextory.py`](audiobookdl/sources/nextory.py) | Support profile selection beyond `profiles[0]` and configurable locales; resolve HLS master/media redirects cleanly (`# TODO` at L251); add `search()`, real chapter titles, and per-user `device_id` |
+| [x] | [`overdrive.py`](audiobookdl/sources/overdrive.py) | Support modern **Libby (`libbyapp.com`)** APIs alongside `listen.overdrive.com`; extract ISBN, series, description, and publisher; validate auth cookies early |
+| [x] | [`podimo.py`](audiobookdl/sources/podimo.py) | Route `retrieve_id_from_share_link()` through `Source._session`; use `get_stream_files()` on `main.m3u8`; add `search()`, `list_library()`, and chapters |
+| [x] | [`saxo.py`](audiobookdl/sources/saxo.py) | Guard empty `_search_for_book()` results; enrich metadata via URL ISBN (description, release date, language, chapters); avoid hardcoded app version constants |
+| [x] | [`storytel.py`](audiobookdl/sources/storytel.py) | Implement `supports_search = True` (`search()`); fix `_download_counter` class attribute; gate raw JSON dumps behind debug mode; externalize `metadata_corrections` |
+| [x] | [`yourcloudlibrary.py`](audiobookdl/sources/yourcloudlibrary.py) | Check `_login()` HTTP response and raise `UserNotAuthorized` on invalid credentials; add `list_library()` and broader URL support |
 
 ---
 

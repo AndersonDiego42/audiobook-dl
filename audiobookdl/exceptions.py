@@ -5,7 +5,9 @@ from typing import Optional
 class AudiobookDLException(Exception):
     error_description = "unknown"
 
-    def __init__(self, error_description = None, **kwargs) -> None:
+    def __init__(self, error_description = None, message: Optional[str] = None, **kwargs) -> None:
+        if message:
+            super().__init__(message)
         if error_description:
             self.error_description = error_description
         self.data = kwargs

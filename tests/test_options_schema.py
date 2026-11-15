@@ -174,6 +174,8 @@ def test_schema_driven_merge_and_preset_precedence(tmp_path):
             "write_opf": True,
             "write_cue": True,
             "enrich_metadata": True,
+            "enrich_providers": "itunes,google",
+            "enrich_interactive": True,
         },
         credential_store=None,
     )

@@ -41,6 +41,8 @@ def build_opf_xml(
             lines.append(f"    <dc:language>{escape(str(lang_code))}</dc:language>")
     if metadata.isbn:
         lines.append(f'    <dc:identifier opf:scheme="ISBN">{escape(metadata.isbn)}</dc:identifier>')
+    if metadata.asin:
+        lines.append(f'    <dc:identifier opf:scheme="ASIN">{escape(metadata.asin)}</dc:identifier>')
     if metadata.scrape_url:
         lines.append(f'    <dc:identifier opf:scheme="URL">{escape(metadata.scrape_url)}</dc:identifier>')
     for genre in metadata.genres:

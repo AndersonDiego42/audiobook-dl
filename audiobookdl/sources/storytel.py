@@ -32,69 +32,25 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from typing import Any, List, Dict, Optional, Sequence, Union
 from urllib3.util import parse_url
-from urllib.parse import urlunparse, parse_qs
+from urllib.parse import quote_plus, urlunparse, parse_qs
 from datetime import datetime, date
 import pycountry
 import json
 import re
 import os
 import uuid
+from audiobookdl.utils import read_asset_file
 
-# fmt: off
-metadata_corrections: Dict[str, Dict[str, Any]] = {
-    "books": {
-        "1623721": { "title": "Bibi & Tina: Schatten über dem Martinshof", "release_date": date(2010,3,12) },
-        "1623873": { "title": "Bibi & Tina: Die ungarischen Reiter", "release_date": date(2010,9,10) },
-        "1623776": { "title": "Bibi & Tina: Der wilde Hengst", "release_date": date(2009,11,20) },
-        "1623780": { "title": "Bibi & Tina: Die geheimnisvolle Köchin", "release_date": date(2012,6,8) },
-        "1623767": { "title": "Bibi & Tina: Der Tiger von Rotenbrunn", "release_date": date(2013,9,6) },
-        "1623757": { "title": "Bibi & Tina: Die falschen Weihnachtsmänner", "release_date": date(2013,11,1) },
-        "1623860": { "title": "Bibi & Tina: Indianerpferde in Gefahr", "release_date": date(2014,9,5) },
-        "1623775": { "title": "Bibi & Tina: Der weiße Mustang", "release_date": date(2015,9,4) },
-        "1623856": { "title": "Bibi & Tina: Holger verliebt sich", "release_date": date(2016,9,9) },
-        "1623760": { "title": "Bibi & Tina: Das Fohlen im Schnee", "release_date": date(2017,9,8) },
-        "1623855": { "title": "Bibi & Tina: Ein heißer Sommer", "release_date": date(2018,7,6) },
-        "1623857": { "title": "Bibi & Tina: Im Land der weißen Pferde", "release_date": date(2019,9,6) },
-        "1048495": { "title": "Bibi & Tina: Der mysteriöse Fremde", "description": "Graf Falko von Falkenstein ist verzweifelt! Er leidet unter Schlaflosigkeit und bittet schließlich einen Wunderheiler um Hilfe. Der mysteriöse Fremde heilt nicht nur den Grafen, sondern wickelt sogar Frau Martin um den Finger. Tina ist gar nicht begeistert und auch Bibi misstraut dem Mann. Als die Freundinnen und Alex versuchen, dem Geheimnis des Heilers auf die Spur zu kommen, überschlagen sich die Ereignisse und die Kinder geraten in Gefahr.", "release_date": date(2020,10,23) }, # MP3 contains the audio twice in a row (second one starts at 2:34:52)
-        "1397689": { "title": "Bibi & Tina: Ein Monster im Wald", "release_date": date(2021,10,22) },
 
-        "1615235": { "title": "Bibi Blocksberg - Hörbuch: Im Tal der wilden Hexen", "release_date": date(2010,3,20) },
-        "1615295": { "title": "Bibi Blocksberg - Das verhexte Wunschhaus", "release_date": date(2011,3,4) },
-        "1615294": { "title": "Bibi Blocksberg - Die Gewitterhexe", "release_date": date(2012,10,19) },
-        "1615236": { "title": "Bibi Blocksberg - Zickia-Alarm!", "release_date": date(2013,6,7) },
-        "1615182": { "title": "Bibi Blocksberg - Das verhexte Schwein", "release_date": date(2013,10,11) },
-        "1615288": { "title": "Bibi Blocksberg - Bibi total verknallt!", "release_date": date(2014,6,6) },
-        "1615205": { "title": "Bibi Blocksberg - Hexkraft gesucht!", "release_date": date(2014,10,10) },
-        "1615204": { "title": "Bibi Blocksberg - Wo ist Moni?", "release_date": date(2015,6,12) },
-        "1615203": { "title": "Bibi Blocksberg - Gustav, der Hexendrache", "release_date": date(2015,10,9) },
-        "1615175": { "title": "Bibi Blocksberg - Abenteuer Indien!", "release_date": date(2017,10,13) },
-        "1615201": { "title": "Bibi Blocksberg - Die Schule ist weg!", "release_date": date(2018,10,12) },
-        "1022245": { "title": "Bibi Blocksberg - Bibi und Herr Fu", "release_date": date(2020,9,18) },
+def _load_metadata_corrections() -> Dict[str, Dict[str, Any]]:
+    raw = json.loads(read_asset_file("assets/sources/storytel/metadata_corrections.json"))
+    for entry in (raw.get("books") or {}).values():
+        if isinstance(entry.get("release_date"), str):
+            entry["release_date"] = date.fromisoformat(entry["release_date"])
+    return raw
 
-        "522762": { "title": "Alvin und die Chipmunks: Der Katzenfluch" },
 
-        "1260956": { "title": "Fast and Furious Spy Racer: Folge 1" },
-
-        "1878866": { "title": "Ghostforce: Folge 1" },
-        "1878880": { "title": "Ghostforce: Folge 2" },
-        "2642089": { "title": "Ghostforce: Folge 3" },
-        "2642148": { "title": "Ghostforce: Folge 4" },
-
-        "1168061": { "title": "Leo Da Vinci: Folge 1", "series": "Leo Da Vinci", "series_order": 1 },
-        "1176396": { "title": "Leo Da Vinci: Folge 2", "series": "Leo Da Vinci", "series_order": 2 },
-        "1178721": { "title": "Leo Da Vinci: Folge 3", "series": "Leo Da Vinci", "series_order": 3 },
-        "1176422": { "title": "Leo Da Vinci: Folge 4", "series": "Leo Da Vinci", "series_order": 4 },
-        "1176424": { "title": "Leo Da Vinci: Folge 5", "series": "Leo Da Vinci", "series_order": 5 },
-        "1176462": { "title": "Leo Da Vinci: Folge 6", "series": "Leo Da Vinci", "series_order": 6 },
-        "1262342": { "title": "Leo Da Vinci: Folge 7", "series": "Leo Da Vinci", "series_order": 7 },
-        "1263433": { "title": "Leo Da Vinci: Folge 8", "series": "Leo Da Vinci", "series_order": 8 },
-        "1263421": { "title": "Leo Da Vinci: Folge 9", "series": "Leo Da Vinci", "series_order": 9 },
-        "1309115": { "title": "Leo Da Vinci: Folge 10", "series": "Leo Da Vinci", "series_order": 10 },
-        "1320400": { "title": "Leo Da Vinci: Folge 11", "series": "Leo Da Vinci", "series_order": 11 },
-        "1328193": { "title": "Leo Da Vinci: Folge 12", "series": "Leo Da Vinci", "series_order": 12 },
-    }
-}
-# fmt: on
+metadata_corrections: Dict[str, Dict[str, Any]] = _load_metadata_corrections()
 
 
 # path data of the headphone icon on the website used to identify audiobooks
@@ -806,6 +762,47 @@ class StorytelSource(Source):
         self._write_json(book_path, audiobook.source_data)
 
     supports_library = True
+    supports_search = True
+
+    def search(self, query: str) -> List[CatalogBook]:
+        cleaned = query.strip()
+        if not cleaned:
+            return []
+        data = self.get_json(
+            f"https://api.storytel.net/search/client/search?query={quote_plus(cleaned)}&kidsMode=false"
+        )
+        raw_items = (
+            data.get("books")
+            or data.get("consumables")
+            or data.get("items")
+            or data.get("results")
+            or []
+        )
+        results: List[CatalogBook] = []
+        for entry in raw_items:
+            if not isinstance(entry, dict):
+                continue
+            model = entry.get("book") or entry.get("consumable") or entry
+            if not isinstance(model, dict):
+                continue
+            book_id = model.get("id") or model.get("consumableId")
+            title = str(model.get("name") or model.get("title") or "").strip()
+            if not book_id or not title:
+                continue
+            authors_raw = model.get("authors") or []
+            author_names = [
+                str(a.get("name") or "") for a in authors_raw if isinstance(a, dict) and a.get("name")
+            ]
+            url = model.get("shareUrl") or f"https://www.storytel.com/books/{book_id}"
+            results.append(
+                CatalogBook(
+                    title=title,
+                    url=str(url),
+                    author=", ".join(author_names),
+                    source="storytel",
+                )
+            )
+        return results
 
     def list_library(self) -> List[CatalogBook]:
         data = self.download_bookshelf()

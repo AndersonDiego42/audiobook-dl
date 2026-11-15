@@ -46,6 +46,8 @@ class GuiConfig:
     output_dir: Optional[str] = None
     output_template: Optional[str] = None
     use_download_archive: Optional[bool] = None
+    theme: Optional[str] = None
+    notify_on_complete: Optional[bool] = None
 
 
 @define
@@ -78,6 +80,8 @@ class Config:
     write_opf: Optional[bool] = None
     write_cue: Optional[bool] = None
     enrich_metadata: Optional[bool] = None
+    enrich_providers: Optional[str] = None
+    enrich_interactive: Optional[bool] = None
     gui: GuiConfig = Factory(GuiConfig)
 
     def clone(self) -> "Config":
@@ -96,6 +100,8 @@ class Config:
             output_dir=self.gui.output_dir,
             output_template=self.gui.output_template,
             use_download_archive=self.gui.use_download_archive,
+            theme=self.gui.theme,
+            notify_on_complete=self.gui.notify_on_complete,
         )
         kwargs: Dict[str, Any] = {"sources": sources_copy, "gui": gui_copy}
         for spec in CONFIG_OPTION_SPECS:
@@ -356,11 +362,28 @@ def structure_config(
             use_archive_val = None
         else:
             use_archive_val = use_archive_raw
+        theme_raw = gui_section.get("theme")
+        theme_val: Optional[str] = None
+        if theme_raw is not None:
+            if isinstance(theme_raw, str) and theme_raw.strip().lower() in ("system", "light", "dark"):
+                theme_val = theme_raw.strip().lower()
+            else:
+                logging.log(
+                    "Warning: config '[gui].theme' must be 'system', 'light', or 'dark'; ignoring"
+                )
+        notify_raw = gui_section.get("notify_on_complete")
+        if notify_raw is not None and not isinstance(notify_raw, bool):
+            logging.log("Warning: config '[gui].notify_on_complete' must be a boolean; ignoring")
+            notify_val = None
+        else:
+            notify_val = notify_raw
         gui_config = GuiConfig(
             window_geometry=gui_section.get("window_geometry") if isinstance(gui_section.get("window_geometry"), str) else None,
             output_dir=gui_section.get("output_dir") if isinstance(gui_section.get("output_dir"), str) else None,
             output_template=gui_section.get("output_template") if isinstance(gui_section.get("output_template"), str) else None,
             use_download_archive=use_archive_val,
+            theme=theme_val,
+            notify_on_complete=notify_val,
         )
 
     parsed_options: Dict[str, Any] = {}
@@ -545,6 +568,8 @@ def save_output_preferences(
     skip_downloaded: Any = _UNSET,
     write_json_metadata: Any = _UNSET,
     enrich_metadata: Any = _UNSET,
+    enrich_providers: Any = _UNSET,
+    enrich_interactive: Any = _UNSET,
     no_chapters: Any = _UNSET,
     debug: Any = _UNSET,
     split_chapters: Any = _UNSET,
@@ -570,6 +595,8 @@ def save_output_preferences(
         "skip_downloaded": skip_downloaded,
         "write_json_metadata": write_json_metadata,
         "enrich_metadata": enrich_metadata,
+        "enrich_providers": enrich_providers,
+        "enrich_interactive": enrich_interactive,
         "no_chapters": no_chapters,
         "debug": debug,
         "split_chapters": split_chapters,
@@ -607,8 +634,10 @@ def save_gui_preferences(
     overwrite: Optional[str] = None,
     *,
     use_download_archive: Optional[bool] = None,
+    theme: Optional[str] = None,
+    notify_on_complete: Optional[bool] = None,
 ) -> str:
-    """Persist GUI window geometry, last output folder, filename template, and archive toggle in `audiobook-dl.toml`."""
+    """Persist GUI window geometry, output prefs, archive toggle, theme, and notifications in `audiobook-dl.toml`."""
     config_location = overwrite or get_config_location(None)
     with file_lock(config_location):
         config_dict = read_config(config_location)
@@ -617,6 +646,7 @@ def save_gui_preferences(
             "window_geometry": window_geometry,
             "output_dir": output_dir,
             "output_template": output_template,
+            "theme": theme.strip().lower() if isinstance(theme, str) else theme,
         }
         for key, val in updates.items():
             if val is None:
@@ -628,6 +658,8 @@ def save_gui_preferences(
                 gui_dict.pop(key, None)
         if use_download_archive is not None:
             gui_dict["use_download_archive"] = bool(use_download_archive)
+        if notify_on_complete is not None:
+            gui_dict["notify_on_complete"] = bool(notify_on_complete)
         if gui_dict:
             config_dict["gui"] = gui_dict
         else:

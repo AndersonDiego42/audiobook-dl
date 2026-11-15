@@ -97,6 +97,9 @@ class DownloadOptions:
     library_list: bool = False
     verify_auth: bool = False
     enrich_metadata: bool = False
+    enrich_providers: Optional[str] = None
+    enrich_interactive: bool = False
+    no_enrich_cache: bool = False
     check_updates: bool = False
     _explicit_fields: FrozenSet[str] = field(
         default_factory=frozenset,

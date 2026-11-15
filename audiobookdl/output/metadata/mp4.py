@@ -23,6 +23,7 @@ MP4_TEXT_ATOMS: Dict[str, str] = {
 MP4_FREEFORM_NAMES: Dict[str, str] = {
     "scrape_url": "URL",
     "isbn": "ISBN",
+    "asin": "ASIN",
 }
 
 MP4_COVER_FORMATS = {

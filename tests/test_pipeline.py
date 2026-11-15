@@ -836,7 +836,7 @@ def test_download_result_series_handles_book_has_no_ebook_and_dual_format_series
 def test_enrichment_and_updater_close_auto_sessions_and_process_reuses_source_session(tmp_path, monkeypatch):
     from unittest.mock import MagicMock, patch
     from audiobookdl import AudiobookFile
-    from audiobookdl.utils.enrichment import enrich_metadata_from_openlibrary
+    from audiobookdl.utils.enrichment import EnrichmentResult, enrich_metadata_from_openlibrary
     from audiobookdl.utils.updater import check_for_updates
 
     closed_count = 0
@@ -859,9 +859,9 @@ def test_enrichment_and_updater_close_auto_sessions_and_process_reuses_source_se
 
     enriched_sessions = []
 
-    def fake_enrich(metadata, **kwargs):
+    def fake_enrich(audiobook, **kwargs):
         enriched_sessions.append(kwargs.get("session"))
-        return True
+        return EnrichmentResult(updated=True, providers_used=["openlibrary"])
 
     fake_session = MagicMock()
     src = MagicMock()
@@ -877,7 +877,7 @@ def test_enrichment_and_updater_close_auto_sessions_and_process_reuses_source_se
         enrich_metadata=True,
     )
     with (
-        patch("audiobookdl.pipeline.enrich_metadata_from_openlibrary", side_effect=fake_enrich),
+        patch("audiobookdl.pipeline.enrich_audiobook_metadata", side_effect=fake_enrich),
         patch("audiobookdl.pipeline.download"),
     ):
         from audiobookdl.pipeline import process_audiobook
