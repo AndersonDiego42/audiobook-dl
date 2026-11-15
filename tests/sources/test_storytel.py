@@ -31,6 +31,8 @@ def _make_source(tmp_path, **option_overrides) -> StorytelSource:
 def _mock_resp(status_code: int = 200, *, json_data=None, content: bytes = b"", text: str = "", headers=None, url: str = "https://api.storytel.net"):
     resp = MagicMock()
     resp.status_code = status_code
+    if json_data is not None and not content:
+        content = json.dumps(json_data).encode("utf-8")
     resp.content = content
     resp.text = text
     resp.headers = headers or {}
@@ -494,5 +496,29 @@ def test_on_download_complete_writes_utf8_json(tmp_path):
     saved = Path(src._get_book_path("12345")).read_text(encoding="utf-8")
     assert unicode_title in saved
     assert json.loads(saved)["title"] == unicode_title
+
+
+def test_storytel_skips_playback_metadata_and_streams_on_print_output(tmp_path):
+    src = _make_source(tmp_path, print_output=True)
+    src._session.get = MagicMock(
+        return_value=_mock_resp(
+            200,
+            json_data={
+                "consumableId": "999",
+                "title": "Print Only Book",
+                "shareUrl": "https://www.storytel.com/se/sv/books/print-only-999",
+                "formats": [{"type": "abook", "isReleased": True}],
+                "authors": [{"name": "Author"}],
+                "narrators": [],
+                "cover": {"url": "https://example.com/cover.jpg"},
+            },
+        )
+    )
+    audiobook = src.download_book_from_book_id("999")
+    assert audiobook.files == []
+    assert audiobook.cover is None
+    assert audiobook.chapters == []
+    assert src._session.get.call_count == 1
+    assert not Path(src._get_playback_metadata_path("999")).exists()
 
 

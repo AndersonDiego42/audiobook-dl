@@ -18,7 +18,7 @@ import pytest
 from audiobookdl import AudiobookMetadata, Chapter, Cover
 from audiobookdl.output import metadata as output_metadata
 from audiobookdl.output.metadata import _chapters, ffmpeg as ffmeta
-from audiobookdl.output.metadata import id3, mp4
+from audiobookdl.output.metadata import id3, mp4, sidecars, vorbis
 
 
 def _make_image_bytes(fmt: str, mode: str = "RGB") -> bytes:
@@ -465,3 +465,95 @@ def test_add_chapters_forwards_audio_bitrate_to_ffmpeg(monkeypatch):
     monkeypatch.setattr(output_metadata.ffmpeg, "add_chapters_ffmpeg", fake_add_chapters_ffmpeg)
     output_metadata.add_chapters("book.m4b", [Chapter(0, "Ch 1")], audio_bitrate="192k")
     assert seen == {"filepath": "book.m4b", "audio_bitrate": "192k"}
+
+
+@pytest.mark.parametrize(
+    ("ext", "codec_args"),
+    [
+        ("flac", ["-c:a", "flac"]),
+        ("ogg", ["-c:a", "libvorbis"]),
+        ("opus", ["-c:a", "libopus"]),
+    ],
+)
+def test_vorbis_metadata_and_cover_roundtrip(tmp_path, ext, codec_args):
+    audio_path = tmp_path / f"sample.{ext}"
+    _create_silent_audio(audio_path, codec_args)
+
+    meta = AudiobookMetadata(
+        title="Vorbis Book",
+        authors=["Author A", "Author B"],
+        narrators=["Narrator X"],
+        series="Saga",
+        series_order=2,
+        genres=["Sci-Fi"],
+        language=pycountry.languages.get(alpha_2="en"),
+        description="A sample description",
+        isbn="9781234567890",
+        publisher="Press",
+        release_date=date(2023, 5, 10),
+        scrape_url="https://example.com/book",
+    )
+    output_metadata.add_metadata(str(audio_path), meta)
+    png_bytes = _make_image_bytes("PNG", mode="RGB")
+    output_metadata.embed_cover(str(audio_path), Cover(png_bytes, "png"))
+
+    from mutagen import File as MutagenFile
+    reloaded = MutagenFile(str(audio_path))
+    assert reloaded is not None
+    assert reloaded["title"] == ["Vorbis Book"]
+    assert reloaded["artist"] == ["Author A", "Author B"]
+    assert reloaded["narrator"] == ["Narrator X"]
+    assert reloaded["album"] == ["Saga"]
+    assert reloaded["series-part"] == ["2"]
+    assert reloaded["language"] == ["eng"]
+    assert reloaded["date"] == ["2023-05-10"]
+    assert reloaded["isbn"] == ["9781234567890"]
+    if ext == "flac":
+        assert len(reloaded.pictures) == 1
+        assert reloaded.pictures[0].mime == "image/png"
+    else:
+        assert "metadata_block_picture" in reloaded
+
+
+def test_sidecars_opf_cue_and_enriched_as_json(tmp_path):
+    meta = AudiobookMetadata(
+        title='Book "One" & More',
+        authors=["Jane Doe"],
+        narrators=["John Smith"],
+        series="Chronicles",
+        series_order=3,
+        genres=["Fiction"],
+        language=pycountry.languages.get(alpha_2="en"),
+        description="Summary & notes",
+        isbn="9780000000001",
+        publisher="AudioHouse",
+        release_date=date(2022, 11, 1),
+    )
+    chapters = [
+        Chapter(start=0, title="Prologue"),
+        Chapter(start=65_400, title='Chapter "1"'),
+    ]
+
+    import json
+    parsed_json = json.loads(meta.as_json(chapters=chapters))
+    assert parsed_json["series"] == ["Chronicles #3"]
+    assert parsed_json["series_order"] == 3
+    assert parsed_json["language"] == "eng"
+    assert len(parsed_json["chapters"]) == 2
+    assert parsed_json["chapters"][1]["start_seconds"] == 65.4
+
+    opf_path = tmp_path / "metadata.opf"
+    sidecars.write_sidecar_opf(meta, str(opf_path), cover_filename="cover.jpg")
+    opf_text = opf_path.read_text(encoding="utf-8")
+    assert "Book &quot;One&quot; &amp; More" in opf_text or "Book \"One\" &amp; More" in opf_text
+    assert 'calibre:series" content="Chronicles"' in opf_text
+    assert 'calibre:series_index" content="3"' in opf_text
+    assert 'href="cover.jpg"' in opf_text
+
+    cue_path = tmp_path / "Book.cue"
+    sidecars.write_sidecar_cue(meta, "Book.mp3", chapters, str(cue_path))
+    cue_text = cue_path.read_text(encoding="utf-8")
+    assert 'PERFORMER "Jane Doe"' in cue_text
+    assert 'FILE "Book.mp3" MP3' in cue_text
+    assert "TRACK 02 AUDIO" in cue_text
+    assert "INDEX 01 01:05:30" in cue_text

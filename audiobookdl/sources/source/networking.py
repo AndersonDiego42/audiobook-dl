@@ -2,39 +2,127 @@ from audiobookdl import AudiobookFile, exceptions, logging
 from audiobookdl.utils.audiobook import AESEncryption
 from audiobookdl.utils.http import DEFAULT_HTTP_TIMEOUT
 
+from http.cookiejar import CookieJar
 from typing import Dict, List, Optional
 import json
 import os
+import random
+import time
+from urllib.parse import urlparse
 import m3u8
 import requests
 
 
+RETRIABLE_STATUS_CODES = frozenset({429, 502, 503, 504})
+DEFAULT_MAX_RETRIES = 3
+MAX_RETRY_DELAY = 30.0
+
+
+def _retry_delay_seconds(attempt: int, resp: Optional[requests.Response]) -> float:
+    """Compute retry backoff with jitter, honoring numeric `Retry-After` when present."""
+    if resp is not None:
+        raw_retry = resp.headers.get("Retry-After") if hasattr(resp, "headers") and resp.headers else None
+        if isinstance(raw_retry, str) and raw_retry.strip().isdigit():
+            return min(MAX_RETRY_DELAY * 2, float(int(raw_retry.strip())))
+    base = min(MAX_RETRY_DELAY, 0.5 * (2 ** attempt))
+    return base + random.uniform(0.0, 0.25 * (attempt + 1))
+
+
+def _sleep_cancellable(seconds: float) -> None:
+    if seconds <= 0:
+        return
+    ctx = logging.get_job_context()
+    cancel_event = ctx.cancel_event if ctx is not None else None
+    if cancel_event is not None:
+        if cancel_event.wait(seconds):
+            raise exceptions.DownloadCancelled
+    else:
+        time.sleep(seconds)
+
+
+def request(
+    self,
+    method: str,
+    url: str,
+    *,
+    force_cookies: bool = False,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    **kwargs,
+) -> requests.Response:
+    """Make an HTTP request with retry/backoff for transient errors and configurable timeout."""
+    if "timeout" in kwargs:
+        timeout = kwargs.pop("timeout")
+    else:
+        opt_timeout = getattr(getattr(self, "_options", None), "timeout", None)
+        timeout = (DEFAULT_HTTP_TIMEOUT[0], float(opt_timeout)) if opt_timeout else DEFAULT_HTTP_TIMEOUT
+    if force_cookies:
+        kwargs["cookies"] = _get_all_cookies(self._session)
+
+    upper_method = method.upper()
+
+    def _send() -> requests.Response:
+        if upper_method == "GET":
+            return self._session.get(url, timeout=timeout, **kwargs)
+        if upper_method == "POST":
+            return self._session.post(url, timeout=timeout, **kwargs)
+        return self._session.request(method, url, timeout=timeout, **kwargs)
+
+    last_exc: Optional[BaseException] = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = _send()
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            last_exc = exc
+            if attempt >= max_retries:
+                raise exceptions.RequestError from exc
+            delay = _retry_delay_seconds(attempt, None)
+            logging.debug(
+                f"Transient network error for {upper_method} {url} ({exc}); retrying in {delay:.2f}s"
+            )
+            _sleep_cancellable(delay)
+            continue
+
+        if resp.status_code in RETRIABLE_STATUS_CODES and attempt < max_retries:
+            delay = _retry_delay_seconds(attempt, resp)
+            logging.debug(
+                f"HTTP {resp.status_code} for {upper_method} {url}; retrying in {delay:.2f}s"
+            )
+            try:
+                resp.close()
+            except Exception:
+                pass
+            _sleep_cancellable(delay)
+            continue
+        return resp
+
+    if last_exc is not None:
+        raise exceptions.RequestError from last_exc
+    raise exceptions.RequestError
+
+
+def _raise_for_failed_response(url: str, resp: requests.Response) -> None:
+    logging.debug(f"Failed to download data from: {url}\nResponse:\n{resp.content}")
+    if resp.status_code in (401, 403):
+        raise exceptions.UserNotAuthorized
+    raise exceptions.RequestError
+
+
 def post(self, url: str, **kwargs) -> bytes:
     """Make post request with `Source` session"""
-    timeout = kwargs.pop("timeout", DEFAULT_HTTP_TIMEOUT)
-    resp = self._session.post(url, timeout=timeout, **kwargs)
+    resp = self.request("POST", url, **kwargs)
     if resp.status_code == 200:
         return resp.content
-    logging.debug(f"Failed to download data from: {url}\nResponse:\n{resp.content}")
-    raise exceptions.RequestError
+    _raise_for_failed_response(url, resp)
+    raise exceptions.RequestError  # unreachable, satisfies type checker
 
 
 def get(self, url: str, force_cookies: bool = False, **kwargs) -> bytes:
     """Make get request with `Source` session"""
-    timeout = kwargs.pop("timeout", DEFAULT_HTTP_TIMEOUT)
-    if force_cookies:
-        resp = self._session.get(
-            url,
-            cookies=_get_all_cookies(self._session),
-            timeout=timeout,
-            **kwargs
-        )
-    else:
-        resp = self._session.get(url, timeout=timeout, **kwargs)
+    resp = self.request("GET", url, force_cookies=force_cookies, **kwargs)
     if resp.status_code == 200:
         return resp.content
-    logging.debug(f"Failed to download data from: {url}\nResponse:\n{resp.content}")
-    raise exceptions.RequestError
+    _raise_for_failed_response(url, resp)
+    raise exceptions.RequestError  # unreachable, satisfies type checker
 
 
 def post_json(self, url: str, **kwargs) -> dict:
@@ -49,6 +137,11 @@ def get_json(self, url: str, **kwargs) -> dict:
     return json.loads(resp.decode('utf8'))
 
 
+def _segment_extension(uri: str) -> str:
+    path = urlparse(uri).path
+    return os.path.splitext(path)[1][1:]
+
+
 def get_stream_files(
     self,
     url: str,
@@ -57,24 +150,42 @@ def get_stream_files(
     expected_content_type="application/octet-stream",
 ) -> List[AudiobookFile]:
     """Creates a list of audio files from an m3u8 file"""
-    if headers is None:
-        headers = {}
-    content = self.get(url, headers=headers).decode("utf-8")
+    base_headers = dict(headers) if headers else {}
+    content = self.get(url, headers=base_headers).decode("utf-8")
     playlist = m3u8.loads(content, uri=url)
-    files = []
-    for _, seg in enumerate(playlist.segments):
-        if extension is None:
-            extension = os.path.splitext(seg.absolute_uri)[1][1:].split("?")[0]
-        current = AudiobookFile(
-            url = seg.absolute_uri,
-            ext = extension,
-            headers = headers,
-            expected_content_type = expected_content_type
+
+    # Resolve master/variant playlists to the highest-bandwidth stream.
+    seen_urls = {url}
+    while playlist.is_variant and playlist.playlists:
+        best = max(
+            playlist.playlists,
+            key=lambda p: (p.stream_info.bandwidth or 0) if p.stream_info else 0,
         )
-        if hasattr(seg.key, "method") and not seg.key.method == "NONE":
+        next_url = best.absolute_uri
+        if not next_url or next_url in seen_urls:
+            break
+        seen_urls.add(next_url)
+        content = self.get(next_url, headers=base_headers).decode("utf-8")
+        playlist = m3u8.loads(content, uri=next_url)
+
+    media_sequence = playlist.media_sequence or 0
+    files = []
+    for idx, seg in enumerate(playlist.segments):
+        seg_ext = extension if extension is not None else _segment_extension(seg.absolute_uri)
+        current = AudiobookFile(
+            url=seg.absolute_uri,
+            ext=seg_ext,
+            headers=dict(base_headers),
+            expected_content_type=expected_content_type,
+        )
+        if seg.key is not None and getattr(seg.key, "method", None) not in (None, "NONE"):
+            if seg.key.iv is not None:
+                iv_bytes = int(seg.key.iv, 0).to_bytes(16, byteorder="big")
+            else:
+                iv_bytes = (media_sequence + idx).to_bytes(16, byteorder="big")
             current.encryption_method = AESEncryption(
-                key = self._get_page(seg.key.absolute_uri, headers=headers),
-                iv = int(seg.key.iv, 0).to_bytes(16, byteorder='big')
+                key=self._get_page(seg.key.absolute_uri, headers=base_headers),
+                iv=iv_bytes,
             )
         files.append(current)
     return files
@@ -86,7 +197,7 @@ def _get_all_cookies(session: requests.Session) -> Dict[str, str]:
 
     :returns: Dictionary of cookies
     """
-    cookies = {}
-    for cookie in session.cookies:
+    cookies: Dict[str, str] = {}
+    for cookie in CookieJar.__iter__(session.cookies):
         cookies[cookie.name] = str(cookie.value)
     return cookies

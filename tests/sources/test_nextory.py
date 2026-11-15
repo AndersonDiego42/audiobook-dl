@@ -238,3 +238,41 @@ def test_checksum_helpers():
     assert calculate_password_checksum("pass", "salt") == (
         hashlib.md5(b"passsalt").hexdigest().upper()
     )
+
+
+def test_wantlist_pagination_and_secret_redaction(tmp_path, monkeypatch):
+    from audiobookdl import logging as adl_logging
+
+    src = _make_source(tmp_path)
+    captured_debug = []
+    monkeypatch.setattr(adl_logging, "debug", lambda msg, **_kw: captured_debug.append(msg))
+
+    src._session.post = MagicMock(
+        side_effect=[
+            _json_resp({"login_token": "super-secret-login-tok", "country": "SE"}),
+            _json_resp({"profile_token": "super-secret-profile-tok"}),
+        ]
+    )
+    src._session.get = MagicMock(
+        return_value=_json_resp({"profiles": [{"login_key": "k1"}]})
+    )
+    src.login("https://www.nextory.se/bok/test-1", username="u", password="p")
+    assert all("super-secret-profile-tok" not in m for m in captured_debug)
+
+    page_0 = [_book_entry(i) for i in range(100)]
+    page_1 = [_book_entry(100)]
+
+    def fake_get(url, params=None, **_kwargs):
+        if url.endswith("/me/product_lists"):
+            return _json_resp({"product_lists": [{"type": "want_to_read", "id": "wl-1"}]})
+        if url.endswith("/want_to_read/products"):
+            if params["page"] == "0":
+                return _json_resp({"products": page_0})
+            if params["page"] == "1":
+                return _json_resp({"products": page_1})
+        raise AssertionError(f"Unexpected GET {url} {params}")
+
+    src._session.get = MagicMock(side_effect=fake_get)
+    items = src.download_want_to_read_list()
+    assert len(items) == 101
+    assert items[-1]["id"] == 100

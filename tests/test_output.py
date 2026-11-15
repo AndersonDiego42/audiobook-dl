@@ -21,7 +21,7 @@ from audiobookdl.output.output import (
     resolve_aac_bitrate,
 )
 from audiobookdl.output.download import get_output_audio_format
-from audiobookdl.utils import find_executable, normalize_audio_bitrate
+from audiobookdl.utils import AudioProbeInfo, find_executable, normalize_audio_bitrate
 from audiobookdl.utils.concurrency import run_cancellable_subprocess
 
 class _OutputTestCase(TypedDict):
@@ -80,7 +80,7 @@ def test_convert_output_preserves_original_on_ffmpeg_failure(tmp_path):
     mp3 = tmp_path / "book.mp3"
     mp3.write_bytes(b"mp3-bytes")
     with patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"), \
-         patch("audiobookdl.output.output._ffmpeg_audio_codec", return_value="mp3"), \
+         patch("audiobookdl.output.output._probe_audio_info", return_value=AudioProbeInfo(codec_name="mp3")), \
          patch("audiobookdl.output.output.run_cancellable_subprocess", return_value=SimpleNamespace(returncode=1, stderr=b"boom")):
         with pytest.raises(GenericAudiobookDLException):
             convert_output([str(mp3)], "m4b")
@@ -98,7 +98,7 @@ def test_convert_output_aac_to_m4b_uses_stream_copy(tmp_path):
         return SimpleNamespace(returncode=0, stderr=b"")
 
     with patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"), \
-         patch("audiobookdl.output.output._ffmpeg_audio_codec", return_value="aac"), \
+         patch("audiobookdl.output.output._probe_audio_info", return_value=AudioProbeInfo(codec_name="aac")), \
          patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run):
         result = convert_output([str(ts_file)], "m4b")
 
@@ -202,8 +202,7 @@ def test_gen_output_location_enforces_utf8_component_limit_and_windows_max_path(
 def test_combine_audiofiles_sizes_remux_pool_dynamically(tmp_path, monkeypatch):
     monkeypatch.setattr(output, "_require_executable", lambda name: name)
     monkeypatch.setattr(output, "_remux_to_mpegts", lambda src, dst, cancel_event=None: open(dst, "wb").write(b"ts") > 0)
-    monkeypatch.setattr(output, "_ffmpeg_audio_codec", lambda path: "mp3")
-    monkeypatch.setattr(output, "_ffprobe_duration", lambda path: 10.0)
+    monkeypatch.setattr(output, "_probe_audio_info", lambda path: AudioProbeInfo(duration=10.0, codec_name="mp3"))
 
     def fake_run(cmd, **kwargs):
         with open(cmd[-1], "wb") as f:
@@ -277,7 +276,7 @@ def test_convert_combine_and_chapters_clean_partial_output_on_cancel(tmp_path, m
         raise DownloadCancelled
 
     monkeypatch.setattr(output, "_require_executable", lambda name: name)
-    monkeypatch.setattr(output, "_ffmpeg_audio_codec", lambda path: "mp3")
+    monkeypatch.setattr(output, "_probe_audio_info", lambda path: AudioProbeInfo(codec_name="mp3"))
     monkeypatch.setattr(output, "run_cancellable_subprocess", cancelling_convert)
 
     with pytest.raises(DownloadCancelled):
@@ -330,7 +329,14 @@ def test_combine_audiofiles_isolates_work_dir_and_cleans_on_failure(tmp_path, mo
 
     monkeypatch.setattr(output, "_require_executable", lambda name: name)
     monkeypatch.setattr(output, "_remux_to_mpegts", lambda s, d, cancel_event=None: open(d, "wb").write(b"ts") > 0)
-    monkeypatch.setattr(output, "_ffmpeg_audio_codec", lambda path: "mp3")
+    monkeypatch.setattr(
+        output,
+        "_probe_audio_info",
+        lambda path: AudioProbeInfo(
+            duration=100.0 if path.endswith("combined.ts") else 10.0,
+            codec_name="mp3",
+        ),
+    )
 
     def failing_mux(cmd, **kwargs):
         # Simulate ffmpeg writing a corrupt partial file before failing
@@ -340,7 +346,6 @@ def test_combine_audiofiles_isolates_work_dir_and_cleans_on_failure(tmp_path, mo
 
     # Empty output triggers FailedCombining when partial file exists? Force size 0 or truncation:
     monkeypatch.setattr(output, "run_cancellable_subprocess", failing_mux)
-    monkeypatch.setattr(output, "_ffprobe_duration", lambda path: 100.0 if path.endswith("combined.ts") else 10.0)
 
     with pytest.raises(FailedCombining):
         combine_audiofiles([str(part0)], str(parts_dir), str(out_m4b))
@@ -395,8 +400,7 @@ def test_convert_output_passes_auto_and_explicit_aac_bitrate(tmp_path):
 
     # Auto mode uses probed bitrate (e.g., 96k)
     with patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"), \
-         patch("audiobookdl.output.output._ffmpeg_audio_codec", return_value="mp3"), \
-         patch("audiobookdl.output.output._ffprobe_audio_bitrate", return_value=96000), \
+         patch("audiobookdl.output.output._probe_audio_info", return_value=AudioProbeInfo(codec_name="mp3", bitrate=96000)), \
          patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run):
         convert_output([str(mp3)], "m4b")
 
@@ -407,8 +411,7 @@ def test_convert_output_passes_auto_and_explicit_aac_bitrate(tmp_path):
     mp3.write_bytes(b"mp3-bytes")
     (tmp_path / "book.m4b").unlink()
     with patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"), \
-         patch("audiobookdl.output.output._ffmpeg_audio_codec", return_value="mp3"), \
-         patch("audiobookdl.output.output._ffprobe_audio_bitrate", return_value=64000), \
+         patch("audiobookdl.output.output._probe_audio_info", return_value=AudioProbeInfo(codec_name="mp3", bitrate=64000)), \
          patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run):
         convert_output([str(mp3)], "m4b", audio_bitrate="192k")
 
@@ -496,4 +499,240 @@ def test_gen_output_location_sanitizes_windows_reserved_names_and_reserves_temp_
 
     assert output.OUTPUT_PATH_EXT_RESERVE >= len(".work/ts_parts/0000.ts")
     assert output.OUTPUT_PATH_EXT_RESERVE >= len(".m4b.chapters.tmp.txt")
+
+
+def test_probe_audio_info_single_ffprobe_call(tmp_path):
+    from unittest.mock import MagicMock
+
+    sample = tmp_path / "sample.mp3"
+    sample.write_bytes(b"audio")
+    payload = '{"format": {"duration": "123.45", "bit_rate": "128000", "format_name": "mp3"}, "streams": [{"codec_name": "mp3", "bit_rate": "96000"}]}'
+    mock_result = MagicMock(returncode=0, stdout=payload)
+
+    with (
+        patch("audiobookdl.utils.find_executable", return_value="ffprobe"),
+        patch("audiobookdl.utils.subprocess.run", return_value=mock_result) as mock_run,
+    ):
+        info = output._probe_audio_info(str(sample))
+
+    mock_run.assert_called_once()
+    assert info.duration == pytest.approx(123.45)
+    assert info.bitrate == 96000
+    assert info.codec_name == "mp3"
+    assert info.format_name == "mp3"
+
+
+def test_combine_audiofiles_skips_remux_on_mpegts_and_single_file_embeds_chapters(tmp_path):
+    from pathlib import Path
+    from unittest.mock import MagicMock
+    from audiobookdl import Chapter
+
+    tmp_dir = tmp_path / "parts"
+    tmp_dir.mkdir()
+    sync_pkt = b"\x47" + b"\x00" * 187
+    p0 = tmp_dir / "0.ts"
+    p1 = tmp_dir / "1.ts"
+    p0.write_bytes(sync_pkt * 4)
+    p1.write_bytes(sync_pkt * 4)
+    out_path = tmp_path / "Book.m4b"
+    cmds = []
+
+    def fake_run(cmd, capture_output=False, cancel_event=None):
+        cmds.append(cmd)
+        Path(cmd[-1]).write_bytes(b"combined-m4b")
+        return MagicMock(returncode=0, stderr=b"")
+
+    with (
+        patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
+        patch("audiobookdl.output.output._remux_to_mpegts") as mock_remux,
+        patch(
+            "audiobookdl.output.output._probe_audio_info",
+            return_value=output.AudioProbeInfo(duration=10.0, bitrate=128000, codec_name="aac", format_name="mpegts"),
+        ),
+        patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run),
+    ):
+        chapters_embedded = output.combine_audiofiles(
+            [str(p0), str(p1)],
+            str(tmp_dir),
+            str(out_path),
+            chapters=[Chapter(start=0, title="Intro"), Chapter(start=5000, title="Ch 1")],
+        )
+        assert chapters_embedded is False
+        mock_remux.assert_not_called()
+
+        single_mp3 = tmp_path / "Single.mp3"
+        single_mp3.write_bytes(b"mp3")
+        new_path, single_embedded = output.convert_single_file(
+            str(single_mp3),
+            "m4b",
+            chapters=[Chapter(start=0, title="Intro"), Chapter(start=5000, title="Ch 1")],
+        )
+        assert new_path == str(tmp_path / "Single.m4b")
+        assert single_embedded is True
+        assert "-map_chapters" in cmds[-1]
+
+
+def test_convert_output_parallel_preserves_sources_on_failure(tmp_path):
+    f0 = tmp_path / "part0.mp3"
+    f1 = tmp_path / "part1.mp3"
+    f0.write_bytes(b"p0")
+    f1.write_bytes(b"p1")
+    out0 = tmp_path / "part0.m4b"
+    out1 = tmp_path / "part1.m4b"
+
+    def fake_convert_single(old_path, target_format, cancel_event=None, audio_bitrate=None, remove_source=True):
+        if old_path == str(f0):
+            out0.write_bytes(b"m4b0")
+            return str(out0), False
+        raise GenericAudiobookDLException("boom")
+
+    with (
+        patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
+        patch("audiobookdl.output.output.convert_single_file", side_effect=fake_convert_single),
+    ):
+        with pytest.raises(GenericAudiobookDLException, match="boom"):
+            convert_output([str(f0), str(f1)], "m4b")
+
+    assert f0.exists()
+    assert f1.exists()
+    assert not out0.exists()
+    assert not out1.exists()
+
+
+def test_run_cancellable_subprocess_ffmpeg_progress_callback():
+    from audiobookdl.utils.concurrency import ffmpeg_progress_callback, run_cancellable_subprocess
+
+    reported = []
+    script = (
+        "import sys; "
+        "sys.stdout.write('out_time_us=1500000\\nprogress=continue\\nout_time_us=3000000\\nprogress=end\\n'); "
+        "sys.stdout.flush()"
+    )
+    with ffmpeg_progress_callback(reported.append):
+        proc = run_cancellable_subprocess(
+            [sys.executable, "-c", script, "-progress", "pipe:1"],
+            capture_output=True,
+        )
+
+    assert proc.returncode == 0
+    assert reported == [1.5, 3.0]
+
+
+def test_gen_output_location_conditional_segments_and_presets():
+    from datetime import date
+    import pycountry
+    from audiobookdl.output.output import OUTPUT_TEMPLATE_PRESETS
+
+    with_series = AudiobookMetadata(
+        title="Dune Messiah",
+        authors=["Frank Herbert"],
+        series="Dune Saga",
+        series_order=2,
+        language=pycountry.languages.get(alpha_2="en"),
+        release_date=date(1969, 10, 15),
+        source="storytel",
+    )
+    abs_path = gen_output_location(OUTPUT_TEMPLATE_PRESETS["audiobookshelf"], with_series, "")
+    assert abs_path.replace("\\", "/") == "Frank Herbert/Dune Saga/Book 02 - Dune Messiah"
+
+    standalone = AudiobookMetadata(
+        title="Standalone Title",
+        authors=["Author One"],
+        language=pycountry.languages.get(alpha_2="de"),
+        release_date=date(2021, 3, 1),
+        scrape_url="https://www.librivox.org/book/123",
+    )
+    abs_standalone = gen_output_location(OUTPUT_TEMPLATE_PRESETS["audiobookshelf"], standalone, "")
+    assert abs_standalone.replace("\\", "/") == "Author One/Standalone Title"
+
+    kavita_path = gen_output_location(OUTPUT_TEMPLATE_PRESETS["kavita"], standalone, "")
+    assert kavita_path.replace("\\", "/") == "Author One/(2021) Standalone Title"
+
+    else_tpl = "{source}/{language}/{series?Series {series}|Standalone} - {title}"
+    rendered_else = gen_output_location(else_tpl, standalone, "")
+    assert rendered_else.replace("\\", "/") == "librivox/deu/Standalone - Standalone Title"
+
+
+def test_real_ffmpeg_split_chapters_and_hls_smart_merge(tmp_path):
+    ffmpeg_bin = find_executable("ffmpeg")
+    if not ffmpeg_bin:
+        pytest.skip("ffmpeg not available")
+    assert ffmpeg_bin is not None
+    from audiobookdl.output.output import (
+        merge_hls_segments_into_chapters,
+        should_smart_merge_hls,
+        split_audio_by_chapters,
+    )
+
+    # Create 4x 1-second MPEG-TS AAC segments
+    seg_paths = []
+    for idx in range(4):
+        seg = tmp_path / f"seg_{idx}.ts"
+        subprocess.run(
+            [
+                ffmpeg_bin,
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                f"sine=frequency={440 + idx * 110}:duration=1",
+                "-c:a",
+                "aac",
+                "-f",
+                "mpegts",
+                str(seg),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        seg_paths.append(str(seg))
+
+    chapters = [
+        Chapter(start=0, title="Intro"),
+        Chapter(start=2000, title="Act I"),
+    ]
+    assert should_smart_merge_hls(seg_paths, chapters) is True
+
+    merge_dir = tmp_path / "merged_chapters"
+    merge_dir.mkdir()
+    copied_segs = []
+    for i, sp in enumerate(seg_paths):
+        dst = merge_dir / f"seg_{i}.ts"
+        dst.write_bytes(open(sp, "rb").read())
+        copied_segs.append(str(dst))
+
+    merged_files = merge_hls_segments_into_chapters(
+        copied_segs,
+        str(merge_dir),
+        chapters,
+        output_format="m4b",
+    )
+    assert len(merged_files) == 2
+    assert os.path.basename(merged_files[0]) == "01 - Intro.m4b"
+    assert os.path.basename(merged_files[1]) == "02 - Act I.m4b"
+    assert all(os.path.exists(p) and os.path.getsize(p) > 0 for p in merged_files)
+
+    # Direct split_audio_by_chapters on single m4b
+    master = tmp_path / "single.mp3"
+    subprocess.run(
+        [
+            ffmpeg_bin,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=3",
+            "-c:a",
+            "libmp3lame",
+            str(master),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    split_dir = tmp_path / "split_mp3"
+    split_paths = split_audio_by_chapters(str(master), str(split_dir), chapters)
+    assert len(split_paths) == 2
+    assert os.path.basename(split_paths[0]) == "01 - Intro.mp3"
+    assert os.path.basename(split_paths[1]) == "02 - Act I.mp3"
+    assert all(os.path.getsize(p) > 0 for p in split_paths)
 

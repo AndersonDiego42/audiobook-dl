@@ -45,12 +45,12 @@ class EverandSource(Source[str]):
         :param series_id: Id of series
         :returns: Book ids of books in series
         """
-        response = self._session.get(
+        response = self.get_json(
             f"https://www.everand.com/series/{series_id}/data",
             headers = {
                 "X-Requested-With": "XMLHttpRequest"
             }
-        ).json()
+        )
         return [
             BookId(i["id"])
             for i in response["compilation"]["modules"][0]["documents"]
@@ -72,7 +72,7 @@ class EverandSource(Source[str]):
             "https://www.everand.com/csrf_token",
             headers = { "href": url }
         )
-        logging.debug(f"{csrf=}")
+        logging.debug(f"csrf_received={bool(csrf)}")
         return Audiobook(
             session = self._session,
             files = self.get_files(book_info),
@@ -133,7 +133,7 @@ class EverandSource(Source[str]):
         account_id = book_info["audiobook"]["account_id"]
         logging.debug(f"{account_id=}")
         session_key = book_info["audiobook"]["session_key"]
-        logging.debug(f"{session_key=}")
+        logging.debug(f"session_key={logging.mask_secret(session_key)}")
         headers = { "Session-Key": session_key }
         license_id = self.get_json(
             f"https://api.findawayworld.com/v4/accounts/{account_id}/audiobooks/{external_id}",

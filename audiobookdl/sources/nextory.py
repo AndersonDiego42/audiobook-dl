@@ -1,13 +1,12 @@
-from .source import Source
+from .source import CatalogBook, Source
 from audiobookdl import AudiobookFile, Chapter, AudiobookMetadata, Cover, Audiobook, BookId, Result, Series, logging
 from audiobookdl.exceptions import DataNotPresent, AudiobookDLException, BookHasNoAudiobook, UserNotAuthorized, GenericAudiobookDLException
 from typing import Any, Optional, Dict, List, Union
 
+import calendar
 from datetime import date, datetime
-from dateutil.relativedelta import relativedelta
 import hashlib
 import uuid
-import platform
 import pycountry
 
 
@@ -45,7 +44,12 @@ class NextorySource(Source):
         return str(uuid.uuid3(uuid.NAMESPACE_DNS, "audiobook-dl"))
 
     def get_compatible_app_version(self):
-        d = date.today() - relativedelta(months=2)
+        today = date.today()
+        month_idx = today.year * 12 + (today.month - 1) - 2
+        year, month_zero = divmod(month_idx, 12)
+        month = month_zero + 1
+        day = min(today.day, calendar.monthrange(year, month)[1])
+        d = date(year, month, day)
         # Nextory ios apps have changed their versioning number to 
         # the format yyyy-mm-dd
         return f"{d.year}-{d.month}-{d.day}"
@@ -64,7 +68,8 @@ class NextorySource(Source):
                 "X-Os-Info": "ios"            }
         )
         # Login for account
-        session_response = self._session.post(
+        session_response = self.request(
+            "POST",
             "https://api.nextory.com/user/v1/sessions",
             json = {
                 "identifier": username,
@@ -72,7 +77,7 @@ class NextorySource(Source):
             },
         )
         session_response_json = session_response.json()
-        logging.debug(f"{session_response=}")
+        logging.debug(f"nextory login status={session_response.status_code}")
         
         
         login_token = session_response_json.get("login_token")
@@ -97,22 +102,20 @@ class NextorySource(Source):
             }
         )
         # Login for user
-        profiles_response = self._session.get(
+        profiles_response_json = self.get_json(
             "https://api.nextory.com/user/v1/me/profiles",
         )
-        profiles_response_json = profiles_response.json()
         profile = profiles_response_json["profiles"][0]
         login_key = profile["login_key"]
-        authorize_response = self._session.post(
+        authorize_response_json = self.post_json(
             "https://api.nextory.com/user/v1/profile/authorize",
             json = {
                 "login_key": login_key
             }
         )
-        authorize_response_json = authorize_response.json()
         profile_token = authorize_response_json["profile_token"]
         self._session.headers.update({"X-Profile-Token": profile_token})
-        logging.debug(f"{profile_token=}")
+        logging.debug(f"profile_token={logging.mask_secret(profile_token)}")
 
 
     def download(self, url) -> Result:
@@ -184,13 +187,13 @@ class NextorySource(Source):
 
     def download_want_to_read_id(self) -> str:
         """Downloads profile id for want to read list"""
-        products_lists = self._session.get(
+        products_lists = self.get_json(
             "https://api.nextory.com/library/v1/me/product_lists",
             params = {
                 "page": 0,
                 "per": 50
             }
-        ).json()["product_lists"]
+        )["product_lists"]
         for product_list in products_lists:
             if product_list["type"] == "want_to_read":
                 return product_list["id"]
@@ -199,22 +202,34 @@ class NextorySource(Source):
 
     def download_want_to_read_list(self) -> List[dict]:
         want_to_read_id = self.download_want_to_read_id()
-        return self._session.get(
-            "https://api.nextory.com/library/v1/me/product_lists/want_to_read/products",
-            params = {
-                "page": "0",
-                "per": "1000",
-                "id": want_to_read_id
-            }
-        ).json()["products"]
+        all_products: List[dict] = []
+        per = 100
+        page = 0
+        while True:
+            data = self.get_json(
+                "https://api.nextory.com/library/v1/me/product_lists/want_to_read/products",
+                params = {
+                    "page": str(page),
+                    "per": str(per),
+                    "id": want_to_read_id
+                }
+            )
+            products = data.get("products") or []
+            all_products.extend(products)
+            if data.get("has_next") is False:
+                break
+            if not products or (len(products) < per and not data.get("has_next")):
+                break
+            page += 1
+        return all_products
 
 
     def download_audio_data(self, book_info: dict) -> dict:
         format_data = self.find_format_data(book_info)
         format_id = format_data["identifier"]
-        return self._session.get(
+        return self.get_json(
             f"https://api.nextory.com/reader/books/{format_id}/packages/audio"
-        ).json()
+        )
 
 
     @staticmethod
@@ -227,6 +242,10 @@ class NextorySource(Source):
 
     def get_files(self, audio_data) -> List[AudiobookFile]:
         files = []
+        session_headers: Dict[str, str] = {
+            str(k): v.decode("latin-1") if isinstance(v, bytes) else str(v)
+            for k, v in self._session.headers.items()
+        }
         for file in audio_data["files"]:
             # master url redirects to media url
             # TODO Handle redirect correctly
@@ -234,7 +253,7 @@ class NextorySource(Source):
             files.extend(
                 self.get_stream_files(
                     media_url,
-                    headers=self._session.headers,
+                    headers=session_headers,
                     expected_content_type=("audio/aac", "audio/x-aac", "video/MP2T"),
                 )
             )
@@ -317,3 +336,30 @@ class NextorySource(Source):
         cover_url = self.find_format_data(book_info)["img_url"]
         cover_data = self.get(cover_url)
         return Cover(cover_data, "jpg")
+
+    supports_library = True
+
+    def list_library(self) -> List[CatalogBook]:
+        products = self.download_want_to_read_list()
+        results: List[CatalogBook] = []
+        for product in products or ():
+            if not isinstance(product, dict):
+                continue
+            prod_id = product.get("id")
+            if not prod_id:
+                continue
+            title = str(product.get("title") or prod_id)
+            authors = [
+                str(a.get("name") or "")
+                for a in (product.get("authors") or [])
+                if isinstance(a, dict)
+            ]
+            results.append(
+                CatalogBook(
+                    title=title,
+                    url=f"https://www.nextory.com/book/{prod_id}",
+                    author=", ".join(a for a in authors if a),
+                    source="nextory",
+                )
+            )
+        return results

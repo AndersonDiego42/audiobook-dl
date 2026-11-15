@@ -5,7 +5,8 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from typing import Any, List, Union
+from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
@@ -1105,3 +1106,327 @@ def test_gui_resume_and_m4b_bitrate_sync_and_persistence(tmp_path):
         assert opts2.audio_bitrate == "192k"
     finally:
         root2.destroy()
+
+
+def test_gui_log_caps_line_count(tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+        for i in range(AudiobookDLApp.MAX_LOG_LINES + 50):
+            app._append_log(f"line {i}")
+        total_lines = int(app.log_text.index("end-1c").split(".")[0])
+        assert total_lines <= AudiobookDLApp.MAX_LOG_LINES + 1
+        assert "line 0" not in app.log_text.get("1.0", "2.0")
+    finally:
+        root.destroy()
+
+
+def test_gui_queue_move_remove_retry_and_clear(tmp_path, monkeypatch):
+    from audiobookdl.gui.app import _QueuedJob, _GuiInteractionHandler
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+        interaction = _GuiInteractionHandler(app._queue, app._cancel_event)
+        opts_a = app.build_options(urls_override=["https://librivox.org/book-a"])
+        opts_b = app.build_options(urls_override=["https://librivox.org/book-b"])
+        job_a = _QueuedJob(job_id="job_a", run_id=1, url="https://librivox.org/book-a", options=opts_a, interaction=interaction)
+        job_b = _QueuedJob(job_id="job_b", run_id=1, url="https://librivox.org/book-b", options=opts_b, interaction=interaction)
+        with app._queue_cond:
+            app._worker_has_active_run = True
+            app._batch_total = 2
+            app._run_seen_urls = {job_a.url, job_b.url}
+            app._pending_jobs.extend([job_a, job_b])
+        app._register_queue_job(job_a)
+        app._register_queue_job(job_b)
+
+        # Move job_b up before job_a
+        app.queue_tree.selection_set("job_b")
+        app._move_selected_queue_item(-1)
+        assert [j.job_id for j in app._pending_jobs if j is not None] == ["job_b", "job_a"]
+        assert list(app.queue_tree.get_children()) == ["job_b", "job_a"]
+
+        # Remove job_a
+        app.queue_tree.selection_set("job_a")
+        app._remove_selected_queue_item()
+        assert [j.job_id for j in app._pending_jobs if j is not None] == ["job_b"]
+        assert list(app.queue_tree.get_children()) == ["job_b"]
+        assert app._batch_total == 1
+
+        # Retry failed items and clear history
+        app._pending_jobs.clear()
+        app._worker_has_active_run = False
+        app._update_queue_row("job_b", "Failed", "timeout")
+
+        retried = {}
+        monkeypatch.setattr(app, "_ensure_ffmpeg_available", lambda _opts: True)
+        monkeypatch.setattr(app, "_save_run_preferences", lambda _opts: None)
+        monkeypatch.setattr(app, "_start_new_run", lambda specs: retried.setdefault("urls", [s[0] for s in specs]))
+        app._retry_failed_queue_items()
+        assert retried["urls"] == ["https://librivox.org/book-b"]
+
+        app._clear_completed_history()
+        assert list(app.queue_tree.get_children()) == []
+    finally:
+        root.destroy()
+
+
+def test_gui_series_preview_filter_and_shift_range(tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+        app.output_dir_var.set(str(tmp_path))
+        app.template_var.set("{title}")
+        app.skip_downloaded_var.set(True)
+        (tmp_path / "Alpha Book.m4b").write_bytes(b"existing")
+
+        sess = requests.Session()
+        books: List[Union[Audiobook, BookId[Any]]] = [
+            Audiobook(
+                session=sess,
+                metadata=AudiobookMetadata(title="Alpha Book", authors=["Author"]),
+                files=[],
+                chapters=[],
+            ),
+            Audiobook(
+                session=sess,
+                metadata=AudiobookMetadata(title="Beta Book", authors=["Author"]),
+                files=[],
+                chapters=[],
+            ),
+            Audiobook(
+                session=sess,
+                metadata=AudiobookMetadata(title="Gamma Book", authors=["Author"]),
+                files=[],
+                chapters=[],
+            ),
+        ]
+        series = Series(title="My Series", books=books)
+        fake_source = MagicMock()
+        fake_source.name = "storytel"
+        dialog = app._show_preview_dialog("https://www.storytel.com/series/1", fake_source, series)
+        root.update_idletasks()
+        try:
+            assert "[Exists]" in dialog._checkbuttons[0][1]
+            assert "[Exists]" not in dialog._checkbuttons[1][1]
+
+            # Shift+Click range selection from 0 to 2 after unchecking index 0
+            dialog._check_vars[0].set(False)
+            dialog._toggle_series_item(0, shift_held=False)
+            dialog._check_vars[2].set(False)
+            dialog._toggle_series_item(2, shift_held=True)
+            assert [v.get() for v in dialog._check_vars] == [False, False, False]
+
+            # Filter entry hides non-matching checkbuttons cleanly
+            dialog._filter_var.set("beta")
+            root.update_idletasks()
+            mapped = [cb.winfo_manager() for _, _, cb in dialog._checkbuttons]
+            assert mapped == ["", "pack", ""]
+        finally:
+            dialog.destroy()
+    finally:
+        root.destroy()
+
+
+def test_gui_ignores_stale_item_progress_and_warns_mixed_services(tmp_path, monkeypatch):
+    from audiobookdl.gui.app import parse_gui_args
+
+    parsed = parse_gui_args(["--config", str(tmp_path / "custom.toml")])
+    assert parsed.config_location == str(tmp_path / "custom.toml")
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+        app._current_ui_run_id = 2
+        app._handle_event(("item_progress", 1, 3, 5, "Old Run Book"))
+        assert app._ui_book_index == 0
+        app._handle_event(("item_progress", 2, 1, 4, "Current Run Book"))
+        assert app._ui_book_index == 1
+        assert app._ui_book_total == 4
+
+        app.service_label_var.set("Storytel")
+        app._on_service_selected()
+        asked = {}
+        monkeypatch.setattr(
+            "audiobookdl.gui.app.messagebox.askyesno",
+            lambda title, msg, parent=None: asked.setdefault("msg", msg) and False,
+        )
+        proceed = app._warn_mixed_service_credentials([
+            "https://www.storytel.com/books/1",
+            "https://www.nextory.com/book/2",
+        ])
+        assert proceed is False
+        assert "Nextory" in asked["msg"]
+    finally:
+        root.destroy()
+
+
+def test_gui_template_preset_and_live_preview(tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+        app.output_dir_var.set(str(tmp_path))
+        app.template_preset_var.set("Audiobookshelf")
+        app._on_preset_selected()
+        assert "series_order_padded" in app.template_var.get()
+        preview = app.template_preview_var.get().replace("\\", "/")
+        assert "Frank Herbert/Dune Chronicles/Book 01 - Dune" in preview
+
+        app.template_var.set("{author} - {title}")
+        assert app.template_preset_var.get() == "Custom"
+    finally:
+        root.destroy()
+
+
+def test_gui_archive_ledger_dialog_filters_and_populates(tmp_path):
+    from audiobookdl.utils.archive import DownloadArchive
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+        archive_path = tmp_path / "downloads.db"
+        app._config.download_archive = str(archive_path)
+        ledger = DownloadArchive(str(archive_path))
+        ledger.record("storytel", "k1", title="First Audiobook", author="Alice")
+        ledger.record("librivox", "k2", title="Second Audiobook", author="Bob")
+
+        dialog = app._show_archive_ledger_dialog()
+        root.update_idletasks()
+        try:
+            assert len(dialog._tree.get_children()) == 2
+            dialog._search_var.set("alice")
+            root.update_idletasks()
+            assert len(dialog._tree.get_children()) == 1
+        finally:
+            dialog.destroy()
+    finally:
+        root.destroy()
+
+
+def test_gui_verify_auth_catalog_browser_and_update_handlers(tmp_path, monkeypatch):
+    from audiobookdl.sources.source import CatalogBook
+    from audiobookdl.utils.updater import UpdateInfo
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+        app.enrich_metadata_var.set(True)
+        opts = app.build_options(urls_override=[])
+        assert opts.enrich_metadata is True
+
+        shown_info = []
+        monkeypatch.setattr(
+            "audiobookdl.gui.app.messagebox.showinfo",
+            lambda title, msg, parent=None: shown_info.append((title, msg)),
+        )
+        app._is_verifying_auth = True
+        app._handle_event(("auth_verified", "Storytel", True, None))
+        assert not app._is_verifying_auth
+        assert "Login OK: Storytel" in app.status_var.get()
+        assert shown_info[-1][0] == "Test Login"
+
+        app._handle_event((
+            "update_checked",
+            UpdateInfo(current_version="0.7.7", latest_version="1.2.0", has_update=True),
+            True,
+        ))
+        assert "Update available: v1.2.0" in app.status_var.get()
+        assert shown_info[-1][0] == "Update Available"
+
+        dialog = app._show_catalog_browser_dialog()
+        root.update_idletasks()
+        try:
+            dialog._populate_items(
+                [
+                    CatalogBook(
+                        title="Found Book 1",
+                        url="https://librivox.org/book-1",
+                        author="Author A",
+                        series="Series X",
+                        source="librivox",
+                    ),
+                    CatalogBook(
+                        title="Found Book 2",
+                        url="https://librivox.org/book-2",
+                        author="Author B",
+                        source="librivox",
+                    ),
+                ]
+            )
+            dialog._tree.selection_set(("book-0",))
+            dialog._add_selected()
+            assert "https://librivox.org/book-1" in app.urls_text.get("1.0", tk.END)
+            assert "https://librivox.org/book-2" not in app.urls_text.get("1.0", tk.END)
+        finally:
+            try:
+                if dialog.winfo_exists():
+                    dialog.destroy()
+            except tk.TclError:
+                pass
+    finally:
+        root.destroy()
+
+
+def test_gui_scroll_layout_prevents_lower_clipping(tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+        root.update_idletasks()
+        req_w = app._content_frame.winfo_reqwidth()
+        req_h = app._content_frame.winfo_reqheight()
+        assert req_w <= 650
+
+        # Short viewport: vertical scrollbar activates and lower Activity controls are not crushed
+        short_h = max(320, req_h - 220)
+        # pyrefly: ignore[bad-argument-type]
+        app._sync_scroll_layout(SimpleNamespace(width=700, height=short_h))
+        root.update_idletasks()
+        assert app._vscroll_visible is True
+        configured_h = int(float(app._scroll_canvas.itemcget(app._scroll_window_id, "height")))
+        assert configured_h == req_h
+        app._scroll_canvas.yview_moveto(1.0)
+        assert app._scroll_canvas.yview()[1] == pytest.approx(1.0)
+
+        # Tall viewport: vertical scrollbar hides and content expands to fill canvas height
+        tall_h = req_h + 150
+        # pyrefly: ignore[bad-argument-type]
+        app._sync_scroll_layout(SimpleNamespace(width=820, height=tall_h))
+        # pyrefly: ignore[unnecessary-comparison]
+        assert app._vscroll_visible is False
+        assert int(float(app._scroll_canvas.itemcget(app._scroll_window_id, "height"))) == tall_h
+        assert app._scroll_canvas.cget("scrollregion") == f"0 0 820 {tall_h}"
+        assert app._scroll_canvas.yview()[0] == pytest.approx(0.0)
+    finally:
+        root.destroy()

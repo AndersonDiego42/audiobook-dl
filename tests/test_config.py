@@ -170,3 +170,51 @@ def test_save_ffmpeg_dir_and_resolve_executable(tmp_path):
         assert utils.find_executable("ffprobe") == os.path.join(str(resolved), f"ffprobe{exe_suffix}")
     finally:
         utils.set_ffmpeg_dir(prev)
+
+
+def test_config_normalizes_source_aliases_and_warns_on_unknown_keys(tmp_path):
+    from audiobookdl import logging
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    cfg_path.write_text(
+        'unknown_top_key = "ignored"\n'
+        'output_format = "m4b"\n'
+        'combine = true\n'
+        'max_workers = "not-an-int"\n'
+        '[gui]\n'
+        'bogus_gui_key = 1\n'
+        '[sources.Scribd]\n'
+        'username = "alias-user"\n'
+        'bad_field = "x"\n'
+        '[sources.libby]\n'
+        'library = "nypl"\n',
+        encoding="utf-8",
+    )
+    messages: list[str] = []
+
+    class _Sink:
+        def on_log(self, _level: str, msg: str) -> None:
+            messages.append(msg)
+
+        def on_progress_start(self, _d: str, _t: float) -> None:
+            pass
+
+        def on_progress_advance(self, _c: float, _t: float) -> None:
+            pass
+
+        def on_progress_finish(self) -> None:
+            pass
+
+    with logging.job_context(logging.JobContext(sink=_Sink())):
+        loaded = load_config(str(cfg_path))
+
+    assert "everand" in loaded.sources
+    assert loaded.sources["everand"].username == "alias-user"
+    assert "overdrive" in loaded.sources
+    assert loaded.sources["overdrive"].library == "nypl"
+    assert loaded.max_workers is None
+    joined = "\n".join(messages)
+    assert "unknown_top_key" in joined
+    assert "bogus_gui_key" in joined
+    assert "bad_field" in joined
+    assert "normalized to 'everand'" in joined

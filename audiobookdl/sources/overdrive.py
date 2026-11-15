@@ -50,14 +50,17 @@ class OverdriveSource(Source):
         cover_data = self.get(cover_url)
         return Cover(cover_data, "jpg")
 
-    def _get_previous_length(self, index: int, book_info) -> int:
-        """Returns the ending point of the previous part"""
-        if index == 0:
-            return 0
-        return self._get_previous_length(index-1, book_info) + \
-            book_info["spine"][index-1]["audio-duration"]
+    def _compute_part_offsets(self, book_info) -> List[float]:
+        """Return cumulative start offsets in seconds for each spine part."""
+        offsets: List[float] = []
+        elapsed = 0.0
+        for part in book_info["spine"]:
+            offsets.append(elapsed)
+            elapsed += part["audio-duration"]
+        return offsets
 
     def get_chapters(self, book_info) -> List[Chapter]:
+        part_offsets = self._compute_part_offsets(book_info)
         chapters = []
         for chapter in book_info["nav"]["toc"]:
             timepoint = 0.
@@ -67,7 +70,8 @@ class OverdriveSource(Source):
             if part_result is None:
                 continue
             part = int(part_result.group(0))-1
-            start = int((self._get_previous_length(part, book_info)+timepoint)*1000)
+            base_offset = part_offsets[part] if 0 <= part < len(part_offsets) else 0.0
+            start = int((base_offset + timepoint) * 1000)
             chapters.append(Chapter(start, chapter["title"]))
         return chapters
 
@@ -84,9 +88,10 @@ class OverdriveSource(Source):
                 toc.append(part["title"])
         files = []
         for num, part in enumerate(book_info["spine"]):
+            title = toc[num] if num < len(toc) else f"Part {num + 1}"
             files.append(AudiobookFile(
                 url = f"{prefix}/{part['path']}",
-                title = toc[num],
+                title = title,
                 ext = "mp3"
             ))
         return files

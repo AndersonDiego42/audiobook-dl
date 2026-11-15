@@ -1,18 +1,28 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 import sys
 import threading
+import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from . import __version__, args, logging, output
 from .args import DownloadOptions
 from .config import Config, SourceConfig, load_config
-from .exceptions import AudiobookDLException, BookHasNoAudiobook, BookNotReleased, DownloadCancelled
+from .exceptions import (
+    AudiobookDLException,
+    BookHasNoAudiobook,
+    BookNotReleased,
+    DownloadCancelled,
+    GenericAudiobookDLException,
+    NoSourceFound,
+)
 from .output.download import download
-from .sources import find_compatible_source
-from .sources.source import Source
+from .sources import find_compatible_source, find_source_by_name
+from .sources.source import CatalogBook, Source
 from .utils import set_ffmpeg_dir
+from .utils.archive import DownloadArchive, default_archive_path, make_book_key
 from .utils.audiobook import Audiobook, BookId, Result, Series
+from .utils.enrichment import enrich_metadata_from_openlibrary, resolve_redirect_url
 
 
 @dataclass
@@ -22,6 +32,10 @@ class DownloadSummary:
     completed: int = 0
     failed: int = 0
     cancelled: bool = False
+    books_completed: int = field(default=0, compare=False)
+    books_skipped: int = field(default=0, compare=False)
+    books_failed: int = field(default=0, compare=False)
+    book_errors: List[Tuple[str, str]] = field(default_factory=list, compare=False)
 
 
 @dataclass(frozen=True)
@@ -84,16 +98,38 @@ def apply_runtime_options(
     config: Config,
 ) -> logging.JobContext:
     """Merge config defaults into `options` and build an isolated `JobContext`."""
-    options.output_template = options.output_template or config.output_template or "{title}"
-    options.database_directory = (
-        options.database_directory
-        or config.database_directory
-        or args.default_database_directory()
-    )
-    options.skip_downloaded = bool(options.skip_downloaded or config.skip_downloaded)
-    options.resume = bool(options.resume or config.resume)
-    if options.audio_bitrate is None and config.audio_bitrate:
+    explicit = getattr(options, "_explicit_fields", frozenset())
+    default_db = args.default_database_directory()
+    if "output_template" not in explicit and getattr(options, "output_preset", None):
+        preset_tpl = output.OUTPUT_TEMPLATE_PRESETS.get(options.output_preset or "")
+        if preset_tpl:
+            options.output_template = preset_tpl
+    elif "output_template" not in explicit and options.output_template == "{title}" and config.output_template:
+        options.output_template = config.output_template
+    if "database_directory" not in explicit and options.database_directory == default_db and config.database_directory:
+        options.database_directory = config.database_directory
+    if "download_archive" not in explicit and options.download_archive is None and config.download_archive:
+        options.download_archive = config.download_archive
+    if "output_format" not in explicit and options.output_format is None and config.output_format:
+        options.output_format = config.output_format
+    if "combine" not in explicit and config.combine is not None:
+        options.combine = config.combine
+    if "skip_downloaded" not in explicit and config.skip_downloaded is not None:
+        options.skip_downloaded = config.skip_downloaded
+    if "resume" not in explicit and config.resume is not None:
+        options.resume = config.resume
+    if "audio_bitrate" not in explicit and options.audio_bitrate is None and config.audio_bitrate:
         options.audio_bitrate = config.audio_bitrate
+    if "overwrite" not in explicit and options.overwrite is None and config.overwrite is not None:
+        options.overwrite = config.overwrite
+    if "max_workers" not in explicit and options.max_workers is None and config.max_workers is not None:
+        options.max_workers = config.max_workers
+    if "book_delay" not in explicit and options.book_delay == 0.0 and config.book_delay is not None:
+        options.book_delay = float(config.book_delay)
+    if "proxy" not in explicit and options.proxy is None and config.proxy:
+        options.proxy = config.proxy
+    if "timeout" not in explicit and options.timeout is None and config.timeout is not None:
+        options.timeout = float(config.timeout)
     if config.ffmpeg_dir:
         set_ffmpeg_dir(config.ffmpeg_dir)
     ffmpeg_out = options.ffmpeg_output or options.debug
@@ -102,6 +138,16 @@ def apply_runtime_options(
         quiet=options.quiet,
         ffmpeg_output=ffmpeg_out,
     )
+
+
+def _pause_between_books(delay: float, cancel_event: Optional[threading.Event]) -> None:
+    if delay <= 0:
+        return
+    if cancel_event is not None:
+        if cancel_event.wait(delay):
+            raise DownloadCancelled
+    else:
+        time.sleep(delay)
 
 
 class Downloader:
@@ -200,6 +246,13 @@ class Downloader:
                 if self.cancel_event is not None and self.cancel_event.is_set():
                     summary.cancelled = True
                     break
+                if index > 0 and self.options.book_delay > 0:
+                    try:
+                        _pause_between_books(self.options.book_delay, self.cancel_event)
+                    except DownloadCancelled:
+                        summary.cancelled = True
+                        logging.log("Download cancelled")
+                        break
                 try:
                     extra_kwargs: Dict[str, Any] = {}
                     if index == 0:
@@ -207,21 +260,33 @@ class Downloader:
                             extra_kwargs["selected_indices"] = selected_indices
                         if prefetched is not None:
                             extra_kwargs["prefetched"] = prefetched
+                    before_failed = summary.books_failed
+                    before_completed = summary.books_completed
+                    before_skipped = summary.books_skipped
                     process_url(
                         url,
                         self.options,
                         self.config,
                         interaction=self.interaction,
                         cancel_event=self.cancel_event,
+                        summary=summary,
                         **extra_kwargs,
                     )
-                    summary.completed += 1
+                    if (
+                        summary.books_failed > before_failed
+                        and summary.books_completed == before_completed
+                        and summary.books_skipped == before_skipped
+                    ):
+                        summary.failed += 1
+                    else:
+                        summary.completed += 1
                 except (DownloadCancelled, KeyboardInterrupt):
                     summary.cancelled = True
                     logging.log("Download cancelled")
                     break
                 except AudiobookDLException as e:
                     summary.failed += 1
+                    summary.book_errors.append((url, e.error_description))
                     e.print()
                     if logging.is_debug_mode():
                         logging.print_traceback()
@@ -266,7 +331,19 @@ def prepare_source_result(
     if not (url.startswith("http://") or url.startswith("https://")):
         url = f"https://{url}"
     logging.log("Finding compatible source")
-    source_class = find_compatible_source(url)
+    try:
+        source_class = find_compatible_source(url)
+    except NoSourceFound:
+        resolved_url = resolve_redirect_url(
+            url,
+            proxy=getattr(options, "proxy", None),
+            timeout=getattr(options, "timeout", None) or 10.0,
+        )
+        if resolved_url == url:
+            raise
+        logging.debug(f"Resolved short URL '{url}' -> '{resolved_url}'")
+        url = resolved_url
+        source_class = find_compatible_source(url)
     source = source_class(options)
     handler = interaction or logging.CliInteractionHandler()
     if source.requires_authentication and not source.authenticated:
@@ -296,6 +373,49 @@ def fetch_metadata(
     return result
 
 
+def print_result_info(
+    source: Source,
+    result: Result,
+    options: DownloadOptions,
+    *,
+    selected_indices: Optional[Sequence[int]] = None,
+) -> None:
+    """Display parsed metadata and resolved output path(s) without downloading media."""
+    logging.log(f"[magenta]{source.name}[/] info:")
+    if isinstance(result, Audiobook):
+        if not result.metadata.source:
+            result.metadata.source = source.name
+        location = output.gen_output_location(
+            options.output_template,
+            result.metadata,
+            options.remove_chars,
+        )
+        authors = ", ".join(result.metadata.authors) or "Unknown"
+        narrators = ", ".join(result.metadata.narrators)
+        fmt = options.output_format or (result.files[0].ext if result.files else "unknown")
+        logging.log(f"  Title:    {result.title}")
+        logging.log(f"  Authors:  {authors}")
+        if narrators:
+            logging.log(f"  Narrator: {narrators}")
+        if result.metadata.series:
+            order = f" #{result.metadata.series_order}" if result.metadata.series_order else ""
+            logging.log(f"  Series:   {result.metadata.series}{order}")
+        logging.log(f"  Parts:    {len(result.files)} | Chapters: {len(result.chapters)} | Format: {fmt}")
+        logging.log(f"  Output:   {location}")
+    elif isinstance(result, Series):
+        indices = (
+            list(selected_indices)
+            if selected_indices is not None
+            else list(range(len(result.books)))
+        )
+        logging.log(f"  Series: {result.title} ({len(result.books)} books, {len(indices)} selected)")
+        for idx in indices:
+            if 0 <= idx < len(result.books):
+                entry = result.books[idx]
+                label = entry.title if isinstance(entry, Audiobook) else str(entry)
+                logging.log(f"    [{idx + 1}] {label}")
+
+
 def download_result(
     source: Source,
     result: Result,
@@ -303,14 +423,43 @@ def download_result(
     interaction: Optional[logging.InteractionHandler] = None,
     cancel_event: Optional[threading.Event] = None,
     selected_indices: Optional[Sequence[int]] = None,
+    summary: Optional[DownloadSummary] = None,
 ) -> None:
-    """Download an already-resolved `Audiobook` or `Series` `Result`."""
+    """Download (or inspect when `options.info_only`) a resolved `Audiobook` or `Series` `Result`."""
     handler = interaction or logging.CliInteractionHandler()
+    if (
+        isinstance(result, Series)
+        and selected_indices is None
+        and getattr(options, "series_items", None)
+    ):
+        try:
+            selected_indices = args.parse_series_selection(
+                options.series_items or "",
+                len(result.books),
+            )
+        except ValueError as exc:
+            raise GenericAudiobookDLException(str(exc)) from exc
+
+    if getattr(options, "info_only", False):
+        print_result_info(source, result, options, selected_indices=selected_indices)
+        return
+
     logging.log("")  # Empty line
     if isinstance(result, Audiobook):
         logging.emit_item_progress(1, 1, result.title)
         logging.log(f"Downloading [blue]{result.title}[/] from [magenta]{source.name}[/]")
-        process_audiobook(source, result, options, interaction=handler, cancel_event=cancel_event)
+        processed = process_audiobook(
+            source,
+            result,
+            options,
+            interaction=handler,
+            cancel_event=cancel_event,
+        )
+        if summary is not None:
+            if processed is False:
+                summary.books_skipped += 1
+            else:
+                summary.books_completed += 1
     elif isinstance(result, Series):
         if selected_indices is None:
             books_to_process: List[Union[BookId[Any], Audiobook]] = list(result.books)
@@ -329,18 +478,36 @@ def download_result(
         logging.log(
             f"Downloading [yellow not bold]{count}[/] books in [blue]{result.title}[/] from [magenta]{source.name}[/]"
         )
+        done_count = 0
+        skip_count = 0
+        fail_count = 0
+        errors: List[Tuple[str, str]] = []
         for index, book in enumerate(books_to_process, start=1):
             if cancel_event is not None and cancel_event.is_set():
                 raise DownloadCancelled
+            if index > 1 and getattr(options, "book_delay", 0.0) > 0:
+                _pause_between_books(options.book_delay, cancel_event)
             logging.emit_item_progress(index, count, getattr(book, "title", None) or result.title)
             try:
                 audiobook = audiobook_from_series(source, book)
                 logging.emit_item_progress(index, count, audiobook.title)
-                process_audiobook(source, audiobook, options, interaction=handler, cancel_event=cancel_event)
+                processed = process_audiobook(
+                    source,
+                    audiobook,
+                    options,
+                    interaction=handler,
+                    cancel_event=cancel_event,
+                )
+                if processed is False:
+                    skip_count += 1
+                else:
+                    done_count += 1
             except BookNotReleased:
+                skip_count += 1
                 logging.log(f"Skipped [blue]{book}[/] (not released)")
                 continue
             except BookHasNoAudiobook:
+                skip_count += 1
                 logging.log(f"Skipped [blue]{book}[/] (no audiobook available)")
                 continue
             except AudiobookDLException as e:
@@ -348,10 +515,22 @@ def download_result(
                     raise
                 # Don't let a single broken book take down a 200+ book run.
                 # Surface the underlying error and move on.
-                logging.log(f"Skipped [blue]{book}[/] ({e.error_description})")
+                fail_count += 1
+                detail = str(e).strip() or e.error_description
+                errors.append((str(book), detail))
+                logging.log(f"Skipped [blue]{book}[/] ({detail})")
                 if logging.is_debug_mode():
                     logging.print_traceback()
                 continue
+        if summary is not None:
+            summary.books_completed += done_count
+            summary.books_skipped += skip_count
+            summary.books_failed += fail_count
+            summary.book_errors.extend(errors)
+        if fail_count > 0 or skip_count > 0:
+            logging.log(
+                f"Series summary: {done_count} completed, {skip_count} skipped, {fail_count} failed"
+            )
 
 
 def process_url(
@@ -362,6 +541,7 @@ def process_url(
     cancel_event: Optional[threading.Event] = None,
     selected_indices: Optional[Sequence[int]] = None,
     prefetched: Optional[Tuple[Source, Result]] = None,
+    summary: Optional[DownloadSummary] = None,
 ) -> None:
     """
     Process `url` based on `options` and `config`.
@@ -384,6 +564,7 @@ def process_url(
         interaction=interaction,
         cancel_event=cancel_event,
         selected_indices=selected_indices,
+        summary=summary,
     )
 
 
@@ -445,11 +626,83 @@ def authenticate(
     """Authenticate `source` using cookie file and/or login credentials."""
     logging.log(f"Authenticating with [magenta]{source.name}[/]")
     source_config = config.sources.get(source.name)
+    if source_config is None:
+        for alias in getattr(source, "names", ()):
+            source_config = config.sources.get(alias.lower())
+            if source_config is not None:
+                break
     cookie_path = get_cookie_path(options, source_config)
     if cookie_path is not None:
         source.load_cookie_file(cookie_path)
-    if source.supports_login and not source.authenticated:
+    elif (
+        getattr(source, "supports_cookies", False)
+        and hasattr(source, "cached_cookie_path")
+        and os.path.exists(source.cached_cookie_path())
+    ):
+        source.load_cookie_file(source.cached_cookie_path())
+    if getattr(source, "supports_login", False) and not source.authenticated:
         login(url, source, options, source_config, interaction=interaction)
+
+
+def _init_service_source(
+    service_name: str,
+    options: DownloadOptions,
+    config: Config,
+    *,
+    interaction: Optional[logging.InteractionHandler] = None,
+    url: str = "",
+) -> Source:
+    """Instantiate `service_name` and authenticate when required."""
+    source_class = find_source_by_name(service_name)
+    source = source_class(options)
+    handler = interaction or logging.CliInteractionHandler()
+    if source.requires_authentication and not source.authenticated:
+        authenticate(url, source, options, config, interaction=handler)
+    return source
+
+
+def verify_service_auth(
+    service_name: str,
+    options: DownloadOptions,
+    config: Config,
+    *,
+    interaction: Optional[logging.InteractionHandler] = None,
+    persist_cookies: bool = True,
+) -> bool:
+    """Authenticate against `service_name` and optionally cache session cookies."""
+    with logging.job_context(apply_runtime_options(options, config)):
+        source = _init_service_source(service_name, options, config, interaction=interaction)
+        ok = source.verify_auth()
+        if ok and persist_cookies and source.supports_cookies and len(source._session.cookies) > 0:
+            source.save_cookie_file()
+        return ok
+
+
+def search_service(
+    service_name: str,
+    query: str,
+    options: DownloadOptions,
+    config: Config,
+    *,
+    interaction: Optional[logging.InteractionHandler] = None,
+) -> List[CatalogBook]:
+    """Search `service_name` catalog for `query`."""
+    with logging.job_context(apply_runtime_options(options, config)):
+        source = _init_service_source(service_name, options, config, interaction=interaction)
+        return source.search(query)
+
+
+def list_service_library(
+    service_name: str,
+    options: DownloadOptions,
+    config: Config,
+    *,
+    interaction: Optional[logging.InteractionHandler] = None,
+) -> List[CatalogBook]:
+    """List books from `service_name`'s user library/bookshelf."""
+    with logging.job_context(apply_runtime_options(options, config)):
+        source = _init_service_source(service_name, options, config, interaction=interaction)
+        return source.list_library()
 
 
 def audiobook_from_series(
@@ -468,15 +721,67 @@ def process_audiobook(
     options: DownloadOptions,
     interaction: Optional[logging.InteractionHandler] = None,
     cancel_event: Optional[threading.Event] = None,
-) -> None:
-    """Operate on `audiobook` based on `options`."""
+) -> bool:
+    """Operate on `audiobook` based on `options`. Return False if skipped via archive."""
+    if not audiobook.metadata.source and source is not None:
+        audiobook.metadata.source = source.name
     if options.print_output:
         print_output(audiobook, options)
-    elif options.cover:
+        return True
+    if options.cover:
         download_cover(audiobook, options)
-    else:
-        download(audiobook, options, interaction=interaction, cancel_event=cancel_event)
+        return True
+
+    source_name = (
+        source.name
+        if source is not None
+        else (audiobook.metadata.source or "unknown")
+    )
+    book_key = make_book_key(source_name, audiobook)
+    explicit_archive = getattr(options, "download_archive", None)
+    ledger_path = explicit_archive or (
+        default_archive_path(options.database_directory)
+        if getattr(options, "database_directory", None)
+        else None
+    )
+    archive: Optional[DownloadArchive] = None
+    if explicit_archive:
+        archive = DownloadArchive(explicit_archive)
+        if archive.contains(source_name, book_key):
+            logging.log(
+                f"Skipping [blue]{audiobook.title}[/], already recorded in download archive."
+            )
+            return False
+
+    if getattr(options, "enrich_metadata", False):
+        enrich_metadata_from_openlibrary(
+            audiobook.metadata,
+            proxy=getattr(options, "proxy", None),
+            timeout=getattr(options, "timeout", None) or 10.0,
+        )
+
+    download(audiobook, options, interaction=interaction, cancel_event=cancel_event)
+    if source is not None:
         source.on_download_complete(audiobook)
+
+    if ledger_path:
+        target_archive = archive if archive is not None else DownloadArchive(ledger_path)
+        location = output.gen_output_location(
+            options.output_template,
+            audiobook.metadata,
+            options.remove_chars,
+        )
+        fmt = options.output_format or (audiobook.files[0].ext if audiobook.files else None)
+        target_archive.record(
+            source_name,
+            book_key,
+            title=audiobook.title,
+            author=audiobook.metadata.author,
+            url=audiobook.metadata.scrape_url,
+            output_path=location,
+            audio_format=fmt,
+        )
+    return True
 
 
 def print_output(audiobook: Audiobook, options: DownloadOptions) -> None:

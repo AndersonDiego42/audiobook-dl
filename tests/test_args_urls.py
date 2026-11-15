@@ -65,3 +65,40 @@ def test_input_file_reads_utf8_with_or_without_bom(tmp_path):
         "https://example.com/日本語",
         "https://example.com/Книга",
     ]
+
+
+def test_parse_series_selection_and_new_cli_flags():
+    assert args.parse_series_selection("1, 3-5, 2, 4", 6) == [0, 2, 3, 4, 1]
+    with pytest.raises(ValueError):
+        args.parse_series_selection("0", 5)
+    with pytest.raises(ValueError):
+        args.parse_series_selection("2-8", 5)
+    with pytest.raises(ValueError):
+        args.parse_series_selection("abc", 5)
+
+    opts = args.parse_arguments([
+        "--overwrite",
+        "--list-sources",
+        "--info",
+        "--series-items", "1,3-4",
+        "--max-workers", "4",
+        "--rate-limit", "1.5",
+        "--proxy", "http://127.0.0.1:8888",
+        "--timeout", "45",
+        "--no-combine",
+        "--no-skip-downloaded",
+        "--no-resume",
+    ])
+    assert opts.overwrite is True
+    assert opts.list_sources is True
+    assert opts.info_only is True
+    assert opts.series_items == "1,3-4"
+    assert opts.max_workers == 4
+    assert opts.book_delay == 1.5
+    assert opts.proxy == "http://127.0.0.1:8888"
+    assert opts.timeout == 45.0
+    assert opts.combine is False
+    assert opts.skip_downloaded is False
+    assert opts.resume is False
+    assert "combine" in opts._explicit_fields
+    assert "output_template" not in opts._explicit_fields

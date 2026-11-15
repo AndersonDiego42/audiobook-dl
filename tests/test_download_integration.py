@@ -391,3 +391,109 @@ def test_add_metadata_to_file_preserves_mp3_chapters_tags_and_cover(tmp_path):
         ("chp2", 1000),
     ]
     assert len(tags.getall("APIC")) == 1
+
+
+def test_downloader_multipart_convert_output_m4b_integration(tmp_path):
+    ffmpeg = find_executable("ffmpeg")
+    ffprobe = find_executable("ffprobe")
+    if not ffmpeg or not ffprobe:
+        pytest.skip("ffmpeg/ffprobe not available")
+    assert ffmpeg is not None
+
+    def _make_mp3_bytes(name: str, freq_hz: int) -> bytes:
+        p = tmp_path / name
+        subprocess.run(
+            [
+                ffmpeg,
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                f"sine=frequency={freq_hz}:duration=0.8",
+                "-c:a",
+                "libmp3lame",
+                str(p),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return p.read_bytes()
+
+    routes: Dict[str, Tuple[str, bytes]] = {
+        "/parts/part1.mp3": ("audio/mpeg", _make_mp3_bytes("src_p1.mp3", 440)),
+        "/parts/part2.mp3": ("audio/mpeg", _make_mp3_bytes("src_p2.mp3", 660)),
+        "/parts/cover.jpg": ("image/jpeg", _make_jpeg_bytes()),
+    }
+
+    class _MultipartHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args) -> None:  # noqa: A002
+            return
+
+        def do_GET(self) -> None:
+            item = routes.get(self.path)
+            if item is None:
+                self.send_response(404)
+                self.end_headers()
+                return
+            ctype, body = item
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _MultipartHandler)
+    srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    srv_thread.start()
+
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        from audiobookdl import AudiobookFile
+
+        class _MultiPartHttpSource(Source):
+            name = "localmp"
+            _authentication_methods = []
+            match = [r"http://127\.0\.0\.1:\d+/mp/.+"]
+
+            def download(self, url: str) -> Audiobook:
+                return Audiobook(
+                    session=self._session,
+                    metadata=AudiobookMetadata(
+                        title="Multipart Convert Book",
+                        authors=["Ada Lovelace"],
+                    ),
+                    files=[
+                        AudiobookFile(url=f"{base}/parts/part1.mp3", title="Track 1", ext="mp3"),
+                        AudiobookFile(url=f"{base}/parts/part2.mp3", title="Track 2", ext="mp3"),
+                    ],
+                    chapters=[Chapter(0, "Intro"), Chapter(800, "Second")],
+                    cover=Cover(image=routes["/parts/cover.jpg"][1], extension="jpg"),
+                )
+
+        out_dir = tmp_path / "out"
+        db_dir = tmp_path / "db"
+        out_dir.mkdir()
+        db_dir.mkdir()
+
+        cfg = load_config(None)
+        opts = args.build_default_options(
+            urls=[f"{base}/mp/1"],
+            combine=True,
+            output_format="m4b",
+            audio_bitrate="96k",
+            output_template=str(out_dir / "{title}"),
+            database_directory=str(db_dir),
+            skip_downloaded=False,
+        )
+        src_inst = _MultiPartHttpSource(opts)
+        ab = src_inst.download(opts.urls[0])
+        summary = Downloader(cfg, opts).download(opts.urls, prefetched=(src_inst, ab))
+        assert summary.completed == 1
+        out_m4b = out_dir / "Multipart Convert Book.m4b"
+        assert out_m4b.is_file()
+        assert 1.3 <= ffprobe_duration(str(out_m4b)) <= 2.0
+        mp4 = MP4(str(out_m4b))
+        assert [c.title for c in mp4.chapters] == ["Intro", "Second"]
+    finally:
+        server.shutdown()
+        server.server_close()

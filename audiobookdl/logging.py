@@ -295,6 +295,16 @@ def _emit_to_sink(level: str, msg: str) -> bool:
     return True
 
 
+def mask_secret(value: Optional[str]) -> str:
+    """Return a redacted representation of a secret/token for debug logging."""
+    if not value:
+        return "<empty>"
+    text = str(value)
+    if len(text) <= 8:
+        return f"<redacted len={len(text)}>"
+    return f"<redacted len={len(text)} tail=...{text[-4:]}>"
+
+
 def debug(msg: str, remove_styling=False):
     """Print debug msg"""
     if is_debug_mode():

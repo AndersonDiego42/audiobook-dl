@@ -1,5 +1,6 @@
 from .source import Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Cover
+from audiobookdl.utils.concurrency import run_cancellable_pool
 from typing import List
 
 class BlinkistSource(Source):
@@ -26,7 +27,7 @@ class BlinkistSource(Source):
 
     def download_cover(self, book_info: dict) -> Cover:
         cover_url = book_info["book"]["cover"]["default"]["src"]
-        cover_data = self._session.get(cover_url).content
+        cover_data = self.get(cover_url)
         return Cover(cover_data, "jpg")
 
 
@@ -39,24 +40,25 @@ class BlinkistSource(Source):
 
 
     def download_files(self, book_info: dict) -> List[AudiobookFile]:
-        files = []
         book_id = book_info["book"]["id"]
-        for chapter in book_info["chapters"]:
+        chapters = book_info["chapters"]
+
+        def _fetch_chapter(chapter: dict) -> AudiobookFile:
             chapter_id = chapter["id"]
-            audio_url = self._session.get(
+            audio_url = self.get_json(
                 f"https://www.blinkist.com/api/books/{book_id}/chapters/{chapter_id}"
-            ).json()["signed_audio_url"]
-            files.append(AudiobookFile(
-                url = audio_url,
-                ext = "m4a",
-            ))
-        return files
+            )["signed_audio_url"]
+            return AudiobookFile(url=audio_url, ext="m4a")
+
+        if len(chapters) <= 1:
+            return [_fetch_chapter(c) for c in chapters]
+        return run_cancellable_pool(_fetch_chapter, chapters, max_workers=8)
 
 
     def download_book_info(self, book_id: str) -> dict:
-        return self._session.get(
+        return self.get_json(
             f"https://www.blinkist.com/api/books/{book_id}/chapters",
-        ).json()
+        )
 
 
     @staticmethod

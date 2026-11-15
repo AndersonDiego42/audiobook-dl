@@ -618,15 +618,14 @@ def test_single_file_conversion_prompts_once_on_target_even_when_intermediate_ex
     )
     accept = RecordingInteraction(confirm_value=True)
 
-    def fake_convert(filenames, target_format, cancel_event=None, audio_bitrate=None):
-        src = filenames[0]
+    def fake_convert(src, target_format, cancel_event=None, audio_bitrate=None, chapters=None):
         dst = f"{src.rsplit('.', 1)[0]}.{target_format}"
         with open(dst, "wb") as f:
             f.write(b"new-m4b")
-        return [dst]
+        return dst, False
 
     with (
-        patch("audiobookdl.output.download.output.convert_output", side_effect=fake_convert),
+        patch("audiobookdl.output.download.output.convert_single_file", side_effect=fake_convert),
         patch("audiobookdl.output.download.metadata.add_metadata"),
     ):
         download_audiobook(_make_audiobook(session_accept), output_dir, options, interaction=accept)
@@ -645,7 +644,7 @@ def test_single_file_conversion_prompts_once_on_target_even_when_intermediate_ex
     )
     only_intermediate = RecordingInteraction(confirm_value=False)
     with (
-        patch("audiobookdl.output.download.output.convert_output", side_effect=fake_convert),
+        patch("audiobookdl.output.download.output.convert_single_file", side_effect=fake_convert),
         patch("audiobookdl.output.download.metadata.add_metadata"),
     ):
         download_audiobook(
@@ -684,7 +683,7 @@ def test_single_file_conversion_resume_honors_existing_target_and_intermediate(t
     final_m4b.write_bytes(b"existing-m4b")
     session_done = MagicMock()
     with (
-        patch("audiobookdl.output.download.output.convert_output") as mock_convert,
+        patch("audiobookdl.output.download.output.convert_single_file") as mock_convert,
         patch("audiobookdl.output.download.metadata.add_metadata") as mock_meta,
     ):
         download_audiobook(
@@ -704,15 +703,15 @@ def test_single_file_conversion_resume_honors_existing_target_and_intermediate(t
     intermediate_mp3.write_bytes(b"cached-mp3")
     session_cached_mp3 = MagicMock()
 
-    def fake_convert(filenames, target_format, cancel_event=None, audio_bitrate=None):
-        assert filenames == [str(intermediate_mp3)]
+    def fake_convert(src, target_format, cancel_event=None, audio_bitrate=None, chapters=None):
+        assert src == str(intermediate_mp3)
         dst = str(final_m4b)
         final_m4b.write_bytes(b"converted-from-cached")
         intermediate_mp3.unlink()
-        return [dst]
+        return dst, False
 
     with (
-        patch("audiobookdl.output.download.output.convert_output", side_effect=fake_convert) as mock_convert,
+        patch("audiobookdl.output.download.output.convert_single_file", side_effect=fake_convert) as mock_convert,
         patch("audiobookdl.output.download.metadata.add_metadata") as mock_meta,
     ):
         download_audiobook(
@@ -735,12 +734,12 @@ def test_single_file_conversion_resume_honors_existing_target_and_intermediate(t
         chunks=[b"fresh-mp3"],
     )
 
-    def fake_convert_fresh(filenames, target_format, cancel_event=None, audio_bitrate=None):
+    def fake_convert_fresh(src, target_format, cancel_event=None, audio_bitrate=None, chapters=None):
         final_m4b.write_bytes(b"rebuilt-m4b")
-        return [str(final_m4b)]
+        return str(final_m4b), False
 
     with (
-        patch("audiobookdl.output.download.output.convert_output", side_effect=fake_convert_fresh),
+        patch("audiobookdl.output.download.output.convert_single_file", side_effect=fake_convert_fresh),
         patch("audiobookdl.output.download.metadata.add_metadata"),
     ):
         download_audiobook(
@@ -814,18 +813,13 @@ def test_combined_multifile_overwrite_prompts_once_and_resume_skips_completed(tm
     )
     accept = RecordingInteraction(confirm_value=True)
 
-    def fake_combine(filepaths, tmp_dir, output_path, cancel_event=None):
+    def fake_combine(filepaths, tmp_dir, output_path, cancel_event=None, chapters=None, audio_bitrate=None):
         with open(output_path, "wb") as f:
-            f.write(b"combined-mp3")
-
-    def fake_convert(filenames, target_format, cancel_event=None, audio_bitrate=None):
-        final_m4b.write_bytes(b"new-combined-m4b")
-        return [str(final_m4b)]
+            f.write(b"new-combined-m4b")
+        return False
 
     with (
-        patch("audiobookdl.output.download.output.combine_supports_direct_output", return_value=False),
         patch("audiobookdl.output.download.output.combine_audiofiles", side_effect=fake_combine),
-        patch("audiobookdl.output.download.output.convert_output", side_effect=fake_convert),
         patch("audiobookdl.output.download.metadata.add_metadata"),
     ):
         download_audiobook(book_overwrite, str(book_dir), opts_overwrite, interaction=accept)
@@ -864,3 +858,100 @@ def test_write_json_metadata_uses_utf8_and_preserves_unicode(tmp_path):
     raw_dir = (book_dir / "metadata.json").read_text(encoding="utf-8")
     assert title in raw_dir
     assert json.loads(raw_dir)["title"] == title
+
+
+def test_download_file_streams_inline_aes_cbc_without_resume(tmp_path):
+    from Crypto.Cipher import AES
+    from audiobookdl.utils.audiobook import AESEncryption
+
+    key = b"0123456789abcdef"
+    iv = b"fedcba9876543210"
+    plaintext = b"0123456789abcdef" * 100
+    ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(plaintext)
+    # Split ciphertext across odd chunk boundaries (not aligned to 16-byte AES blocks)
+    chunks = [ciphertext[i : i + 17] for i in range(0, len(ciphertext), 17)]
+
+    session = MagicMock()
+    session.get.return_value = _mock_response(
+        headers={"Content-Length": str(len(ciphertext))},
+        chunks=chunks,
+    )
+    book = Audiobook(
+        session=session,
+        metadata=AudiobookMetadata(title="AES Stream"),
+        files=[AudiobookFile(url="https://example.com/enc.ts", ext="ts", encryption_method=AESEncryption(key=key, iv=iv))],
+    )
+    progress = []
+    with patch("audiobookdl.output.download.encryption.decrypt_file") as mock_decrypt_file:
+        out_path = download_file((book, str(tmp_path / "aes"), 0, progress.append, None))
+
+    mock_decrypt_file.assert_not_called()
+    assert open(out_path, "rb").read() == plaintext
+    assert sum(progress) == pytest.approx(1.0)
+
+
+def test_download_file_batches_large_progress_callbacks(tmp_path):
+    chunk = b"x" * 30_000
+    total = len(chunk) * 20
+    session = MagicMock()
+    session.get.return_value = _mock_response(
+        headers={"Content-Length": str(total)},
+        chunks=[chunk] * 20,
+    )
+    audiobook = _make_audiobook(session)
+    progress = []
+
+    with patch("audiobookdl.output.download.time.monotonic", return_value=100.0):
+        out_path = download_file((audiobook, str(tmp_path / "batched"), 0, progress.append, None))
+
+    assert len(progress) < 20
+    assert sum(progress) == pytest.approx(1.0)
+    assert len(open(out_path, "rb").read()) == total
+
+
+def test_overwrite_flag_bypasses_interactive_prompts(tmp_path):
+    target = tmp_path / "Existing Book.mp3"
+    target.write_bytes(b"old")
+
+    class FailingInteraction:
+        def ask_input(self, prompt: str, hidden: bool = False) -> str:
+            raise AssertionError("Unexpected prompt")
+
+        def confirm(self, message: str) -> bool:
+            raise AssertionError("Unexpected confirm prompt")
+
+    # overwrite=False cancels immediately without prompting
+    opts_no = DownloadOptions(overwrite=False, skip_downloaded=False, resume=False, write_json_metadata=False, no_chapters=True)
+    with pytest.raises(DownloadCancelled):
+        download_audiobook(_make_audiobook(MagicMock()), str(tmp_path / "Existing Book"), opts_no, interaction=FailingInteraction())
+    assert target.read_bytes() == b"old"
+
+    # overwrite=True replaces without prompting
+    session = MagicMock()
+    session.get.return_value = _mock_response({"Content-Length": "3"}, [b"new"])
+    opts_yes = DownloadOptions(overwrite=True, skip_downloaded=False, resume=False, write_json_metadata=False, no_chapters=True)
+    with patch("audiobookdl.output.download.metadata.add_metadata"):
+        download_audiobook(_make_audiobook(session), str(tmp_path / "Existing Book"), opts_yes, interaction=FailingInteraction())
+    assert target.read_bytes() == b"new"
+
+
+def test_download_file_resolves_lazy_url_resolver(tmp_path):
+    session = MagicMock()
+    session.get.return_value = _mock_response(
+        headers={"Content-Length": "4"},
+        chunks=[b"lazy"],
+    )
+    book = Audiobook(
+        session=session,
+        metadata=AudiobookMetadata(title="Lazy URL"),
+        files=[
+            AudiobookFile(
+                url="https://example.com/placeholder",
+                ext="mp3",
+                url_resolver=lambda: "https://cdn.example.com/fresh-signed.mp3",
+            )
+        ],
+    )
+    out_path = download_file((book, str(tmp_path / "lazy"), 0, lambda _: None, None))
+    assert open(out_path, "rb").read() == b"lazy"
+    assert session.get.call_args.args[0] == "https://cdn.example.com/fresh-signed.mp3"

@@ -27,6 +27,8 @@ class ServiceInfo:
     label: str
     auth_methods: Tuple[str, ...]
     login_fields: Tuple[str, ...]
+    supports_search: bool = False
+    supports_library: bool = False
 
 
 def get_available_services() -> List[ServiceInfo]:
@@ -37,11 +39,25 @@ def get_available_services() -> List[ServiceInfo]:
             label=" / ".join(cls.names),
             auth_methods=tuple(cls._authentication_methods),
             login_fields=tuple(cls.login_data),
+            supports_search=bool(getattr(cls, "supports_search", False)),
+            supports_library=bool(getattr(cls, "supports_library", False)),
         )
         for cls in get_source_classes()
         if cls.names
     ]
     return sorted(services, key=lambda s: s.label.lower())
+
+
+def find_source_by_name(service_name: str) -> Type[Source]:
+    """Resolve a service class by canonical name or configured alias."""
+    from audiobookdl.config import normalize_source_key
+
+    target = normalize_source_key(service_name)
+    for cls in get_source_classes():
+        for name in cls.names:
+            if name.lower() == target:
+                return cls
+    raise NoSourceFound
 
 
 def detect_service_key(url: str) -> Optional[str]:

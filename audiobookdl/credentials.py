@@ -7,6 +7,7 @@ import os
 from typing import Any, Dict, Optional, Tuple
 
 from audiobookdl import logging
+from audiobookdl.utils.fs import atomic_write_text, file_lock
 
 
 PLAINTEXT_OPT_IN_ENV = "AUDIOBOOK_DL_ALLOW_PLAINTEXT_CREDENTIALS"
@@ -163,16 +164,16 @@ class DpapiCredentialStore(CredentialStore):
             if os.path.exists(self.vault_path):
                 os.remove(self.vault_path)
             return
-        parent = os.path.dirname(os.path.abspath(self.vault_path))
-        os.makedirs(parent, exist_ok=True)
-        tmp_path = f"{self.vault_path}.tmp"
         payload = {"version": 1, "entries": entries}
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-        os.replace(tmp_path, self.vault_path)
+        atomic_write_text(
+            self.vault_path,
+            json.dumps(payload, indent=2),
+            private=True,
+        )
 
     def get_password(self, service_key: str, username: Optional[str]) -> Optional[str]:
-        entries = self._read_entries()
+        with file_lock(self.vault_path):
+            entries = self._read_entries()
         entry = entries.get(service_key)
         if not isinstance(entry, dict):
             return None
@@ -197,26 +198,30 @@ class DpapiCredentialStore(CredentialStore):
             password.encode("utf-8"),
             _dpapi_entropy(service_key, username),
         )
-        entries = self._read_entries()
-        entries[service_key] = {
-            "username": username,
-            "ciphertext": base64.b64encode(encrypted).decode("ascii"),
-        }
-        self._write_entries(entries)
-
-    def delete_password(self, service_key: str, username: Optional[str]) -> None:
-        entries = self._read_entries()
-        entry = entries.get(service_key)
-        if not isinstance(entry, dict):
-            return
-        if username is None or entry.get("username") == username:
-            entries.pop(service_key, None)
+        with file_lock(self.vault_path):
+            entries = self._read_entries()
+            entries[service_key] = {
+                "username": username,
+                "ciphertext": base64.b64encode(encrypted).decode("ascii"),
+            }
             self._write_entries(entries)
 
+    def delete_password(self, service_key: str, username: Optional[str]) -> None:
+        with file_lock(self.vault_path):
+            entries = self._read_entries()
+            entry = entries.get(service_key)
+            if not isinstance(entry, dict):
+                return
+            if username is None or entry.get("username") == username:
+                entries.pop(service_key, None)
+                self._write_entries(entries)
+
     def stored_services(self) -> Dict[str, Optional[str]]:
+        with file_lock(self.vault_path):
+            entries = self._read_entries()
         return {
             service_key: entry.get("username")
-            for service_key, entry in self._read_entries().items()
+            for service_key, entry in entries.items()
             if isinstance(entry, dict)
         }
 

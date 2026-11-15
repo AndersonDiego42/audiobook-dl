@@ -1,15 +1,14 @@
 from .source import Source
 from audiobookdl import logging
-from audiobookdl.exceptions import NoSourceFound, DataNotPresent
+from audiobookdl.exceptions import NoSourceFound, DataNotPresent, RequestError
 from audiobookdl.utils import read_asset_file
 from audiobookdl.utils.audiobook import Audiobook, AudiobookFile, AudiobookMetadata, Cover, Series, BookId, Result
 from audiobookdl.utils import http
+from audiobookdl.utils.http import DEFAULT_HTTP_TIMEOUT
 
 import re
 from datetime import datetime
 from typing import List
-import requests
-from requests import Response
 from urllib3.util import parse_url
 
 class PodimoSource(Source[dict]):
@@ -25,7 +24,7 @@ class PodimoSource(Source[dict]):
 
 
     def _login(self, url: str, username: str, password: str) -> None:
-        response = self.graphql_request(
+        data = self.graphql_request(
             operation_name = "web_logInUser",
             query = "login",
             variables = {
@@ -33,21 +32,21 @@ class PodimoSource(Source[dict]):
                 "password": password
             }
         )
-        authorization_token = response.json()["data"]["tokenWithCredentials"]["token"]
-        logging.debug(f"{authorization_token=}")
+        authorization_token = data["data"]["tokenWithCredentials"]["token"]
+        logging.debug(f"authorization_token={logging.mask_secret(authorization_token)}")
         self._session.headers.update({"authorization": authorization_token})
 
 
-    def graphql_request(self, operation_name: str, query: str, variables: dict) -> Response:
+    def graphql_request(self, operation_name: str, query: str, variables: dict) -> dict:
         """
         Make graphql request to Podimo
 
         :param operation_name: Name of operation
         :param query: File query is stored in
         :param variables: Variables for query
-        :returns: Response from server
+        :returns: Parsed JSON response from server
         """
-        response = self._session.post(
+        return self.post_json(
             "https://podimo.com/graphql",
             headers = {"User-Agent": "JS GraphQL"},
             json = {
@@ -56,7 +55,6 @@ class PodimoSource(Source[dict]):
                 "variables": variables
             }
         )
-        return response
 
 
     @staticmethod
@@ -124,30 +122,37 @@ class PodimoSource(Source[dict]):
 
 
     def download_podcast_metadata(self, podcast_id: str) -> dict:
-        response = self.graphql_request(
+        data = self.graphql_request(
             operation_name = "PodcastResultsQuery",
             query = "podcast",
             variables = {
                 "id": podcast_id
             }
         )
-        return response.json()["data"]["podcastById"]
+        return data["data"]["podcastById"]
 
 
     def download_podcast_episode_ids(self, podcast_id: str) -> List:
-        response = self.graphql_request(
-            operation_name = "PodcastEpisodesResultsQuery",
-            query = "podcast_episodes",
-            variables = {
-                "limit": 100,
-                "offset": 0,
-                "podcastId": podcast_id,
-                "sorting": "PUBLISHED_ASCENDING"
-            }
-        )
         episodes = []
-        for episode in response.json()["data"]["podcastEpisodes"]:
-            episodes.append(BookId(episode))
+        limit = 100
+        offset = 0
+        while True:
+            data = self.graphql_request(
+                operation_name = "PodcastEpisodesResultsQuery",
+                query = "podcast_episodes",
+                variables = {
+                    "limit": limit,
+                    "offset": offset,
+                    "podcastId": podcast_id,
+                    "sorting": "PUBLISHED_ASCENDING"
+                }
+            )
+            page = data["data"]["podcastEpisodes"] or []
+            for episode in page:
+                episodes.append(BookId(episode))
+            if len(page) < limit:
+                break
+            offset += len(page)
         return episodes
 
 
@@ -156,7 +161,7 @@ class PodimoSource(Source[dict]):
         episode_id = episode_info["id"]
         podcast_id = episode_info["podcastId"]
         return Audiobook(
-            session = requests.Session(),
+            session = self.create_unauthenticated_session(),
             files = self.get_podcast_file(episode_id, podcast_id),
             metadata = self.format_podcast_metadata(episode_info),
             cover = self.download_cover(episode_info["imageUrl"])
@@ -171,7 +176,7 @@ class PodimoSource(Source[dict]):
         :param podcast_id: Internal id for podcast
         :returns: Links to all podcast audio files
         """
-        response = self.graphql_request(
+        data = self.graphql_request(
             operation_name = "ShortLivedPodcastMediaUrlQuery",
             query = "podcast_episode_file",
             variables = {
@@ -179,7 +184,7 @@ class PodimoSource(Source[dict]):
                 "podcastId": podcast_id
             }
         )
-        file_url = response.json()["data"]["podcastEpisodeAudioById"]["url"]
+        file_url = data["data"]["podcastEpisodeAudioById"]["url"]
         if "m3u8" in file_url:
             audio_url = file_url.replace("main.m3u8", "stream_audio_high/stream.m3u8")
             return self.get_stream_files(audio_url)
@@ -212,10 +217,9 @@ class PodimoSource(Source[dict]):
 
     def download_audiobook(self, audiobook_id: str) -> Audiobook:
         book_info = self.download_book_info(audiobook_id)
-        metadata = self.format_audiobook_metadata(book_info)
         return Audiobook(
             # Will sometimes get a 'Authentication required' message if logged in
-            session = requests.Session(),
+            session = self.create_unauthenticated_session(),
             files = self.get_audiobook_files(audiobook_id),
             metadata = self.format_audiobook_metadata(book_info),
             cover = self.download_cover(book_info["coverImage"]["url"])
@@ -223,26 +227,26 @@ class PodimoSource(Source[dict]):
 
 
     def get_audiobook_files(self, audiobook_id: str) -> List[AudiobookFile]:
-        response = self.graphql_request(
+        data = self.graphql_request(
             operation_name = "ShortLivedAudiobookMediaUrlQuery",
             query = "files",
             variables = {
                 "id": audiobook_id
             }
         )
-        audiobook_url = response.json()["data"]["audiobookAudioById"]["url"]
+        audiobook_url = data["data"]["audiobookAudioById"]["url"]
         return [AudiobookFile(url = audiobook_url, ext = "mp3")]
 
 
     def download_book_info(self, audiobook_id: str) -> dict:
-        response = self.graphql_request(
+        data = self.graphql_request(
             operation_name = "AudiobookResultsQuery",
             query = "book_info",
             variables = {
                 "id": audiobook_id
             }
         )
-        return response.json()["data"]["audiobookById"]
+        return data["data"]["audiobookById"]
 
 
     def format_audiobook_metadata(self, book_info) -> AudiobookMetadata:
@@ -257,5 +261,8 @@ class PodimoSource(Source[dict]):
 
     def download_cover(self, cover_url: str) -> Cover:
         # Will sometimes get a 'Authentication required' message if logged in
-        response = requests.get(cover_url)
+        session = self.create_unauthenticated_session()
+        response = session.get(cover_url, timeout=DEFAULT_HTTP_TIMEOUT)
+        if response.status_code != 200:
+            raise RequestError
         return Cover(image = response.content, extension = "png")

@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from audiobookdl.args import DownloadOptions
-from .source import Source
+from .source import CatalogBook, Source
 from audiobookdl import (
     AudiobookFile,
     Chapter,
@@ -24,6 +24,7 @@ from audiobookdl.exceptions import (
     BookHasNoAudiobook,
     BookNotReleased,
     DataNotPresent,
+    RequestError,
 )
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
@@ -181,7 +182,8 @@ class StorytelSource(Source):
         # Generate a new UUID for each request
         generated_device_id = str(uuid.uuid4())
 
-        resp = self._session.post(
+        resp = self.request(
+            "POST",
             f"https://www.storytel.com/api/login.action?m=1&token=guestsv&userid=-1&version=24.22"
             f"&terminal=android&locale=sv&deviceId={generated_device_id}&kidsMode=false",
 
@@ -303,9 +305,14 @@ class StorytelSource(Source):
     ) -> Audiobook:
         book_details = self.download_book_details(consumableId)
         metadata = self.get_metadata(book_details)
-        files = self.get_files(book_details)
-        cover = self.download_cover(book_details)
-        chapters = self.get_chapters(book_details)
+        options = getattr(self, "_options", None)
+        print_only = bool(options and getattr(options, "print_output", False))
+        cover_only = bool(options and getattr(options, "cover", False))
+        no_chapters = bool(options and getattr(options, "no_chapters", False))
+
+        files = [] if (print_only or cover_only) else self.get_files(book_details)
+        cover = None if print_only else self.download_cover(book_details)
+        chapters = [] if (print_only or cover_only or no_chapters) else self.get_chapters(book_details)
         self._update_metadata(consumableId, book_details, metadata, files)
 
         return Audiobook(
@@ -345,12 +352,13 @@ class StorytelSource(Source):
         update metadata once all data is available
         """
         # The ISBN is only available from the download link
-        parsed = parse_url(files[0].url)
-        q = parse_qs(parsed.query)
-        if "isbn" in q:
-            isbn = q["isbn"][0]
-            book_details["_download_url_isbn"] = isbn
-            metadata.isbn = isbn
+        if files:
+            parsed = parse_url(files[0].url)
+            q = parse_qs(parsed.query)
+            if "isbn" in q:
+                isbn = q["isbn"][0]
+                book_details["_download_url_isbn"] = isbn
+                metadata.isbn = isbn
         if consumableId in metadata_corrections["books"]:
             corrections = metadata_corrections["books"][consumableId]
             for key, value in corrections.items():
@@ -361,15 +369,10 @@ class StorytelSource(Source):
 
     def download_bookshelf(self) -> Dict[str, Any]:
         """Download bookshelf data"""
-        resp = self._session.post(
+        data: Dict[str, Any] = self.post_json(
             "https://api.storytel.net/libraries/bookshelf",
             json={"items": []},
-            headers={"content-type": "application/x-www-form-urlencoded"},
         )
-        if resp.status_code != 200:
-            # e.g. an expired session returns 4xx with a non-book body
-            raise UserNotAuthorized
-        data: Dict[str, Any] = resp.json()
 
         bookshelf_path = os.path.join(self.database_directory_lists, "bookshelf.json")
         self._write_json(bookshelf_path, data)
@@ -417,34 +420,34 @@ class StorytelSource(Source):
         :param formats: comma serapted list of formats (abook,ebook,podcast)
         :param languages: comma seperated list of languages (en,de,tr,ar,ru,pl,it,es,sv,fr,nl)
         """
-        nextPageToken = 0
+        result: Optional[Dict[str, Any]] = None
+        next_page_token: Optional[str] = None
+        first_page = True
 
-        # API returns only 10 items per request
-        # if the nextPageToken
-        result: Dict[str, Any] = {"nextPageToken": False}
-
-        while result["nextPageToken"] != None:
+        while first_page or next_page_token is not None:
             params: dict[str, str] = {
                 "includeListDetails": "true",  # include listMetadata,filterOptions,sortOption sections
                 "includeFormats": formats,
                 "includeLanguages": languages,
                 "kidsMode": "false",
             }
-            if result["nextPageToken"]:
-                params["nextPageToken"] = result["nextPageToken"]
+            if next_page_token is not None:
+                params["nextPageToken"] = next_page_token
 
-            resp = self._session.get(
+            data = self.get_json(
                 f"https://api.storytel.net/explore/lists/{list_type}/{list_id}",
                 params=params,
             )
-
-            data = resp.json()
-            if result["nextPageToken"] == 0:
+            if first_page or result is None:
                 result = data
+                result.setdefault("items", [])
+                first_page = False
             else:
-                result["items"].extend(data["items"])
-                result["nextPageToken"] = data["nextPageToken"]
+                result["items"].extend(data.get("items", []))
+                result["nextPageToken"] = data.get("nextPageToken")
+            next_page_token = data.get("nextPageToken")
 
+        assert result is not None
         lists_path = self._get_lists_path(result["id"], languages, formats)
         self._write_json(lists_path, result)
 
@@ -452,11 +455,16 @@ class StorytelSource(Source):
 
     def download_book_details(self, consumableId: str) -> Dict[str, Any]:
         """Download books details"""
-        resp = self._session.get(
-            f"https://api.storytel.net/book-details/consumables/{consumableId}?kidsMode=false&configVariant=default"
+        resp = self.request(
+            "GET",
+            f"https://api.storytel.net/book-details/consumables/{consumableId}?kidsMode=false&configVariant=default",
         )
         if resp.status_code == 404:
             raise BookNotFound
+        if resp.status_code in (401, 403):
+            raise UserNotAuthorized
+        if resp.status_code != 200:
+            raise RequestError
         data = resp.json()
         return data
 
@@ -465,7 +473,8 @@ class StorytelSource(Source):
 
         Get the final Audio URL by sending a requests to the assets API and return the redirect location.
         """
-        resp = self._session.get(
+        resp = self.request(
+            "GET",
             f"https://api.storytel.net/assets/v2/consumables/{consumableId}/abook",
             allow_redirects=False,
         )
@@ -484,7 +493,7 @@ class StorytelSource(Source):
         return [
             AudiobookFile(
                 url=audio_url,
-                headers=self._session.headers,
+                headers=dict(self._session.headers),
                 ext="mp3",
                 expected_status_code=200,
                 expected_content_type="audio/mpeg",
@@ -549,7 +558,7 @@ class StorytelSource(Source):
         """Download information about the audiobook files"""
         consumableId = book_details["consumableId"]
         url = f"https://api.storytel.net/playback-metadata/consumable/{consumableId}"
-        playback_metadata = self._session.get(url).json()
+        playback_metadata = self.get_json(url)
         playback_metadata_path = self._get_playback_metadata_path(consumableId)
         self._write_json(playback_metadata_path, playback_metadata)
         if not "formats" in playback_metadata:
@@ -594,3 +603,28 @@ class StorytelSource(Source):
         consumableId = audiobook.source_data["consumableId"]
         book_path = self._get_book_path(consumableId)
         self._write_json(book_path, audiobook.source_data)
+
+    supports_library = True
+
+    def list_library(self) -> List[CatalogBook]:
+        data = self.download_bookshelf()
+        results: List[CatalogBook] = []
+        for item in data.get("items", {}).values():
+            model = item.get("model", {})
+            book_id = model.get("id")
+            if not book_id:
+                continue
+            title = str(model.get("name") or model.get("title") or book_id)
+            authors_raw = model.get("authors") or []
+            author_names = [
+                str(a.get("name") or "") for a in authors_raw if isinstance(a, dict)
+            ]
+            results.append(
+                CatalogBook(
+                    title=title,
+                    url=f"https://www.storytel.com/books/{book_id}",
+                    author=", ".join(a for a in author_names if a),
+                    source="storytel",
+                )
+            )
+        return results

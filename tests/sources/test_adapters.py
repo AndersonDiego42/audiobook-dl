@@ -71,14 +71,19 @@ def test_blinkist_source_parses_api_fixtures(tmp_path):
         "chapters": [{"id": "c1"}, {"id": "c2"}],
     }
     src = BlinkistSource(_opts(tmp_path))
-    src._session.get = MagicMock(
-        side_effect=[
-            _json_resp(book_info),
-            _json_resp({"signed_audio_url": "https://cdn.blinkist.com/c1.m4a"}),
-            _json_resp({"signed_audio_url": "https://cdn.blinkist.com/c2.m4a"}),
-            MagicMock(status_code=200, content=b"cover-bytes"),
-        ]
-    )
+
+    def fake_blinkist_get(url, **_kwargs):
+        if url.endswith("/chapters"):
+            return _json_resp(book_info)
+        if url.endswith("/chapters/c1"):
+            return _json_resp({"signed_audio_url": "https://cdn.blinkist.com/c1.m4a"})
+        if url.endswith("/chapters/c2"):
+            return _json_resp({"signed_audio_url": "https://cdn.blinkist.com/c2.m4a"})
+        if url.endswith("/cover.jpg"):
+            return MagicMock(status_code=200, content=b"cover-bytes")
+        raise AssertionError(f"Unexpected GET {url}")
+
+    src._session.get = MagicMock(side_effect=fake_blinkist_get)
     book = src.download("https://www.blinkist.com/en/nc/reader/blink-slug?lang=en")
     assert book.metadata.title == "Blink Book"
     assert book.metadata.authors == ["Jane Doe"]
@@ -519,9 +524,11 @@ def test_podimo_source_share_link_and_audiobook_metadata(tmp_path):
     src._session.post = MagicMock(
         side_effect=[_json_resp(book_info_resp), _json_resp(files_resp)]
     )
+    unauth_session = MagicMock()
+    unauth_session.get.return_value = MagicMock(status_code=200, content=b"pod-cover")
     with (
         patch("audiobookdl.utils.http.redirect_of", return_value="https://open.podimo.com/audiobook/abc-123"),
-        patch("audiobookdl.sources.podimo.requests.get", return_value=MagicMock(content=b"pod-cover")),
+        patch.object(src, "create_unauthenticated_session", return_value=unauth_session),
     ):
         book = src.download("https://share.podimo.com/s/short")
 
@@ -531,3 +538,157 @@ def test_podimo_source_share_link_and_audiobook_metadata(tmp_path):
     assert book.metadata.narrators == ["P Narrator"]
     assert book.files[0].url == "https://cdn.podimo.com/audio.mp3"
     assert book.cover is not None and book.cover.extension == "png"
+
+
+def test_overdrive_handles_short_toc_and_cumulative_offsets(tmp_path):
+    bdata = {
+        "title": {"main": "Short TOC Book"},
+        "creator": [],
+        "-odread-furbish-uri": "cover.jpg",
+        "spine": [
+            {"path": "Part01.mp3", "audio-duration": 10.0},
+            {"path": "Part02.mp3", "audio-duration": 20.0},
+            {"path": "Part03.mp3", "audio-duration": 30.0},
+        ],
+        "nav": {
+            "toc": [
+                {"title": "Opening", "path": "Part01.mp3#0"},
+                {"title": "Finale", "path": "Part03.mp3#5.0"},
+            ]
+        },
+    }
+    html = f"<script>window.bData = {json.dumps(bdata)};</script>".encode("utf-8")
+    src = OverdriveSource(_opts(tmp_path))
+    src._session.get = MagicMock(
+        side_effect=[
+            MagicMock(status_code=200, content=html),
+            MagicMock(status_code=200, content=b"od-cover"),
+        ]
+    )
+    book = src.download("https://sample.listen.overdrive.com/")
+    assert [f.title for f in book.files] == ["Opening", "Finale", "Part 3"]
+    assert [(c.start, c.title) for c in book.chapters] == [
+        (0, "Opening"),
+        (35000, "Finale"),
+    ]
+
+
+def test_bookbeat_preserves_case_insensitive_headers_and_paginates(tmp_path):
+    page_1 = {
+        "_embedded": {"savedBooks": [{"bookid": i} for i in range(100)]},
+        "_links": {"next": {"href": "https://api.bookbeat.com/api/my/books/saved?offset=100&limit=100"}},
+    }
+    page_2 = {
+        "_embedded": {"savedBooks": [{"bookid": 100}]},
+    }
+    src = BookBeatSource(_opts(tmp_path))
+    src._session.post = MagicMock(return_value=_json_resp({"token": "bb-jwt"}))
+    src._session.get = MagicMock(side_effect=[_json_resp(page_1), _json_resp(page_2)])
+
+    src.login("https://www.bookbeat.com/book/100", username="u", password="p")
+    assert src._session.headers["Authorization"] == "Bearer bb-jwt"
+    assert len(src.saved_books["_embedded"]["savedBooks"]) == 101
+
+
+def test_ereolen_error_paths(tmp_path):
+    import pytest
+    from audiobookdl.exceptions import BookHasNoAudiobook, DataNotPresent, RequestError
+
+    src = EreolenSource(_opts(tmp_path))
+    page_html = b'<div data-fbi-base-url="https://fbi-api.dbc.dk/opac/graphql"></div>'
+
+    # 1. GraphQL returns None -> RequestError
+    src._session.get = MagicMock(return_value=MagicMock(status_code=200, content=page_html))
+    src._session.post = MagicMock(return_value=MagicMock(status_code=500, content=b""))
+    with pytest.raises(RequestError):
+        src.download("https://ereolen.dk/work/work-of:123")
+
+    # 2. No audiobook manifestation -> BookHasNoAudiobook
+    no_audio_graphql = {
+        "data": {
+            "work": {
+                "titles": {"full": ["Ebook Only"]},
+                "creators": [],
+                "manifestations": {
+                    "all": [{"materialTypes": [{"materialTypeSpecific": {"display": "ebog"}}]}]
+                },
+            }
+        }
+    }
+    src._session.get = MagicMock(return_value=MagicMock(status_code=200, content=page_html))
+    src._session.post = MagicMock(return_value=_json_resp(no_audio_graphql))
+    with pytest.raises(BookHasNoAudiobook):
+        src.download("https://ereolen.dk/work/work-of:123")
+
+    # 3. Audiobook exists but not in active user loans -> DataNotPresent
+    audio_graphql = {
+        "data": {
+            "work": {
+                "titles": {"full": ["Loaned Audio"]},
+                "creators": [],
+                "manifestations": {
+                    "all": [
+                        {
+                            "materialTypes": [{"materialTypeSpecific": {"display": "lydbog (online)"}}],
+                            "identifiers": [{"value": "id-999"}],
+                        }
+                    ]
+                },
+            }
+        }
+    }
+    src3 = EreolenSource(_opts(tmp_path))
+    src3._session.get = MagicMock(
+        side_effect=[
+            MagicMock(status_code=200, content=page_html),
+            _json_resp({"loans": [{"libraryBook": {"identifier": "other"}, "orderId": "ord-1"}]}),
+        ]
+    )
+    src3._session.post = MagicMock(return_value=_json_resp(audio_graphql))
+    with pytest.raises(DataNotPresent):
+        src3.download("https://ereolen.dk/work/work-of:123")
+
+
+def test_saxo_missing_isbn_and_yourcloudlibrary_malformed_json(tmp_path):
+    import pytest
+    from audiobookdl.exceptions import DataNotPresent, NoSourceFound
+
+    saxo = SaxoSource(_opts(tmp_path))
+    with pytest.raises(NoSourceFound):
+        saxo._extract_isbn("https://www.saxo.com/dk/book-without-trailing-digits")
+
+    ycl = YourCloudLibrarySource(_opts(tmp_path))
+    assert (
+        ycl.get_listening_url("https://ebook.yourcloudlibrary.com/library/demo/detail/book-42")
+        == "https://audio.yourcloudlibrary.com/listen/book-42"
+    )
+    ycl._session.get = MagicMock(return_value=MagicMock(status_code=200, content=b"<html>no json here</html>"))
+    with pytest.raises(DataNotPresent):
+        ycl.extract_json_string("https://audio.yourcloudlibrary.com/listen/book-42", "accountId")
+
+
+def test_librivox_missing_chapters_and_catalog_list_library_edge_cases(tmp_path):
+    lv = LibrivoxSource(_opts(tmp_path))
+    lv._session.get = MagicMock(return_value=MagicMock(status_code=200, content=b"<html><body><h1>Empty</h1></body></html>"))
+    assert lv.get_files("https://librivox.org/empty") == []
+    assert lv._parse_feed_books({"books": [{"title": "", "url_librivox": ""}, "not-a-dict"]}) == []
+
+    ab_src = AudiobooksdotcomSource(_opts(tmp_path))
+    ab_src._session.get = MagicMock(
+        return_value=MagicMock(
+            status_code=200,
+            content=b"<html><body><ul></ul></body></html>",
+        )
+    )
+    assert ab_src.list_library() == []
+
+    nxt = NextorySource(_opts(tmp_path))
+    nxt.download_want_to_read_list = lambda: [  # type: ignore[method-assign]
+        "not-a-dict",
+        {"title": "No ID"},
+        {"id": 10, "title": "Valid Nextory"},
+    ]
+    items = nxt.list_library()
+    assert len(items) == 1
+    assert items[0].title == "Valid Nextory"
+    assert items[0].url == "https://www.nextory.com/book/10"

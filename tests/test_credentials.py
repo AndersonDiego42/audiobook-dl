@@ -155,3 +155,25 @@ def test_keyring_credential_store_and_plaintext_fallback(tmp_path, monkeypatch):
         credential_store=opt_in_store,
     )
     assert read_config(str(cfg_path))["sources"]["nextory"]["password"] == "opted-in-pw"
+
+
+def test_concurrent_config_writes_do_not_corrupt_or_drop_entries(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+
+    def write_service(idx: int) -> None:
+        save_source_credentials(
+            f"svc_{idx}",
+            username=f"user_{idx}",
+            overwrite=str(cfg_path),
+            credential_store=PlaintextFallbackCredentialStore(allow_plaintext=False),
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(write_service, range(16)))
+
+    parsed = read_config(str(cfg_path))
+    assert len(parsed["sources"]) == 16
+    for idx in range(16):
+        assert parsed["sources"][f"svc_{idx}"]["username"] == f"user_{idx}"

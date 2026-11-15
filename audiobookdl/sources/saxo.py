@@ -1,7 +1,8 @@
 from .source import Source
-from audiobookdl import logging, AudiobookFile, AudiobookMetadata, Chapter, Cover, Audiobook
+from audiobookdl import logging, AudiobookFile, AudiobookMetadata, Cover, Audiobook
 from audiobookdl.exceptions import NoSourceFound
 from audiobookdl.utils.audiobook import AESEncryption
+from audiobookdl.utils.concurrency import run_cancellable_pool
 import re
 from typing import List
 
@@ -30,7 +31,7 @@ class SaxoSource(Source):
         )
         self.bearer_token = resp["access_token"]
         self.user_id = resp["id"]
-        logging.debug(f"{self.bearer_token=}")
+        logging.debug(f"bearer_token={logging.mask_secret(self.bearer_token)}")
         logging.debug(f"{self.user_id=}")
 
 
@@ -84,9 +85,10 @@ class SaxoSource(Source):
 
 
     def get_files(self, book_info) -> List[AudiobookFile]:
-        result = []
         book_id = book_info["bookId"]
-        for file in book_info["techInfo"]["chapters"]:
+        chapters = book_info["techInfo"]["chapters"]
+
+        def _fetch_file(file: dict) -> AudiobookFile:
             filename = file["fileName"]
             link = self.get_json(
                 f"https://api-read.saxo.com/api/v1/book/{book_id}/content/encryptedstream/{filename}",
@@ -96,7 +98,7 @@ class SaxoSource(Source):
                     "App-Version": self._APP_VERSION,
                 },
             )["link"]
-            result.append(AudiobookFile(
+            return AudiobookFile(
                 url = link,
                 ext = "mp3",
                 # Encryption keys extracted from app
@@ -104,8 +106,11 @@ class SaxoSource(Source):
                     b"CD3E9D141D8EFC0886912E7A8F3652C4",
                     b"78CB354D377772F1",
                 )
-            ))
-        return result
+            )
+
+        if len(chapters) <= 1:
+            return [_fetch_file(f) for f in chapters]
+        return run_cancellable_pool(_fetch_file, chapters, max_workers=8)
 
     def get_metadata(self, book_info) -> AudiobookMetadata:
         metadata: dict = book_info["bookMetadata"]

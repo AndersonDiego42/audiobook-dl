@@ -1,5 +1,6 @@
 from .source import Source
 from audiobookdl import AudiobookFile, Chapter, logging, AudiobookMetadata, Cover, Audiobook
+from audiobookdl.utils.concurrency import run_cancellable_pool
 
 from typing import List, Optional, Tuple
 import base64
@@ -70,14 +71,16 @@ class ChirpSource(Source):
 
 
     def get_files(self, book_id: int, key: bytes, iv: bytes, tracks) -> List[AudiobookFile]:
-        files = []
-        for track in tracks:
-            files.append(AudiobookFile(
-                url = self.get_audio_url(book_id, key, iv, track),
-                ext = "mp3",
-                title = track["displayName"],
-            ))
-        return files
+        def _fetch_track(track) -> AudiobookFile:
+            return AudiobookFile(
+                url=self.get_audio_url(book_id, key, iv, track),
+                ext="mp3",
+                title=track["displayName"],
+            )
+
+        if len(tracks) <= 1:
+            return [_fetch_track(track) for track in tracks]
+        return run_cancellable_pool(_fetch_track, tracks, max_workers=8)
 
 
     def get_chapters(self, tracks) -> List[Chapter]:

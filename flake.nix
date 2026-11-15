@@ -53,7 +53,7 @@
             rich
             tomli
             urllib3
-            dateutils
+            python-dateutil
           ];
 
           meta = {

@@ -315,3 +315,87 @@ def test_cli_input_file_batch_cover_and_print_output(
     assert str(beta_tags["TIT2"]) == "Batch Beta"
     assert len(alpha_tags.getall("APIC")) == 1
     assert len(beta_tags.getall("APIC")) == 1
+
+
+@pytest.mark.ffmpeg
+def test_cli_mid_download_cancellation_leaves_no_final_output(
+    cli_runner: CliRunner,
+    e2e_workspace: E2EWorkspace,
+    e2e_server: LocalAudiobookServer,
+    media_factory: MediaFixtureFactory,
+    ffmpeg_tools: tuple,
+) -> None:
+    import subprocess
+    import sys
+    import threading
+    import time
+
+    _ = ffmpeg_tools
+    mp3_p1 = media_factory.make_mp3("cancel_p1.mp3", duration_sec=0.8, freq_hz=440)
+    cover = media_factory.make_jpeg()
+
+    part2_started = threading.Event()
+    release_part2 = threading.Event()
+
+    def _slow_part2(_req: RouteRequest) -> RouteResponse:
+        part2_started.set()
+        release_part2.wait(timeout=10.0)
+        return RouteResponse(body=mp3_p1, content_type="audio/mpeg", status_code=200)
+
+    e2e_server.add_route(
+        "/books/cancel-mid",
+        build_librivox_html(
+            title="Cancelled Book",
+            cover_url="http://librivox.org/assets/cancel-cover.jpg",
+            parts=[
+                ("Part 1", "http://librivox.org/audio/cancel-p1.mp3"),
+                ("Part 2", "http://librivox.org/audio/cancel-p2.mp3"),
+            ],
+        ),
+        content_type="text/html; charset=utf-8",
+        host="librivox.org",
+    )
+    e2e_server.add_route("/assets/cancel-cover.jpg", cover, content_type="image/jpeg", host="librivox.org")
+    e2e_server.add_route("/audio/cancel-p1.mp3", mp3_p1, content_type="audio/mpeg", host="librivox.org")
+    e2e_server.add_handler("GET", "/audio/cancel-p2.mp3", _slow_part2, host="librivox.org")
+
+    cfg_path = e2e_workspace.write_toml("")
+    env, _ = e2e_workspace.build_env(proxy_url=cli_runner.proxy_url)
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "audiobookdl",
+            "--config",
+            str(cfg_path),
+            "--database_directory",
+            str(e2e_workspace.db_dir),
+            "--combine",
+            "-f",
+            "m4b",
+            "-o",
+            str(e2e_workspace.output_dir / "{title}"),
+            "http://librivox.org/books/cancel-mid",
+        ],
+        cwd=str(e2e_workspace.work_dir),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert part2_started.wait(timeout=15.0), "CLI never reached part 2 download"
+        time.sleep(0.1)
+        proc.terminate()
+        proc.wait(timeout=10.0)
+    finally:
+        release_part2.set()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5.0)
+        if proc.stdout:
+            proc.stdout.close()
+        if proc.stderr:
+            proc.stderr.close()
+
+    assert proc.returncode != 0
+    assert not (e2e_workspace.output_dir / "Cancelled Book.m4b").exists()

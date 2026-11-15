@@ -1,6 +1,6 @@
 from datetime import date
 import requests
-from typing import Dict, Generic, List, Optional, Union, Sequence, Tuple, TypeVar, Any, MutableMapping
+from typing import Callable, Dict, Generic, List, Optional, Union, Sequence, Tuple, TypeVar, Any, MutableMapping
 import json
 from attrs import define, Factory
 import pycountry
@@ -45,6 +45,8 @@ class AudiobookFile:
     expected_content_type: Optional[str] = None
     # Expected status code of the download request
     expected_status_code: int = 200
+    # Optional lazy URL resolver invoked when downloading starts
+    url_resolver: Optional[Callable[[], str]] = None
 
 
 @define
@@ -61,6 +63,7 @@ class AudiobookMetadata:
     isbn: Optional[str] = None
     publisher: Optional[str] = None
     release_date: Optional[date] = None
+    source: Optional[str] = None
 
     def add_author(self, author: str):
         """Add author to metadata"""
@@ -95,6 +98,7 @@ class AudiobookMetadata:
         add("isbn")
         add("publisher")
         add("release_date")
+        add("source")
         if allow_duplicate_keys == None: # return original lists
             add("authors")
             add("narrators")
@@ -134,9 +138,9 @@ class AudiobookMetadata:
         return "; ".join(self.genres)
 
 
-    def as_dict(self) -> dict:
+    def as_dict(self, chapters: Optional[Sequence[Chapter]] = None) -> dict:
         """
-        Export metadata as dictionary
+        Export metadata as dictionary (compatible with Audiobookshelf/Plex readers).
 
         :returns: Metadata as dictionary
         """
@@ -152,8 +156,11 @@ class AudiobookMetadata:
             # Audiobookshelf expects series as a string array, e.g. ["Name #1"]
             if self.series_order is not None:
                 result["series"] = [f"{self.series} #{self.series_order}"]
+                result["series_order"] = self.series_order
             else:
                 result["series"] = [self.series]
+        elif self.series_order is not None:
+            result["series_order"] = self.series_order
         if self.language:
             result["language"] = self.language
         if self.description:
@@ -164,11 +171,23 @@ class AudiobookMetadata:
             result["publisher"] = self.publisher
         if self.release_date:
             result["release_date"] = self.release_date
+        if self.source:
+            result["source"] = self.source
+        if chapters:
+            result["chapters"] = [
+                {
+                    "id": idx,
+                    "start_ms": ch.start,
+                    "start_seconds": round(ch.start / 1000.0, 3),
+                    "title": ch.title,
+                }
+                for idx, ch in enumerate(chapters, start=1)
+            ]
 
         return result
 
 
-    def as_json(self) -> str:
+    def as_json(self, chapters: Optional[Sequence[Chapter]] = None) -> str:
         """
         Export metadata as json
 
@@ -182,7 +201,7 @@ class AudiobookMetadata:
                     return z.alpha_3
                 else:
                     return super().default(z)
-        return json.dumps(self.as_dict(), cls=AudiobookMetadataJSONEncoder, ensure_ascii=False)
+        return json.dumps(self.as_dict(chapters=chapters), cls=AudiobookMetadataJSONEncoder, ensure_ascii=False)
 
 
 def add_if_value_exists(metadata: AudiobookMetadata, l: List[Tuple[str, str]]):
@@ -218,7 +237,7 @@ class Series(Generic[T]):
     # Title of series
     title: str
     # Internal ids of book in series
-    books: List[Union[BookId[T], Audiobook]]
+    books: Sequence[Union[BookId[T], Audiobook]]
 
 Result = Union[
     Audiobook,

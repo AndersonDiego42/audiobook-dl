@@ -1,4 +1,4 @@
-from . import id3, mp4, ffmpeg
+from . import id3, mp4, ffmpeg, vorbis
 from audiobookdl import logging, Chapter, AudiobookMetadata, Cover
 from audiobookdl.utils import program_in_path
 
@@ -12,6 +12,8 @@ def add_metadata(filepath: str, metadata: AudiobookMetadata):
         id3.add_id3_metadata(filepath, metadata)
     elif mp4.is_mp4_file(filepath):
         mp4.add_mp4_metadata(filepath, metadata)
+    elif vorbis.is_vorbis_file(filepath):
+        vorbis.add_vorbis_metadata(filepath, metadata)
     else:
         logging.debug("Could not add any metadata")
 
@@ -22,6 +24,8 @@ def embed_cover(filepath: str, cover: Cover):
         id3.embed_id3_cover(filepath, cover)
     elif mp4.is_mp4_file(filepath):
         mp4.embed_mp4_cover(filepath, cover)
+    elif vorbis.is_vorbis_file(filepath):
+        vorbis.embed_vorbis_cover(filepath, cover)
     else:
         logging.debug("Could not embed cover")
 

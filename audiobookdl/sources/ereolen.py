@@ -4,11 +4,7 @@ from audiobookdl.exceptions import RequestError, DataNotPresent, BookHasNoAudiob
 
 from typing import List
 import re
-import json
-import pycountry
 from urllib.parse import urlparse
-import importlib
-import requests
 
 class EreolenSource(Source):
     _authentication_methods = [
@@ -33,7 +29,7 @@ class EreolenSource(Source):
         library_id = self.find_elem_in_page(login_page_url, "#libraryid-input", "value")
         library_name = self.find_elem_in_page(login_page_url, "#libraryname-input", "value")
         logging.debug(f"{library_name=} {library_id=}")
-        response = self._session.post(
+        self.post(
             f"https://login.bib.dk{login_path}",
             headers = { "Content-Type": "application/x-www-form-urlencoded" },
             data = {
@@ -53,7 +49,7 @@ class EreolenSource(Source):
         self._session.headers.update({
             "Authorization": f"Bearer {user_token}"
         })
-        logging.debug(f"{user_token=}")
+        logging.debug(f"user_token={logging.mask_secret(user_token)}")
 
 
     def download(self, url: str) -> Audiobook:
@@ -99,7 +95,7 @@ class EreolenSource(Source):
             raise DataNotPresent
 
         return Audiobook(
-            session = requests.Session(),
+            session = self.create_unauthenticated_session(),
             files = self.get_files(order_id),
             metadata = AudiobookMetadata(
                 title = metadata["titles"]["full"][0],

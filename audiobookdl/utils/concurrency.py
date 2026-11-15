@@ -1,9 +1,10 @@
+from contextlib import contextmanager
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import contextvars
 import subprocess
 import tempfile
 import threading
-from typing import Callable, List, Optional, Sequence, TypeVar, cast
+from typing import Callable, Iterator, List, Optional, Sequence, TypeVar, cast
 
 from audiobookdl.exceptions import DownloadCancelled
 from audiobookdl.utils import subprocess_kwargs
@@ -11,6 +12,21 @@ from audiobookdl.utils import subprocess_kwargs
 
 T_in = TypeVar("T_in")
 T_out = TypeVar("T_out")
+
+_ffmpeg_progress_var: contextvars.ContextVar[Optional[Callable[[float], None]]] = contextvars.ContextVar(
+    "ffmpeg_progress_callback",
+    default=None,
+)
+
+
+@contextmanager
+def ffmpeg_progress_callback(callback: Optional[Callable[[float], None]]) -> Iterator[None]:
+    """Attach a per-context progress callback (receiving elapsed seconds) to FFmpeg runs."""
+    token = _ffmpeg_progress_var.set(callback)
+    try:
+        yield
+    finally:
+        _ffmpeg_progress_var.reset(token)
 
 
 def _terminate_process(proc: subprocess.Popen[bytes], timeout: float = 3.0) -> None:
@@ -42,14 +58,35 @@ def run_cancellable_subprocess(
     if cancel_event is not None and cancel_event.is_set():
         raise DownloadCancelled
     stderr_file = tempfile.TemporaryFile() if capture_output else None
+    progress_cb = _ffmpeg_progress_var.get()
+    wants_progress = progress_cb is not None and "-progress" in command
     proc: Optional[subprocess.Popen[bytes]] = None
+    reader_thread: Optional[threading.Thread] = None
     try:
         proc = subprocess.Popen(
             list(command),
-            stdout=subprocess.DEVNULL if capture_output else None,
+            stdout=subprocess.PIPE if wants_progress else (subprocess.DEVNULL if capture_output else None),
             stderr=stderr_file,
             **subprocess_kwargs(capture_output=capture_output),
         )
+        if wants_progress and proc.stdout is not None and progress_cb is not None:
+            cb = progress_cb
+            pipe = proc.stdout
+
+            def _drain_progress() -> None:
+                try:
+                    for raw_line in pipe:
+                        line = raw_line.decode("utf-8", "ignore").strip()
+                        if line.startswith("out_time_us="):
+                            raw_val = line.split("=", 1)[1].strip()
+                            if raw_val.lstrip("-").isdigit():
+                                micros = max(0, int(raw_val))
+                                cb(micros / 1_000_000.0)
+                except OSError:
+                    pass
+
+            reader_thread = threading.Thread(target=_drain_progress, daemon=True)
+            reader_thread.start()
         while True:
             if cancel_event is not None and cancel_event.is_set():
                 _terminate_process(proc)
@@ -61,6 +98,8 @@ def run_cancellable_subprocess(
                 break
             except subprocess.TimeoutExpired:
                 continue
+        if reader_thread is not None:
+            reader_thread.join(timeout=1.0)
         stderr_bytes = b""
         if stderr_file is not None:
             stderr_file.seek(0)
@@ -74,6 +113,13 @@ def run_cancellable_subprocess(
     finally:
         if proc is not None and proc.poll() is None:
             _terminate_process(proc)
+        if proc is not None and proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
+        if reader_thread is not None and reader_thread.is_alive():
+            reader_thread.join(timeout=1.0)
         if stderr_file is not None:
             stderr_file.close()
 

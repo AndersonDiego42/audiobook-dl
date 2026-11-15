@@ -37,7 +37,7 @@ def test_concurrent_run_downloads_isolate_logging_sinks_and_flags():
     sink_b = _CaptureSink()
     barrier = threading.Barrier(2)
 
-    def fake_process_url(url, options, config, interaction=None, cancel_event=None):
+    def fake_process_url(url, options, config, interaction=None, cancel_event=None, summary=None):
         barrier.wait(timeout=2.0)
         logging.log(f"start {url}")
         logging.debug(f"dbg {url}")

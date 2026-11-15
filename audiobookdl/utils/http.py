@@ -3,6 +3,7 @@ import requests
 
 
 DEFAULT_HTTP_TIMEOUT: Tuple[int, int] = (15, 60)
+DEFAULT_USER_AGENT: str = "audiobook-dl"
 
 
 def redirect_of(url: str, amount: int = 1) -> Optional[str]:

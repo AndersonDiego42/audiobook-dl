@@ -1,4 +1,6 @@
+from dataclasses import dataclass
 import importlib.resources
+import json
 import math
 import os
 import re
@@ -124,21 +126,53 @@ def program_in_path(program: str) -> bool:
     return find_executable(program) is not None
 
 
-def ffprobe_duration(path: str) -> float:
-    """Return the duration of `path` in seconds via `ffprobe`, or `0.0` on failure."""
+@dataclass(frozen=True)
+class AudioProbeInfo:
+    """Consolidated media metadata returned by a single `ffprobe` JSON call."""
+
+    duration: float = 0.0
+    bitrate: Optional[int] = None
+    codec_name: str = ""
+    format_name: str = ""
+
+
+def _parse_positive_int(raw: Any) -> Optional[int]:
+    if raw is None:
+        return None
+    try:
+        val = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return val if val > 0 else None
+
+
+def _parse_positive_float(raw: Any) -> float:
+    if raw is None:
+        return 0.0
+    try:
+        val = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return 0.0
+    return val if math.isfinite(val) and val > 0 else 0.0
+
+
+def probe_audio_info(path: str) -> AudioProbeInfo:
+    """Probe duration, bitrate, codec, and container format in one `ffprobe` call."""
     ffprobe = find_executable("ffprobe")
     if ffprobe is None:
-        return 0.0
+        return AudioProbeInfo()
     try:
         result = subprocess.run(
             [
                 ffprobe,
                 "-v",
                 "error",
+                "-select_streams",
+                "a:0",
                 "-show_entries",
-                "format=duration",
+                "format=duration,bit_rate,format_name:stream=codec_name,bit_rate,duration",
                 "-of",
-                "default=noprint_wrappers=1:nokey=1",
+                "json",
                 path,
             ],
             capture_output=True,
@@ -146,59 +180,36 @@ def ffprobe_duration(path: str) -> float:
             **subprocess_kwargs(capture_output=True),
         )
     except OSError:
-        return 0.0
+        return AudioProbeInfo()
+    if result.returncode != 0 or not result.stdout.strip():
+        return AudioProbeInfo()
     try:
-        duration = float(result.stdout.strip())
+        payload = json.loads(result.stdout)
     except ValueError:
-        return 0.0
-    return duration if math.isfinite(duration) and duration > 0 else 0.0
+        return AudioProbeInfo()
+    fmt = payload.get("format") or {}
+    streams = payload.get("streams") or []
+    stream = streams[0] if streams else {}
+    duration = _parse_positive_float(fmt.get("duration")) or _parse_positive_float(stream.get("duration"))
+    bitrate = _parse_positive_int(stream.get("bit_rate")) or _parse_positive_int(fmt.get("bit_rate"))
+    codec_name = str(stream.get("codec_name") or "").strip()
+    format_name = str(fmt.get("format_name") or "").strip()
+    return AudioProbeInfo(
+        duration=duration,
+        bitrate=bitrate,
+        codec_name=codec_name,
+        format_name=format_name,
+    )
+
+
+def ffprobe_duration(path: str) -> float:
+    """Return the duration of `path` in seconds via `ffprobe`, or `0.0` on failure."""
+    return probe_audio_info(path).duration
 
 
 def ffprobe_audio_bitrate(path: str) -> Optional[int]:
     """Return the bitrate of `path` in bits/sec via `ffprobe`, or `None` if unavailable."""
-    ffprobe = find_executable("ffprobe")
-    if ffprobe is None:
-        return None
-    queries = (
-        [
-            ffprobe,
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "stream=bit_rate",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            path,
-        ],
-        [
-            ffprobe,
-            "-v",
-            "error",
-            "-show_entries",
-            "format=bit_rate",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            path,
-        ],
-    )
-    for cmd in queries:
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                **subprocess_kwargs(capture_output=True),
-            )
-        except OSError:
-            return None
-        raw = result.stdout.strip()
-        if raw.isdigit():
-            bps = int(raw)
-            if bps > 0:
-                return bps
-    return None
+    return probe_audio_info(path).bitrate
 
 
 def resolve_audio_bitrate(

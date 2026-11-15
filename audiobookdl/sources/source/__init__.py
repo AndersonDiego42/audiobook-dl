@@ -13,7 +13,8 @@ import lxml.html
 from lxml.cssselect import CSSSelector
 import re
 import os
-from http.cookiejar import MozillaCookieJar
+from dataclasses import dataclass
+from http.cookiejar import CookieJar, MozillaCookieJar
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, TypeVar, Generic
 from ssl import SSLContext
 import urllib3
@@ -22,6 +23,18 @@ if TYPE_CHECKING:
     from audiobookdl.args import DownloadOptions
 
 T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class CatalogBook:
+    """Lightweight discovery entry returned by `Source.search` / `Source.list_library`."""
+
+    title: str
+    url: str
+    author: str = ""
+    series: Optional[str] = None
+    source: str = ""
+
 
 class Source(Generic[T]):
     """An abstract class for downloading audiobooks from a specific
@@ -37,10 +50,14 @@ class Source(Generic[T]):
     _authentication_methods: List[str] = [ "cookies" ]
     # Create database directory for source
     create_storage_dir: bool = False
+    # Discovery capabilities
+    supports_search: bool = False
+    supports_library: bool = False
 
     def __init__(self, options: DownloadOptions):
         self.__authenticated: bool = False
         self.__pages: Dict[str, bytes] = {}
+        self._options: DownloadOptions = options
         self.database_directory = os.path.join(options.database_directory, self.name)
         self.skip_downloaded = options.skip_downloaded
         self._session: requests.Session = self.create_session(options)
@@ -77,9 +94,39 @@ class Source(Generic[T]):
         if self.supports_cookies:
             logging.debug(f"Loading cookies from '{cookie_file}'")
             cookie_jar = MozillaCookieJar()
-            cookie_jar.load(cookie_file, ignore_expires=True)
+            cookie_jar.load(cookie_file, ignore_discard=True, ignore_expires=True)
             self._session.cookies.update(cookie_jar)
             self.__authenticated = True
+
+    def cached_cookie_path(self) -> str:
+        """Return the per-source persistent session cookie jar file path."""
+        return os.path.join(self.database_directory, "session_cookies.txt")
+
+    def save_cookie_file(self, cookie_file: Optional[str] = None) -> str:
+        """Persist current session cookies in Netscape format and return path written."""
+        target = cookie_file or self.cached_cookie_path()
+        parent = os.path.dirname(os.path.abspath(target))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        jar = MozillaCookieJar(target)
+        for cookie in CookieJar.__iter__(self._session.cookies):
+            jar.set_cookie(cookie)
+        jar.save(target, ignore_discard=True, ignore_expires=True)
+        return target
+
+    def search(self, query: str) -> List[CatalogBook]:
+        """Search the service catalog for audiobooks matching `query`."""
+        raise NotImplementedError(f"{self.name} does not support catalog search")
+
+    def list_library(self) -> List[CatalogBook]:
+        """Return audiobook entries from the user's bookshelf/library or feed."""
+        raise NotImplementedError(f"{self.name} does not support library listing")
+
+    def verify_auth(self, url: str = "") -> bool:
+        """Return True if authentication credentials/cookies appear valid."""
+        if not self.requires_authentication:
+            return True
+        return self.authenticated
 
 
     @property
@@ -174,13 +221,14 @@ class Source(Generic[T]):
         return re.findall(regex, self._get_page(url, **kwargs).decode("utf8"))
 
     # Networking
+    request = networking.request
     post = networking.post
     get = networking.get
     post_json = networking.post_json
     get_json = networking.get_json
     get_stream_files = networking.get_stream_files
 
-    def create_ssl_context(self, options: DownloadOptions) -> SSLContext:
+    def create_ssl_context(self, options: Optional[DownloadOptions] = None) -> SSLContext:
         try:
             ssl_context: SSLContext = urllib3.util.create_urllib3_context()  # type: ignore[attr-defined]
 
@@ -196,7 +244,7 @@ class Source(Generic[T]):
         except AttributeError: # AttributeError: module 'urllib3.util' has no attribute 'create_urllib3_context'
             raise GenericAudiobookDLException(f"Please update urllib3 to version >= 2 using the command 'pip install -U urllib3'")
 
-    def create_session(self, options: DownloadOptions) -> requests.Session:
+    def create_session(self, options: Optional[DownloadOptions] = None) -> requests.Session:
         session = requests.Session()
         ssl_context: SSLContext = self.create_ssl_context(options)
         session.mount(
@@ -207,4 +255,11 @@ class Source(Generic[T]):
             "http://",
             HTTPAdapter(pool_connections=20, pool_maxsize=20),
         )
+        proxy = getattr(options, "proxy", None) if options is not None else None
+        if proxy:
+            session.proxies.update({"http": proxy, "https": proxy})
         return session
+
+    def create_unauthenticated_session(self) -> requests.Session:
+        """Create a fresh pooled session without auth headers or cookies for CDN requests."""
+        return self.create_session(getattr(self, "_options", None))

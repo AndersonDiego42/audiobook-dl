@@ -1,8 +1,8 @@
 from .source import Source
 from audiobookdl import AudiobookFile, Chapter, AudiobookMetadata, Cover, Audiobook
-from typing import Any, List, Optional, Dict, MutableMapping, Union
+from typing import Any, List, Dict, MutableMapping, Optional, Union
 import uuid
-from audiobookdl.exceptions import UserNotAuthorized, MissingBookAccess
+from audiobookdl.exceptions import MissingBookAccess
 import base64
 import re
 
@@ -35,7 +35,7 @@ class BookBeatSource(Source):
             "bb-client": "BookBeatApp",
             "bb-device": self.create_device_id(),
         }
-        self._session.headers = headers
+        self._session.headers.update(headers)
         login_json = {"username": username, "password": password}
         tokens = self.post_json(
             "https://api.bookbeat.com/api/login",
@@ -43,9 +43,29 @@ class BookBeatSource(Source):
         )
         token = tokens["token"]
         self._session.headers.update({"authorization": f"Bearer {token}"})
-        self.saved_books = self.get_json(
-            "https://api.bookbeat.com/api/my/books/saved?offset=0&limit=100"
-        )
+        self.saved_books = self._fetch_saved_books()
+
+    def _fetch_saved_books(self) -> Dict[str, Any]:
+        """Fetch all saved books from BookBeat across paginated responses."""
+        limit = 100
+        offset = 0
+        all_saved: List[Dict[str, Any]] = []
+        next_url: Optional[str] = f"https://api.bookbeat.com/api/my/books/saved?offset={offset}&limit={limit}"
+        seen_urls = set()
+        while next_url and next_url not in seen_urls:
+            seen_urls.add(next_url)
+            page = self.get_json(next_url)
+            page_books = page.get("_embedded", {}).get("savedBooks", [])
+            all_saved.extend(page_books)
+            next_link = page.get("_links", {}).get("next", {}).get("href")
+            if next_link:
+                next_url = next_link
+            elif len(page_books) >= limit:
+                offset += len(page_books)
+                next_url = f"https://api.bookbeat.com/api/my/books/saved?offset={offset}&limit={limit}"
+            else:
+                next_url = None
+        return {"_embedded": {"savedBooks": all_saved}}
 
 
     def download(self, url: str) -> Audiobook:
@@ -84,7 +104,7 @@ class BookBeatSource(Source):
             return [
                 AudiobookFile(
                     url=lic["_links"]["download"]["href"],
-                    headers=self._session.headers,
+                    headers=dict(self._session.headers),
                     ext="mp4",
                 )
             ]
@@ -107,7 +127,7 @@ class BookBeatSource(Source):
                 if "narrator" in contributor["role"]:
                     metadata.add_narrator(name)
             return metadata
-        except:
+        except (KeyError, IndexError, TypeError):
             return metadata
 
 
@@ -129,8 +149,8 @@ class BookBeatSource(Source):
         """Find book by id from owned books"""
         for book in self.saved_books["_embedded"]["savedBooks"]:
             if str(book["bookid"]) == book_id:
-                book["metadata"] = self._session.get(
+                book["metadata"] = self.get_json(
                     book["_links"]["book"]["href"]
-                ).json()
+                )
                 return book
         raise MissingBookAccess

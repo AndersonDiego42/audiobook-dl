@@ -86,10 +86,9 @@ def test_download_routes_direct_audiobook_and_rejects_unknown_url(tmp_path):
         ]
     )
 
-    with patch(
-        "audiobookdl.sources.podimo.requests.get",
-        return_value=MagicMock(content=b"cover-png"),
-    ):
+    unauth_session = MagicMock()
+    unauth_session.get.return_value = MagicMock(status_code=200, content=b"cover-png")
+    with patch.object(src, "create_unauthenticated_session", return_value=unauth_session):
         result = src.download("https://open.podimo.com/audiobook/book-99")
 
     assert isinstance(result, Audiobook)
@@ -170,10 +169,9 @@ def test_download_podcast_and_episodes_with_hls_and_mp3_streams(tmp_path):
     assert len(series.books) == 3
     assert all(isinstance(b, BookId) for b in series.books)
 
-    with patch(
-        "audiobookdl.sources.podimo.requests.get",
-        return_value=MagicMock(content=b"ep-cover"),
-    ):
+    unauth_session = MagicMock()
+    unauth_session.get.return_value = MagicMock(status_code=200, content=b"ep-cover")
+    with patch.object(src, "create_unauthenticated_session", return_value=unauth_session):
         book1 = src.download_from_id(series.books[0].id)  # type: ignore[union-attr]
         book2 = src.download_from_id(series.books[1].id)  # type: ignore[union-attr]
 
@@ -263,3 +261,31 @@ def test_share_link_follows_two_redirects_to_podcast_and_handles_failures(tmp_pa
     ):
         with pytest.raises(DataNotPresent):
             src.download("https://share.podimo.com/s/wrong-kind")
+
+
+def test_podimo_pagination_and_redacted_token_logs(tmp_path, monkeypatch):
+    from audiobookdl import logging as adl_logging
+
+    src = _make_source(tmp_path)
+    debug_msgs = []
+    monkeypatch.setattr(adl_logging, "debug", lambda msg, **_kw: debug_msgs.append(msg))
+
+    src._session.post = MagicMock(
+        return_value=_json_resp(
+            {"data": {"tokenWithCredentials": {"token": "podimo-secret-jwt-value"}}}
+        )
+    )
+    src.login("https://open.podimo.com/audiobook/1", username="u", password="p")
+    assert all("podimo-secret-jwt-value" not in msg for msg in debug_msgs)
+
+    page_1 = [{"id": f"ep-{i}", "podcastId": "pod-1"} for i in range(100)]
+    page_2 = [{"id": "ep-100", "podcastId": "pod-1"}]
+    src._session.post = MagicMock(
+        side_effect=[
+            _json_resp({"data": {"podcastEpisodes": page_1}}),
+            _json_resp({"data": {"podcastEpisodes": page_2}}),
+        ]
+    )
+    episodes = src.download_podcast_episode_ids("pod-1")
+    assert len(episodes) == 101
+    assert episodes[-1].id["id"] == "ep-100"

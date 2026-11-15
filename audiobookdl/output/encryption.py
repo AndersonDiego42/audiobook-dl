@@ -6,6 +6,32 @@ from audiobookdl.utils.audiobook import AudiobookFileEncryption, AESEncryption
 DECRYPT_CHUNK_SIZE = 64 * 1024  # 64 KiB, an exact multiple of AES's 16-byte block size
 
 
+class AESStreamDecryptor:
+    """Incrementally decrypts AES-CBC byte chunks of arbitrary boundaries."""
+
+    def __init__(self, key: bytes, iv: bytes) -> None:
+        self._cipher = AES.new(key, AES.MODE_CBC, iv)
+        self._buffer = bytearray()
+
+    def decrypt_chunk(self, chunk: bytes) -> bytes:
+        """Buffer `chunk` and decrypt any complete 16-byte AES blocks."""
+        self._buffer.extend(chunk)
+        usable = (len(self._buffer) // AES.block_size) * AES.block_size
+        if usable <= 0:
+            return b""
+        out = self._cipher.decrypt(bytes(self._buffer[:usable]))
+        del self._buffer[:usable]
+        return out
+
+    def finalize(self) -> bytes:
+        """Decrypt any trailing bytes at end-of-stream."""
+        if not self._buffer:
+            return b""
+        tail = bytes(self._buffer)
+        self._buffer.clear()
+        return self._cipher.decrypt(tail)
+
+
 def decrypt_file(
     path: str,
     encryption_method: AudiobookFileEncryption,

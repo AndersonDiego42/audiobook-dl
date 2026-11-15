@@ -1,4 +1,4 @@
-from .source import Source
+from .source import CatalogBook, Source
 from audiobookdl import AudiobookFile, logging, AudiobookMetadata, Cover, Audiobook, Series, Result, BookId
 from audiobookdl.exceptions import NoSourceFound, DataNotPresent, GenericAudiobookDLException
 from rich.markup import escape
@@ -134,15 +134,27 @@ class AudiobooksdotcomSource(Source):
         :param scrape_url: Url of page to scrape for audio link
         :returns: List of audio files with a single file in it
         """
-        response = self._session.get(
-            scrape_url,
-        )
+        page_text = self.get(scrape_url).decode("utf-8", errors="replace")
         audio_match = re.search(
             r'(?<=(mp3: "))[^"]+',
-            response.text
+            page_text
         )
         if audio_match is None:
-            logging.debug(f"Could not find audio URL. Page content from {scrape_url} was:\n{escape(response.text)}")
+            logging.debug(f"Could not find audio URL. Page content from {scrape_url} was:\n{escape(page_text)}")
             raise DataNotPresent
         audio_url = audio_match.group()
         return [ AudiobookFile(url=audio_url, ext="mp3") ]
+
+    supports_library = True
+
+    def list_library(self) -> List[CatalogBook]:
+        series = self.download_library("https://www.audiobooks.com/browse/library")
+        return [
+            CatalogBook(
+                title=book.title or str(book.id),
+                url=f"https://www.audiobooks.com/audiobook/{book.id}",
+                source="audiobooks.com",
+            )
+            for book in series.books
+            if hasattr(book, "id")
+        ]

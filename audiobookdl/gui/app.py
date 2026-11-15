@@ -1,5 +1,12 @@
-from audiobookdl import __version__, args, logging
-from audiobookdl.pipeline import DownloadSummary, prepare_source_result, run_downloads
+from audiobookdl import __version__, args, logging, output
+from audiobookdl.pipeline import (
+    DownloadSummary,
+    list_service_library,
+    prepare_source_result,
+    run_downloads,
+    search_service,
+    verify_service_auth,
+)
 from audiobookdl.config import (
     Config,
     SourceConfig,
@@ -12,7 +19,7 @@ from audiobookdl.config import (
 )
 from audiobookdl.exceptions import DownloadCancelled
 from audiobookdl.sources import ServiceInfo, detect_service_key, get_available_services
-from audiobookdl.sources.source import Source
+from audiobookdl.sources.source import CatalogBook, Source
 from audiobookdl.utils import (
     AUDIO_BITRATE_PRESETS,
     find_executable,
@@ -20,15 +27,34 @@ from audiobookdl.utils import (
     resolve_ffmpeg_dir,
     set_ffmpeg_dir,
 )
-from audiobookdl.utils.audiobook import Audiobook, BookId, Cover, Result, Series
+from audiobookdl.utils.archive import DownloadArchive, default_archive_path
+from audiobookdl.utils.updater import (
+    UpdateInfo,
+    check_for_updates,
+    install_ffmpeg_via_winget,
+    winget_available,
+)
+from audiobookdl.utils.audiobook import (
+    Audiobook,
+    AudiobookMetadata,
+    BookId,
+    Cover,
+    Result,
+    Series,
+)
 
+import argparse
+from collections import deque
+import ctypes
 from dataclasses import dataclass
+from datetime import date
 import importlib.resources
 import io
 import os
 from pathlib import Path
 import queue
 import re
+import subprocess
 import sys
 import tempfile
 import threading
@@ -36,10 +62,28 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Set, Tuple, Union
+import uuid
 
 
 OUTPUT_FORMATS = ("Original", "m4b", "mp3", "m4a", "flac", "opus")
+TEMPLATE_PRESET_LABELS: Tuple[Tuple[str, str], ...] = (
+    ("Custom", ""),
+    ("Default", output.OUTPUT_TEMPLATE_PRESETS["default"]),
+    ("Audiobookshelf", output.OUTPUT_TEMPLATE_PRESETS["audiobookshelf"]),
+    ("Plex", output.OUTPUT_TEMPLATE_PRESETS["plex"]),
+    ("Kavita", output.OUTPUT_TEMPLATE_PRESETS["kavita"]),
+)
+_PRESET_LABEL_TO_TEMPLATE: Dict[str, str] = {label: tpl for label, tpl in TEMPLATE_PRESET_LABELS if tpl}
+_TEMPLATE_TO_PRESET_LABEL: Dict[str, str] = {tpl: label for label, tpl in TEMPLATE_PRESET_LABELS if tpl}
+_SAMPLE_PREVIEW_METADATA = AudiobookMetadata(
+    title="Dune",
+    authors=["Frank Herbert"],
+    series="Dune Chronicles",
+    series_order=1,
+    release_date=date(1965, 8, 1),
+    source="storytel",
+)
 _GEOMETRY_RE = re.compile(r"^(\d+)x(\d+)(?:([+-]\d+)([+-]\d+))?$")
 
 
@@ -161,6 +205,7 @@ def parse_url_text(raw: str) -> List[str]:
 @dataclass
 class _QueuedJob:
     """Single queued URL download job consumed by the persistent GUI worker."""
+    job_id: str
     run_id: int
     url: str
     options: args.DownloadOptions
@@ -174,6 +219,10 @@ class _GuiLogSink:
 
     def __init__(self, event_queue: "queue.Queue[tuple]") -> None:
         self._queue = event_queue
+        self._active_run_id = 0
+
+    def set_active_run_id(self, run_id: int) -> None:
+        self._active_run_id = run_id
 
     def on_log(self, level: str, message: str) -> None:
         self._queue.put(("log", level, message))
@@ -204,7 +253,7 @@ class _GuiLogSink:
         ))
 
     def on_item_progress(self, current: int, total: int, title: str) -> None:
-        self._queue.put(("item_progress", current, total, title))
+        self._queue.put(("item_progress", self._active_run_id, current, total, title))
 
     def on_progress_finish(self) -> None:
         self._queue.put(("progress_finish",))
@@ -260,6 +309,37 @@ class _GuiInteractionHandler:
                 ev.set()
 
 
+class PreviewDialog(tk.Toplevel):
+    """Typed `Toplevel` window hosting book metadata or a series selection checklist."""
+
+    _cover_photo: Optional[Any] = None
+    _check_vars: List[tk.BooleanVar]
+    _filter_var: tk.StringVar
+    _checkbuttons: List[Tuple[int, str, ttk.Checkbutton]]
+    _toggle_series_item: Callable[..., None]
+
+
+class ArchiveLedgerDialog(tk.Toplevel):
+    """Typed `Toplevel` window hosting the SQLite download history ledger."""
+
+    _tree: ttk.Treeview
+    _search_var: tk.StringVar
+    _refresh: Callable[..., None]
+
+
+class CatalogBrowserDialog(tk.Toplevel):
+    """Typed `Toplevel` window hosting service catalog search and library browsing."""
+
+    _tree: ttk.Treeview
+    _service_var: tk.StringVar
+    _query_var: tk.StringVar
+    _status_var: tk.StringVar
+    _sync_buttons: Callable[..., None]
+    _populate_items: Callable[[Sequence[CatalogBook]], None]
+    _run_fetch: Callable[[str], None]
+    _add_selected: Callable[[], None]
+
+
 class AudiobookDLApp:
     """Simple Tkinter desktop UI for audiobook-dl."""
 
@@ -272,8 +352,12 @@ class AudiobookDLApp:
         if saved_geometry and is_valid_geometry(saved_geometry):
             self.root.geometry(saved_geometry)
         else:
-            self.root.geometry("760x680")
-        self.root.minsize(660, 600)
+            screen_w = max(660, self.root.winfo_screenwidth())
+            screen_h = max(480, self.root.winfo_screenheight())
+            default_w = min(780, max(660, screen_w - 40))
+            default_h = min(780, max(480, screen_h - 80))
+            self.root.geometry(f"{default_w}x{default_h}")
+        self.root.minsize(660, 480)
         self._apply_window_icon()
 
         self._style = ttk.Style()
@@ -289,14 +373,16 @@ class AudiobookDLApp:
         self._sink = _GuiLogSink(self._queue)
         self._cancel_event = threading.Event()
         self._interaction: Optional[_GuiInteractionHandler] = None
-        self._job_queue: "queue.Queue[Optional[_QueuedJob]]" = queue.Queue()
+        self._pending_jobs: Deque[Optional[_QueuedJob]] = deque()
         self._queue_lock = threading.Lock()
+        self._queue_cond = threading.Condition(self._queue_lock)
         self._worker: Optional[threading.Thread] = None
         self._worker_has_active_run = False
         self._worker_run_id = 0
         self._current_ui_run_id = 0
         self._batch_total = 0
         self._run_seen_urls: Set[str] = set()
+        self._queue_records: Dict[str, Dict[str, Any]] = {}
         self._ui_item_index = 0
         self._ui_item_total = 0
         self._ui_book_index = 0
@@ -308,14 +394,20 @@ class AudiobookDLApp:
         self._last_metrics_render_at = 0.0
         self._is_running = False
         self._is_previewing = False
+        self._is_verifying_auth = False
+        self._catalog_request_id = 0
         self._preview_cancel_event = threading.Event()
         self._preview_interaction: Optional[_GuiInteractionHandler] = None
-        self._preview_dialog: Optional[tk.Toplevel] = None
+        self._preview_dialog: Optional[PreviewDialog] = None
+        self._vscroll_visible = False
+        self._last_canvas_size: Optional[Tuple[int, int]] = None
+        self._last_content_req_size: Optional[Tuple[int, int]] = None
         self._interactive_widgets: List[
             Union[ttk.Entry, ttk.Button, ttk.Checkbutton, ttk.Combobox]
         ] = []
 
         self._init_variables()
+        self._build_menu_bar()
         self._build_ui()
         self._load_service_into_form()
         self._update_ffmpeg_status()
@@ -348,8 +440,12 @@ class AudiobookDLApp:
     def _init_variables(self) -> None:
         saved_output_dir = (self._config.gui.output_dir or "").strip()
         self.output_dir_var = tk.StringVar(value=saved_output_dir or default_output_dir())
-        saved_template = (self._config.gui.output_template or "").strip()
-        self.template_var = tk.StringVar(value=saved_template or "{title}")
+        saved_template = (self._config.gui.output_template or "").strip() or "{title}"
+        self.template_var = tk.StringVar(value=saved_template)
+        self.template_preset_var = tk.StringVar(
+            value=_TEMPLATE_TO_PRESET_LABEL.get(saved_template, "Custom")
+        )
+        self.template_preview_var = tk.StringVar(value="")
 
         first_label = self._services[0].label if self._services else ""
         self.service_label_var = tk.StringVar(value=first_label)
@@ -378,6 +474,7 @@ class AudiobookDLApp:
         self.resume_var = tk.BooleanVar(value=bool(self._config.resume))
         self.no_chapters_var = tk.BooleanVar(value=False)
         self.write_json_var = tk.BooleanVar(value=False)
+        self.enrich_metadata_var = tk.BooleanVar(value=False)
         self.debug_var = tk.BooleanVar(value=False)
 
         self.status_var = tk.StringVar(value="Ready")
@@ -385,15 +482,138 @@ class AudiobookDLApp:
         self.metrics_var = tk.StringVar(value="")
         self.ffmpeg_status_var = tk.StringVar(value="")
 
+    def _sync_scroll_layout(self, event: Optional[tk.Event] = None) -> None:
+        if event is not None:
+            canvas_w = event.width
+            canvas_h = event.height
+            self._last_canvas_size = (canvas_w, canvas_h)
+        elif self._last_canvas_size is not None:
+            canvas_w, canvas_h = self._last_canvas_size
+        else:
+            canvas_w = self._scroll_canvas.winfo_width()
+            canvas_h = self._scroll_canvas.winfo_height()
+        if canvas_w <= 1 or canvas_h <= 1:
+            return
+        req_w = self._content_frame.winfo_reqwidth()
+        req_h = self._content_frame.winfo_reqheight()
+        self._last_content_req_size = (req_w, req_h)
+        target_w = max(canvas_w, req_w)
+        target_h = max(canvas_h, req_h)
+        self._scroll_canvas.itemconfigure(
+            self._scroll_window_id,
+            width=target_w,
+            height=target_h,
+        )
+        self._scroll_canvas.configure(scrollregion=(0, 0, target_w, target_h))
+        needs_vscroll = req_h > canvas_h + 1
+        if needs_vscroll and not self._vscroll_visible:
+            self._vscroll.grid(row=0, column=1, sticky="ns")
+            self._vscroll_visible = True
+        elif not needs_vscroll and self._vscroll_visible:
+            self._vscroll.grid_remove()
+            self._vscroll_visible = False
+            self._scroll_canvas.yview_moveto(0.0)
+
+    def _on_content_configure(self, _event: Optional[tk.Event] = None) -> None:
+        req_size = (
+            self._content_frame.winfo_reqwidth(),
+            self._content_frame.winfo_reqheight(),
+        )
+        if req_size != self._last_content_req_size:
+            self._sync_scroll_layout()
+
+    def _ensure_focus_visible(self, event: tk.Event) -> None:
+        if not self._vscroll_visible:
+            return
+        widget = getattr(event, "widget", None)
+        if widget is None or widget in (self.root, self._scroll_canvas, self._content_frame):
+            return
+        try:
+            if widget.winfo_toplevel() is not self.root:
+                return
+            content_y = self._content_frame.winfo_rooty()
+            widget_top = widget.winfo_rooty() - content_y
+            widget_height = widget.winfo_height()
+            widget_bottom = widget_top + widget_height
+            content_h = self._content_frame.winfo_height()
+            canvas_h = self._scroll_canvas.winfo_height()
+        except tk.TclError:
+            return
+        if content_h <= canvas_h or canvas_h <= 1 or widget_height <= 1 or widget_height > canvas_h:
+            return
+        first, last = self._scroll_canvas.yview()
+        view_top = first * content_h
+        view_bottom = last * content_h
+        if widget_top < view_top:
+            self._scroll_canvas.yview_moveto(max(0.0, (widget_top - 8) / content_h))
+        elif widget_bottom > view_bottom:
+            self._scroll_canvas.yview_moveto(min(1.0, (widget_bottom + 8 - canvas_h) / content_h))
+
+    def _on_main_mousewheel(self, event: tk.Event) -> None:
+        widget = getattr(event, "widget", None)
+        if widget is not None:
+            if "popdown" in str(widget):
+                return
+            for scrollable in (self.urls_text, self.log_text, self.queue_tree):
+                if widget is scrollable:
+                    try:
+                        if scrollable.yview() != (0.0, 1.0):
+                            return
+                    except Exception:
+                        return
+        first, last = self._scroll_canvas.yview()
+        if first <= 0.0 and last >= 1.0:
+            return
+        delta = getattr(event, "delta", 0)
+        if delta:
+            step = -1 if delta > 0 else 1
+            if sys.platform != "darwin" and abs(delta) >= 120:
+                step = int(-delta / 120)
+            self._scroll_canvas.yview_scroll(step, "units")
+        elif getattr(event, "num", None) == 4:
+            self._scroll_canvas.yview_scroll(-1, "units")
+        elif getattr(event, "num", None) == 5:
+            self._scroll_canvas.yview_scroll(1, "units")
+
     def _build_ui(self) -> None:
-        container = ttk.Frame(self.root, padding=14)
-        container.pack(fill=tk.BOTH, expand=True)
+        scroll_host = ttk.Frame(self.root)
+        scroll_host.pack(fill=tk.BOTH, expand=True)
+        scroll_host.columnconfigure(0, weight=1)
+        scroll_host.rowconfigure(0, weight=1)
+
+        canvas_bg = self._style.lookup("TFrame", "background") or ""
+        canvas_kwargs: Dict[str, Any] = {"highlightthickness": 0, "borderwidth": 0}
+        if canvas_bg:
+            canvas_kwargs["background"] = canvas_bg
+        self._scroll_canvas = tk.Canvas(scroll_host, **canvas_kwargs)
+        self._scroll_canvas.grid(row=0, column=0, sticky="nsew")
+
+        self._vscroll = ttk.Scrollbar(
+            scroll_host,
+            orient="vertical",
+            command=self._scroll_canvas.yview,
+        )
+        self._scroll_canvas.configure(yscrollcommand=self._vscroll.set)
+
+        container = ttk.Frame(self._scroll_canvas, padding=(12, 8))
+        self._content_frame = container
+        self._scroll_window_id = self._scroll_canvas.create_window(
+            (0, 0),
+            window=container,
+            anchor="nw",
+        )
+        container.bind("<Configure>", self._on_content_configure)
+        self._scroll_canvas.bind("<Configure>", self._sync_scroll_layout)
+        self.root.bind("<FocusIn>", self._ensure_focus_visible)
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.root.bind(seq, self._on_main_mousewheel)
+
         container.columnconfigure(0, weight=1)
         container.rowconfigure(5, weight=1)
 
         # Header
         header = ttk.Frame(container)
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         header.columnconfigure(0, weight=1)
         title_text = f"audiobook-dl  v{__version__}"
         if is_portable_mode():
@@ -423,12 +643,12 @@ class AudiobookDLApp:
         self.ffmpeg_locate_btn.pack(side=tk.LEFT)
 
         # URLs
-        url_frame = ttk.LabelFrame(container, text="Audiobook URL(s)", padding=10)
-        url_frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        url_frame = ttk.LabelFrame(container, text="Audiobook URL(s)", padding=(10, 6))
+        url_frame.grid(row=1, column=0, sticky="ew", pady=(0, 6))
         url_frame.columnconfigure(0, weight=1)
 
-        self.urls_text = tk.Text(url_frame, height=3, wrap="word")
-        self.urls_text.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.urls_text = tk.Text(url_frame, height=2, width=40, wrap="word")
+        self.urls_text.grid(row=0, column=0, sticky="ew")
         self.urls_text.bind("<Tab>", self._focus_next)
         self.urls_text.bind("<Shift-Tab>", self._focus_prev)
         self.urls_text.bind("<Control-Return>", lambda _e: self.start_download())
@@ -437,45 +657,68 @@ class AudiobookDLApp:
         self.urls_text.bind("<ButtonRelease-1>", lambda _e: self.root.after(10, self._on_urls_changed))
         self._build_url_context_menu()
 
-        url_btn_col = ttk.Frame(url_frame)
-        url_btn_col.grid(row=0, column=1, sticky="ns")
-        paste_btn = ttk.Button(url_btn_col, text="Paste", command=self._paste_urls_from_clipboard)
-        paste_btn.pack(fill=tk.X, pady=(0, 4))
-        load_btn = ttk.Button(url_btn_col, text="Load .txt...", command=self._browse_url_file)
-        load_btn.pack(fill=tk.X, pady=(0, 4))
-        clear_url_btn = ttk.Button(url_btn_col, text="Clear", command=self._clear_urls)
-        clear_url_btn.pack(fill=tk.X)
-
+        url_footer = ttk.Frame(url_frame)
+        url_footer.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        url_footer.columnconfigure(0, weight=1)
         ttk.Label(
-            url_frame,
-            text="Paste, drag a link, or load .txt with book/series URLs (one per line). Ctrl+Enter to download or queue.",
+            url_footer,
+            text="One URL per line \u2022 Right-click: Paste & Queue \u2022 Ctrl+Enter to start",
             foreground="#555555",
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ).grid(row=0, column=0, sticky="w")
+        url_btn_row = ttk.Frame(url_footer)
+        url_btn_row.grid(row=0, column=1, sticky="e")
+        paste_btn = ttk.Button(url_btn_row, text="Paste", command=self._paste_urls_from_clipboard)
+        paste_btn.pack(side=tk.LEFT, padx=(0, 4))
+        load_btn = ttk.Button(url_btn_row, text="Load .txt...", command=self._browse_url_file)
+        load_btn.pack(side=tk.LEFT, padx=(0, 4))
+        clear_url_btn = ttk.Button(url_btn_row, text="Clear", command=self._clear_urls)
+        clear_url_btn.pack(side=tk.LEFT)
 
         # Output Location
-        out_frame = ttk.LabelFrame(container, text="Output", padding=10)
-        out_frame.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        out_frame = ttk.LabelFrame(container, text="Output", padding=(10, 6))
+        out_frame.grid(row=2, column=0, sticky="ew", pady=(0, 6))
         out_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(out_frame, text="Folder:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
+        ttk.Label(out_frame, text="Folder:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
         out_entry = ttk.Entry(out_frame, textvariable=self.output_dir_var)
-        out_entry.grid(row=0, column=1, sticky="ew", pady=(0, 6))
+        out_entry.grid(row=0, column=1, sticky="ew", pady=(0, 4))
         out_browse = ttk.Button(out_frame, text="Browse...", command=self._browse_output_dir)
-        out_browse.grid(row=0, column=2, padx=(8, 0), pady=(0, 6))
+        out_browse.grid(row=0, column=2, padx=(8, 0), pady=(0, 4))
 
-        ttk.Label(out_frame, text="Template:").grid(row=1, column=0, sticky="w", padx=(0, 8))
-        tpl_entry = ttk.Entry(out_frame, textvariable=self.template_var)
-        tpl_entry.grid(row=1, column=1, columnspan=2, sticky="ew")
+        ttk.Label(out_frame, text="Template:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
+        tpl_row = ttk.Frame(out_frame)
+        tpl_row.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(0, 4))
+        tpl_row.columnconfigure(0, weight=1)
+        tpl_entry = ttk.Entry(tpl_row, textvariable=self.template_var)
+        tpl_entry.grid(row=0, column=0, sticky="ew")
+        self.preset_combo = ttk.Combobox(
+            tpl_row,
+            textvariable=self.template_preset_var,
+            values=[label for label, _tpl in TEMPLATE_PRESET_LABELS],
+            state="readonly",
+            width=16,
+        )
+        self.preset_combo.grid(row=0, column=1, padx=(8, 0))
+        self.preset_combo.bind("<<ComboboxSelected>>", self._on_preset_selected)
+
+        ttk.Label(out_frame, text="Preview:").grid(row=2, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(out_frame, textvariable=self.template_preview_var, foreground="#555555").grid(
+            row=2, column=1, columnspan=2, sticky="w"
+        )
+        for var in (self.output_dir_var, self.template_var, self.output_format_var, self.combine_var):
+            var.trace_add("write", lambda *_args: self._update_template_preview())
+        self.template_var.trace_add("write", lambda *_args: self._sync_preset_from_template())
+        self._update_template_preview()
 
         # Service & Authentication
-        auth_frame = ttk.LabelFrame(container, text="Service & Authentication", padding=10)
-        auth_frame.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        auth_frame = ttk.LabelFrame(container, text="Service & Authentication", padding=(10, 6))
+        auth_frame.grid(row=3, column=0, sticky="ew", pady=(0, 6))
         auth_frame.columnconfigure(1, weight=1)
         auth_frame.columnconfigure(3, weight=1)
 
-        ttk.Label(auth_frame, text="Service:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
+        ttk.Label(auth_frame, text="Service:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
         service_row = ttk.Frame(auth_frame)
-        service_row.grid(row=0, column=1, columnspan=4, sticky="ew", pady=(0, 6))
+        service_row.grid(row=0, column=1, columnspan=4, sticky="ew", pady=(0, 4))
         service_row.columnconfigure(1, weight=1)
 
         self.service_combo = ttk.Combobox(
@@ -495,47 +738,49 @@ class AudiobookDLApp:
             row=0, column=2, sticky="e", padx=(8, 0)
         )
 
-        ttk.Label(auth_frame, text="Cookies File:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
+        ttk.Label(auth_frame, text="Cookies File:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
         self.cookie_entry = ttk.Entry(auth_frame, textvariable=self.cookie_file_var)
-        self.cookie_entry.grid(row=1, column=1, columnspan=3, sticky="ew", pady=(0, 6))
+        self.cookie_entry.grid(row=1, column=1, columnspan=3, sticky="ew", pady=(0, 4))
         self.cookie_browse = ttk.Button(auth_frame, text="Browse...", command=self._browse_cookie_file)
-        self.cookie_browse.grid(row=1, column=4, padx=(8, 0), pady=(0, 6))
+        self.cookie_browse.grid(row=1, column=4, padx=(8, 0), pady=(0, 4))
 
-        ttk.Label(auth_frame, text="Username:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
+        ttk.Label(auth_frame, text="Username:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
         self.user_entry = ttk.Entry(auth_frame, textvariable=self.username_var)
-        self.user_entry.grid(row=2, column=1, sticky="ew", padx=(0, 12), pady=(0, 6))
+        self.user_entry.grid(row=2, column=1, sticky="ew", padx=(0, 10), pady=(0, 4))
 
-        ttk.Label(auth_frame, text="Password:").grid(row=2, column=2, sticky="w", padx=(0, 8), pady=(0, 6))
+        ttk.Label(auth_frame, text="Password:").grid(row=2, column=2, sticky="w", padx=(0, 8), pady=(0, 4))
         self.password_entry = ttk.Entry(auth_frame, textvariable=self.password_var, show="*")
-        self.password_entry.grid(row=2, column=3, sticky="ew", pady=(0, 6))
+        self.password_entry.grid(row=2, column=3, sticky="ew", pady=(0, 4))
         self.show_pw_btn = ttk.Checkbutton(
             auth_frame,
             text="Show",
             variable=self.show_password_var,
             command=self._toggle_password_visibility,
         )
-        self.show_pw_btn.grid(row=2, column=4, padx=(8, 0), pady=(0, 6))
+        self.show_pw_btn.grid(row=2, column=4, padx=(8, 0), pady=(0, 4))
 
         ttk.Label(auth_frame, text="Library:").grid(row=3, column=0, sticky="w", padx=(0, 8))
-        self.lib_entry = ttk.Entry(auth_frame, textvariable=self.library_var)
-        self.lib_entry.grid(row=3, column=1, sticky="ew", padx=(0, 12))
+        self.lib_entry = ttk.Entry(auth_frame, textvariable=self.library_var, width=14)
+        self.lib_entry.grid(row=3, column=1, sticky="ew", padx=(0, 10))
 
         auth_actions = ttk.Frame(auth_frame)
         auth_actions.grid(row=3, column=2, columnspan=3, sticky="ew")
         self.remember_cb = ttk.Checkbutton(
             auth_actions,
-            text="Remember login & password",
+            text="Remember login",
             variable=self.remember_login_var,
         )
         self.remember_cb.pack(side=tk.LEFT)
         self.forget_auth_btn = ttk.Button(auth_actions, text="Forget", command=self.forget_current_credentials)
         self.forget_auth_btn.pack(side=tk.RIGHT)
         self.save_auth_btn = ttk.Button(auth_actions, text="Save", command=self.save_current_credentials)
-        self.save_auth_btn.pack(side=tk.RIGHT, padx=(0, 6))
+        self.save_auth_btn.pack(side=tk.RIGHT, padx=(0, 4))
+        self.test_auth_btn = ttk.Button(auth_actions, text="Test Login", command=self.verify_current_auth)
+        self.test_auth_btn.pack(side=tk.RIGHT, padx=(0, 4))
 
         # Options
-        opt_frame = ttk.LabelFrame(container, text="Options", padding=10)
-        opt_frame.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+        opt_frame = ttk.LabelFrame(container, text="Options", padding=(10, 6))
+        opt_frame.grid(row=4, column=0, sticky="ew", pady=(0, 6))
 
         cb_m4b = ttk.Checkbutton(
             opt_frame,
@@ -563,18 +808,18 @@ class AudiobookDLApp:
         cb_skip.grid(row=0, column=5, sticky="w")
 
         cb_no_chapters = ttk.Checkbutton(opt_frame, text="No chapters", variable=self.no_chapters_var)
-        cb_no_chapters.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        cb_no_chapters.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         cb_json = ttk.Checkbutton(opt_frame, text="Write JSON metadata", variable=self.write_json_var)
-        cb_json.grid(row=1, column=2, columnspan=2, sticky="w", pady=(6, 0))
+        cb_json.grid(row=1, column=2, columnspan=2, sticky="w", pady=(4, 0))
 
         cb_debug = ttk.Checkbutton(opt_frame, text="Debug logs", variable=self.debug_var)
-        cb_debug.grid(row=1, column=4, sticky="w", pady=(6, 0))
+        cb_debug.grid(row=1, column=4, sticky="w", pady=(4, 0))
 
         cb_resume = ttk.Checkbutton(opt_frame, text="Resume partial", variable=self.resume_var)
-        cb_resume.grid(row=1, column=5, sticky="w", pady=(6, 0))
+        cb_resume.grid(row=1, column=5, sticky="w", pady=(4, 0))
 
-        ttk.Label(opt_frame, text="M4B Quality:").grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(opt_frame, text="M4B Quality:").grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
         bitrate_values = list(AUDIO_BITRATE_PRESETS)
         if self.audio_bitrate_var.get() not in bitrate_values:
             bitrate_values.append(self.audio_bitrate_var.get())
@@ -585,16 +830,23 @@ class AudiobookDLApp:
             state="readonly",
             width=10,
         )
-        bitrate_combo.grid(row=2, column=2, columnspan=2, sticky="w", pady=(6, 0))
+        bitrate_combo.grid(row=2, column=2, columnspan=2, sticky="w", pady=(4, 0))
+
+        cb_enrich = ttk.Checkbutton(
+            opt_frame,
+            text="Enrich metadata",
+            variable=self.enrich_metadata_var,
+        )
+        cb_enrich.grid(row=2, column=4, columnspan=2, sticky="w", pady=(4, 0))
 
         # Actions, Progress & Log
-        log_frame = ttk.LabelFrame(container, text="Activity", padding=10)
+        log_frame = ttk.LabelFrame(container, text="Activity", padding=(10, 6))
         log_frame.grid(row=5, column=0, sticky="nsew")
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(3, weight=1)
 
         action_bar = ttk.Frame(log_frame)
-        action_bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        action_bar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
         action_bar.columnconfigure(5, weight=1)
 
         self.download_btn = ttk.Button(action_bar, text="Download", command=self.start_download)
@@ -616,7 +868,7 @@ class AudiobookDLApp:
         self.status_label.grid(row=0, column=5, sticky="e")
 
         meta_bar = ttk.Frame(log_frame)
-        meta_bar.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        meta_bar.grid(row=1, column=0, sticky="ew", pady=(0, 2))
         meta_bar.columnconfigure(1, weight=1)
 
         self.batch_label = ttk.Label(meta_bar, textvariable=self.batch_var, foreground="#333333")
@@ -626,15 +878,69 @@ class AudiobookDLApp:
         self.metrics_label.grid(row=0, column=1, sticky="e")
 
         self.progressbar = ttk.Progressbar(log_frame, mode="determinate", maximum=100)
-        self.progressbar.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        self.progressbar.grid(row=2, column=0, sticky="ew", pady=(0, 6))
 
-        self.log_text = ScrolledText(log_frame, height=10, state="disabled", wrap="word")
-        self.log_text.grid(row=3, column=0, sticky="nsew")
+        self.activity_notebook = ttk.Notebook(log_frame)
+        self.activity_notebook.grid(row=3, column=0, sticky="nsew")
+
+        log_tab = ttk.Frame(self.activity_notebook)
+        log_tab.columnconfigure(0, weight=1)
+        log_tab.rowconfigure(0, weight=1)
+        self.log_text = ScrolledText(log_tab, height=4, width=40, state="disabled", wrap="word")
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        self.activity_notebook.add(log_tab, text="Activity Log")
+
+        queue_tab = ttk.Frame(self.activity_notebook, padding=4)
+        queue_tab.columnconfigure(0, weight=1)
+        queue_tab.rowconfigure(1, weight=1)
+
+        queue_toolbar = ttk.Frame(queue_tab)
+        queue_toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        self.queue_remove_btn = ttk.Button(queue_toolbar, text="Remove", command=self._remove_selected_queue_item)
+        self.queue_remove_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self.queue_up_btn = ttk.Button(queue_toolbar, text="Move Up", command=lambda: self._move_selected_queue_item(-1))
+        self.queue_up_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self.queue_down_btn = ttk.Button(queue_toolbar, text="Move Down", command=lambda: self._move_selected_queue_item(1))
+        self.queue_down_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self.queue_retry_btn = ttk.Button(queue_toolbar, text="Retry Failed", command=self._retry_failed_queue_items)
+        self.queue_retry_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self.queue_clear_btn = ttk.Button(queue_toolbar, text="Clear Completed", command=self._clear_completed_history)
+        self.queue_clear_btn.pack(side=tk.RIGHT)
+
+        self.queue_tree = ttk.Treeview(
+            queue_tab,
+            columns=("service", "url", "status", "detail"),
+            show="headings",
+            selectmode="browse",
+            height=3,
+        )
+        self.queue_tree.heading("service", text="Service")
+        self.queue_tree.heading("url", text="URL / Title")
+        self.queue_tree.heading("status", text="Status")
+        self.queue_tree.heading("detail", text="Detail")
+        self.queue_tree.column("service", width=90, stretch=False)
+        self.queue_tree.column("url", width=220, stretch=True)
+        self.queue_tree.column("status", width=90, stretch=False)
+        self.queue_tree.column("detail", width=140, stretch=True)
+        queue_scroll = ttk.Scrollbar(queue_tab, orient="vertical", command=self.queue_tree.yview)
+        self.queue_tree.configure(yscrollcommand=queue_scroll.set)
+        self.queue_tree.grid(row=1, column=0, sticky="nsew")
+        queue_scroll.grid(row=1, column=1, sticky="ns")
+        self.activity_notebook.add(queue_tab, text="Queue & History")
+
+        # Bind optional drag-and-drop URL support when tkinterdnd2 is available on host Tk.
+        if hasattr(self.urls_text, "drop_target_register") and hasattr(self.urls_text, "dnd_bind"):
+            try:
+                self.urls_text.drop_target_register("DND_Text")  # type: ignore[attr-defined]
+                self.urls_text.dnd_bind("<<Drop>>", self._on_url_drop)  # type: ignore[attr-defined]
+            except Exception:
+                pass
 
         self._interactive_widgets = [
             out_entry,
             out_browse,
             tpl_entry,
+            self.preset_combo,
             self.service_combo,
             self.cookie_entry,
             self.cookie_browse,
@@ -643,6 +949,7 @@ class AudiobookDLApp:
             self.show_pw_btn,
             self.lib_entry,
             self.remember_cb,
+            self.test_auth_btn,
             self.save_auth_btn,
             self.forget_auth_btn,
             cb_m4b,
@@ -653,8 +960,357 @@ class AudiobookDLApp:
             cb_resume,
             cb_no_chapters,
             cb_json,
+            cb_enrich,
             cb_debug,
         ]
+
+    def _build_menu_bar(self) -> None:
+        menubar = tk.Menu(self.root)
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="Load URLs from .txt...", command=self._browse_url_file, accelerator="Ctrl+O")
+        file_menu.add_command(label="Open Output Folder", command=self._open_output_folder)
+        file_menu.add_command(label="Reload Config", command=self._reload_config)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self._on_close, accelerator="Ctrl+Q")
+        menubar.add_cascade(label="File", menu=file_menu)
+
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        tools_menu.add_command(label="Save Credentials", command=self.save_current_credentials)
+        tools_menu.add_command(label="Test Login", command=self.verify_current_auth)
+        tools_menu.add_command(label="Browse Library / Search...", command=self._show_catalog_browser_dialog)
+        tools_menu.add_command(label="Locate FFmpeg Folder...", command=self.browse_ffmpeg_dir)
+        tools_menu.add_command(label="Download History Ledger...", command=self._show_archive_ledger_dialog)
+        tools_menu.add_separator()
+        tools_menu.add_command(label="Retry Failed Jobs", command=self._retry_failed_queue_items)
+        tools_menu.add_command(label="Clear Completed History", command=self._clear_completed_history)
+        tools_menu.add_command(label="Clear Log", command=self._clear_log)
+        menubar.add_cascade(label="Tools", menu=tools_menu)
+
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="FFmpeg Setup Guide", command=self._show_ffmpeg_guidance)
+        if sys.platform.startswith("win"):
+            help_menu.add_command(label="Install FFmpeg via winget...", command=self._install_ffmpeg_winget)
+        help_menu.add_command(label="Check for Updates...", command=self.check_updates_interactive)
+        help_menu.add_separator()
+        help_menu.add_command(label="About audiobook-dl", command=self._show_about_dialog)
+        menubar.add_cascade(label="Help", menu=help_menu)
+
+        self.root.configure(menu=menubar)
+        self.root.bind("<Control-o>", lambda _e: self._browse_url_file())
+        self.root.bind("<Control-q>", lambda _e: self._on_close())
+
+    def _on_url_drop(self, event: Any) -> None:
+        dropped = getattr(event, "data", "")
+        if not dropped:
+            return
+        urls = parse_url_text(str(dropped).strip("{}"))
+        if urls:
+            existing = parse_url_text(self.urls_text.get("1.0", tk.END))
+            merged = list(dict.fromkeys([*existing, *urls]))
+            self.urls_text.delete("1.0", tk.END)
+            self.urls_text.insert("1.0", "\n".join(merged))
+            self._on_urls_changed()
+
+    def _reload_config(self) -> None:
+        try:
+            loaded = self._load_saved_config()
+            with self._queue_lock:
+                self._config = loaded
+            self._load_service_into_form()
+            self._update_ffmpeg_status()
+            self.status_var.set("Config reloaded")
+            self._append_log("Reloaded configuration.")
+        except Exception as exc:
+            messagebox.showerror("Config Error", str(exc), parent=self.root)
+
+    def _show_about_dialog(self) -> None:
+        messagebox.showinfo(
+            "About audiobook-dl",
+            f"audiobook-dl v{__version__}\n"
+            f"Supported services: {len(self._services)}\n"
+            "https://github.com/jo1gi/audiobook-dl",
+            parent=self.root,
+        )
+
+    def _archive_ledger_path(self) -> str:
+        cfg = self._config_snapshot()
+        if cfg.download_archive:
+            return cfg.download_archive
+        db_dir = cfg.database_directory or args.default_database_directory()
+        return default_archive_path(db_dir)
+
+    def _show_archive_ledger_dialog(self) -> ArchiveLedgerDialog:
+        """Open a modal dialog displaying recorded download history from SQLite."""
+        dialog = ArchiveLedgerDialog(self.root)
+        dialog.title("Download History Ledger")
+        dialog.transient(self.root)
+        dialog.geometry("760x440")
+        dialog.minsize(560, 320)
+
+        body = ttk.Frame(dialog, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(1, weight=1)
+
+        search_var = tk.StringVar()
+        top_bar = ttk.Frame(body)
+        top_bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        ttk.Label(top_bar, text="Search:").pack(side=tk.LEFT, padx=(0, 6))
+        search_entry = ttk.Entry(top_bar, textvariable=search_var, width=32)
+        search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+
+        tree = ttk.Treeview(
+            body,
+            columns=("downloaded_at", "source", "title", "author", "output_path"),
+            show="headings",
+            selectmode="browse",
+        )
+        tree.heading("downloaded_at", text="Date (UTC)")
+        tree.heading("source", text="Service")
+        tree.heading("title", text="Title")
+        tree.heading("author", text="Author")
+        tree.heading("output_path", text="Output Path")
+        tree.column("downloaded_at", width=140, stretch=False)
+        tree.column("source", width=90, stretch=False)
+        tree.column("title", width=180, stretch=True)
+        tree.column("author", width=130, stretch=True)
+        tree.column("output_path", width=180, stretch=True)
+        scroll = ttk.Scrollbar(body, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.grid(row=1, column=0, sticky="nsew")
+        scroll.grid(row=1, column=1, sticky="ns")
+
+        archive_path = self._archive_ledger_path()
+
+        def _populate(*_args: Any) -> None:
+            for iid in tree.get_children():
+                tree.delete(iid)
+            if not os.path.exists(archive_path):
+                return
+            ledger = DownloadArchive(archive_path)
+            for entry in ledger.list_entries(query=search_var.get(), limit=500):
+                tree.insert(
+                    "",
+                    tk.END,
+                    iid=str(entry.id),
+                    values=(
+                        entry.downloaded_at,
+                        entry.source,
+                        entry.title,
+                        entry.author,
+                        entry.output_path or "",
+                    ),
+                )
+
+        def _remove_selected() -> None:
+            sel = tree.selection()
+            if not sel:
+                return
+            entry_id = int(sel[0])
+            DownloadArchive(archive_path).delete_entry(entry_id)
+            tree.delete(sel[0])
+
+        def _clear_all() -> None:
+            if not os.path.exists(archive_path):
+                return
+            if not messagebox.askyesno(
+                "Clear Ledger",
+                "Delete all entries from the download history ledger?",
+                parent=dialog,
+            ):
+                return
+            DownloadArchive(archive_path).clear()
+            _populate()
+
+        ttk.Button(top_bar, text="Refresh", command=_populate).pack(side=tk.LEFT)
+
+        btn_bar = ttk.Frame(body)
+        btn_bar.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(btn_bar, text="Remove Selected", command=_remove_selected).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btn_bar, text="Clear All", command=_clear_all).pack(side=tk.LEFT)
+        ttk.Button(btn_bar, text="Close", command=dialog.destroy).pack(side=tk.RIGHT)
+
+        search_var.trace_add("write", _populate)
+        _populate()
+        dialog._tree = tree
+        dialog._search_var = search_var
+        dialog._refresh = _populate
+        return dialog
+
+    def _show_catalog_browser_dialog(self) -> CatalogBrowserDialog:
+        """Open a modal dialog to search service catalogs or list saved libraries."""
+        browseable = [
+            svc for svc in self._services if svc.supports_search or svc.supports_library
+        ]
+        dialog = CatalogBrowserDialog(self.root)
+        dialog.title("Browse Library / Search")
+        dialog.transient(self.root)
+        dialog.geometry("760x460")
+        dialog.minsize(560, 340)
+
+        body = ttk.Frame(dialog, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(1, weight=1)
+
+        selected_service = self._selected_service()
+        default_label = (
+            selected_service.label
+            if selected_service is not None and (selected_service.supports_search or selected_service.supports_library)
+            else (browseable[0].label if browseable else "")
+        )
+        service_var = tk.StringVar(value=default_label)
+        query_var = tk.StringVar()
+        status_var = tk.StringVar(value="Choose a service and click Search or List Library.")
+
+        top_bar = ttk.Frame(body)
+        top_bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        ttk.Label(top_bar, text="Service:").pack(side=tk.LEFT, padx=(0, 6))
+        svc_combo = ttk.Combobox(
+            top_bar,
+            textvariable=service_var,
+            values=[svc.label for svc in browseable],
+            state="readonly",
+            width=22,
+        )
+        svc_combo.pack(side=tk.LEFT, padx=(0, 8))
+
+        query_entry = ttk.Entry(top_bar, textvariable=query_var, width=28)
+        query_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        search_btn = ttk.Button(top_bar, text="Search")
+        search_btn.pack(side=tk.LEFT, padx=(0, 6))
+        library_btn = ttk.Button(top_bar, text="List Library")
+        library_btn.pack(side=tk.LEFT)
+
+        tree = ttk.Treeview(
+            body,
+            columns=("title", "author", "series", "url"),
+            show="headings",
+            selectmode="extended",
+        )
+        tree.heading("title", text="Title")
+        tree.heading("author", text="Author")
+        tree.heading("series", text="Series")
+        tree.heading("url", text="URL")
+        tree.column("title", width=220, stretch=True)
+        tree.column("author", width=150, stretch=True)
+        tree.column("series", width=130, stretch=True)
+        tree.column("url", width=220, stretch=True)
+        scroll = ttk.Scrollbar(body, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.grid(row=1, column=0, sticky="nsew")
+        scroll.grid(row=1, column=1, sticky="ns")
+
+        btn_bar = ttk.Frame(body)
+        btn_bar.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        status_label = ttk.Label(btn_bar, textvariable=status_var, foreground="#555555")
+        status_label.pack(side=tk.LEFT)
+
+        def _sync_buttons(*_args: Any) -> None:
+            svc = self._services_by_label.get(service_var.get())
+            if svc is None:
+                query_entry.configure(state="disabled")
+                search_btn.configure(state="disabled")
+                library_btn.configure(state="disabled")
+                return
+            query_entry.configure(state="normal" if svc.supports_search else "disabled")
+            search_btn.configure(state="normal" if svc.supports_search else "disabled")
+            library_btn.configure(state="normal" if svc.supports_library else "disabled")
+
+        def _run_fetch(mode: str) -> None:
+            svc = self._services_by_label.get(service_var.get())
+            if svc is None:
+                return
+            query_text = query_var.get().strip()
+            if mode == "search" and not query_text:
+                status_var.set("Enter a search term first.")
+                return
+            self._catalog_request_id += 1
+            request_id = self._catalog_request_id
+            options = self.build_options(urls_override=[])
+            cfg = self._config_snapshot()
+            interaction = _GuiInteractionHandler(self._queue, threading.Event())
+            search_btn.configure(state="disabled")
+            library_btn.configure(state="disabled")
+            status_var.set(f"{'Searching' if mode == 'search' else 'Loading library for'} {svc.label}...")
+
+            def _worker() -> None:
+                try:
+                    if mode == "search":
+                        books = search_service(
+                            svc.key,
+                            query_text,
+                            options,
+                            cfg,
+                            interaction=interaction,
+                        )
+                    else:
+                        books = list_service_library(
+                            svc.key,
+                            options,
+                            cfg,
+                            interaction=interaction,
+                        )
+                    self._queue.put(("catalog_loaded", request_id, dialog, books, None))
+                except Exception as exc:
+                    self._queue.put(("catalog_loaded", request_id, dialog, [], exc))
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        def _populate_items(books: Sequence[CatalogBook]) -> None:
+            for iid in tree.get_children():
+                tree.delete(iid)
+            for idx, book in enumerate(books):
+                tree.insert(
+                    "",
+                    tk.END,
+                    iid=f"book-{idx}",
+                    values=(book.title, book.author, book.series, book.url),
+                )
+            _sync_buttons()
+            count = len(books)
+            status_var.set(f"Found {count} book{'s' if count != 1 else ''}.")
+
+        def _add_selected() -> None:
+            selected_iids = tree.selection()
+            if not selected_iids:
+                selected_iids = tree.get_children()
+            urls_to_add = []
+            for iid in selected_iids:
+                values = tree.item(iid, "values")
+                if values and len(values) >= 4 and str(values[3]).strip():
+                    urls_to_add.append(str(values[3]).strip())
+            if not urls_to_add:
+                return
+            existing = parse_url_text(self.urls_text.get("1.0", tk.END))
+            existing_set = set(existing)
+            added = [u for u in urls_to_add if u not in existing_set]
+            if added:
+                combined = "\n".join([*existing, *added])
+                self.urls_text.delete("1.0", tk.END)
+                self.urls_text.insert("1.0", combined)
+                self._on_urls_changed()
+            self.status_var.set(f"Added {len(added)} URL{'s' if len(added) != 1 else ''} from catalog")
+            dialog.destroy()
+
+        search_btn.configure(command=lambda: _run_fetch("search"))
+        library_btn.configure(command=lambda: _run_fetch("library"))
+        query_entry.bind("<Return>", lambda _e: _run_fetch("search"))
+        svc_combo.bind("<<ComboboxSelected>>", _sync_buttons)
+
+        ttk.Button(btn_bar, text="Close", command=dialog.destroy).pack(side=tk.RIGHT)
+        ttk.Button(btn_bar, text="Add Selected to URLs", command=_add_selected).pack(side=tk.RIGHT, padx=(0, 6))
+
+        _sync_buttons()
+        dialog._tree = tree
+        dialog._service_var = service_var
+        dialog._query_var = query_var
+        dialog._status_var = status_var
+        dialog._sync_buttons = _sync_buttons
+        dialog._populate_items = _populate_items
+        dialog._run_fetch = _run_fetch
+        dialog._add_selected = _add_selected
+        return dialog
 
     def _focus_next(self, event: tk.Event) -> str:
         next_widget = event.widget.tk_focusNext()
@@ -762,6 +1418,30 @@ class AudiobookDLApp:
         self._show_ffmpeg_guidance()
         return False
 
+    def _install_ffmpeg_winget(self) -> None:
+        """Install FFmpeg via Windows winget (`Gyan.FFmpeg`) on a background thread."""
+        if not sys.platform.startswith("win") or not winget_available():
+            messagebox.showinfo(
+                "winget Unavailable",
+                "Windows Package Manager (winget) was not found on PATH.",
+                parent=self.root,
+            )
+            return
+        if not messagebox.askyesno(
+            "Install FFmpeg via winget",
+            "Run `winget install -e --id Gyan.FFmpeg` to install FFmpeg?",
+            parent=self.root,
+        ):
+            return
+        self.status_var.set("Installing FFmpeg via winget...")
+        self._append_log("Installing FFmpeg via winget (Gyan.FFmpeg)...")
+
+        def _worker() -> None:
+            ok, detail = install_ffmpeg_via_winget()
+            self._queue.put(("ffmpeg_install_done", ok, detail))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _show_ffmpeg_guidance(self) -> None:
         ffmpeg_path = find_executable("ffmpeg")
         ffprobe_path = find_executable("ffprobe")
@@ -862,9 +1542,59 @@ class AudiobookDLApp:
         self.password_entry.configure(state=login_state)
         self.show_pw_btn.configure(state=login_state)
         self.lib_entry.configure(state=library_state)
+        self.test_auth_btn.configure(
+            state="disabled" if self._is_verifying_auth else save_state
+        )
         self.save_auth_btn.configure(state=save_state)
         has_saved = service.key in self._config.sources
         self.forget_auth_btn.configure(state="normal" if has_saved else "disabled")
+
+    def verify_current_auth(self) -> None:
+        """Test authentication for the currently selected service in the background."""
+        if self._is_verifying_auth or self._is_running:
+            return
+        service = self._selected_service()
+        if service is None or not service.auth_methods:
+            return
+        options = self.build_options(urls_override=[])
+        cfg = self._config_snapshot()
+        interaction = _GuiInteractionHandler(self._queue, threading.Event())
+        self._is_verifying_auth = True
+        self.test_auth_btn.configure(state="disabled")
+        self.status_var.set(f"Testing login for {service.label}...")
+
+        def _worker() -> None:
+            try:
+                ok = verify_service_auth(service.key, options, cfg, interaction=interaction)
+                self._queue.put(("auth_verified", service.label, ok, None))
+            except Exception as exc:
+                self._queue.put(("auth_verified", service.label, False, exc))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _schedule_update_check(self) -> None:
+        """Run a quiet background update check at launch unless opted out."""
+        if self._config.check_updates is False:
+            return
+        proxy = self._config.proxy
+
+        def _worker() -> None:
+            info = check_for_updates(proxy=proxy, respect_opt_out=True)
+            if info is not None and info.has_update:
+                self._queue.put(("update_checked", info, False))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def check_updates_interactive(self) -> None:
+        """Check for newer releases from the Help menu."""
+        self.status_var.set("Checking for updates...")
+        proxy = self._config.proxy
+
+        def _worker() -> None:
+            info = check_for_updates(proxy=proxy, respect_opt_out=False)
+            self._queue.put(("update_checked", info, True))
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def save_current_credentials(self, quiet: bool = False) -> None:
         """Persist the selected service's login, password, library, and cookie path."""
@@ -930,6 +1660,31 @@ class AudiobookDLApp:
         self.m4b_var.set(is_m4b)
         if is_m4b:
             self.combine_var.set(True)
+
+    def _on_preset_selected(self, _event: Optional[tk.Event] = None) -> None:
+        chosen = self.template_preset_var.get()
+        tpl = _PRESET_LABEL_TO_TEMPLATE.get(chosen)
+        if tpl:
+            self.template_var.set(tpl)
+
+    def _sync_preset_from_template(self) -> None:
+        tpl = self.template_var.get().strip()
+        target_label = _TEMPLATE_TO_PRESET_LABEL.get(tpl, "Custom")
+        if self.template_preset_var.get() != target_label:
+            self.template_preset_var.set(target_label)
+
+    def _update_template_preview(self) -> None:
+        folder = self.output_dir_var.get().strip() or default_output_dir()
+        tpl = self.template_var.get().strip() or "{title}"
+        full_tpl = os.path.join(folder, tpl)
+        fmt = self.output_format_var.get().strip()
+        ext = "m4b" if fmt in ("", "Original") else fmt
+        try:
+            rendered = output.gen_output_location(full_tpl, _SAMPLE_PREVIEW_METADATA, "")
+            suffix = f".{ext}" if self.combine_var.get() else f"/01.{ext}"
+            self.template_preview_var.set(f"{rendered}{suffix}")
+        except Exception as exc:
+            self.template_preview_var.set(f"(invalid template: {exc})")
 
     def _toggle_password_visibility(self) -> None:
         self.password_entry.configure(show="" if self.show_password_var.get() else "*")
@@ -1031,19 +1786,65 @@ class AudiobookDLApp:
         if not os.path.isdir(folder):
             messagebox.showinfo("Folder Missing", f"Folder does not exist yet:\n{folder}", parent=self.root)
             return
-        if os.name == "nt":
-            os.startfile(folder)  # type: ignore[attr-defined]
-        else:
-            messagebox.showinfo("Output Folder", folder, parent=self.root)
+        try:
+            if sys.platform.startswith("win") and hasattr(os, "startfile"):
+                os.startfile(folder)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", folder])
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except OSError as exc:
+            messagebox.showerror(
+                "Open Folder Failed",
+                f"Could not open folder:\n{folder}\n\n{exc}",
+                parent=self.root,
+            )
+
+    def _config_snapshot(self) -> Config:
+        """Return a thread-safe shallow copy of the current cached configuration."""
+        with self._queue_lock:
+            cfg = self._config
+            return Config(
+                sources={
+                    k: SourceConfig(
+                        username=sc.username,
+                        password=sc.password,
+                        library=sc.library,
+                        cookie_file=sc.cookie_file,
+                    )
+                    for k, sc in cfg.sources.items()
+                },
+                output_template=cfg.output_template,
+                database_directory=cfg.database_directory,
+                skip_downloaded=cfg.skip_downloaded,
+                ffmpeg_dir=cfg.ffmpeg_dir,
+                output_format=cfg.output_format,
+                combine=cfg.combine,
+                audio_bitrate=cfg.audio_bitrate,
+                resume=cfg.resume,
+                overwrite=cfg.overwrite,
+                max_workers=cfg.max_workers,
+                book_delay=cfg.book_delay,
+                proxy=cfg.proxy,
+                timeout=cfg.timeout,
+                download_archive=cfg.download_archive,
+                gui=cfg.gui,
+            )
 
     def _clear_log(self) -> None:
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", tk.END)
         self.log_text.configure(state="disabled")
 
+    MAX_LOG_LINES = 5000
+
     def _append_log(self, text: str) -> None:
         self.log_text.configure(state="normal")
         self.log_text.insert(tk.END, text + "\n")
+        line_count = int(self.log_text.index("end-1c").split(".")[0])
+        if line_count > self.MAX_LOG_LINES:
+            excess = line_count - self.MAX_LOG_LINES
+            self.log_text.delete("1.0", f"{excess + 1}.0")
         self.log_text.see(tk.END)
         self.log_text.configure(state="disabled")
 
@@ -1146,6 +1947,7 @@ class AudiobookDLApp:
             library=library,
             skip_downloaded=self.skip_downloaded_var.get(),
             write_json_metadata=self.write_json_var.get(),
+            enrich_metadata=self.enrich_metadata_var.get(),
             config_location=config_location,
             resume=self.resume_var.get(),
             audio_bitrate=audio_bitrate,
@@ -1164,12 +1966,150 @@ class AudiobookDLApp:
             return False
         return True
 
+    @staticmethod
+    def _make_job_id() -> str:
+        return uuid.uuid4().hex[:12]
+
+    def _service_label_for_url(self, url: str) -> str:
+        detected = detect_service_key(url)
+        if detected and detected in self._services_by_key:
+            return self._services_by_key[detected].label
+        return detected or "Unknown"
+
+    def _register_queue_job(self, job: _QueuedJob) -> None:
+        """Insert a queued job row into the Queue & History table and internal index."""
+        service_label = self._service_label_for_url(job.url)
+        self._queue_records[job.job_id] = {
+            "job_id": job.job_id,
+            "run_id": job.run_id,
+            "url": job.url,
+            "status": "Queued",
+            "detail": "",
+            "service": service_label,
+        }
+        self.queue_tree.insert(
+            "",
+            tk.END,
+            iid=job.job_id,
+            values=(service_label, job.url, "Queued", ""),
+        )
+
+    def _update_queue_row(self, job_id: str, status: str, detail: str = "") -> None:
+        rec = self._queue_records.get(job_id)
+        if rec is None:
+            return
+        rec["status"] = status
+        rec["detail"] = detail
+        if self.queue_tree.exists(job_id):
+            self.queue_tree.item(
+                job_id,
+                values=(rec["service"], rec["url"], status, detail),
+            )
+
+    def _remove_selected_queue_item(self) -> None:
+        selected = self.queue_tree.selection()
+        if not selected:
+            return
+        job_id = selected[0]
+        rec = self._queue_records.get(job_id)
+        if rec is None:
+            return
+        with self._queue_cond:
+            pending_idx: Optional[int] = None
+            for idx, job in enumerate(self._pending_jobs):
+                if job is not None and job.job_id == job_id:
+                    pending_idx = idx
+                    break
+            if pending_idx is not None:
+                del self._pending_jobs[pending_idx]
+                self._batch_total = max(0, self._batch_total - 1)
+                self._run_seen_urls.discard(rec["url"])
+                new_total = self._batch_total
+            elif rec["status"] == "Running":
+                messagebox.showinfo(
+                    "Job Active",
+                    "The currently running download cannot be removed; use Cancel instead.",
+                    parent=self.root,
+                )
+                return
+            else:
+                new_total = None
+        if new_total is not None:
+            self._ui_item_total = max(self._ui_item_index, new_total)
+            self._refresh_batch_label()
+        self._queue_records.pop(job_id, None)
+        if self.queue_tree.exists(job_id):
+            self.queue_tree.delete(job_id)
+
+    def _move_selected_queue_item(self, direction: int) -> None:
+        selected = self.queue_tree.selection()
+        if not selected or direction not in (-1, 1):
+            return
+        job_id = selected[0]
+        with self._queue_cond:
+            pending_list = list(self._pending_jobs)
+            pos = next(
+                (i for i, job in enumerate(pending_list) if job is not None and job.job_id == job_id),
+                None,
+            )
+            if pos is None:
+                return
+            target = pos + direction
+            if target < 0 or target >= len(pending_list) or pending_list[target] is None:
+                return
+            neighbor_id = pending_list[target].job_id  # type: ignore[union-attr]
+            pending_list[pos], pending_list[target] = pending_list[target], pending_list[pos]
+            self._pending_jobs = deque(pending_list)
+
+        if self.queue_tree.exists(job_id) and self.queue_tree.exists(neighbor_id):
+            idx_a = self.queue_tree.index(job_id)
+            idx_b = self.queue_tree.index(neighbor_id)
+            self.queue_tree.move(job_id, "", idx_b)
+            self.queue_tree.move(neighbor_id, "", idx_a)
+
+    def _retry_failed_queue_items(self) -> None:
+        failed_urls = [
+            rec["url"]
+            for iid in self.queue_tree.get_children()
+            for rec in [self._queue_records.get(iid)]
+            if rec is not None and rec["status"] in ("Failed", "Cancelled")
+        ]
+        if not failed_urls:
+            self.status_var.set("No failed or cancelled jobs to retry")
+            return
+        if self._is_running:
+            if not self._cancel_event.is_set():
+                self._enqueue_additional_urls(failed_urls)
+            return
+        options = self.build_options()
+        if not self._ensure_ffmpeg_available(options):
+            return
+        self._save_run_preferences(options)
+        unique_urls = list(dict.fromkeys(failed_urls))
+        job_specs = [
+            (u, self.build_options(urls_override=[u]), None, None)
+            for u in unique_urls
+        ]
+        self._start_new_run(job_specs)
+
+    def _clear_completed_history(self) -> None:
+        removable = [
+            iid
+            for iid in self.queue_tree.get_children()
+            if self._queue_records.get(iid, {}).get("status") in ("Completed", "Failed", "Cancelled")
+        ]
+        for iid in removable:
+            self._queue_records.pop(iid, None)
+            if self.queue_tree.exists(iid):
+                self.queue_tree.delete(iid)
+
     def _enqueue_additional_urls(self, urls: List[str]) -> bool:
         """Append new URLs to the currently active download queue."""
         if not self._validate_cookie_file():
             return True
         unique_urls = list(dict.fromkeys(urls))
-        with self._queue_lock:
+        added_jobs: List[_QueuedJob] = []
+        with self._queue_cond:
             if not self._worker_has_active_run:
                 return False
             new_urls = [u for u in unique_urls if u not in self._run_seen_urls]
@@ -1185,13 +2125,19 @@ class AudiobookDLApp:
             self._run_seen_urls.update(new_urls)
             for u in new_urls:
                 job_opts = self.build_options(urls_override=[u])
-                self._job_queue.put(_QueuedJob(
+                job = _QueuedJob(
+                    job_id=self._make_job_id(),
                     run_id=run_id,
                     url=u,
                     options=job_opts,
                     interaction=interaction,
-                ))
+                )
+                self._pending_jobs.append(job)
+                added_jobs.append(job)
             new_total = self._batch_total
+            self._queue_cond.notify_all()
+        for job in added_jobs:
+            self._register_queue_job(job)
         self._ui_item_total = new_total
         self._refresh_batch_label()
         self.status_var.set(f"Queued +{len(new_urls)} (total {new_total})")
@@ -1215,7 +2161,9 @@ class AudiobookDLApp:
             output_template=self.template_var.get().strip() or "{title}",
             overwrite=self._config_location,
         )
-        self._config = self._load_saved_config()
+        loaded = self._load_saved_config()
+        with self._queue_lock:
+            self._config = loaded
 
     def _start_new_run(
         self,
@@ -1234,22 +2182,31 @@ class AudiobookDLApp:
         self._last_metrics_render_at = 0.0
         self._set_running_state(True)
 
-        with self._queue_lock:
+        queued_jobs: List[_QueuedJob] = []
+        with self._queue_cond:
             self._worker_run_id += 1
             run_id = self._worker_run_id
             self._current_ui_run_id = run_id
+            self._sink.set_active_run_id(run_id)
             self._worker_has_active_run = True
             self._batch_total = len(job_specs)
             self._run_seen_urls = {url for url, _, _, _ in job_specs}
             for url, job_opts, selected_indices, prefetched in job_specs:
-                self._job_queue.put(_QueuedJob(
+                job = _QueuedJob(
+                    job_id=self._make_job_id(),
                     run_id=run_id,
                     url=url,
                     options=job_opts,
                     interaction=self._interaction,
                     selected_indices=selected_indices,
                     prefetched=prefetched,
-                ))
+                )
+                self._pending_jobs.append(job)
+                queued_jobs.append(job)
+            self._queue_cond.notify_all()
+
+        for job in queued_jobs:
+            self._register_queue_job(job)
 
         self._ui_item_index = 1
         self._ui_item_total = len(job_specs)
@@ -1261,6 +2218,44 @@ class AudiobookDLApp:
             f"--- Starting download ({len(job_specs)} URL{'s' if len(job_specs) != 1 else ''}) ---"
         )
         self._ensure_worker_started()
+
+    def _warn_mixed_service_credentials(self, urls: Sequence[str]) -> bool:
+        """Warn before starting if batch URLs target an unconfigured auth service alongside another."""
+        selected = self._selected_service()
+        selected_key = selected.key if selected else None
+        detected_keys: List[str] = []
+        for url in urls:
+            key = detect_service_key(url)
+            if key and key not in detected_keys:
+                detected_keys.append(key)
+        if len(detected_keys) <= 1 and (not detected_keys or detected_keys[0] == selected_key):
+            return True
+        cfg = self._config_snapshot()
+        missing: List[str] = []
+        for key in detected_keys:
+            if key == selected_key:
+                continue
+            info = self._services_by_key.get(key)
+            if info is None or not info.auth_methods:
+                continue
+            src_cfg = cfg.sources.get(key)
+            has_creds = src_cfg is not None and any((
+                src_cfg.username,
+                src_cfg.password,
+                src_cfg.cookie_file,
+                src_cfg.library,
+            ))
+            if not has_creds:
+                missing.append(info.label)
+        if not missing:
+            return True
+        return messagebox.askyesno(
+            "Missing Credentials for Batch Service",
+            "Some entered URLs target services without saved credentials:\n"
+            f"  {', '.join(missing)}\n\n"
+            "Continue anyway?",
+            parent=self.root,
+        )
 
     def start_download(self) -> None:
         if self._is_previewing:
@@ -1283,6 +2278,8 @@ class AudiobookDLApp:
             return
 
         if not self._validate_cookie_file():
+            return
+        if not self._warn_mixed_service_credentials(urls):
             return
 
         options = self.build_options()
@@ -1352,7 +2349,7 @@ class AudiobookDLApp:
         interaction: _GuiInteractionHandler,
     ) -> None:
         try:
-            config = load_config(options.config_location)
+            config = self._config_snapshot()
             ctx = logging.JobContext(
                 debug=options.debug,
                 quiet=options.quiet,
@@ -1401,12 +2398,12 @@ class AudiobookDLApp:
         self.status_var.set(f"Preview ready: {result.title[:60]}")
         self._show_preview_dialog(url, source, result)
 
-    def _show_preview_dialog(self, url: str, source: Source, result: Result) -> tk.Toplevel:
+    def _show_preview_dialog(self, url: str, source: Source, result: Result) -> PreviewDialog:
         """Display resolved `Audiobook` metadata/cover or a selectable `Series` checklist."""
         if self._preview_dialog is not None and self._preview_dialog.winfo_exists():
             self._preview_dialog.destroy()
 
-        dialog = tk.Toplevel(self.root)
+        dialog = PreviewDialog(self.root)
         self._preview_dialog = dialog
         dialog.title(f"Preview \u2014 {result.title}")
         dialog.transient(self.root)
@@ -1427,7 +2424,7 @@ class AudiobookDLApp:
             cover_frame.grid(row=0, column=0, sticky="nw", padx=(0, 14))
             photo = _render_cover_thumbnail(result.cover, dialog, max_size=180)
             if photo is not None:
-                dialog._cover_photo = photo  # type: ignore[attr-defined]
+                dialog._cover_photo = photo
                 ttk.Label(cover_frame, image=photo).pack()
             else:
                 ttk.Label(
@@ -1498,22 +2495,49 @@ class AudiobookDLApp:
             ).grid(row=1, column=0, sticky="w")
 
             selected_count_var = tk.StringVar()
+            filter_var = tk.StringVar()
             check_vars: List[tk.BooleanVar] = [tk.BooleanVar(value=True) for _ in result.books]
-            dialog._check_vars = check_vars  # type: ignore[attr-defined]
+            dialog._check_vars = check_vars
+            dialog._filter_var = filter_var
+            checkbuttons: List[Tuple[int, str, ttk.Checkbutton]] = []
+            dialog._checkbuttons = checkbuttons
+            last_clicked: Dict[str, Optional[int]] = {"index": None}
 
             def _update_selected_count() -> None:
                 chosen = sum(1 for v in check_vars if v.get())
                 selected_count_var.set(f"Selected: {chosen} / {book_count}")
 
             def _set_all(val: bool) -> None:
-                for v in check_vars:
-                    v.set(val)
+                query = filter_var.get().strip().lower()
+                if query:
+                    for idx_item, label_item, _cb in checkbuttons:
+                        if query in label_item.lower():
+                            check_vars[idx_item].set(val)
+                else:
+                    for v in check_vars:
+                        v.set(val)
                 _update_selected_count()
+
+            def _toggle_series_item(idx: int, shift_held: bool = False) -> None:
+                if shift_held and last_clicked["index"] is not None:
+                    start, end = sorted((last_clicked["index"], idx))
+                    target_val = check_vars[idx].get()
+                    query = filter_var.get().strip().lower()
+                    for pos, label_item, _cb in checkbuttons:
+                        if start <= pos <= end and (not query or query in label_item.lower()):
+                            check_vars[pos].set(target_val)
+                last_clicked["index"] = idx
+                _update_selected_count()
+
+            dialog._toggle_series_item = _toggle_series_item
 
             toolbar = ttk.Frame(body)
             toolbar.grid(row=1, column=0, sticky="ew", pady=(0, 6))
-            ttk.Button(toolbar, text="Select All", command=lambda: _set_all(True)).pack(side=tk.LEFT, padx=(0, 6))
-            ttk.Button(toolbar, text="Deselect All", command=lambda: _set_all(False)).pack(side=tk.LEFT)
+            ttk.Button(toolbar, text="Select All", command=lambda: _set_all(True)).pack(side=tk.LEFT, padx=(0, 4))
+            ttk.Button(toolbar, text="Deselect All", command=lambda: _set_all(False)).pack(side=tk.LEFT, padx=(0, 8))
+            ttk.Label(toolbar, text="Filter:").pack(side=tk.LEFT, padx=(0, 4))
+            filter_entry = ttk.Entry(toolbar, textvariable=filter_var, width=22)
+            filter_entry.pack(side=tk.LEFT, padx=(0, 8))
             ttk.Label(toolbar, textvariable=selected_count_var, foreground="#333333").pack(side=tk.RIGHT)
             _update_selected_count()
 
@@ -1545,15 +2569,60 @@ class AudiobookDLApp:
                 canvas.grid(row=0, column=0, sticky="nsew")
                 scrollbar.grid(row=0, column=1, sticky="ns")
 
+                def _on_mousewheel(event: tk.Event) -> None:
+                    delta = getattr(event, "delta", 0)
+                    if delta:
+                        step = -1 if delta > 0 else 1
+                        if sys.platform != "darwin" and abs(delta) >= 120:
+                            step = int(-delta / 120)
+                        canvas.yview_scroll(step, "units")
+                    elif getattr(event, "num", None) == 4:
+                        canvas.yview_scroll(-1, "units")
+                    elif getattr(event, "num", None) == 5:
+                        canvas.yview_scroll(1, "units")
+
+                for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                    canvas.bind(seq, _on_mousewheel)
+                    inner.bind(seq, _on_mousewheel)
+
+                check_skip = self.skip_downloaded_var.get()
                 for idx, book in enumerate(result.books):
                     label = f"{idx + 1}. {describe_series_book(idx, book)}"
+                    if check_skip and self._series_book_exists(book):
+                        label = f"{label} [Exists]"
                     cb = ttk.Checkbutton(
                         inner,
                         text=label,
                         variable=check_vars[idx],
-                        command=_update_selected_count,
+                    )
+                    cb.configure(
+                        command=lambda i=idx: _toggle_series_item(
+                            i,
+                            shift_state.get("held", False),
+                        )
                     )
                     cb.pack(anchor="w", fill=tk.X, pady=1)
+                    for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                        cb.bind(seq, _on_mousewheel)
+                    checkbuttons.append((idx, label, cb))
+
+                shift_state: Dict[str, bool] = {"held": False}
+                for _idx, _label, cb_widget in checkbuttons:
+                    cb_widget.bind(
+                        "<ButtonPress-1>",
+                        lambda e, state=shift_state: state.__setitem__("held", bool(e.state & 0x0001)),
+                    )
+
+                def _apply_filter(*_args: Any) -> None:
+                    query = filter_var.get().strip().lower()
+                    for _pos, item_label, cb_widget in checkbuttons:
+                        if not query or query in item_label.lower():
+                            cb_widget.pack(anchor="w", fill=tk.X, pady=1)
+                        else:
+                            cb_widget.pack_forget()
+                    canvas.configure(scrollregion=canvas.bbox("all"))
+
+                filter_var.trace_add("write", _apply_filter)
 
             btn_bar = ttk.Frame(body)
             btn_bar.grid(row=3, column=0, sticky="ew", pady=(12, 0))
@@ -1582,6 +2651,29 @@ class AudiobookDLApp:
 
         return dialog
 
+    def _series_book_exists(self, book: Union[BookId[Any], Audiobook]) -> bool:
+        """Return True when `book` already appears on disk at the configured output path."""
+        if not isinstance(book, Audiobook):
+            return False
+        try:
+            opts = self.build_options()
+            template = opts.output_template or "{title}"
+            target = output.gen_output_location(template, book.metadata, opts.remove_chars)
+            if os.path.exists(target):
+                return True
+            if opts.output_format and os.path.exists(f"{target}.{opts.output_format}"):
+                return True
+            parent = os.path.dirname(target) or "."
+            base = os.path.basename(target)
+            if os.path.isdir(parent):
+                for entry in os.listdir(parent):
+                    stem, _ext = os.path.splitext(entry)
+                    if stem == base:
+                        return True
+        except (OSError, ValueError, KeyError):
+            return False
+        return False
+
     def _enqueue_from_preview(
         self,
         url: str,
@@ -1593,25 +2685,32 @@ class AudiobookDLApp:
         if not self._ensure_ffmpeg_available(options):
             return
         if self._is_running:
-            with self._queue_lock:
+            added_job: Optional[_QueuedJob] = None
+            new_total = 0
+            with self._queue_cond:
                 if self._worker_has_active_run:
                     if self._interaction is None:
                         self._interaction = _GuiInteractionHandler(self._queue, self._cancel_event)
                     self._batch_total += 1
                     self._run_seen_urls.add(url)
-                    self._job_queue.put(_QueuedJob(
+                    added_job = _QueuedJob(
+                        job_id=self._make_job_id(),
                         run_id=self._worker_run_id,
                         url=url,
                         options=options,
                         interaction=self._interaction,
                         selected_indices=selected_indices,
                         prefetched=prefetched,
-                    ))
+                    )
+                    self._pending_jobs.append(added_job)
                     new_total = self._batch_total
-                    self._ui_item_total = new_total
-                    self._refresh_batch_label()
-                    self.status_var.set(f"Queued preview item (total {new_total})")
-                    return
+                    self._queue_cond.notify_all()
+            if added_job is not None:
+                self._register_queue_job(added_job)
+                self._ui_item_total = new_total
+                self._refresh_batch_label()
+                self.status_var.set(f"Queued preview item (total {new_total})")
+                return
 
         self._save_run_preferences(options)
         self._start_new_run([(url, self.build_options(urls_override=[url]), selected_indices, prefetched)])
@@ -1634,24 +2733,28 @@ class AudiobookDLApp:
         if self._interaction is not None:
             self._interaction.release_all()
 
-    def _drain_pending_jobs(self) -> bool:
+    def _drain_pending_jobs(self, cancel_status: str = "Cancelled") -> bool:
         """Remove queued jobs after cancellation/error; return True if close sentinel seen."""
         saw_sentinel = False
-        with self._queue_lock:
-            while True:
-                try:
-                    pending = self._job_queue.get_nowait()
-                except queue.Empty:
-                    break
+        cancelled_ids: List[str] = []
+        with self._queue_cond:
+            while self._pending_jobs:
+                pending = self._pending_jobs.popleft()
                 if pending is None:
                     saw_sentinel = True
                     break
+                cancelled_ids.append(pending.job_id)
             self._worker_has_active_run = False
+        for job_id in cancelled_ids:
+            self._queue.put(("job_status", job_id, cancel_status, ""))
         return saw_sentinel
 
     def _worker_loop(self) -> None:
         while True:
-            first_job = self._job_queue.get()
+            with self._queue_cond:
+                while not self._pending_jobs:
+                    self._queue_cond.wait()
+                first_job = self._pending_jobs.popleft()
             if first_job is None:
                 break
 
@@ -1666,16 +2769,18 @@ class AudiobookDLApp:
                 item_index += 1
                 if self._cancel_event.is_set():
                     batch_summary.cancelled = True
-                    saw_sentinel = self._drain_pending_jobs()
+                    self._queue.put(("job_status", current_job.job_id, "Cancelled", ""))
+                    saw_sentinel = self._drain_pending_jobs("Cancelled")
                     break
 
                 with self._queue_lock:
                     item_total = self._batch_total
 
                 self._queue.put(("batch_item", run_id, item_index, item_total, current_job.url))
+                self._queue.put(("job_status", current_job.job_id, "Running", ""))
 
                 try:
-                    config = load_config(current_job.options.config_location)
+                    config = self._config_snapshot()
                     run_kwargs: Dict[str, Any] = {
                         "interaction": current_job.interaction,
                         "cancel_event": self._cancel_event,
@@ -1693,22 +2798,37 @@ class AudiobookDLApp:
                     )
                     batch_summary.completed += summary.completed
                     batch_summary.failed += summary.failed
+                    batch_summary.books_completed += summary.books_completed
+                    batch_summary.books_skipped += summary.books_skipped
+                    batch_summary.books_failed += summary.books_failed
+                    batch_summary.book_errors.extend(summary.book_errors)
                     if summary.cancelled:
                         batch_summary.cancelled = True
-                        saw_sentinel = self._drain_pending_jobs()
+                        self._queue.put(("job_status", current_job.job_id, "Cancelled", ""))
+                        saw_sentinel = self._drain_pending_jobs("Cancelled")
                         break
+                    if summary.failed > 0 or summary.books_failed > 0:
+                        detail = summary.book_errors[0] if summary.book_errors else "Download failed"
+                        self._queue.put(("job_status", current_job.job_id, "Failed", detail[:120]))
+                    else:
+                        detail = (
+                            f"{summary.books_completed} ok"
+                            if summary.books_completed
+                            else ("Skipped" if summary.books_skipped else "Done")
+                        )
+                        self._queue.put(("job_status", current_job.job_id, "Completed", detail))
                 except Exception as exc:
                     fatal_exc = exc
-                    saw_sentinel = self._drain_pending_jobs()
+                    self._queue.put(("job_status", current_job.job_id, "Failed", str(exc)[:120]))
+                    saw_sentinel = self._drain_pending_jobs("Cancelled")
                     break
 
-                with self._queue_lock:
-                    try:
-                        next_job = self._job_queue.get_nowait()
-                    except queue.Empty:
+                with self._queue_cond:
+                    if not self._pending_jobs:
                         self._worker_has_active_run = False
                         current_job = None
                     else:
+                        next_job = self._pending_jobs.popleft()
                         if next_job is None:
                             self._worker_has_active_run = False
                             saw_sentinel = True
@@ -1770,11 +2890,15 @@ class AudiobookDLApp:
                 self._ui_book_index = 0
                 self._ui_book_total = 0
                 self._refresh_batch_label()
+        elif kind == "job_status":
+            _, job_id, status_text, detail = item
+            self._update_queue_row(job_id, status_text, detail)
         elif kind == "item_progress":
-            _, book_index, book_total, _title = item
-            self._ui_book_index = book_index
-            self._ui_book_total = book_total
-            self._refresh_batch_label()
+            _, run_id, book_index, book_total, _title = item
+            if run_id == self._current_ui_run_id:
+                self._ui_book_index = book_index
+                self._ui_book_total = book_total
+                self._refresh_batch_label()
         elif kind == "progress_start":
             _, description, _total = item
             self.progressbar.stop()
@@ -1818,10 +2942,83 @@ class AudiobookDLApp:
         elif kind == "preview_done":
             _, preview_url, prepared, preview_exc = item
             self._handle_preview_done(preview_url, prepared, preview_exc)
+        elif kind == "auth_verified":
+            _, service_label, ok, auth_exc = item
+            self._is_verifying_auth = False
+            self._update_service_field_states()
+            if auth_exc is not None:
+                self.status_var.set(f"Login failed for {service_label}")
+                self._append_log(f"[ERROR] Login check failed for {service_label}: {auth_exc}")
+                messagebox.showerror("Test Login Failed", str(auth_exc), parent=self.root)
+            elif ok:
+                self.status_var.set(f"Login OK: {service_label}")
+                self._append_log(f"Verified login for {service_label}.")
+                messagebox.showinfo("Test Login", f"Authentication succeeded for {service_label}.", parent=self.root)
+            else:
+                self.status_var.set(f"Login invalid: {service_label}")
+                messagebox.showwarning("Test Login", f"Authentication failed for {service_label}.", parent=self.root)
+        elif kind == "catalog_loaded":
+            _, req_id, dialog, books, cat_exc = item
+            if req_id != self._catalog_request_id:
+                return
+            catalog_dialog: CatalogBrowserDialog = dialog
+            try:
+                if not catalog_dialog.winfo_exists():
+                    return
+            except tk.TclError:
+                return
+            if cat_exc is not None:
+                catalog_dialog._sync_buttons()
+                catalog_dialog._status_var.set("Error loading items")
+                messagebox.showerror("Catalog Error", str(cat_exc), parent=catalog_dialog)
+            else:
+                catalog_dialog._populate_items(books)
+        elif kind == "ffmpeg_install_done":
+            _, ok, detail = item
+            self._update_ffmpeg_status()
+            if ok:
+                self.status_var.set("FFmpeg installed")
+                self._append_log(detail)
+                messagebox.showinfo("FFmpeg Installed", detail, parent=self.root)
+            else:
+                self.status_var.set("FFmpeg install failed")
+                self._append_log(f"[ERROR] {detail}")
+                messagebox.showerror("FFmpeg Install Failed", detail, parent=self.root)
+        elif kind == "update_checked":
+            _, info, interactive = item
+            self._handle_update_checked(info, interactive)
         elif kind == "done":
             _, run_id, summary, exc = item
             if run_id == self._current_ui_run_id:
                 self._finish_run(summary, exc)
+
+    def _handle_update_checked(self, info: Optional[UpdateInfo], interactive: bool) -> None:
+        if info is None:
+            if interactive:
+                self.status_var.set("Update check failed")
+                messagebox.showwarning(
+                    "Update Check",
+                    "Could not reach update server to check for new releases.",
+                    parent=self.root,
+                )
+            return
+        if info.has_update:
+            msg = (
+                f"A new version of audiobook-dl is available: v{info.latest_version} "
+                f"(current: v{info.current_version}).\n\n"
+                f"Download: {info.release_url}"
+            )
+            self.status_var.set(f"Update available: v{info.latest_version}")
+            self._append_log(f"Update available: v{info.latest_version} ({info.release_url})")
+            if interactive:
+                messagebox.showinfo("Update Available", msg, parent=self.root)
+        elif interactive:
+            self.status_var.set(f"Up to date (v{info.current_version})")
+            messagebox.showinfo(
+                "Up to Date",
+                f"You are running the latest version (v{info.current_version}).",
+                parent=self.root,
+            )
 
     def _finish_run(self, summary: Optional[DownloadSummary], exc: Optional[Exception]) -> None:
         self._set_running_state(False)
@@ -1882,8 +3079,44 @@ class AudiobookDLApp:
             self._preview_cancel_event.set()
             if self._preview_interaction is not None:
                 self._preview_interaction.release_all()
-        self._job_queue.put(None)
+        with self._queue_cond:
+            self._pending_jobs.append(None)
+            self._queue_cond.notify_all()
         self.root.destroy()
+
+
+def _enable_high_dpi_awareness() -> None:
+    """Enable per-monitor DPI awareness on Windows when supported by the OS."""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        shcore = ctypes.windll.shcore  # type: ignore[attr-defined]
+        shcore.SetProcessDpiAwareness(2)
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+def parse_gui_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """Parse CLI arguments supported by the desktop GUI launcher."""
+    parser = argparse.ArgumentParser(prog="audiobook-dl-gui")
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Validate bundled assets and GUI initialization without opening a window",
+    )
+    parser.add_argument(
+        "-c",
+        "--config",
+        dest="config_location",
+        default=None,
+        help="Path to an audiobook-dl TOML configuration file",
+    )
+    return parser.parse_args(list(argv) if argv is not None else None)
 
 
 def run_self_test(check_gui: bool = True) -> None:
@@ -1924,13 +3157,16 @@ def run_self_test(check_gui: bool = True) -> None:
                 root.destroy()
 
 
-def main() -> None:
+def main(argv: Optional[Sequence[str]] = None) -> None:
     """Launch the audiobook-dl desktop GUI."""
-    if "--self-test" in sys.argv[1:]:
+    parsed = parse_gui_args(argv)
+    if parsed.self_test:
         run_self_test(check_gui=True)
         return
+    _enable_high_dpi_awareness()
     root = tk.Tk()
-    AudiobookDLApp(root)
+    app = AudiobookDLApp(root, config_location=parsed.config_location)
+    app._schedule_update_check()
     root.mainloop()
 
 
