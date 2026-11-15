@@ -20,6 +20,14 @@ from audiobookdl.config import (
 from audiobookdl.exceptions import DownloadCancelled
 from audiobookdl.gui.formatting import format_failed_job_detail
 from audiobookdl.options_schema import PERSISTED_GUI_OPTION_SPECS
+from audiobookdl.pack import (
+    PackBookSpec,
+    PackOverrides,
+    discover_pack_groups,
+    inspect_local_book,
+    run_pack,
+    scope_overrides_for_batch,
+)
 from audiobookdl.pipeline import (
     DownloadSummary,
     list_service_library,
@@ -42,8 +50,20 @@ from audiobookdl.utils.updater import check_for_updates, install_ffmpeg_via_wing
 
 
 @dataclass
+class PackJobRequest:
+    """Payload describing a local audiobook repackaging job."""
+
+    paths: List[str]
+    recursive: bool = False
+    delete_source: bool = False
+    output_dir: Optional[str] = None
+    overrides: Optional[PackOverrides] = None
+    label: str = ""
+
+
+@dataclass
 class QueuedJob:
-    """Single queued URL download job consumed by the persistent GUI worker."""
+    """Single queued URL download or local pack job consumed by the persistent GUI worker."""
 
     job_id: str
     run_id: int
@@ -52,6 +72,7 @@ class QueuedJob:
     interaction: "GuiInteractionHandler"
     selected_indices: Optional[List[int]] = None
     prefetched: Optional[Tuple[Source, Result]] = None
+    pack_request: Optional[PackJobRequest] = None
 
 
 class GuiLogSink:
@@ -306,6 +327,7 @@ class GuiController:
             "status": "Queued",
             "detail": "",
             "service": service_label,
+            "job_kind": "pack" if job.pack_request is not None else "download",
         }
         self.queue_records[job.job_id] = rec
         return rec
@@ -418,6 +440,79 @@ class GuiController:
             self.queue_cond.notify_all()
             return added_job, new_total
 
+    def start_or_enqueue_pack_jobs(
+        self,
+        requests_with_options: Sequence[Tuple[PackJobRequest, args.DownloadOptions]],
+    ) -> Tuple[bool, int, List[QueuedJob], int]:
+        """Queue local pack jobs on the active run or start a new run when idle.
+
+        Returns `(was_appended, run_id, queued_jobs, batch_total)`.
+        """
+        queued_jobs: List[QueuedJob] = []
+        with self.queue_cond:
+            was_appended = self.worker_has_active_run
+            if not was_appended:
+                self.cancel_event.clear()
+                self.interaction = GuiInteractionHandler(self.event_queue, self.cancel_event)
+                self.worker_run_id += 1
+                self.worker_has_active_run = True
+                self.batch_total = len(requests_with_options)
+                self.run_seen_urls.clear()
+                self.sink.set_active_run_id(self.worker_run_id)
+            else:
+                if self.interaction is None:
+                    self.interaction = GuiInteractionHandler(self.event_queue, self.cancel_event)
+                self.batch_total += len(requests_with_options)
+            run_id = self.worker_run_id
+            interaction = self.interaction
+            for req, opts in requests_with_options:
+                display = req.label or (req.paths[0] if req.paths else "Local folder")
+                job = QueuedJob(
+                    job_id=self.make_job_id(),
+                    run_id=run_id,
+                    url=display,
+                    options=opts,
+                    interaction=interaction,
+                    pack_request=req,
+                )
+                self.pending_jobs.append(job)
+                queued_jobs.append(job)
+            new_total = self.batch_total
+            self.queue_cond.notify_all()
+
+        self.ensure_worker_started()
+        return was_appended, run_id, queued_jobs, new_total
+
+    def inspect_local_pack_preview(
+        self,
+        paths: Sequence[str],
+        options: args.DownloadOptions,
+        *,
+        recursive: bool = False,
+        output_dir: Optional[str] = None,
+        overrides: Optional[PackOverrides] = None,
+    ) -> List[PackBookSpec]:
+        """Discover and inspect local audiobook specs cleanly without modifying files."""
+        groups = discover_pack_groups(paths, recursive=recursive)
+        total = len(groups)
+        specs: List[PackBookSpec] = []
+        probe_cache: Dict[str, Any] = {}
+        session = self.get_http_session()
+        book_overrides = scope_overrides_for_batch(overrides, total)
+        for source_root, raw_tracks in groups:
+            specs.append(
+                inspect_local_book(
+                    source_root,
+                    raw_tracks,
+                    options,
+                    output_dir=output_dir,
+                    overrides=book_overrides,
+                    probe_cache=probe_cache,
+                    session=session,
+                )
+            )
+        return specs
+
     def remove_pending_job(self, job_id: str) -> Tuple[bool, Optional[int], bool]:
         """Remove a job from pending queue/records; returns `(removed, new_batch_total, is_active_running)`."""
         rec = self.queue_records.get(job_id)
@@ -468,7 +563,9 @@ class GuiController:
             rec["url"]
             for iid in ordered_ids
             for rec in [self.queue_records.get(iid)]
-            if rec is not None and rec["status"] in ("Failed", "Cancelled")
+            if rec is not None
+            and rec.get("job_kind", "download") == "download"
+            and rec["status"] in ("Failed", "Cancelled")
         ]
 
     def clear_completed_records(self, ordered_ids: Sequence[str]) -> List[str]:
@@ -542,21 +639,45 @@ class GuiController:
 
                 try:
                     config = self.config_snapshot()
-                    run_kwargs: Dict[str, Any] = {
-                        "interaction": current_job.interaction,
-                        "cancel_event": self.cancel_event,
-                        "sink": self.sink,
-                    }
-                    if current_job.selected_indices is not None:
-                        run_kwargs["selected_indices"] = current_job.selected_indices
-                    if current_job.prefetched is not None:
-                        run_kwargs["prefetched"] = current_job.prefetched
-                    summary = run_downloads(
-                        [current_job.url],
-                        current_job.options,
-                        config,
-                        **run_kwargs,
-                    )
+                    if current_job.pack_request is not None:
+                        req = current_job.pack_request
+                        pack_summary = run_pack(
+                            req.paths,
+                            current_job.options,
+                            config,
+                            output_dir=req.output_dir,
+                            recursive=req.recursive,
+                            delete_source=req.delete_source,
+                            overrides=req.overrides,
+                            interaction=current_job.interaction,
+                            cancel_event=self.cancel_event,
+                            sink=self.sink,
+                        )
+                        summary = DownloadSummary(
+                            completed=1 if pack_summary.books_completed and pack_summary.books_failed == 0 else 0,
+                            failed=1 if pack_summary.books_failed > 0 else 0,
+                            cancelled=pack_summary.cancelled,
+                            books_completed=pack_summary.books_completed,
+                            books_skipped=pack_summary.books_skipped,
+                            books_failed=pack_summary.books_failed,
+                            book_errors=list(pack_summary.book_errors),
+                        )
+                    else:
+                        run_kwargs: Dict[str, Any] = {
+                            "interaction": current_job.interaction,
+                            "cancel_event": self.cancel_event,
+                            "sink": self.sink,
+                        }
+                        if current_job.selected_indices is not None:
+                            run_kwargs["selected_indices"] = current_job.selected_indices
+                        if current_job.prefetched is not None:
+                            run_kwargs["prefetched"] = current_job.prefetched
+                        summary = run_downloads(
+                            [current_job.url],
+                            current_job.options,
+                            config,
+                            **run_kwargs,
+                        )
                     batch_summary.completed += summary.completed
                     batch_summary.failed += summary.failed
                     batch_summary.books_completed += summary.books_completed

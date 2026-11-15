@@ -469,7 +469,7 @@ def download_result(
 
     if getattr(options, "info_only", False):
         if isinstance(result, Audiobook) and getattr(options, "enrich_metadata", False):
-            _enrich_audiobook(source, result, options, interaction=handler)
+            enrich_audiobook_with_options(result, options, source=source, interaction=handler)
         print_result_info(source, result, options, selected_indices=selected_indices)
         return
 
@@ -794,11 +794,11 @@ def _format_candidate_choice(candidate: EnrichmentCandidate) -> str:
     return " ".join(parts)
 
 
-def _enrich_audiobook(
-    source: Optional[Source],
+def enrich_audiobook_with_options(
     audiobook: Audiobook,
     options: DownloadOptions,
     *,
+    source: Optional[Source] = None,
     interaction: Optional[logging.InteractionHandler] = None,
 ) -> Optional[EnrichmentResult]:
     """Run multi-provider metadata enrichment for `audiobook` according to `options`."""
@@ -886,7 +886,12 @@ def process_audiobook(
             return False
 
     if getattr(options, "enrich_metadata", False):
-        _enrich_audiobook(source, audiobook, options, interaction=interaction)
+        enrich_audiobook_with_options(
+            audiobook,
+            options,
+            source=source,
+            interaction=interaction,
+        )
 
     download(audiobook, options, interaction=interaction, cancel_event=cancel_event)
     if source is not None:

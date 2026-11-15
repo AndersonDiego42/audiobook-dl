@@ -1,4 +1,5 @@
-from datetime import date
+from datetime import date, datetime
+import re
 import requests
 from typing import Callable, Dict, Generic, List, Optional, Union, Sequence, Tuple, TypeVar, Any, MutableMapping
 import json
@@ -256,6 +257,41 @@ def is_ebook_extension(ext: Optional[str]) -> bool:
     if not ext:
         return False
     return ext.lstrip(".").lower() in EBOOK_EXTENSIONS
+
+
+def parse_release_date(raw: Any) -> Optional[date]:
+    """Parse a release date (`YYYY-MM-DD`, `YYYY-MM`, `YYYY`, `int`, or `date`) cleanly."""
+    if isinstance(raw, date) and not isinstance(raw, datetime):
+        return raw
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        if 1 <= raw <= 9999:
+            return date(raw, 1, 1)
+        return None
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    m_full = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})", cleaned)
+    if m_full:
+        try:
+            return date(int(m_full.group(1)), int(m_full.group(2)), int(m_full.group(3)))
+        except ValueError:
+            pass
+    m_ym = re.match(r"^(\d{4})-(\d{1,2})$", cleaned)
+    if m_ym:
+        try:
+            return date(int(m_ym.group(1)), int(m_ym.group(2)), 1)
+        except ValueError:
+            pass
+    m_y = re.match(r"^(\d{4})$", cleaned)
+    if m_y:
+        year = int(m_y.group(1))
+        if 1 <= year <= 9999:
+            return date(year, 1, 1)
+    return None
 
 
 def is_ebook(audiobook: Audiobook) -> bool:

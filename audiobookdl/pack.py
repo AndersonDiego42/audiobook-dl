@@ -1,0 +1,771 @@
+"""Offline local audiobook discovery, tag/sidecar inspection, and repackaging."""
+
+from __future__ import annotations
+
+from collections import Counter
+from dataclasses import dataclass, field
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import threading
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+import uuid
+
+import requests
+
+from audiobookdl import Audiobook, AudiobookMetadata, Chapter, Cover, args, logging
+from audiobookdl.config import Config, load_config
+from audiobookdl.exceptions import AudiobookDLException, DownloadCancelled, GenericAudiobookDLException
+from audiobookdl.output import download as output_download
+from audiobookdl.output import output
+from audiobookdl.output.metadata.reader import (
+    TrackTagInfo,
+    infer_metadata_from_path,
+    merge_metadata,
+    read_cover_file,
+    read_sidecar_metadata,
+    read_track_tags,
+)
+from audiobookdl.pipeline import apply_runtime_options, enrich_audiobook_with_options
+from audiobookdl.utils import (
+    AudioProbeInfo,
+    find_executable,
+    probe_audio_info,
+    subprocess_kwargs,
+)
+from audiobookdl.utils.audiobook import AudiobookFile
+
+
+SUPPORTED_PACK_EXTENSIONS = frozenset(
+    {"mp3", "m4a", "m4b", "mp4", "aac", "ogg", "opus", "flac", "wav", "wma"}
+)
+
+_NATURAL_CHUNK_RE = re.compile(r"(\d+)")
+_LEADING_TRACK_NUM_RE = re.compile(r"^(?:\d{1,4}[\s._-]+)+")
+
+
+@dataclass
+class PackOverrides:
+    """Explicit user overrides applied on top of extracted local metadata."""
+
+    title: Optional[str] = None
+    authors: List[str] = field(default_factory=list)
+    narrators: List[str] = field(default_factory=list)
+    series: Optional[str] = None
+    series_order: Optional[int] = None
+    isbn: Optional[str] = None
+    asin: Optional[str] = None
+    cover_path: Optional[str] = None
+
+
+@dataclass
+class PackBookSpec:
+    """Resolved local book ready for previewing or repackaging."""
+
+    source_root: str
+    track_paths: List[str]
+    audiobook: Audiobook
+    output_format: str
+    output_path: str
+    total_duration_seconds: float = 0.0
+    chapters_source: str = "tracks"
+
+
+@dataclass
+class PackSummary:
+    """Result totals for a `run_pack` invocation."""
+
+    books_completed: int = 0
+    books_skipped: int = 0
+    books_failed: int = 0
+    cancelled: bool = False
+    book_errors: List[Tuple[str, str]] = field(default_factory=list)
+    output_paths: List[str] = field(default_factory=list)
+
+
+def natural_sort_key(text: str) -> Tuple[Any, ...]:
+    """Return a case-insensitive natural sort key splitting numeric runs cleanly."""
+    parts = _NATURAL_CHUNK_RE.split(text.casefold())
+    key: List[Any] = []
+    for part in parts:
+        if not part:
+            continue
+        if part.isdigit():
+            key.append((0, int(part), part))
+        else:
+            key.append((1, 0, part))
+    return tuple(key)
+
+
+def _is_supported_audio_file(path: str) -> bool:
+    if not os.path.isfile(path):
+        return False
+    ext = os.path.splitext(path)[1].lstrip(".").lower()
+    return ext in SUPPORTED_PACK_EXTENSIONS
+
+
+def _direct_audio_files(directory: str) -> List[str]:
+    try:
+        entries = sorted(os.listdir(directory), key=natural_sort_key)
+    except OSError as exc:
+        raise GenericAudiobookDLException(f"Cannot read folder '{directory}': {exc}") from exc
+    out: List[str] = []
+    for name in entries:
+        full = os.path.join(directory, name)
+        if _is_supported_audio_file(full):
+            out.append(os.path.abspath(full))
+    return out
+
+
+def discover_pack_groups(
+    paths: Sequence[str],
+    *,
+    recursive: bool = False,
+) -> List[Tuple[str, List[str]]]:
+    """Discover `(source_root, track_paths)` book units from local directories/files.
+
+    Non-recursive directory arguments treat each folder's direct audio files as one book.
+    Recursive directory arguments walk subdirectories in natural order and emit every
+    directory containing at least one supported audio file. Explicit file arguments are
+    combined into a single book group.
+    """
+    if not paths:
+        raise GenericAudiobookDLException("Provide at least one local folder or audio file to pack")
+
+    groups: List[Tuple[str, List[str]]] = []
+    standalone_files: List[str] = []
+    seen_groups: set[Tuple[str, ...]] = set()
+
+    def _append_group(root_dir: str, files: List[str]) -> None:
+        normalized = tuple(os.path.normcase(os.path.abspath(f)) for f in files)
+        if normalized in seen_groups:
+            return
+        seen_groups.add(normalized)
+        groups.append((os.path.abspath(root_dir), files))
+
+    for raw_path in paths:
+        abs_path = os.path.abspath(raw_path)
+        if not os.path.exists(abs_path):
+            raise GenericAudiobookDLException(f"Local path not found: {raw_path}")
+        if os.path.isfile(abs_path):
+            if not _is_supported_audio_file(abs_path):
+                raise GenericAudiobookDLException(f"Unsupported audio file format: {raw_path}")
+            standalone_files.append(abs_path)
+            continue
+
+        if not os.path.isdir(abs_path):
+            raise GenericAudiobookDLException(f"Not a file or directory: {raw_path}")
+
+        if not recursive:
+            direct = _direct_audio_files(abs_path)
+            if not direct:
+                raise GenericAudiobookDLException(
+                    f"No audio files found directly in '{raw_path}'. "
+                    "Pass --recursive to scan subdirectories."
+                )
+            _append_group(abs_path, direct)
+        else:
+            found_any = False
+            for walk_root, dirs, files in os.walk(abs_path):
+                dirs.sort(key=natural_sort_key)
+                audio_in_dir = [
+                    os.path.abspath(os.path.join(walk_root, name))
+                    for name in sorted(files, key=natural_sort_key)
+                    if _is_supported_audio_file(os.path.join(walk_root, name))
+                ]
+                if audio_in_dir:
+                    _append_group(walk_root, audio_in_dir)
+                    found_any = True
+            if not found_any:
+                raise GenericAudiobookDLException(
+                    f"No supported audio files found under '{raw_path}'."
+                )
+
+    if standalone_files:
+        deduped_files: List[str] = []
+        seen_file_keys: set[str] = set()
+        for fpath in standalone_files:
+            key = os.path.normcase(fpath)
+            if key not in seen_file_keys:
+                seen_file_keys.add(key)
+                deduped_files.append(fpath)
+        if len(deduped_files) == 1:
+            root = deduped_files[0]
+        else:
+            root = os.path.dirname(deduped_files[0])
+        _append_group(root, deduped_files)
+
+    return groups
+
+
+def sort_track_paths(
+    paths: Sequence[str],
+    tag_map: Optional[Mapping[str, TrackTagInfo]] = None,
+) -> Tuple[List[str], Dict[str, TrackTagInfo]]:
+    """Sort audio tracks by `(disc, track)` tags when present, falling back to natural filenames."""
+    tags: Dict[str, TrackTagInfo] = dict(tag_map) if tag_map is not None else {}
+    for p in paths:
+        if p not in tags:
+            tags[p] = read_track_tags(p)
+
+    def _sort_key(path: str) -> Tuple[Any, ...]:
+        info = tags.get(path)
+        has_track = info is not None and info.track_number is not None
+        has_disc = info is not None and info.disc_number is not None
+        missing_flag = 0 if (has_track or has_disc) else 1
+        disc = (info.disc_number or 0) if info is not None else 0
+        track = (info.track_number or 0) if info is not None else 0
+        return (
+            missing_flag,
+            disc,
+            track,
+            natural_sort_key(os.path.basename(path)),
+            os.path.normcase(path),
+        )
+
+    return sorted(paths, key=_sort_key), tags
+
+
+def _probe_embedded_chapters(filepath: str) -> List[Chapter]:
+    """Read embedded chapters from a single audio file via `ffprobe`, returning `[]` if unavailable."""
+    ffprobe = find_executable("ffprobe")
+    if ffprobe is None:
+        return []
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_chapters",
+                "-of",
+                "json",
+                filepath,
+            ],
+            capture_output=True,
+            text=True,
+            **subprocess_kwargs(capture_output=True),
+        )
+    except OSError:
+        return []
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+    try:
+        payload = json.loads(result.stdout)
+    except ValueError:
+        return []
+    raw = payload.get("chapters")
+    if not isinstance(raw, list):
+        return []
+    chapters: List[Chapter] = []
+    for idx, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            continue
+        try:
+            start_ms = max(0, round(float(item["start_time"]) * 1000))
+        except (KeyError, TypeError, ValueError):
+            continue
+        tags = item.get("tags") or {}
+        title = ""
+        if isinstance(tags, dict):
+            title = str(tags.get("title") or "").strip()
+        chapters.append(Chapter(start=start_ms, title=title or f"Chapter {idx}"))
+    return chapters
+
+
+def _clean_filename_chapter_title(filepath: str, index: int) -> str:
+    stem = os.path.splitext(os.path.basename(filepath))[0].strip()
+    stripped = _LEADING_TRACK_NUM_RE.sub("", stem).strip(" -_.")
+    return stripped or stem or f"Chapter {index}"
+
+
+def _most_common_non_empty(values: Iterable[Optional[str]]) -> Optional[str]:
+    counts: Counter[str] = Counter()
+    for v in values:
+        cleaned = (v or "").strip()
+        if cleaned:
+            counts[cleaned] += 1
+    if not counts:
+        return None
+    return counts.most_common(1)[0][0]
+
+
+def _aggregate_book_metadata(
+    source_root: str,
+    sorted_tracks: Sequence[str],
+    tag_map: Mapping[str, TrackTagInfo],
+    sidecar_meta: Optional[AudiobookMetadata],
+    overrides: Optional[PackOverrides],
+) -> AudiobookMetadata:
+    """Combine track tags, folder sidecars, path heuristics, and user overrides cleanly."""
+    tag_infos = [tag_map.get(p, TrackTagInfo()) for p in sorted_tracks]
+    meta = AudiobookMetadata("")
+
+    if len(tag_infos) == 1:
+        t0 = tag_infos[0]
+        merge_metadata(meta, t0.metadata)
+        if not meta.title and t0.album:
+            meta.title = t0.album
+    elif tag_infos:
+        shared_series = _most_common_non_empty(t.metadata.series for t in tag_infos)
+        shared_album = _most_common_non_empty(t.album for t in tag_infos)
+        distinct_titles = {t.title.strip() for t in tag_infos if t.title and t.title.strip()}
+        if shared_album and (len(distinct_titles) > 1 or not distinct_titles):
+            if not shared_series or shared_album != shared_series:
+                meta.title = shared_album
+        if not meta.title and len(distinct_titles) == 1:
+            meta.title = next(iter(distinct_titles))
+        for info in tag_infos:
+            # Copy per-track shared fields (authors, narrators, series, etc.), preserving computed title
+            saved_title = meta.title
+            merge_metadata(meta, info.metadata)
+            meta.title = saved_title
+
+    if sidecar_meta is not None:
+        # Sidecar title overrides generic missing title; fill all remaining fields
+        if sidecar_meta.title and (not meta.title or meta.title == "Audiobook"):
+            meta.title = sidecar_meta.title
+        merge_metadata(meta, sidecar_meta)
+
+    inferred = infer_metadata_from_path(source_root)
+    merge_metadata(meta, inferred)
+
+    if overrides is not None:
+        if overrides.title:
+            meta.title = overrides.title.strip()
+        if overrides.authors:
+            meta.authors = list(overrides.authors)
+        if overrides.narrators:
+            meta.narrators = list(overrides.narrators)
+        if overrides.series is not None:
+            meta.series = overrides.series.strip() or None
+        if overrides.series_order is not None:
+            meta.series_order = overrides.series_order
+        if overrides.isbn is not None:
+            meta.isbn = overrides.isbn.strip() or None
+        if overrides.asin is not None:
+            meta.asin = overrides.asin.strip() or None
+
+    if not meta.title:
+        meta.title = "Audiobook"
+    return meta
+
+
+def _resolve_pack_cover(
+    sorted_tracks: Sequence[str],
+    tag_map: Mapping[str, TrackTagInfo],
+    sidecar_cover: Optional[Cover],
+    overrides: Optional[PackOverrides],
+) -> Optional[Cover]:
+    if overrides and overrides.cover_path:
+        cover = read_cover_file(overrides.cover_path)
+        if cover is None:
+            raise GenericAudiobookDLException(f"Cover file could not be read: {overrides.cover_path}")
+        return cover
+    if sidecar_cover is not None:
+        return sidecar_cover
+    for p in sorted_tracks:
+        info = tag_map.get(p)
+        if info is not None and info.cover is not None:
+            return info.cover
+    return None
+
+
+def _build_pack_chapters(
+    sorted_tracks: Sequence[str],
+    tag_map: Mapping[str, TrackTagInfo],
+    sidecar_chapters: Sequence[Chapter],
+    book_title: str,
+    probe_cache: Dict[str, AudioProbeInfo],
+    *,
+    no_chapters: bool,
+) -> Tuple[List[Chapter], float, str]:
+    total_seconds = 0.0
+    durations_ms: List[int] = []
+    for path in sorted_tracks:
+        info = probe_audio_info(path)
+        probe_cache[path] = info
+        total_seconds += max(0.0, info.duration)
+        durations_ms.append(max(0, round(info.duration * 1000)))
+
+    if no_chapters:
+        return [], total_seconds, "disabled"
+
+    if sidecar_chapters:
+        return list(sidecar_chapters), total_seconds, "sidecar"
+
+    if len(sorted_tracks) == 1:
+        embedded = _probe_embedded_chapters(sorted_tracks[0])
+        if embedded:
+            return embedded, total_seconds, "embedded"
+        return [], total_seconds, "none"
+
+    chapters: List[Chapter] = []
+    cursor_ms = 0
+    for idx, (path, dur_ms) in enumerate(zip(sorted_tracks, durations_ms), start=1):
+        tag = tag_map.get(path)
+        tag_title = (tag.title or "").strip() if tag else ""
+        if tag_title and tag_title != book_title:
+            ch_title = tag_title
+        else:
+            ch_title = _clean_filename_chapter_title(path, idx)
+        chapters.append(Chapter(start=cursor_ms, title=ch_title))
+        cursor_ms += dur_ms
+    return chapters, total_seconds, "tracks"
+
+
+def resolve_pack_output_path(
+    metadata: AudiobookMetadata,
+    options: args.DownloadOptions,
+    output_format: str,
+    *,
+    output_dir: Optional[str] = None,
+) -> str:
+    """Resolve destination file path using `--output-template`, `output_dir`, and `output_format`."""
+    ext = output_format.lstrip(".").lower() or "m4b"
+    location = output.gen_output_location(
+        options.output_template,
+        metadata,
+        options.remove_chars,
+    )
+    if output_dir and not os.path.isabs(location):
+        location = os.path.join(output_dir, location)
+    suffix = f".{ext}"
+    if location.lower().endswith(suffix):
+        return os.path.abspath(location)
+    return os.path.abspath(f"{location}{suffix}")
+
+
+def inspect_local_book(
+    source_root: str,
+    raw_paths: Sequence[str],
+    options: args.DownloadOptions,
+    *,
+    output_dir: Optional[str] = None,
+    overrides: Optional[PackOverrides] = None,
+    probe_cache: Optional[Dict[str, AudioProbeInfo]] = None,
+    session: Optional[requests.Session] = None,
+) -> PackBookSpec:
+    """Inspect tracks, sidecars, and tags for a local audiobook without modifying disk."""
+    sorted_tracks, tag_map = sort_track_paths(raw_paths)
+    sidecar_dir = source_root if os.path.isdir(source_root) else os.path.dirname(source_root)
+    audio_stem = os.path.splitext(os.path.basename(sorted_tracks[0]))[0] if len(sorted_tracks) == 1 else None
+    sidecar_meta, sidecar_cover, sidecar_chapters = read_sidecar_metadata(sidecar_dir, audio_stem=audio_stem)
+
+    metadata = _aggregate_book_metadata(
+        source_root,
+        sorted_tracks,
+        tag_map,
+        sidecar_meta,
+        overrides,
+    )
+    cover = _resolve_pack_cover(sorted_tracks, tag_map, sidecar_cover, overrides)
+    cache = probe_cache if probe_cache is not None else {}
+    chapters, total_seconds, chapters_source = _build_pack_chapters(
+        sorted_tracks,
+        tag_map,
+        sidecar_chapters,
+        metadata.title,
+        cache,
+        no_chapters=bool(getattr(options, "no_chapters", False)),
+    )
+
+    output_format = (getattr(options, "output_format", None) or "m4b").lstrip(".").lower()
+    output_path = resolve_pack_output_path(
+        metadata,
+        options,
+        output_format,
+        output_dir=output_dir,
+    )
+    files = [
+        AudiobookFile(url=p, ext=os.path.splitext(p)[1].lstrip(".").lower())
+        for p in sorted_tracks
+    ]
+    book_session = session if session is not None else requests.Session()
+    audiobook = Audiobook(
+        session=book_session,
+        metadata=metadata,
+        files=files,
+        chapters=chapters,
+        cover=cover,
+    )
+    return PackBookSpec(
+        source_root=source_root,
+        track_paths=sorted_tracks,
+        audiobook=audiobook,
+        output_format=output_format,
+        output_path=output_path,
+        total_duration_seconds=total_seconds,
+        chapters_source=chapters_source,
+    )
+
+
+def _pack_single_track(
+    src_path: str,
+    staged_path: str,
+    work_tmp_dir: str,
+    spec: PackBookSpec,
+    options: args.DownloadOptions,
+    *,
+    cancel_event: Optional[threading.Event],
+    probe_cache: Dict[str, AudioProbeInfo],
+) -> Tuple[bool, bool]:
+    """Convert or copy a single local track into `staged_path`.
+
+    Returns `(chapters_embedded, cover_embedded)`.
+    """
+    src_ext = os.path.splitext(src_path)[1].lstrip(".").lower()
+    target_ext = spec.output_format.lstrip(".").lower()
+    chapters = None if options.no_chapters else (spec.audiobook.chapters or None)
+    if src_ext == target_ext:
+        shutil.copy2(src_path, staged_path)
+        return False, False
+
+    staged_input = os.path.join(work_tmp_dir, f"input.{src_ext}")
+    shutil.copy2(src_path, staged_input)
+    if src_path in probe_cache:
+        probe_cache[staged_input] = probe_cache[src_path]
+    converted_path, chapters_embedded = output.convert_single_file(
+        staged_input,
+        target_ext,
+        cancel_event=cancel_event,
+        audio_bitrate=options.audio_bitrate,
+        chapters=chapters,
+        remove_source=True,
+        metadata=spec.audiobook.metadata,
+        cover=spec.audiobook.cover,
+        probe_cache=probe_cache,
+    )
+    shutil.move(converted_path, staged_path)
+    cover_embedded = spec.audiobook.cover is not None and target_ext in output.MP4_CONTAINERS
+    return chapters_embedded, cover_embedded
+
+
+def _remove_source_tracks(track_paths: Sequence[str], source_root: str) -> None:
+    """Remove packed source tracks and prune `source_root` only if it becomes empty."""
+    for path in track_paths:
+        if os.path.exists(path):
+            os.remove(path)
+    if os.path.isdir(source_root):
+        try:
+            if not os.listdir(source_root):
+                os.rmdir(source_root)
+        except OSError:
+            pass
+
+
+def pack_book(
+    spec: PackBookSpec,
+    options: args.DownloadOptions,
+    *,
+    output_dir: Optional[str] = None,
+    delete_source: bool = False,
+    interaction: Optional[logging.InteractionHandler] = None,
+    cancel_event: Optional[threading.Event] = None,
+    probe_cache: Optional[Dict[str, AudioProbeInfo]] = None,
+) -> str:
+    """Repackage a single inspected `PackBookSpec` and return the final output path."""
+    if cancel_event is not None and cancel_event.is_set():
+        raise DownloadCancelled
+
+    if getattr(options, "enrich_metadata", False):
+        enrich_audiobook_with_options(
+            spec.audiobook,
+            options,
+            interaction=interaction,
+        )
+        # Recompute output path after enrichment in case template uses newly populated fields
+        spec.output_path = resolve_pack_output_path(
+            spec.audiobook.metadata,
+            options,
+            spec.output_format,
+            output_dir=output_dir,
+        )
+
+    output_path = spec.output_path
+    output_download.confirm_overwrite_file(
+        output_path,
+        interaction=interaction,
+        overwrite=options.overwrite,
+    )
+
+    final_parent = os.path.dirname(output_path) or os.getcwd()
+    os.makedirs(final_parent, exist_ok=True)
+    base_name = os.path.basename(output_path)
+    staged_path = os.path.join(
+        final_parent,
+        f".{base_name}.pack-{uuid.uuid4().hex[:8]}.{spec.output_format}",
+    )
+    work_tmp_dir = tempfile.mkdtemp(prefix="audiobookdl-pack-")
+    cache = probe_cache if probe_cache is not None else {}
+
+    try:
+        chapters = None if options.no_chapters else (spec.audiobook.chapters or None)
+        if len(spec.track_paths) == 1:
+            chapters_embedded, cover_embedded = _pack_single_track(
+                spec.track_paths[0],
+                staged_path,
+                work_tmp_dir,
+                spec,
+                options,
+                cancel_event=cancel_event,
+                probe_cache=cache,
+            )
+        else:
+            logging.book_update(f"Packing {len(spec.track_paths)} tracks to .{spec.output_format}")
+            chapters_embedded = output.combine_audiofiles(
+                list(spec.track_paths),
+                work_tmp_dir,
+                staged_path,
+                cancel_event=cancel_event,
+                chapters=chapters,
+                audio_bitrate=options.audio_bitrate,
+                metadata=spec.audiobook.metadata,
+                cover=spec.audiobook.cover,
+                probe_cache=cache,
+            )
+            cover_embedded = spec.audiobook.cover is not None and spec.output_format in output.MP4_CONTAINERS
+
+        if not (os.path.isfile(staged_path) and os.path.getsize(staged_path) > 0):
+            raise GenericAudiobookDLException(
+                f"Repackaging failed to produce output file '{output_path}'"
+            )
+
+        os.replace(staged_path, output_path)
+        output_download.add_metadata_to_file(
+            spec.audiobook,
+            output_path,
+            options,
+            cancel_event=cancel_event,
+            chapters_embedded=chapters_embedded,
+            cover_embedded=cover_embedded,
+        )
+    except Exception:
+        if os.path.exists(staged_path):
+            try:
+                os.remove(staged_path)
+            except OSError:
+                pass
+        raise
+    finally:
+        if os.path.isdir(work_tmp_dir):
+            shutil.rmtree(work_tmp_dir, ignore_errors=True)
+
+    if delete_source:
+        src_norm = {os.path.normcase(os.path.abspath(p)) for p in spec.track_paths}
+        if os.path.normcase(os.path.abspath(output_path)) not in src_norm:
+            _remove_source_tracks(spec.track_paths, spec.source_root)
+
+    return output_path
+
+
+def scope_overrides_for_batch(
+    overrides: Optional[PackOverrides],
+    total_books: int,
+) -> Optional[PackOverrides]:
+    """Return full `overrides` for single-book batches or shared fields for multi-book batches."""
+    if overrides is None or total_books <= 1:
+        return overrides
+    return PackOverrides(
+        authors=list(overrides.authors),
+        narrators=list(overrides.narrators),
+        series=overrides.series,
+        cover_path=overrides.cover_path,
+    )
+
+
+def run_pack(
+    paths: Sequence[str],
+    options: args.DownloadOptions,
+    config: Optional[Config] = None,
+    *,
+    output_dir: Optional[str] = None,
+    recursive: bool = False,
+    delete_source: bool = False,
+    dry_run: bool = False,
+    overrides: Optional[PackOverrides] = None,
+    interaction: Optional[logging.InteractionHandler] = None,
+    cancel_event: Optional[threading.Event] = None,
+    sink: Optional[logging.LogSink] = None,
+) -> PackSummary:
+    """Discover, inspect, and repackage local audiobooks with isolated `JobContext`."""
+    resolved_config = config if config is not None else load_config(options.config_location)
+    ctx = apply_runtime_options(options, resolved_config)
+    ctx.interaction = interaction if interaction is not None else logging.CliInteractionHandler()
+    ctx.cancel_event = cancel_event
+    ctx.sink = sink if sink is not None else logging.get_ui_sink()
+
+    if not getattr(options, "output_format", None):
+        options.output_format = "m4b"
+
+    summary = PackSummary()
+    session = requests.Session()
+    try:
+        with logging.job_context(ctx):
+            groups = discover_pack_groups(paths, recursive=recursive)
+            total = len(groups)
+            probe_cache: Dict[str, AudioProbeInfo] = {}
+            for idx, (source_root, raw_tracks) in enumerate(groups, start=1):
+                if cancel_event is not None and cancel_event.is_set():
+                    summary.cancelled = True
+                    break
+                book_overrides = scope_overrides_for_batch(overrides, total)
+                try:
+                    spec = inspect_local_book(
+                        source_root,
+                        raw_tracks,
+                        options,
+                        output_dir=output_dir,
+                        overrides=book_overrides,
+                        probe_cache=probe_cache,
+                        session=session,
+                    )
+                    logging.emit_item_progress(idx, total, spec.audiobook.title)
+                    if dry_run:
+                        logging.log(
+                            f"[Dry Run] [blue]{spec.audiobook.title}[/] "
+                            f"({len(spec.track_paths)} track{'s' if len(spec.track_paths) != 1 else ''}, "
+                            f"{len(spec.audiobook.chapters)} chapter{'s' if len(spec.audiobook.chapters) != 1 else ''}) "
+                            f"-> {spec.output_path}"
+                        )
+                        summary.output_paths.append(spec.output_path)
+                        summary.books_completed += 1
+                        continue
+
+                    logging.log(f"Packing [blue]{spec.audiobook.title}[/] ({len(spec.track_paths)} tracks)")
+                    final_path = pack_book(
+                        spec,
+                        options,
+                        output_dir=output_dir,
+                        delete_source=delete_source,
+                        interaction=ctx.interaction,
+                        cancel_event=cancel_event,
+                        probe_cache=probe_cache,
+                    )
+                    summary.output_paths.append(final_path)
+                    summary.books_completed += 1
+                    logging.log(f"Packed [green]{final_path}[/]")
+                except (DownloadCancelled, KeyboardInterrupt):
+                    summary.cancelled = True
+                    summary.books_skipped += 1
+                    logging.log("Pack cancelled")
+                    break
+                except AudiobookDLException as exc:
+                    summary.books_failed += 1
+                    summary.book_errors.append((source_root, exc.error_description))
+                    exc.print()
+                    if logging.is_debug_mode():
+                        logging.print_traceback()
+                except Exception as exc:
+                    summary.books_failed += 1
+                    summary.book_errors.append((source_root, str(exc)))
+                    logging.error(f"Failed packing '{source_root}': {exc}")
+                    if logging.is_debug_mode():
+                        logging.print_traceback()
+    finally:
+        session.close()
+
+    return summary

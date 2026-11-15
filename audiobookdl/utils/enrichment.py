@@ -1,6 +1,6 @@
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date
 from difflib import SequenceMatcher
 import html
 from io import BytesIO
@@ -12,7 +12,13 @@ import pycountry
 import requests
 
 from audiobookdl import logging
-from audiobookdl.utils.audiobook import Audiobook, AudiobookMetadata, Chapter, Cover
+from audiobookdl.utils.audiobook import (
+    Audiobook,
+    AudiobookMetadata,
+    Chapter,
+    Cover,
+    parse_release_date,
+)
 from audiobookdl.utils.enrichment_cache import (
     DEFAULT_CACHE_TTL_SECONDS,
     EnrichmentCache,
@@ -181,40 +187,6 @@ def _strip_html(raw: Any) -> Optional[str]:
     lines = [line.strip() for line in text.splitlines()]
     cleaned = "\n".join(line for line in lines if line)
     return cleaned.strip() or None
-
-
-def _parse_date(raw: Any) -> Optional[date]:
-    if isinstance(raw, date) and not isinstance(raw, datetime):
-        return raw
-    if isinstance(raw, datetime):
-        return raw.date()
-    if isinstance(raw, int) and not isinstance(raw, bool):
-        if 1 <= raw <= 9999:
-            return date(raw, 1, 1)
-        return None
-    if not isinstance(raw, str):
-        return None
-    cleaned = raw.strip()
-    if not cleaned:
-        return None
-    m_full = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})", cleaned)
-    if m_full:
-        try:
-            return date(int(m_full.group(1)), int(m_full.group(2)), int(m_full.group(3)))
-        except ValueError:
-            pass
-    m_ym = re.match(r"^(\d{4})-(\d{1,2})$", cleaned)
-    if m_ym:
-        try:
-            return date(int(m_ym.group(1)), int(m_ym.group(2)), 1)
-        except ValueError:
-            pass
-    m_y = re.match(r"^(\d{4})$", cleaned)
-    if m_y:
-        year = int(m_y.group(1))
-        if 1 <= year <= 9999:
-            return date(year, 1, 1)
-    return None
 
 
 def _parse_language(raw: Any) -> Optional[Any]:
@@ -413,7 +385,7 @@ def _parse_audnexus_book(payload: Mapping[str, Any]) -> Optional[EnrichmentCandi
     description = _strip_html(payload.get("summary") or payload.get("description"))
     cover_url = str(payload.get("image") or "").strip() or None
     publisher = str(payload.get("publisherName") or "").strip() or None
-    release_date = _parse_date(payload.get("releaseDate"))
+    release_date = parse_release_date(payload.get("releaseDate"))
     language = _parse_language(payload.get("language"))
     isbn = _clean_isbn(payload.get("isbn"))
 
@@ -466,7 +438,7 @@ def _parse_audible_product(product: Mapping[str, Any]) -> Optional[EnrichmentCan
 
     description = _strip_html(product.get("publisher_summary") or product.get("merchandising_summary"))
     publisher = str(product.get("publisher_name") or "").strip() or None
-    release_date = _parse_date(product.get("release_date"))
+    release_date = parse_release_date(product.get("release_date"))
     language = _parse_language(product.get("language"))
 
     return EnrichmentCandidate(
@@ -677,7 +649,7 @@ def _query_itunes(
         genre = str(item.get("primaryGenreName") or "").strip()
         genres = [genre] if genre else []
         description = _strip_html(item.get("description"))
-        release_date = _parse_date(item.get("releaseDate"))
+        release_date = parse_release_date(item.get("releaseDate"))
         artwork_raw = item.get("artworkUrl100") or item.get("artworkUrl60") or item.get("artworkUrl30")
         cover_url = _upgrade_itunes_artwork(str(artwork_raw)) if artwork_raw else None
         raw_id = str(item.get("collectionId")) if item.get("collectionId") is not None else None
@@ -789,7 +761,7 @@ def _query_google(
             description=_strip_html(info.get("description")),
             isbn=_extract_google_isbn(info.get("industryIdentifiers")),
             publisher=str(info.get("publisher") or "").strip() or None,
-            release_date=_parse_date(info.get("publishedDate")),
+            release_date=parse_release_date(info.get("publishedDate")),
             cover_url=_upgrade_google_cover(info.get("imageLinks")),
             raw_id=str(item.get("id")) if item.get("id") is not None else None,
         )
@@ -877,7 +849,7 @@ def _query_openlibrary(
             description=description,
             isbn=_extract_first_isbn(doc),
             publisher=publisher or None,
-            release_date=_parse_date(doc.get("first_publish_year")),
+            release_date=parse_release_date(doc.get("first_publish_year")),
             cover_url=cover_url,
             raw_id=str(doc.get("key")) if doc.get("key") else None,
         )

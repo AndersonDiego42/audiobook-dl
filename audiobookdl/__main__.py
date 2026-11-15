@@ -1,8 +1,10 @@
 import sys
+from typing import Optional, Sequence
 import requests
 
 from audiobookdl import __version__, args, logging
 from audiobookdl.config import load_config
+from audiobookdl.pack import PackOverrides, run_pack
 from audiobookdl.pipeline import (
     Downloader,
     apply_runtime_options,
@@ -14,9 +16,53 @@ from audiobookdl.sources import get_available_services
 from audiobookdl.utils.updater import check_for_updates
 
 
-def main() -> None:
+def _build_pack_overrides(pack_opts: args.PackOptions) -> Optional[PackOverrides]:
+    if not any((
+        pack_opts.title,
+        pack_opts.authors,
+        pack_opts.narrators,
+        pack_opts.series is not None,
+        pack_opts.series_order is not None,
+        pack_opts.isbn is not None,
+        pack_opts.asin is not None,
+        pack_opts.cover_path,
+    )):
+        return None
+    return PackOverrides(
+        title=pack_opts.title,
+        authors=pack_opts.authors,
+        narrators=pack_opts.narrators,
+        series=pack_opts.series,
+        series_order=pack_opts.series_order,
+        isbn=pack_opts.isbn,
+        asin=pack_opts.asin,
+        cover_path=pack_opts.cover_path,
+    )
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
     """CLI entry point for `audiobook-dl`."""
-    options = args.parse_arguments()
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv and raw_argv[0] == "pack":
+        pack_dl_options, pack_options = args.parse_pack_arguments(raw_argv[1:])
+        config = load_config(pack_dl_options.config_location)
+        summary = run_pack(
+            pack_options.paths,
+            pack_dl_options,
+            config,
+            output_dir=pack_options.output_dir,
+            recursive=pack_options.recursive,
+            delete_source=pack_options.delete_source,
+            dry_run=pack_options.dry_run,
+            overrides=_build_pack_overrides(pack_options),
+        )
+        if summary.cancelled:
+            sys.exit(130)
+        if summary.books_failed > 0:
+            sys.exit(1)
+        return
+
+    options = args.parse_arguments(raw_argv)
     if getattr(options, "list_sources", False):
         for service in get_available_services():
             methods = ", ".join(service.auth_methods) if service.auth_methods else "none"

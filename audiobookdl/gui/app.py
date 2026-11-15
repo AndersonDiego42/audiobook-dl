@@ -17,8 +17,9 @@ from audiobookdl.config import SourceConfig, is_portable_mode
 from audiobookdl.exceptions import DownloadCancelled
 from audiobookdl.gui.archive_dialog import ArchiveLedgerDialog
 from audiobookdl.gui.catalog_dialog import CatalogBrowserDialog
-from audiobookdl.gui.controller import GuiController, QueuedJob
+from audiobookdl.gui.controller import GuiController, PackJobRequest, QueuedJob
 from audiobookdl.gui.cookie_dialog import CookieImportDialog
+from audiobookdl.gui.pack_dialog import PackDialog
 from audiobookdl.gui.formatting import (
     MEDIA_TYPE_OPTIONS,
     OUTPUT_FORMATS,
@@ -647,7 +648,7 @@ class AudiobookDLApp:
 
         action_bar = ttk.Frame(log_frame)
         action_bar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
-        action_bar.columnconfigure(5, weight=1)
+        action_bar.columnconfigure(6, weight=1)
 
         self.download_btn = ttk.Button(action_bar, text="Download", command=self.start_download)
         self.download_btn.grid(row=0, column=0, padx=(0, 6))
@@ -658,13 +659,16 @@ class AudiobookDLApp:
         self.preview_btn = ttk.Button(action_bar, text="Preview", command=self.preview_metadata)
         self.preview_btn.grid(row=0, column=2, padx=(0, 6))
 
-        self.open_folder_btn = ttk.Button(action_bar, text="Open Folder", command=self._open_output_folder)
-        self.open_folder_btn.grid(row=0, column=3, padx=(0, 6))
+        self.pack_btn = ttk.Button(action_bar, text="Pack Local...", command=self._show_pack_dialog)
+        self.pack_btn.grid(row=0, column=3, padx=(0, 6))
 
-        ttk.Button(action_bar, text="Clear Log", command=self._clear_log).grid(row=0, column=4)
+        self.open_folder_btn = ttk.Button(action_bar, text="Open Folder", command=self._open_output_folder)
+        self.open_folder_btn.grid(row=0, column=4, padx=(0, 6))
+
+        ttk.Button(action_bar, text="Clear Log", command=self._clear_log).grid(row=0, column=5)
 
         self.status_label = ttk.Label(action_bar, textvariable=self.status_var, anchor="e")
-        self.status_label.grid(row=0, column=5, sticky="e")
+        self.status_label.grid(row=0, column=6, sticky="e")
 
         meta_bar = ttk.Frame(log_frame)
         meta_bar.grid(row=1, column=0, sticky="ew", pady=(0, 2))
@@ -804,6 +808,7 @@ class AudiobookDLApp:
             command=self._show_cookie_import_dialog,
         )
         tools_menu.add_command(label="Browse Library / Search...", command=self._show_catalog_browser_dialog)
+        tools_menu.add_command(label="Pack Local Audiobooks...", command=self._show_pack_dialog)
         tools_menu.add_command(label="Locate FFmpeg Folder...", command=self.browse_ffmpeg_dir)
         tools_menu.add_command(label="Download History Ledger...", command=self._show_archive_ledger_dialog)
         tools_menu.add_separator()
@@ -1533,7 +1538,9 @@ class AudiobookDLApp:
 
     def _register_queue_job(self, job: QueuedJob) -> None:
         """Insert a queued job row into the Queue & History table and internal index."""
-        service_label = self._service_label_for_url(job.url)
+        service_label = (
+            "Local Pack" if job.pack_request is not None else self._service_label_for_url(job.url)
+        )
         self._controller.register_queue_record(job, service_label)
         self.queue_tree.insert(
             "",
@@ -1664,11 +1671,8 @@ class AudiobookDLApp:
             use_download_archive=self.download_archive_var.get(),
         )
 
-    def _start_new_run(
-        self,
-        job_specs: Sequence[Tuple[str, args.DownloadOptions, Optional[List[int]], Optional[Tuple[Source, Result]]]],
-    ) -> None:
-        """Initialize UI and queue state for a fresh download run."""
+    def _prepare_run_ui_state(self, run_id: int, item_total: int, log_header: str) -> None:
+        """Initialize progress, timer, and batch counters for a fresh queue run."""
         self.progressbar.stop()
         self.progressbar.configure(mode="determinate", value=0)
         self.status_var.set("Starting...")
@@ -1678,22 +1682,76 @@ class AudiobookDLApp:
         self._last_eta_seconds = None
         self._last_metrics_render_at = 0.0
         self._set_running_state(True)
-
-        run_id, queued_jobs = self._controller.start_new_run(job_specs)
         self._current_ui_run_id = run_id
-
-        for job in queued_jobs:
-            self._register_queue_job(job)
-
         self._ui_item_index = 1
-        self._ui_item_total = len(job_specs)
+        self._ui_item_total = item_total
         self._ui_book_index = 0
         self._ui_book_total = 0
         self._refresh_batch_label()
         self._update_metrics_display(force=True)
-        self._append_log(
-            f"--- Starting download ({len(job_specs)} URL{'s' if len(job_specs) != 1 else ''}) ---"
+        self._append_log(log_header)
+
+    def _start_new_run(
+        self,
+        job_specs: Sequence[Tuple[str, args.DownloadOptions, Optional[List[int]], Optional[Tuple[Source, Result]]]],
+    ) -> None:
+        """Initialize UI and queue state for a fresh download run."""
+        run_id, queued_jobs = self._controller.start_new_run(job_specs)
+        self._prepare_run_ui_state(
+            run_id,
+            len(job_specs),
+            f"--- Starting download ({len(job_specs)} URL{'s' if len(job_specs) != 1 else ''}) ---",
         )
+        for job in queued_jobs:
+            self._register_queue_job(job)
+
+    def _show_pack_dialog(self) -> None:
+        """Open the modal Local Audiobook Repackager dialog."""
+        options = self._try_build_options(urls_override=[])
+        if options is None:
+            return
+        if not self._ensure_ffmpeg_available(options):
+            return
+        output_dir = self.output_dir_var.get().strip() or default_output_dir()
+        PackDialog(
+            self.root,
+            self._controller,
+            options,
+            output_dir=output_dir,
+            on_submit=self._on_pack_submitted,
+            palette=self._palette,
+        )
+
+    def _on_pack_submitted(self, requests_list: List[PackJobRequest], output_format: str) -> None:
+        """Queue one or more local repackaging requests onto `GuiController`."""
+        pairs: List[Tuple[PackJobRequest, args.DownloadOptions]] = []
+        for req in requests_list:
+            opts = self._try_build_options(urls_override=[])
+            if opts is None:
+                return
+            opts.output_format = output_format
+            pairs.append((req, opts))
+        if not pairs:
+            return
+        self._save_run_preferences(pairs[0][1])
+
+        was_appended, run_id, queued_jobs, new_total = self._controller.start_or_enqueue_pack_jobs(pairs)
+        if was_appended:
+            for job in queued_jobs:
+                self._register_queue_job(job)
+            self._ui_item_total = new_total
+            self._refresh_batch_label()
+            self.status_var.set(f"Queued +{len(queued_jobs)} pack job(s) (total {new_total})")
+            self._append_log(f"--- Added {len(queued_jobs)} local pack job(s) to queue ---")
+            return
+
+        self._prepare_run_ui_state(
+            run_id,
+            len(queued_jobs),
+            f"--- Starting local pack ({len(queued_jobs)} book{'s' if len(queued_jobs) != 1 else ''}) ---",
+        )
+        for job in queued_jobs:
+            self._register_queue_job(job)
 
     def _warn_mixed_service_credentials(self, urls: Sequence[str]) -> bool:
         """Warn before starting if batch URLs target an unconfigured auth service alongside another."""

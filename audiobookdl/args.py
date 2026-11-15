@@ -120,6 +120,8 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> DownloadOptions:
     parser = argparse.ArgumentParser(
         prog="audiobook-dl",
         description="Download audiobooks from websites",
+        epilog="Subcommands:\n  audiobook-dl pack <paths...>   Repackage local folders/tracks offline into .m4b",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         argument_default=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -134,6 +136,155 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> DownloadOptions:
     if "urls" in provided and not provided["urls"]:
         provided.pop("urls")
     return build_default_options(**provided)
+
+
+_PACK_SHARED_OPTION_NAMES: FrozenSet[str] = frozenset(
+    {
+        "output_template",
+        "output_preset",
+        "output_format",
+        "remove_chars",
+        "no_chapters",
+        "audio_bitrate",
+        "write_json_metadata",
+        "write_cover",
+        "write_opf",
+        "write_cue",
+        "overwrite",
+        "enrich_metadata",
+        "enrich_providers",
+        "enrich_interactive",
+        "no_enrich_cache",
+        "database_directory",
+        "proxy",
+        "timeout",
+        "config_location",
+        "debug",
+        "quiet",
+        "ffmpeg_output",
+    }
+)
+
+
+def _parse_series_order_arg(value: str) -> int:
+    try:
+        parsed = float(value.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Expected integer for --series-order, got {value!r}") from exc
+    if not parsed.is_integer():
+        raise argparse.ArgumentTypeError(f"Expected integer for --series-order, got {value!r}")
+    return int(parsed)
+
+
+@dataclass
+class PackOptions:
+    """Pack-subcommand arguments for offline local audiobook repackaging."""
+
+    paths: List[str] = field(default_factory=list)
+    recursive: bool = False
+    delete_source: bool = False
+    dry_run: bool = False
+    output_dir: Optional[str] = None
+    title: Optional[str] = None
+    authors: List[str] = field(default_factory=list)
+    narrators: List[str] = field(default_factory=list)
+    series: Optional[str] = None
+    series_order: Optional[int] = None
+    isbn: Optional[str] = None
+    asin: Optional[str] = None
+    cover_path: Optional[str] = None
+
+
+def build_pack_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser for `audiobook-dl pack`."""
+    parser = argparse.ArgumentParser(
+        prog="audiobook-dl pack",
+        description="Offline repackager to merge local audio tracks into chaptered .m4b audiobooks",
+        argument_default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "paths",
+        nargs="+",
+        help="Local folder(s) or audio track(s) to repackage",
+    )
+    parser.add_argument(
+        "-r",
+        "--recursive",
+        action="store_true",
+        help="Recursively pack subdirectories that contain audio tracks",
+    )
+    parser.add_argument(
+        "--delete-source",
+        action="store_true",
+        help="Delete original source tracks after successful repackaging (kept by default)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview discovered books, chapters, metadata, and output paths without writing files",
+    )
+    parser.add_argument(
+        "--output-dir",
+        dest="pack_output_dir",
+        help="Base directory for relative output templates",
+    )
+    parser.add_argument(
+        "--output-template",
+        dest="output_template",
+        help="Alias for -o/--output location template",
+    )
+    parser.add_argument("--title", dest="pack_title", help="Override audiobook title")
+    parser.add_argument(
+        "--author",
+        dest="pack_authors",
+        action="append",
+        help="Override author (repeatable)",
+    )
+    parser.add_argument(
+        "--narrator",
+        dest="pack_narrators",
+        action="append",
+        help="Override narrator (repeatable)",
+    )
+    parser.add_argument("--series", dest="pack_series", help="Override series name")
+    parser.add_argument(
+        "--series-order",
+        dest="pack_series_order",
+        type=_parse_series_order_arg,
+        help="Override series index",
+    )
+    parser.add_argument("--isbn", dest="pack_isbn", help="Override ISBN")
+    parser.add_argument("--asin", dest="pack_asin", help="Override ASIN")
+    parser.add_argument("--cover", dest="pack_cover_path", help="Path to custom cover image")
+
+    for spec in OPTION_REGISTRY:
+        if spec.name in _PACK_SHARED_OPTION_NAMES:
+            spec.add_cli_arguments(parser)
+    return parser
+
+
+def parse_pack_arguments(
+    argv: Optional[Sequence[str]] = None,
+) -> tuple[DownloadOptions, PackOptions]:
+    """Parse arguments for `audiobook-dl pack` into `(DownloadOptions, PackOptions)`."""
+    parser = build_pack_parser()
+    raw = vars(parser.parse_args(argv))
+    pack_opts = PackOptions(
+        paths=list(raw.pop("paths", [])),
+        recursive=bool(raw.pop("recursive", False)),
+        delete_source=bool(raw.pop("delete_source", False)),
+        dry_run=bool(raw.pop("dry_run", False)),
+        output_dir=raw.pop("pack_output_dir", None),
+        title=raw.pop("pack_title", None),
+        authors=list(raw.pop("pack_authors", [])),
+        narrators=list(raw.pop("pack_narrators", [])),
+        series=raw.pop("pack_series", None),
+        series_order=raw.pop("pack_series_order", None),
+        isbn=raw.pop("pack_isbn", None),
+        asin=raw.pop("pack_asin", None),
+        cover_path=raw.pop("pack_cover_path", None),
+    )
+    return build_default_options(**raw), pack_opts
 
 
 def get_urls(options: DownloadOptions) -> List[str]:
