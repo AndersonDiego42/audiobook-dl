@@ -192,13 +192,7 @@ def add_metadata_to_file(
     :param filepath: Filepath of output file
     :options: Cli options
     """
-    # General metadata
-    logging.book_update("Adding metadata")
-    metadata.add_metadata(filepath, audiobook.metadata)
-    if options.write_json_metadata:
-        with open(f"{filepath}.json", "w", encoding="utf-8") as f:
-            f.write(audiobook.metadata.as_json())
-    # Chapters
+    # Chapters must be muxed before container metadata/cover because ffmpeg's remux drops unmapped MP4 atoms
     if audiobook.chapters and not options.no_chapters:
         logging.book_update("Adding chapters")
         metadata.add_chapters(
@@ -207,6 +201,12 @@ def add_metadata_to_file(
             cancel_event=cancel_event,
             audio_bitrate=options.audio_bitrate,
         )
+    # General metadata
+    logging.book_update("Adding metadata")
+    metadata.add_metadata(filepath, audiobook.metadata)
+    if options.write_json_metadata:
+        with open(f"{filepath}.json", "w", encoding="utf-8") as f:
+            f.write(audiobook.metadata.as_json())
     # Cover
     if audiobook.cover:
         logging.book_update("Embedding cover")
