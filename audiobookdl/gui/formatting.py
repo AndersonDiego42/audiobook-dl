@@ -9,6 +9,11 @@ import tkinter as tk
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from audiobookdl import output
+from audiobookdl.options_schema import (
+    GUI_MEDIA_TYPE_OPTIONS,
+    GUI_OUTPUT_FORMATS,
+    GUI_OVERWRITE_OPTIONS,
+)
 from audiobookdl.utils.audiobook import (
     Audiobook,
     AudiobookMetadata,
@@ -18,8 +23,9 @@ from audiobookdl.utils.audiobook import (
 )
 
 
-OUTPUT_FORMATS = ("Original", "m4b", "mp3", "m4a", "flac", "opus")
-MEDIA_TYPE_OPTIONS = ("Auto", "Audiobook", "Ebook", "Both")
+OUTPUT_FORMATS = GUI_OUTPUT_FORMATS
+MEDIA_TYPE_OPTIONS = GUI_MEDIA_TYPE_OPTIONS
+OVERWRITE_OPTIONS = GUI_OVERWRITE_OPTIONS
 TEMPLATE_PRESET_LABELS: Tuple[Tuple[str, str], ...] = (
     ("Custom", ""),
     ("Default", output.OUTPUT_TEMPLATE_PRESETS["default"]),

@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import sys
 
 import pytest
@@ -50,7 +51,7 @@ def test_save_output_preferences_preserves_sources(tmp_path):
         encoding="utf-8",
     )
 
-    save_output_preferences("m4b", True, overwrite=str(cfg_path))
+    save_output_preferences("m4b", True, config_location=str(cfg_path))
     loaded = load_config(str(cfg_path))
     assert loaded.output_format == "m4b"
     assert loaded.combine is True
@@ -59,7 +60,7 @@ def test_save_output_preferences_preserves_sources(tmp_path):
     save_output_preferences(
         "m4b",
         True,
-        overwrite=str(cfg_path),
+        config_location=str(cfg_path),
         audio_bitrate="192k",
         resume=True,
     )
@@ -68,7 +69,7 @@ def test_save_output_preferences_preserves_sources(tmp_path):
     assert loaded_with_opts.resume is True
 
     # Updating only format/combine without passing audio_bitrate/resume preserves them
-    save_output_preferences("mp3", False, overwrite=str(cfg_path))
+    save_output_preferences("mp3", False, config_location=str(cfg_path))
     preserved = load_config(str(cfg_path))
     assert preserved.output_format == "mp3"
     assert preserved.combine is False
@@ -76,7 +77,7 @@ def test_save_output_preferences_preserves_sources(tmp_path):
     assert preserved.resume is True
 
     # Passing None clears audio_bitrate
-    save_output_preferences(None, False, overwrite=str(cfg_path), audio_bitrate=None, resume=False)
+    save_output_preferences(None, False, config_location=str(cfg_path), audio_bitrate=None, resume=False)
     reloaded = load_config(str(cfg_path))
     assert reloaded.output_format is None
     assert reloaded.combine is False
@@ -133,7 +134,7 @@ def test_save_gui_preferences_round_trip_and_preserves_other_sections(tmp_path):
     )
 
     # Saving output preferences preserves [gui] and [sources.*]
-    save_output_preferences("m4b", True, overwrite=str(cfg_path))
+    save_output_preferences("m4b", True, config_location=str(cfg_path))
 
     loaded = load_config(str(cfg_path))
     assert loaded.output_format == "m4b"
@@ -172,6 +173,25 @@ def test_save_ffmpeg_dir_and_resolve_executable(tmp_path):
         utils.set_ffmpeg_dir(prev)
 
 
+class _RecordingSink:
+    """In-memory `LogSink` helper for capturing config warnings during tests."""
+
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def on_log(self, level: str, message: str) -> None:
+        self.messages.append(message)
+
+    def on_progress_start(self, description: str, total: float) -> None:
+        pass
+
+    def on_progress_advance(self, completed: float, total: float) -> None:
+        pass
+
+    def on_progress_finish(self) -> None:
+        pass
+
+
 def test_config_normalizes_source_aliases_and_warns_on_unknown_keys(tmp_path):
     from audiobookdl import logging
 
@@ -190,22 +210,8 @@ def test_config_normalizes_source_aliases_and_warns_on_unknown_keys(tmp_path):
         'library = "nypl"\n',
         encoding="utf-8",
     )
-    messages: list[str] = []
-
-    class _Sink:
-        def on_log(self, _level: str, msg: str) -> None:
-            messages.append(msg)
-
-        def on_progress_start(self, _d: str, _t: float) -> None:
-            pass
-
-        def on_progress_advance(self, _c: float, _t: float) -> None:
-            pass
-
-        def on_progress_finish(self) -> None:
-            pass
-
-    with logging.job_context(logging.JobContext(sink=_Sink())):
+    sink = _RecordingSink()
+    with logging.job_context(logging.JobContext(sink=sink)):
         loaded = load_config(str(cfg_path))
 
     assert "everand" in loaded.sources
@@ -213,7 +219,7 @@ def test_config_normalizes_source_aliases_and_warns_on_unknown_keys(tmp_path):
     assert "overdrive" in loaded.sources
     assert loaded.sources["overdrive"].library == "nypl"
     assert loaded.max_workers is None
-    joined = "\n".join(messages)
+    joined = "\n".join(sink.messages)
     assert "unknown_top_key" in joined
     assert "bogus_gui_key" in joined
     assert "bad_field" in joined
@@ -230,28 +236,84 @@ def test_load_and_save_media_type_config(tmp_path):
 
     # Invalid value emits a warning and clears media_type
     cfg_path.write_text('media_type = "comic"\n', encoding="utf-8")
-    messages: list[str] = []
-
-    class _Sink:
-        def on_log(self, _level: str, msg: str) -> None:
-            messages.append(msg)
-
-        def on_progress_start(self, _d: str, _t: float) -> None:
-            pass
-
-        def on_progress_advance(self, _c: float, _t: float) -> None:
-            pass
-
-        def on_progress_finish(self) -> None:
-            pass
-
-    with logging.job_context(logging.JobContext(sink=_Sink())):
+    sink = _RecordingSink()
+    with logging.job_context(logging.JobContext(sink=sink)):
         invalid_loaded = load_config(str(cfg_path))
     assert invalid_loaded.media_type is None
-    assert any("media_type" in msg for msg in messages)
+    assert any("media_type" in msg for msg in sink.messages)
 
     # Round-trip save_output_preferences
-    save_output_preferences(None, False, overwrite=str(cfg_path), media_type="both")
+    save_output_preferences(None, False, config_location=str(cfg_path), media_type="both")
     saved = load_config(str(cfg_path))
     assert saved.media_type == "both"
+
+
+def test_save_output_and_gui_preferences_round_trip_all_toggles(tmp_path):
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    custom_archive = str(tmp_path / "custom.sqlite")
+    cfg_path.write_text(f'download_archive = "{custom_archive.replace(chr(92), "/")}"\n', encoding="utf-8")
+
+    save_output_preferences(
+        "m4b",
+        True,
+        config_location=str(cfg_path),
+        skip_downloaded=True,
+        write_json_metadata=True,
+        enrich_metadata=True,
+        no_chapters=True,
+        debug=True,
+        split_chapters=True,
+        write_opf=True,
+        write_cue=True,
+        write_cover=True,
+        remove_chars=":?",
+        cover=True,
+        overwrite=False,
+        max_workers=6,
+        book_delay=1.5,
+        proxy="http://127.0.0.1:8888",
+        timeout=45.0,
+    )
+    save_gui_preferences(overwrite=str(cfg_path), use_download_archive=False)
+
+    loaded = load_config(str(cfg_path))
+    assert loaded.skip_downloaded is True
+    assert loaded.write_json_metadata is True
+    assert loaded.enrich_metadata is True
+    assert loaded.no_chapters is True
+    assert loaded.debug is True
+    assert loaded.split_chapters is True
+    assert loaded.write_opf is True
+    assert loaded.write_cue is True
+    assert loaded.write_cover is True
+    assert loaded.remove_chars == ":?"
+    assert loaded.cover is True
+    assert loaded.overwrite is False
+    assert loaded.max_workers == 6
+    assert loaded.book_delay == pytest.approx(1.5)
+    assert loaded.proxy == "http://127.0.0.1:8888"
+    assert loaded.timeout == pytest.approx(45.0)
+    assert loaded.gui.use_download_archive is False
+    assert loaded.download_archive is not None
+    assert Path(loaded.download_archive) == Path(custom_archive)
+
+    # Clearing optional fields with None/0/"" removes them cleanly without touching unrelated values
+    save_output_preferences(
+        config_location=str(cfg_path),
+        remove_chars="",
+        overwrite=None,
+        max_workers=None,
+        book_delay=0.0,
+        proxy=None,
+        timeout=None,
+    )
+    cleared = load_config(str(cfg_path))
+    assert cleared.remove_chars is None
+    assert cleared.overwrite is None
+    assert cleared.max_workers is None
+    assert cleared.book_delay is None
+    assert cleared.proxy is None
+    assert cleared.timeout is None
+    assert cleared.skip_downloaded is True
+    assert cleared.debug is True
 

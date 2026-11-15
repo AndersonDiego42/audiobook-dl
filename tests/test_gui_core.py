@@ -350,7 +350,7 @@ def test_gui_m4b_option_sync_and_persistence(tmp_path):
 
         # Persist output preferences and verify reload
         from audiobookdl.config import save_output_preferences
-        save_output_preferences("m4b", True, overwrite=str(cfg_path))
+        save_output_preferences("m4b", True, config_location=str(cfg_path))
 
         root.destroy()
         root = tk.Tk()
@@ -1225,6 +1225,7 @@ def test_gui_series_preview_filter_and_shift_range(tmp_path):
         try:
             assert "[Exists]" in dialog._item_labels[0]
             assert "[Exists]" not in dialog._item_labels[1]
+            assert dialog._tree is not None
             assert list(dialog._tree.get_children()) == ["0", "1", "2"]
 
             # Shift+Click range selection from 0 to 2 after unchecking index 0
@@ -1556,4 +1557,236 @@ def test_gui_failed_job_formats_book_error_tuple_as_string(tmp_path, monkeypatch
         assert values[3] == expected_detail
     finally:
         root.destroy()
+
+
+def test_gui_cli_parity_controls_build_options_and_config_loading(tmp_path, monkeypatch):
+    from audiobookdl.utils.archive import default_archive_path
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    db_dir = tmp_path / "db"
+    custom_archive = tmp_path / "custom-archive.sqlite"
+    cfg_path.write_text(
+        f'database_directory = "{str(db_dir).replace(os.sep, "/")}"\n'
+        'overwrite = false\n'
+        'max_workers = 4\n'
+        'book_delay = 2.5\n'
+        'proxy = "http://127.0.0.1:8888"\n'
+        'timeout = 45\n',
+        encoding="utf-8",
+    )
+
+    try:
+        app = AudiobookDLApp(root, config_location=str(cfg_path))
+        assert app.overwrite_var.get() == "Keep existing"
+        assert app.max_workers_var.get() == "4"
+        assert app.book_delay_var.get() == "2.5"
+        assert app.proxy_var.get() == "http://127.0.0.1:8888"
+        assert app.timeout_var.get() == "45"
+        assert app.download_archive_var.get() is False
+
+        # Set all 12 parity controls and verify DownloadOptions output
+        app.split_chapters_var.set(True)
+        app.write_opf_var.set(True)
+        app.write_cue_var.set(True)
+        app.write_cover_var.set(True)
+        app.download_archive_var.set(True)
+        app.max_workers_var.set("7")
+        app.book_delay_var.set("1.25")
+        app.proxy_var.set("http://127.0.0.1:9090")
+        app.timeout_var.set("60")
+        app.overwrite_var.set("Overwrite")
+        app.remove_chars_var.set(":?")
+        app.cover_only_var.set(True)
+
+        opts = app.build_options(urls_override=["https://example.com/book"])
+        assert opts.split_chapters is True
+        assert opts.write_opf is True
+        assert opts.write_cue is True
+        assert opts.write_cover is True
+        assert opts.download_archive is not None
+        assert Path(opts.download_archive) == Path(default_archive_path(str(db_dir)))
+        assert opts.max_workers == 7
+        assert opts.book_delay == pytest.approx(1.25)
+        assert opts.proxy == "http://127.0.0.1:9090"
+        assert opts.timeout == pytest.approx(60.0)
+        assert opts.overwrite is True
+        assert opts.remove_chars == ":?"
+        assert opts.cover is True
+
+        # Cover-only preview & FFmpeg bypass even when combine/split_chapters are set
+        assert app.template_preview_var.get().endswith("Dune.jpg")
+        monkeypatch.setattr("audiobookdl.gui.app.find_executable", lambda _cmd: None)
+        assert app._ensure_ffmpeg_available(opts) is True
+
+        # Splitting chapters without cover-only requires FFmpeg
+        app.cover_only_var.set(False)
+        app.combine_var.set(False)
+        app.output_format_var.set("Original")
+        split_opts = app.build_options(urls_override=["https://example.com/book"])
+        assert split_opts.split_chapters is True
+        assert app.template_preview_var.get().endswith("/01.m4b")
+        monkeypatch.setattr("audiobookdl.gui.app.messagebox.askyesnocancel", lambda *_a, **_kw: False)
+        assert app._ensure_ffmpeg_available(split_opts) is True
+
+        # Invalid numeric option shows error dialog and prevents run
+        errors: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            "audiobookdl.gui.app.messagebox.showerror",
+            lambda title, msg, parent=None: errors.append((title, msg)),
+        )
+        app.urls_text.insert("1.0", "https://example.com/book\n")
+        app.max_workers_var.set("not-a-number")
+        app.start_download()
+        assert not app.is_running
+        assert errors and errors[-1][0] == "Invalid Option"
+
+        # Reloading config updates config-backed controls including download_archive toggle
+        cfg_path.write_text(
+            f'download_archive = "{str(custom_archive).replace(os.sep, "/")}"\n'
+            'overwrite = true\n'
+            'max_workers = 2\n',
+            encoding="utf-8",
+        )
+        app._reload_config()
+        assert app.download_archive_var.get() is True
+        assert app.overwrite_var.get() == "Overwrite"
+        assert app.max_workers_var.get() == "2"
+        reloaded_opts = app.build_options(urls_override=[])
+        assert reloaded_opts.download_archive is not None
+        assert Path(reloaded_opts.download_archive) == custom_archive
+
+        # Unchecking archive toggle explicitly disables download_archive
+        app.download_archive_var.set(False)
+        assert app.build_options(urls_override=[]).download_archive is None
+    finally:
+        root.destroy()
+
+
+def test_gui_persists_all_toggles_on_close_and_run_start(tmp_path):
+    from audiobookdl.config import load_config
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    custom_archive = tmp_path / "my-archive.sqlite"
+    cfg_path.write_text(
+        f'download_archive = "{str(custom_archive).replace(os.sep, "/")}"\n',
+        encoding="utf-8",
+    )
+
+    root = tk.Tk()
+    root.withdraw()
+    app = AudiobookDLApp(root, config_location=str(cfg_path))
+    assert app.download_archive_var.get() is True
+
+    app.output_format_var.set("mp3")
+    app.combine_var.set(True)
+    app.media_type_var.set("Ebook")
+    app.audio_bitrate_var.set("128k")
+    app.resume_var.set(False)
+    app.skip_downloaded_var.set(True)
+    app.write_json_var.set(True)
+    app.enrich_metadata_var.set(True)
+    app.no_chapters_var.set(True)
+    app.debug_var.set(True)
+    app.split_chapters_var.set(True)
+    app.write_opf_var.set(True)
+    app.write_cue_var.set(True)
+    app.write_cover_var.set(True)
+    app.cover_only_var.set(True)
+    app.remove_chars_var.set(":?")
+    app.overwrite_var.set("Keep existing")
+    app.max_workers_var.set("5")
+    app.book_delay_var.set("2.5")
+    app.proxy_var.set("http://127.0.0.1:8123")
+    app.timeout_var.set("30")
+    app.download_archive_var.set(False)
+
+    # Closing the window without starting a download persists all toggles
+    app._on_close()
+
+    cfg_after_close = load_config(str(cfg_path))
+    assert cfg_after_close.download_archive is not None
+    assert Path(cfg_after_close.download_archive) == custom_archive
+    assert cfg_after_close.gui.use_download_archive is False
+
+    root2 = tk.Tk()
+    root2.withdraw()
+    try:
+        app2 = AudiobookDLApp(root2, config_location=str(cfg_path))
+        assert app2.output_format_var.get() == "mp3"
+        assert app2.combine_var.get() is True
+        assert app2.media_type_var.get() == "Ebook"
+        assert app2.audio_bitrate_var.get() == "128k"
+        assert app2.resume_var.get() is False
+        assert app2.skip_downloaded_var.get() is True
+        assert app2.write_json_var.get() is True
+        assert app2.enrich_metadata_var.get() is True
+        assert app2.no_chapters_var.get() is True
+        assert app2.debug_var.get() is True
+        assert app2.split_chapters_var.get() is True
+        assert app2.write_opf_var.get() is True
+        assert app2.write_cue_var.get() is True
+        assert app2.write_cover_var.get() is True
+        assert app2.cover_only_var.get() is True
+        assert app2.remove_chars_var.get() == ":?"
+        assert app2.overwrite_var.get() == "Keep existing"
+        assert app2.max_workers_var.get() == "5"
+        assert app2.book_delay_var.get() == "2.5"
+        assert app2.proxy_var.get() == "http://127.0.0.1:8123"
+        assert app2.timeout_var.get() == "30"
+        assert app2.download_archive_var.get() is False
+
+        # Flip toggles and persist via _save_run_preferences (run-start path)
+        app2.skip_downloaded_var.set(False)
+        app2.debug_var.set(False)
+        app2.enrich_metadata_var.set(False)
+        app2.download_archive_var.set(True)
+        opts2 = app2.build_options(urls_override=["https://example.com/book"])
+        app2._save_run_preferences(opts2)
+    finally:
+        root2.destroy()
+
+    root3 = tk.Tk()
+    root3.withdraw()
+    try:
+        app3 = AudiobookDLApp(root3, config_location=str(cfg_path))
+        assert app3.skip_downloaded_var.get() is False
+        assert app3.debug_var.get() is False
+        assert app3.enrich_metadata_var.get() is False
+        assert app3.download_archive_var.get() is True
+        rebuilt = app3.build_options(urls_override=[])
+        assert rebuilt.download_archive is not None
+        assert Path(rebuilt.download_archive) == custom_archive
+        # Toggling write_json_metadata & no_chapters persisted across both sessions
+        assert app3.write_json_var.get() is True
+        assert app3.no_chapters_var.get() is True
+    finally:
+        root3.destroy()
+
+
+def test_gui_close_persists_valid_toggles_despite_invalid_numeric_input(tmp_path):
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    root = tk.Tk()
+    root.withdraw()
+    app = AudiobookDLApp(root, config_location=str(cfg_path))
+    app.debug_var.set(True)
+    app.write_opf_var.set(True)
+    app.max_workers_var.set("not-a-number")
+    app._on_close()
+
+    root2 = tk.Tk()
+    root2.withdraw()
+    try:
+        app2 = AudiobookDLApp(root2, config_location=str(cfg_path))
+        assert app2.debug_var.get() is True
+        assert app2.write_opf_var.get() is True
+        assert app2.max_workers_var.get() == ""
+    finally:
+        root2.destroy()
+
 

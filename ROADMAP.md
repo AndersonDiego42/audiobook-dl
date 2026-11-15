@@ -91,7 +91,7 @@ This document catalogs verified bugs, performance bottlenecks, security/resilien
 
 - [x] **Decompose `audiobookdl/gui/app.py` (3,203 lines)**  
   Split into clean submodules under `audiobookdl/gui/`: state/queue controller (`controller.py`), `PreviewDialog` (`preview_dialog.py`), `ArchiveLedgerDialog` (`archive_dialog.py`), `CatalogBrowserDialog` (`catalog_dialog.py`), formatting helpers (`formatting.py`), reusable widgets (`widgets.py`), and the main window view (`app.py`).
-- [ ] **Unify runtime option definitions across CLI, Config, Pipeline & GUI**  
+- [x] **Unify runtime option definitions across CLI, Config, Pipeline & GUI**  
   Options are currently synchronized manually across [`args.py`](audiobookdl/args.py), [`config.py`](audiobookdl/config.py), [`pipeline.py`](audiobookdl/pipeline.py), and [`app.py`](audiobookdl/gui/app.py). Introduce a declarative option registry/schema as the single source of truth for defaults, serialization, and UI/CLI bindings.
 - [ ] **Entry-point plugin architecture for sources** — [`audiobookdl/sources/__init__.py`](audiobookdl/sources/__init__.py)  
   Replace manual enumeration in `get_source_classes()` with `importlib.metadata.entry_points(group="audiobookdl.sources")` alongside built-in sources so third-party adapters load dynamically.
@@ -123,9 +123,9 @@ This document catalogs verified bugs, performance bottlenecks, security/resilien
 
 ## 6. Desktop GUI Enhancements
 
-- [ ] **Reach full CLI feature parity in the GUI**  
+- [x] **Reach full CLI feature parity in the GUI**  
   Add controls for `--split-chapters`, `--write-opf`, `--write-cue`, `--write-cover`, `--download-archive` toggle, `--max-workers`, `--book-delay`, `--proxy`, `--timeout`, `--overwrite`, `--remove-chars`, and `--cover`-only downloads.
-- [ ] **Persist all GUI toggles across sessions** — [`audiobookdl/gui/app.py`](audiobookdl/gui/app.py#L2177), [L3092](audiobookdl/gui/app.py#L3092)  
+- [x] **Persist all GUI toggles across sessions**  
   Save `skip_downloaded`, `write_json_metadata`, `enrich_metadata`, `no_chapters`, and `debug` alongside output preferences in `audiobook-dl.toml`.
 - [ ] **Persistent job queue, Pause/Resume & per-phase sub-progress**  
   Persist queued/failed jobs across restarts, allow pausing/resuming queues, retry failed jobs in one click, and display multi-stage progress (Download -> Decrypt -> Remux/Combine -> Tagging).

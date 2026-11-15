@@ -11,6 +11,7 @@ import requests
 from . import __version__, args, logging, output
 from .args import DownloadOptions
 from .config import Config, SourceConfig, load_config
+from .options_schema import MERGEABLE_OPTION_SPECS
 from .exceptions import (
     AudiobookDLException,
     BookHasNoAudiobook,
@@ -103,39 +104,32 @@ def apply_runtime_options(
 ) -> logging.JobContext:
     """Merge config defaults into `options` and build an isolated `JobContext`."""
     explicit = getattr(options, "_explicit_fields", frozenset())
-    default_db = args.default_database_directory()
-    if "output_template" not in explicit and getattr(options, "output_preset", None):
+    preset_requested = "output_template" not in explicit and bool(getattr(options, "output_preset", None))
+    if preset_requested:
         preset_tpl = output.OUTPUT_TEMPLATE_PRESETS.get(options.output_preset or "")
         if preset_tpl:
             options.output_template = preset_tpl
-    elif "output_template" not in explicit and options.output_template == "{title}" and config.output_template:
-        options.output_template = config.output_template
-    if "database_directory" not in explicit and options.database_directory == default_db and config.database_directory:
-        options.database_directory = config.database_directory
-    if "download_archive" not in explicit and options.download_archive is None and config.download_archive:
-        options.download_archive = config.download_archive
-    if "output_format" not in explicit and options.output_format is None and config.output_format:
-        options.output_format = config.output_format
-    if "media_type" not in explicit and config.media_type:
-        options.media_type = config.media_type
-    if "combine" not in explicit and config.combine is not None:
-        options.combine = config.combine
-    if "skip_downloaded" not in explicit and config.skip_downloaded is not None:
-        options.skip_downloaded = config.skip_downloaded
-    if "resume" not in explicit and config.resume is not None:
-        options.resume = config.resume
-    if "audio_bitrate" not in explicit and options.audio_bitrate is None and config.audio_bitrate:
-        options.audio_bitrate = config.audio_bitrate
-    if "overwrite" not in explicit and options.overwrite is None and config.overwrite is not None:
-        options.overwrite = config.overwrite
-    if "max_workers" not in explicit and options.max_workers is None and config.max_workers is not None:
-        options.max_workers = config.max_workers
-    if "book_delay" not in explicit and options.book_delay == 0.0 and config.book_delay is not None:
-        options.book_delay = float(config.book_delay)
-    if "proxy" not in explicit and options.proxy is None and config.proxy:
-        options.proxy = config.proxy
-    if "timeout" not in explicit and options.timeout is None and config.timeout is not None:
-        options.timeout = float(config.timeout)
+
+    for spec in MERGEABLE_OPTION_SPECS:
+        if spec.name == "output_template" and preset_requested:
+            continue
+        if spec.name in explicit:
+            continue
+        cfg_key = spec.config_key or spec.name
+        cfg_value = getattr(config, cfg_key, None)
+        if spec.merge_require_truthy:
+            if not cfg_value:
+                continue
+        elif cfg_value is None:
+            continue
+        if spec.merge_only_if_default and getattr(options, spec.name) != spec.resolve_default():
+            continue
+        setattr(
+            options,
+            spec.name,
+            spec.merge_cast(cfg_value) if spec.merge_cast is not None else cfg_value,
+        )
+
     if config.ffmpeg_dir:
         set_ffmpeg_dir(config.ffmpeg_dir)
     ffmpeg_out = options.ffmpeg_output or options.debug

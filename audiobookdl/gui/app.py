@@ -11,7 +11,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
 import time
-from typing import Any, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from audiobookdl import __version__, args, output
 from audiobookdl.config import SourceConfig, is_portable_mode
@@ -22,6 +22,7 @@ from audiobookdl.gui.controller import GuiController, QueuedJob
 from audiobookdl.gui.formatting import (
     MEDIA_TYPE_OPTIONS,
     OUTPUT_FORMATS,
+    OVERWRITE_OPTIONS,
     PRESET_LABEL_TO_TEMPLATE,
     SAMPLE_PREVIEW_METADATA,
     TEMPLATE_PRESET_LABELS,
@@ -40,6 +41,7 @@ from audiobookdl.gui.widgets import (
     attach_url_context_menu,
     bind_text_tab_navigation,
 )
+from audiobookdl.options_schema import GUI_OPTION_SPECS, PERSISTED_GUI_OPTION_SPECS
 from audiobookdl.pipeline import DownloadSummary
 from audiobookdl.sources import ServiceInfo, detect_service_key, get_available_services
 from audiobookdl.sources.source import Source
@@ -58,6 +60,30 @@ class AudiobookDLApp:
     """Main Tkinter desktop window for audiobook-dl."""
 
     MAX_LOG_LINES = 5000
+
+    # Populated dynamically from `GUI_OPTION_SPECS` in `_init_variables`.
+    combine_var: tk.BooleanVar
+    remove_chars_var: tk.StringVar
+    debug_var: tk.BooleanVar
+    cover_only_var: tk.BooleanVar
+    no_chapters_var: tk.BooleanVar
+    split_chapters_var: tk.BooleanVar
+    output_format_var: tk.StringVar
+    media_type_var: tk.StringVar
+    skip_downloaded_var: tk.BooleanVar
+    download_archive_var: tk.BooleanVar
+    write_json_var: tk.BooleanVar
+    write_cover_var: tk.BooleanVar
+    write_opf_var: tk.BooleanVar
+    write_cue_var: tk.BooleanVar
+    resume_var: tk.BooleanVar
+    audio_bitrate_var: tk.StringVar
+    overwrite_var: tk.StringVar
+    max_workers_var: tk.StringVar
+    book_delay_var: tk.StringVar
+    proxy_var: tk.StringVar
+    timeout_var: tk.StringVar
+    enrich_metadata_var: tk.BooleanVar
 
     def __init__(self, root: tk.Tk, config_location: Optional[str] = None) -> None:
         self.root = root
@@ -100,7 +126,7 @@ class AudiobookDLApp:
         self._is_verifying_auth = False
         self._preview_dialog: Optional[PreviewDialog] = None
         self._interactive_widgets: List[
-            Union[ttk.Entry, ttk.Button, ttk.Checkbutton, ttk.Combobox]
+            Union[ttk.Entry, ttk.Button, ttk.Checkbutton, ttk.Combobox, ttk.Spinbox]
         ] = []
 
         self._init_variables()
@@ -148,31 +174,21 @@ class AudiobookDLApp:
         self.show_password_var = tk.BooleanVar(value=False)
         self.remember_login_var = tk.BooleanVar(value=True)
 
-        saved_format = cfg.output_format or "Original"
-        if saved_format not in OUTPUT_FORMATS:
-            saved_format = "Original"
-        self.output_format_var = tk.StringVar(value=saved_format)
-        self.m4b_var = tk.BooleanVar(value=(saved_format == "m4b"))
-        saved_media_type = (cfg.media_type or "auto").strip().lower()
-        media_label = {
-            "auto": "Auto",
-            "audiobook": "Audiobook",
-            "ebook": "Ebook",
-            "both": "Both",
-        }.get(saved_media_type, "Auto")
-        self.media_type_var = tk.StringVar(value=media_label)
-        saved_bitrate = (cfg.audio_bitrate or "").strip()
-        if not saved_bitrate or saved_bitrate.lower() == "auto":
-            saved_bitrate = "Auto"
-        self.audio_bitrate_var = tk.StringVar(value=saved_bitrate)
-        default_combine = True if cfg.combine is None else cfg.combine
-        self.combine_var = tk.BooleanVar(value=default_combine)
-        self.skip_downloaded_var = tk.BooleanVar(value=bool(cfg.skip_downloaded))
-        self.resume_var = tk.BooleanVar(value=bool(cfg.resume))
-        self.no_chapters_var = tk.BooleanVar(value=False)
-        self.write_json_var = tk.BooleanVar(value=False)
-        self.enrich_metadata_var = tk.BooleanVar(value=False)
-        self.debug_var = tk.BooleanVar(value=False)
+        for spec in GUI_OPTION_SPECS:
+            binding = spec.gui
+            if binding is None:
+                continue
+            cfg_val = getattr(cfg, spec.config_key, None) if spec.config_key else None
+            initial = binding.init_value(cfg_val)
+            var: tk.Variable = (
+                tk.BooleanVar(value=bool(initial))
+                if binding.var_type == "bool"
+                else tk.StringVar(value=str(initial))
+            )
+            setattr(self, binding.var_attr, var)
+        if cfg.gui.use_download_archive is not None:
+            self.download_archive_var.set(bool(cfg.gui.use_download_archive))
+        self.m4b_var = tk.BooleanVar(value=(self.output_format_var.get() == "m4b"))
 
         self.status_var = tk.StringVar(value="Ready")
         self.batch_var = tk.StringVar(value="")
@@ -290,7 +306,15 @@ class AudiobookDLApp:
         ttk.Label(out_frame, textvariable=self.template_preview_var, foreground="#555555").grid(
             row=2, column=1, columnspan=2, sticky="w"
         )
-        for var in (self.output_dir_var, self.template_var, self.output_format_var, self.combine_var):
+        for var in (
+            self.output_dir_var,
+            self.template_var,
+            self.output_format_var,
+            self.combine_var,
+            self.remove_chars_var,
+            self.cover_only_var,
+            self.split_chapters_var,
+        ):
             var.trace_add("write", lambda *_args: self._update_template_preview())
         self.template_var.trace_add("write", lambda *_args: self._sync_preset_from_template())
         self._update_template_preview()
@@ -364,75 +388,183 @@ class AudiobookDLApp:
         self.test_auth_btn.pack(side=tk.RIGHT, padx=(0, 4))
 
         # Options
-        opt_frame = ttk.LabelFrame(container, text="Options", padding=(10, 6))
+        opt_frame = ttk.LabelFrame(container, text="Options", padding=(8, 4))
         opt_frame.grid(row=4, column=0, sticky="ew", pady=(0, 6))
+        opt_frame.columnconfigure(0, weight=1)
+
+        self.options_notebook = ttk.Notebook(opt_frame)
+        self.options_notebook.grid(row=0, column=0, sticky="ew")
+
+        general_tab = ttk.Frame(self.options_notebook, padding=(8, 6))
+        self.options_notebook.add(general_tab, text="General")
 
         cb_m4b = ttk.Checkbutton(
-            opt_frame,
+            general_tab,
             text="Download as .m4b",
             variable=self.m4b_var,
             command=self._on_m4b_toggled,
         )
-        cb_m4b.grid(row=0, column=0, columnspan=2, sticky="w", padx=(0, 14))
+        cb_m4b.grid(row=0, column=0, columnspan=2, sticky="w", padx=(0, 12))
 
-        ttk.Label(opt_frame, text="Format:").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        ttk.Label(general_tab, text="Format:").grid(row=0, column=2, sticky="w", padx=(0, 4))
         format_combo = ttk.Combobox(
-            opt_frame,
+            general_tab,
             textvariable=self.output_format_var,
             values=OUTPUT_FORMATS,
             state="readonly",
             width=10,
         )
-        format_combo.grid(row=0, column=3, sticky="w", padx=(0, 14))
+        format_combo.grid(row=0, column=3, sticky="w", padx=(0, 12))
         format_combo.bind("<<ComboboxSelected>>", self._on_format_selected)
 
-        cb_combine = ttk.Checkbutton(opt_frame, text="Combine parts", variable=self.combine_var)
-        cb_combine.grid(row=0, column=4, sticky="w", padx=(0, 14))
+        cb_combine = ttk.Checkbutton(general_tab, text="Combine parts", variable=self.combine_var)
+        cb_combine.grid(row=0, column=4, sticky="w", padx=(0, 12))
 
-        cb_skip = ttk.Checkbutton(opt_frame, text="Skip downloaded", variable=self.skip_downloaded_var)
+        cb_skip = ttk.Checkbutton(general_tab, text="Skip downloaded", variable=self.skip_downloaded_var)
         cb_skip.grid(row=0, column=5, sticky="w")
 
-        cb_no_chapters = ttk.Checkbutton(opt_frame, text="No chapters", variable=self.no_chapters_var)
-        cb_no_chapters.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        cb_resume = ttk.Checkbutton(general_tab, text="Resume partial", variable=self.resume_var)
+        cb_resume.grid(row=1, column=0, columnspan=2, sticky="w", padx=(0, 12), pady=(4, 0))
 
-        cb_json = ttk.Checkbutton(opt_frame, text="Write JSON metadata", variable=self.write_json_var)
-        cb_json.grid(row=1, column=2, columnspan=2, sticky="w", pady=(4, 0))
-
-        cb_debug = ttk.Checkbutton(opt_frame, text="Debug logs", variable=self.debug_var)
-        cb_debug.grid(row=1, column=4, sticky="w", pady=(4, 0))
-
-        cb_resume = ttk.Checkbutton(opt_frame, text="Resume partial", variable=self.resume_var)
-        cb_resume.grid(row=1, column=5, sticky="w", pady=(4, 0))
-
-        ttk.Label(opt_frame, text="M4B Quality:").grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        bitrate_values = list(AUDIO_BITRATE_PRESETS)
-        if self.audio_bitrate_var.get() not in bitrate_values:
-            bitrate_values.append(self.audio_bitrate_var.get())
-        bitrate_combo = ttk.Combobox(
-            opt_frame,
-            textvariable=self.audio_bitrate_var,
-            values=bitrate_values,
+        ttk.Label(general_tab, text="Overwrite:").grid(row=1, column=2, sticky="w", padx=(0, 4), pady=(4, 0))
+        overwrite_combo = ttk.Combobox(
+            general_tab,
+            textvariable=self.overwrite_var,
+            values=OVERWRITE_OPTIONS,
             state="readonly",
-            width=10,
+            width=12,
         )
-        bitrate_combo.grid(row=2, column=2, columnspan=2, sticky="w", pady=(4, 0))
+        overwrite_combo.grid(row=1, column=3, sticky="w", padx=(0, 12), pady=(4, 0))
 
-        cb_enrich = ttk.Checkbutton(
-            opt_frame,
-            text="Enrich metadata",
-            variable=self.enrich_metadata_var,
+        cb_archive = ttk.Checkbutton(
+            general_tab,
+            text="Use archive ledger",
+            variable=self.download_archive_var,
         )
-        cb_enrich.grid(row=2, column=4, columnspan=2, sticky="w", pady=(4, 0))
+        cb_archive.grid(row=1, column=4, sticky="w", padx=(0, 12), pady=(4, 0))
 
-        ttk.Label(opt_frame, text="Media:").grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        cb_cover_only = ttk.Checkbutton(
+            general_tab,
+            text="Cover only",
+            variable=self.cover_only_var,
+        )
+        cb_cover_only.grid(row=1, column=5, sticky="w", pady=(4, 0))
+
+        ttk.Label(general_tab, text="Media:").grid(row=2, column=0, sticky="w", padx=(0, 4), pady=(4, 0))
         media_combo = ttk.Combobox(
-            opt_frame,
+            general_tab,
             textvariable=self.media_type_var,
             values=MEDIA_TYPE_OPTIONS,
             state="readonly",
             width=10,
         )
-        media_combo.grid(row=3, column=2, columnspan=2, sticky="w", pady=(4, 0))
+        media_combo.grid(row=2, column=1, sticky="w", padx=(0, 12), pady=(4, 0))
+
+        ttk.Label(general_tab, text="M4B Quality:").grid(row=2, column=2, sticky="w", padx=(0, 4), pady=(4, 0))
+        bitrate_values = list(AUDIO_BITRATE_PRESETS)
+        if self.audio_bitrate_var.get() not in bitrate_values:
+            bitrate_values.append(self.audio_bitrate_var.get())
+        bitrate_combo = ttk.Combobox(
+            general_tab,
+            textvariable=self.audio_bitrate_var,
+            values=bitrate_values,
+            state="readonly",
+            width=10,
+        )
+        bitrate_combo.grid(row=2, column=3, sticky="w", padx=(0, 12), pady=(4, 0))
+
+        cb_enrich = ttk.Checkbutton(
+            general_tab,
+            text="Enrich metadata",
+            variable=self.enrich_metadata_var,
+        )
+        cb_enrich.grid(row=2, column=4, sticky="w", padx=(0, 12), pady=(4, 0))
+
+        cb_debug = ttk.Checkbutton(general_tab, text="Debug logs", variable=self.debug_var)
+        cb_debug.grid(row=2, column=5, sticky="w", pady=(4, 0))
+
+        sidecars_tab = ttk.Frame(self.options_notebook, padding=(8, 6))
+        sidecars_tab.columnconfigure(3, weight=1)
+        self.options_notebook.add(sidecars_tab, text="Chapters & Sidecars")
+
+        cb_no_chapters = ttk.Checkbutton(sidecars_tab, text="No chapters", variable=self.no_chapters_var)
+        cb_no_chapters.grid(row=0, column=0, sticky="w", padx=(0, 14))
+
+        cb_split_chapters = ttk.Checkbutton(
+            sidecars_tab,
+            text="Split chapters",
+            variable=self.split_chapters_var,
+        )
+        cb_split_chapters.grid(row=0, column=1, columnspan=2, sticky="w")
+
+        cb_json = ttk.Checkbutton(sidecars_tab, text="Write JSON metadata", variable=self.write_json_var)
+        cb_json.grid(row=1, column=0, sticky="w", padx=(0, 14), pady=(4, 0))
+
+        cb_opf = ttk.Checkbutton(sidecars_tab, text="Write OPF", variable=self.write_opf_var)
+        cb_opf.grid(row=1, column=1, sticky="w", padx=(0, 14), pady=(4, 0))
+
+        cb_cue = ttk.Checkbutton(sidecars_tab, text="Write CUE", variable=self.write_cue_var)
+        cb_cue.grid(row=1, column=2, sticky="w", padx=(0, 14), pady=(4, 0))
+
+        cb_write_cover = ttk.Checkbutton(sidecars_tab, text="Write cover", variable=self.write_cover_var)
+        cb_write_cover.grid(row=1, column=3, sticky="w", pady=(4, 0))
+
+        remove_row = ttk.Frame(sidecars_tab)
+        remove_row.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        ttk.Label(remove_row, text="Remove chars:").pack(side=tk.LEFT, padx=(0, 6))
+        remove_chars_entry = ttk.Entry(remove_row, textvariable=self.remove_chars_var, width=18)
+        remove_chars_entry.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(
+            remove_row,
+            text="Characters stripped from output paths",
+            foreground="#555555",
+        ).pack(side=tk.LEFT)
+
+        network_tab = ttk.Frame(self.options_notebook, padding=(8, 6))
+        network_tab.columnconfigure(5, weight=1)
+        self.options_notebook.add(network_tab, text="Network & Performance")
+
+        ttk.Label(network_tab, text="Max workers:").grid(row=0, column=0, sticky="w", padx=(0, 4))
+        max_workers_spin = ttk.Spinbox(
+            network_tab,
+            from_=1,
+            to=20,
+            textvariable=self.max_workers_var,
+            width=6,
+        )
+        max_workers_spin.grid(row=0, column=1, sticky="w", padx=(0, 14))
+
+        ttk.Label(network_tab, text="Book delay (s):").grid(row=0, column=2, sticky="w", padx=(0, 4))
+        book_delay_spin = ttk.Spinbox(
+            network_tab,
+            from_=0,
+            to=3600,
+            increment=0.5,
+            textvariable=self.book_delay_var,
+            width=7,
+        )
+        book_delay_spin.grid(row=0, column=3, sticky="w", padx=(0, 14))
+
+        ttk.Label(network_tab, text="Timeout (s):").grid(row=0, column=4, sticky="w", padx=(0, 4))
+        timeout_spin = ttk.Spinbox(
+            network_tab,
+            from_=1,
+            to=3600,
+            increment=5,
+            textvariable=self.timeout_var,
+            width=7,
+        )
+        timeout_spin.grid(row=0, column=5, sticky="w")
+
+        ttk.Label(network_tab, text="Proxy URL:").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=(6, 0))
+        proxy_entry = ttk.Entry(network_tab, textvariable=self.proxy_var)
+        proxy_entry.grid(row=1, column=1, columnspan=5, sticky="ew", pady=(6, 0))
+
+        ttk.Label(
+            network_tab,
+            text="Leave Max workers / Timeout / Proxy blank for defaults (6 workers, e.g. http://127.0.0.1:8080)",
+            foreground="#555555",
+        ).grid(row=2, column=0, columnspan=6, sticky="w", pady=(4, 0))
 
         # Actions, Progress & Log
         log_frame = ttk.LabelFrame(container, text="Activity", padding=(10, 6))
@@ -538,13 +670,25 @@ class AudiobookDLApp:
             self.forget_auth_btn,
             cb_m4b,
             format_combo,
+            overwrite_combo,
             bitrate_combo,
             media_combo,
             cb_combine,
             cb_skip,
             cb_resume,
+            cb_archive,
+            cb_cover_only,
             cb_no_chapters,
+            cb_split_chapters,
             cb_json,
+            cb_opf,
+            cb_cue,
+            cb_write_cover,
+            remove_chars_entry,
+            max_workers_spin,
+            book_delay_spin,
+            timeout_spin,
+            proxy_entry,
             cb_enrich,
             cb_debug,
         ]
@@ -605,8 +749,22 @@ class AudiobookDLApp:
 
     def _reload_config(self) -> None:
         try:
-            self._controller.reload_config()
+            cfg = self._controller.reload_config()
+            if (cfg.gui.output_dir or "").strip():
+                self.output_dir_var.set((cfg.gui.output_dir or "").strip())
+            if (cfg.gui.output_template or "").strip():
+                self.template_var.set((cfg.gui.output_template or "").strip())
+            for spec in GUI_OPTION_SPECS:
+                binding = spec.gui
+                if binding is None or not spec.config_key:
+                    continue
+                cfg_val = getattr(cfg, spec.config_key, None)
+                getattr(self, binding.var_attr).set(binding.init_value(cfg_val))
+            if cfg.gui.use_download_archive is not None:
+                self.download_archive_var.set(bool(cfg.gui.use_download_archive))
+            self.m4b_var.set(self.output_format_var.get() == "m4b")
             self._load_service_into_form()
+            self._update_service_field_states()
             self._update_ffmpeg_status()
             self.status_var.set("Config reloaded")
             self._append_log("Reloaded configuration.")
@@ -634,7 +792,10 @@ class AudiobookDLApp:
 
     def _show_catalog_browser_dialog(self) -> CatalogBrowserDialog:
         def _on_fetch(mode: str, svc: ServiceInfo, query_text: str, dialog: CatalogBrowserDialog) -> None:
-            options = self.build_options(urls_override=[])
+            options = self._try_build_options(urls_override=[], parent=dialog)
+            if options is None:
+                dialog.set_error_status("Invalid option value")
+                return
             self._controller.start_catalog_fetch(mode, svc.key, query_text, options, dialog)
 
         def _on_add_urls(urls_to_add: List[str]) -> None:
@@ -700,26 +861,32 @@ class AudiobookDLApp:
         return True
 
     def _ensure_ffmpeg_available(self, options: args.DownloadOptions) -> bool:
-        """Validate FFmpeg/FFprobe up front when combine or format conversion is enabled."""
+        """Validate FFmpeg/FFprobe up front when combine, split, or format conversion is enabled."""
+        if getattr(options, "cover", False):
+            return True
         if getattr(options, "media_type", "auto") == "ebook":
             return True
-        if not (options.combine or options.output_format):
+        needs_ffmpeg = bool(options.combine or options.output_format or options.split_chapters)
+        if not needs_ffmpeg:
             return True
+        needs_ffprobe = bool(options.combine or options.split_chapters)
         has_ffmpeg = find_executable("ffmpeg") is not None
         has_ffprobe = find_executable("ffprobe") is not None
-        if has_ffmpeg and (not options.combine or has_ffprobe):
+        if has_ffmpeg and (not needs_ffprobe or has_ffprobe):
             return True
 
         missing_parts = []
         if not has_ffmpeg:
             missing_parts.append("ffmpeg")
-        if options.combine and not has_ffprobe:
+        if needs_ffprobe and not has_ffprobe:
             missing_parts.append("ffprobe")
         missing_text = " and ".join(missing_parts)
 
         reasons = []
         if options.combine:
             reasons.append("combine parts")
+        if options.split_chapters:
+            reasons.append("split chapters")
         if options.output_format:
             reasons.append(f"convert to .{options.output_format}")
         reason_text = " and ".join(reasons)
@@ -736,7 +903,7 @@ class AudiobookDLApp:
             if self.browse_ffmpeg_dir():
                 has_ffmpeg = find_executable("ffmpeg") is not None
                 has_ffprobe = find_executable("ffprobe") is not None
-                return has_ffmpeg and (not options.combine or has_ffprobe)
+                return has_ffmpeg and (not needs_ffprobe or has_ffprobe)
             return False
         if choice is False:
             return True
@@ -876,7 +1043,9 @@ class AudiobookDLApp:
         service = self._selected_service()
         if service is None or not service.auth_methods:
             return
-        options = self.build_options(urls_override=[])
+        options = self._try_build_options(urls_override=[])
+        if options is None:
+            return
         self._is_verifying_auth = True
         self.test_auth_btn.configure(state="disabled")
         self.status_var.set(f"Testing login for {service.label}...")
@@ -973,9 +1142,15 @@ class AudiobookDLApp:
         full_tpl = os.path.join(folder, tpl)
         fmt = self.output_format_var.get().strip()
         ext = "m4b" if fmt in ("", "Original") else fmt
+        remove_chars = self.remove_chars_var.get()
         try:
-            rendered = output.gen_output_location(full_tpl, SAMPLE_PREVIEW_METADATA, "")
-            suffix = f".{ext}" if self.combine_var.get() else f"/01.{ext}"
+            rendered = output.gen_output_location(full_tpl, SAMPLE_PREVIEW_METADATA, remove_chars)
+            if self.cover_only_var.get():
+                suffix = ".jpg"
+            elif self.split_chapters_var.get() or not self.combine_var.get():
+                suffix = f"/01.{ext}"
+            else:
+                suffix = f".{ext}"
             self.template_preview_var.set(f"{rendered}{suffix}")
         except Exception as exc:
             self.template_preview_var.set(f"(invalid template: {exc})")
@@ -1127,17 +1302,35 @@ class AudiobookDLApp:
             parts.append(f"ETA {format_duration(self._last_eta_seconds)}")
         self.metrics_var.set("  \u2022  ".join(parts))
 
+    def _try_build_options(
+        self,
+        urls_override: Optional[Sequence[str]] = None,
+        parent: Optional[tk.Misc] = None,
+    ) -> Optional[args.DownloadOptions]:
+        """Build `DownloadOptions`, displaying a validation dialog on invalid numeric/text input."""
+        try:
+            return self.build_options(urls_override=urls_override)
+        except ValueError as exc:
+            self.status_var.set("Invalid option value")
+            messagebox.showerror(
+                "Invalid Option",
+                str(exc),
+                parent=parent or self.root,
+            )
+            return None
+
     def build_options(self, urls_override: Optional[Sequence[str]] = None) -> args.DownloadOptions:
         """Build `DownloadOptions` from current UI field values."""
         output_dir = self.output_dir_var.get().strip() or default_output_dir()
         template = self.template_var.get().strip() or "{title}"
         output_template = os.path.join(output_dir, template)
-        selected_format = self.output_format_var.get().strip()
-        output_format = None if selected_format in ("", "Original") else selected_format
-        selected_media = self.media_type_var.get().strip().lower()
-        media_type = selected_media if selected_media in args.MEDIA_TYPE_CHOICES else "auto"
-        selected_bitrate = self.audio_bitrate_var.get().strip()
-        audio_bitrate = None if selected_bitrate in ("", "Auto", "auto") else selected_bitrate
+        option_values = {
+            spec.name: spec.gui.read_option(getattr(self, spec.gui.var_attr).get())
+            for spec in GUI_OPTION_SPECS
+            if spec.gui is not None
+        }
+        use_download_archive = bool(option_values.pop("download_archive", False))
+        download_archive = self._archive_ledger_path() if use_download_archive else None
 
         urls = (
             list(urls_override)
@@ -1173,21 +1366,13 @@ class AudiobookDLApp:
         return args.build_default_options(
             urls=urls,
             cookie_file=cookie_file,
-            combine=self.combine_var.get(),
             output_template=output_template,
-            debug=self.debug_var.get(),
-            no_chapters=self.no_chapters_var.get(),
-            output_format=output_format,
-            media_type=media_type,
             username=username,
             password=password,
             library=library,
-            skip_downloaded=self.skip_downloaded_var.get(),
-            write_json_metadata=self.write_json_var.get(),
-            enrich_metadata=self.enrich_metadata_var.get(),
+            download_archive=download_archive,
             config_location=effective_config_location,
-            resume=self.resume_var.get(),
-            audio_bitrate=audio_bitrate,
+            **option_values,
         )
 
     def _validate_cookie_file(self) -> bool:
@@ -1274,7 +1459,9 @@ class AudiobookDLApp:
             if not self._controller.cancel_event.is_set():
                 self._enqueue_additional_urls(failed_urls)
             return
-        options = self.build_options()
+        options = self._try_build_options()
+        if options is None:
+            return
         if not self._ensure_ffmpeg_available(options):
             return
         self._save_run_preferences(options)
@@ -1293,6 +1480,8 @@ class AudiobookDLApp:
     def _enqueue_additional_urls(self, urls: List[str]) -> bool:
         """Append new URLs to the currently active download queue."""
         if not self._validate_cookie_file():
+            return True
+        if self._try_build_options(urls_override=[]) is None:
             return True
         has_active_run, added_jobs, new_total = self._controller.enqueue_additional_urls(
             urls,
@@ -1314,6 +1503,20 @@ class AudiobookDLApp:
         )
         return True
 
+    def _read_persisted_gui_preferences(self) -> Dict[str, Any]:
+        """Read valid persisted GUI toggle/option values without failing on transient invalid input."""
+        prefs: Dict[str, Any] = {}
+        for spec in PERSISTED_GUI_OPTION_SPECS:
+            binding = spec.gui
+            if binding is None:
+                continue
+            raw_val = getattr(self, binding.var_attr).get()
+            try:
+                prefs[spec.name] = binding.read_option(raw_val)
+            except ValueError:
+                continue
+        return prefs
+
     def _save_run_preferences(self, options: args.DownloadOptions) -> None:
         if self.remember_login_var.get():
             self.save_current_credentials(quiet=True)
@@ -1321,6 +1524,7 @@ class AudiobookDLApp:
             options,
             output_dir=self.output_dir_var.get().strip() or default_output_dir(),
             output_template=self.template_var.get().strip() or "{title}",
+            use_download_archive=self.download_archive_var.get(),
         )
 
     def _start_new_run(
@@ -1417,7 +1621,9 @@ class AudiobookDLApp:
         if not self._warn_mixed_service_credentials(urls):
             return
 
-        options = self.build_options()
+        options = self._try_build_options()
+        if options is None:
+            return
         if not self._ensure_ffmpeg_available(options):
             return
         self._save_run_preferences(options)
@@ -1462,7 +1668,9 @@ class AudiobookDLApp:
         if len(urls) > 1:
             self._append_log(f"Previewing first URL: {target_url}")
 
-        options = self.build_options(urls_override=[target_url])
+        options = self._try_build_options(urls_override=[target_url])
+        if options is None:
+            return
         self._set_previewing_state(True)
         self.progressbar.configure(mode="indeterminate", value=0)
         self.progressbar.start(12)
@@ -1546,7 +1754,9 @@ class AudiobookDLApp:
         selected_indices: Optional[List[int]],
     ) -> None:
         """Start or queue a download from an inspected preview result."""
-        options = self.build_options(urls_override=[url])
+        options = self._try_build_options(urls_override=[url])
+        if options is None:
+            return
         if not self._ensure_ffmpeg_available(options):
             return
         if self._is_running:
@@ -1771,6 +1981,8 @@ class AudiobookDLApp:
                 window_geometry=geom if is_valid_geometry(geom) else None,
                 output_dir=self.output_dir_var.get().strip() or None,
                 output_template=self.template_var.get().strip() or None,
+                use_download_archive=self.download_archive_var.get(),
+                output_prefs=self._read_persisted_gui_preferences(),
             )
         except OSError:
             pass

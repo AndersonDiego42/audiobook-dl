@@ -5,7 +5,14 @@ from audiobookdl.credentials import (
     get_credential_store,
 )
 from audiobookdl.exceptions import ConfigNotFound
-from audiobookdl.utils import normalize_audio_bitrate
+from audiobookdl.options_schema import (
+    CONFIG_OPTION_SPECS,
+    GUI_CONFIG_KEYS,
+    KNOWN_TOP_LEVEL_CONFIG_KEYS,
+    OPTIONS_BY_NAME,
+    SOURCE_CONFIG_KEYS,
+    validate_config_value,
+)
 from audiobookdl.utils.fs import atomic_write_text, file_lock
 from attrs import Factory, define
 
@@ -38,6 +45,7 @@ class GuiConfig:
     window_geometry: Optional[str] = None
     output_dir: Optional[str] = None
     output_template: Optional[str] = None
+    use_download_archive: Optional[bool] = None
 
 
 @define
@@ -60,31 +68,42 @@ class Config:
     timeout: Optional[float] = None
     download_archive: Optional[str] = None
     check_updates: Optional[bool] = None
+    remove_chars: Optional[str] = None
+    debug: Optional[bool] = None
+    cover: Optional[bool] = None
+    no_chapters: Optional[bool] = None
+    split_chapters: Optional[bool] = None
+    write_json_metadata: Optional[bool] = None
+    write_cover: Optional[bool] = None
+    write_opf: Optional[bool] = None
+    write_cue: Optional[bool] = None
+    enrich_metadata: Optional[bool] = None
     gui: GuiConfig = Factory(GuiConfig)
 
+    def clone(self) -> "Config":
+        """Return an isolated copy of this configuration for background jobs."""
+        sources_copy = {
+            name: SourceConfig(
+                username=src.username,
+                password=src.password,
+                library=src.library,
+                cookie_file=src.cookie_file,
+            )
+            for name, src in self.sources.items()
+        }
+        gui_copy = GuiConfig(
+            window_geometry=self.gui.window_geometry,
+            output_dir=self.gui.output_dir,
+            output_template=self.gui.output_template,
+            use_download_archive=self.gui.use_download_archive,
+        )
+        kwargs: Dict[str, Any] = {"sources": sources_copy, "gui": gui_copy}
+        for spec in CONFIG_OPTION_SPECS:
+            if spec.config_key is not None:
+                kwargs[spec.config_key] = getattr(self, spec.config_key)
+        return Config(**kwargs)
 
-_KNOWN_TOP_LEVEL_KEYS = frozenset({
-    "sources",
-    "gui",
-    "output_template",
-    "database_directory",
-    "skip_downloaded",
-    "output_format",
-    "media_type",
-    "combine",
-    "ffmpeg_dir",
-    "resume",
-    "audio_bitrate",
-    "overwrite",
-    "max_workers",
-    "book_delay",
-    "proxy",
-    "timeout",
-    "download_archive",
-    "check_updates",
-})
-_KNOWN_GUI_KEYS = frozenset({"window_geometry", "output_dir", "output_template"})
-_KNOWN_SOURCE_KEYS = frozenset({"username", "password", "library", "cookie_file"})
+
 _STATIC_SOURCE_ALIASES = {
     "audiobooksdotcom": "audiobooks.com",
     "libby": "overdrive",
@@ -261,7 +280,7 @@ def structure_config(
     """
     # Warn on unknown top-level keys
     for key in config_dict:
-        if key not in _KNOWN_TOP_LEVEL_KEYS:
+        if key not in KNOWN_TOP_LEVEL_CONFIG_KEYS:
             logging.log(f"Warning: unknown config key '{key}' ignored")
 
     # Add sources with normalized canonical keys and validation warnings
@@ -282,7 +301,7 @@ def structure_config(
                     f"Warning: config source alias '{raw_source_name}' normalized to '{source_name}'"
                 )
             for key in values:
-                if key not in _KNOWN_SOURCE_KEYS:
+                if key not in SOURCE_CONFIG_KEYS:
                     logging.log(
                         f"Warning: unknown key '{key}' in '[sources.{raw_source_name}]' ignored"
                     )
@@ -329,93 +348,36 @@ def structure_config(
         logging.log("Warning: config '[gui]' must be a table; ignoring")
     elif isinstance(gui_section, dict):
         for key in gui_section:
-            if key not in _KNOWN_GUI_KEYS:
+            if key not in GUI_CONFIG_KEYS:
                 logging.log(f"Warning: unknown key '{key}' in '[gui]' ignored")
+        use_archive_raw = gui_section.get("use_download_archive")
+        if use_archive_raw is not None and not isinstance(use_archive_raw, bool):
+            logging.log("Warning: config '[gui].use_download_archive' must be a boolean; ignoring")
+            use_archive_val = None
+        else:
+            use_archive_val = use_archive_raw
         gui_config = GuiConfig(
             window_geometry=gui_section.get("window_geometry") if isinstance(gui_section.get("window_geometry"), str) else None,
             output_dir=gui_section.get("output_dir") if isinstance(gui_section.get("output_dir"), str) else None,
             output_template=gui_section.get("output_template") if isinstance(gui_section.get("output_template"), str) else None,
+            use_download_archive=use_archive_val,
         )
 
-    def _opt_str(key: str) -> Optional[str]:
-        val = config_dict.get(key)
-        if val is None:
-            return None
-        if not isinstance(val, str):
-            logging.log(f"Warning: invalid '{key}' in config (expected string); ignoring")
-            return None
-        return val
-
-    def _opt_bool(key: str) -> Optional[bool]:
-        val = config_dict.get(key)
-        if val is None:
-            return None
-        if not isinstance(val, bool):
-            logging.log(f"Warning: invalid '{key}' in config (expected boolean); ignoring")
-            return None
-        return val
-
-    raw_bitrate = _opt_str("audio_bitrate")
-    audio_bitrate: Optional[str] = None
-    if raw_bitrate is not None:
-        try:
-            audio_bitrate = normalize_audio_bitrate(raw_bitrate)
-        except ValueError:
-            logging.log(f"Warning: invalid 'audio_bitrate' in config ('{raw_bitrate}'); ignoring")
-
-    max_workers: Optional[int] = None
-    raw_workers = config_dict.get("max_workers")
-    if raw_workers is not None:
-        if isinstance(raw_workers, int) and not isinstance(raw_workers, bool) and raw_workers >= 1:
-            max_workers = raw_workers
-        else:
-            logging.log("Warning: invalid 'max_workers' in config (expected integer >= 1); ignoring")
-
-    book_delay: Optional[float] = None
-    raw_delay = config_dict.get("book_delay")
-    if raw_delay is not None:
-        if isinstance(raw_delay, (int, float)) and not isinstance(raw_delay, bool) and raw_delay >= 0:
-            book_delay = float(raw_delay)
-        else:
-            logging.log("Warning: invalid 'book_delay' in config (expected number >= 0); ignoring")
-
-    timeout: Optional[float] = None
-    raw_timeout = config_dict.get("timeout")
-    if raw_timeout is not None:
-        if isinstance(raw_timeout, (int, float)) and not isinstance(raw_timeout, bool) and raw_timeout > 0:
-            timeout = float(raw_timeout)
-        else:
-            logging.log("Warning: invalid 'timeout' in config (expected number > 0); ignoring")
-
-    raw_media_type = _opt_str("media_type")
-    media_type: Optional[str] = None
-    if raw_media_type is not None:
-        normalized_media_type = raw_media_type.strip().lower()
-        if normalized_media_type in ("auto", "audiobook", "ebook", "both"):
-            media_type = normalized_media_type
-        else:
-            logging.log(f"Warning: invalid 'media_type' in config ('{raw_media_type}'); ignoring")
+    parsed_options: Dict[str, Any] = {}
+    for spec in CONFIG_OPTION_SPECS:
+        key = spec.config_key
+        if key is None or spec.config_kind is None:
+            continue
+        value, warning = validate_config_value(key, spec.config_kind, config_dict.get(key))
+        if warning is not None:
+            logging.log(warning)
+        parsed_options[key] = value
 
     # Create config object
     return Config(
         sources=sources,
-        output_template=_opt_str("output_template"),
-        database_directory=_opt_str("database_directory"),
-        skip_downloaded=_opt_bool("skip_downloaded"),
-        output_format=_opt_str("output_format"),
-        media_type=media_type,
-        combine=_opt_bool("combine"),
-        ffmpeg_dir=_opt_str("ffmpeg_dir"),
-        resume=_opt_bool("resume"),
-        audio_bitrate=audio_bitrate,
-        overwrite=_opt_bool("overwrite"),
-        max_workers=max_workers,
-        book_delay=book_delay,
-        proxy=_opt_str("proxy"),
-        timeout=timeout,
-        download_archive=_opt_str("download_archive"),
-        check_updates=_opt_bool("check_updates"),
         gui=gui_config,
+        **parsed_options,
     )
 
 
@@ -573,38 +535,69 @@ _UNSET: Any = object()
 
 
 def save_output_preferences(
-    output_format: Optional[str],
-    combine: bool,
-    overwrite: Optional[str] = None,
+    output_format: Any = _UNSET,
+    combine: Any = _UNSET,
+    config_location: Optional[str] = None,
     *,
     audio_bitrate: Any = _UNSET,
     resume: Any = _UNSET,
     media_type: Any = _UNSET,
+    skip_downloaded: Any = _UNSET,
+    write_json_metadata: Any = _UNSET,
+    enrich_metadata: Any = _UNSET,
+    no_chapters: Any = _UNSET,
+    debug: Any = _UNSET,
+    split_chapters: Any = _UNSET,
+    write_opf: Any = _UNSET,
+    write_cue: Any = _UNSET,
+    write_cover: Any = _UNSET,
+    remove_chars: Any = _UNSET,
+    cover: Any = _UNSET,
+    overwrite: Any = _UNSET,
+    max_workers: Any = _UNSET,
+    book_delay: Any = _UNSET,
+    proxy: Any = _UNSET,
+    timeout: Any = _UNSET,
 ) -> str:
-    """Persist GUI output format, combine, bitrate, resume, and media type preferences in `audiobook-dl.toml`."""
-    config_location = overwrite or get_config_location(None)
-    with file_lock(config_location):
-        config_dict = read_config(config_location)
-        if output_format:
-            config_dict["output_format"] = output_format
-        else:
-            config_dict.pop("output_format", None)
-        config_dict["combine"] = bool(combine)
-        if audio_bitrate is not _UNSET:
-            normalized_bitrate = normalize_audio_bitrate(audio_bitrate)
-            if normalized_bitrate:
-                config_dict["audio_bitrate"] = normalized_bitrate
+    """Persist GUI output and toggle preferences in `audiobook-dl.toml`."""
+    resolved_location = config_location or get_config_location(None)
+    updates = {
+        "output_format": output_format,
+        "combine": combine,
+        "audio_bitrate": audio_bitrate,
+        "resume": resume,
+        "media_type": media_type,
+        "skip_downloaded": skip_downloaded,
+        "write_json_metadata": write_json_metadata,
+        "enrich_metadata": enrich_metadata,
+        "no_chapters": no_chapters,
+        "debug": debug,
+        "split_chapters": split_chapters,
+        "write_opf": write_opf,
+        "write_cue": write_cue,
+        "write_cover": write_cover,
+        "remove_chars": remove_chars,
+        "cover": cover,
+        "overwrite": overwrite,
+        "max_workers": max_workers,
+        "book_delay": book_delay,
+        "proxy": proxy,
+        "timeout": timeout,
+    }
+    with file_lock(resolved_location):
+        config_dict = read_config(resolved_location)
+        for key, raw_value in updates.items():
+            if raw_value is _UNSET:
+                continue
+            spec = OPTIONS_BY_NAME[key]
+            if spec.toml_serializer is None:
+                continue
+            should_set, serialized = spec.toml_serializer(raw_value)
+            if should_set:
+                config_dict[key] = serialized
             else:
-                config_dict.pop("audio_bitrate", None)
-        if resume is not _UNSET:
-            config_dict["resume"] = bool(resume)
-        if media_type is not _UNSET:
-            normalized_media = str(media_type).strip().lower() if media_type else ""
-            if normalized_media and normalized_media != "auto":
-                config_dict["media_type"] = normalized_media
-            else:
-                config_dict.pop("media_type", None)
-        return _write_config_dict(config_location, config_dict)
+                config_dict.pop(key, None)
+        return _write_config_dict(resolved_location, config_dict)
 
 
 def save_gui_preferences(
@@ -612,8 +605,10 @@ def save_gui_preferences(
     output_dir: Optional[str] = None,
     output_template: Optional[str] = None,
     overwrite: Optional[str] = None,
+    *,
+    use_download_archive: Optional[bool] = None,
 ) -> str:
-    """Persist GUI window geometry, last output folder, and filename template in `audiobook-dl.toml`."""
+    """Persist GUI window geometry, last output folder, filename template, and archive toggle in `audiobook-dl.toml`."""
     config_location = overwrite or get_config_location(None)
     with file_lock(config_location):
         config_dict = read_config(config_location)
@@ -631,6 +626,8 @@ def save_gui_preferences(
                 gui_dict[key] = cleaned
             else:
                 gui_dict.pop(key, None)
+        if use_download_archive is not None:
+            gui_dict["use_download_archive"] = bool(use_download_archive)
         if gui_dict:
             config_dict["gui"] = gui_dict
         else:

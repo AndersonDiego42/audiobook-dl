@@ -5,13 +5,12 @@ from dataclasses import dataclass
 import os
 import queue
 import threading
-from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 import uuid
 
 from audiobookdl import args, logging
 from audiobookdl.config import (
     Config,
-    SourceConfig,
     load_config,
     save_ffmpeg_dir,
     save_gui_preferences,
@@ -20,6 +19,7 @@ from audiobookdl.config import (
 )
 from audiobookdl.exceptions import DownloadCancelled
 from audiobookdl.gui.formatting import format_failed_job_detail
+from audiobookdl.options_schema import PERSISTED_GUI_OPTION_SPECS
 from audiobookdl.pipeline import (
     DownloadSummary,
     list_service_library,
@@ -195,36 +195,9 @@ class GuiController:
         return loaded
 
     def config_snapshot(self) -> Config:
-        """Return a thread-safe shallow copy of the current cached configuration."""
+        """Return a thread-safe isolated copy of the current cached configuration."""
         with self.queue_lock:
-            cfg = self.config
-            return Config(
-                sources={
-                    k: SourceConfig(
-                        username=sc.username,
-                        password=sc.password,
-                        library=sc.library,
-                        cookie_file=sc.cookie_file,
-                    )
-                    for k, sc in cfg.sources.items()
-                },
-                output_template=cfg.output_template,
-                database_directory=cfg.database_directory,
-                skip_downloaded=cfg.skip_downloaded,
-                ffmpeg_dir=cfg.ffmpeg_dir,
-                output_format=cfg.output_format,
-                media_type=cfg.media_type,
-                combine=cfg.combine,
-                audio_bitrate=cfg.audio_bitrate,
-                resume=cfg.resume,
-                overwrite=cfg.overwrite,
-                max_workers=cfg.max_workers,
-                book_delay=cfg.book_delay,
-                proxy=cfg.proxy,
-                timeout=cfg.timeout,
-                download_archive=cfg.download_archive,
-                gui=cfg.gui,
-            )
+            return self.config.clone()
 
     def save_ffmpeg_dir(self, resolved_dir: str) -> Config:
         set_ffmpeg_dir(resolved_dir)
@@ -256,19 +229,15 @@ class GuiController:
         *,
         output_dir: str,
         output_template: str,
+        use_download_archive: Optional[bool] = None,
     ) -> Config:
-        save_output_preferences(
-            output_format=options.output_format,
-            combine=options.combine,
-            overwrite=self.config_location,
-            audio_bitrate=options.audio_bitrate,
-            resume=options.resume,
-            media_type=options.media_type,
-        )
+        prefs = {spec.name: getattr(options, spec.name) for spec in PERSISTED_GUI_OPTION_SPECS}
+        save_output_preferences(config_location=self.config_location, **prefs)
         save_gui_preferences(
             output_dir=output_dir,
             output_template=output_template,
             overwrite=self.config_location,
+            use_download_archive=use_download_archive,
         )
         return self.reload_config()
 
@@ -278,12 +247,17 @@ class GuiController:
         window_geometry: Optional[str],
         output_dir: Optional[str],
         output_template: Optional[str],
+        use_download_archive: Optional[bool] = None,
+        output_prefs: Optional[Mapping[str, Any]] = None,
     ) -> None:
+        if output_prefs:
+            save_output_preferences(config_location=self.config_location, **output_prefs)
         save_gui_preferences(
             window_geometry=window_geometry,
             output_dir=output_dir,
             output_template=output_template,
             overwrite=self.config_location,
+            use_download_archive=use_download_archive,
         )
 
     def get_http_session(self) -> Any:
