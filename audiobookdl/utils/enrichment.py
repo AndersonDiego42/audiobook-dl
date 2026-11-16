@@ -9,7 +9,6 @@ from typing import Any
 from collections.abc import Callable, Mapping, Sequence
 
 from PIL import Image
-import pycountry
 import requests
 
 from audiobookdl import logging
@@ -18,6 +17,7 @@ from audiobookdl.utils.audiobook import (
     AudiobookMetadata,
     Chapter,
     Cover,
+    parse_language,
     parse_release_date,
 )
 from audiobookdl.utils.enrichment_cache import (
@@ -188,31 +188,6 @@ def _strip_html(raw: Any) -> str | None:
     lines = [line.strip() for line in text.splitlines()]
     cleaned = "\n".join(line for line in lines if line)
     return cleaned.strip() or None
-
-
-def _parse_language(raw: Any) -> Any | None:
-    if raw is None:
-        return None
-    if hasattr(raw, "alpha_3"):
-        return raw
-    text = str(raw).strip()
-    if not text:
-        return None
-    base = re.split(r"[-_]", text)[0].strip()
-    for candidate in (text, base):
-        if len(candidate) == 2:
-            found = pycountry.languages.get(alpha_2=candidate.lower())
-            if found is not None:
-                return found
-        elif len(candidate) == 3:
-            found = pycountry.languages.get(alpha_3=candidate.lower())
-            if found is not None:
-                return found
-        else:
-            found = pycountry.languages.get(name=candidate.title())
-            if found is not None:
-                return found
-    return None
 
 
 def _parse_series_order(raw: Any) -> int | None:
@@ -387,7 +362,7 @@ def _parse_audnexus_book(payload: Mapping[str, Any]) -> EnrichmentCandidate | No
     cover_url = str(payload.get("image") or "").strip() or None
     publisher = str(payload.get("publisherName") or "").strip() or None
     release_date = parse_release_date(payload.get("releaseDate"))
-    language = _parse_language(payload.get("language"))
+    language = parse_language(payload.get("language"))
     isbn = _clean_isbn(payload.get("isbn"))
 
     return EnrichmentCandidate(
@@ -440,7 +415,7 @@ def _parse_audible_product(product: Mapping[str, Any]) -> EnrichmentCandidate | 
     description = _strip_html(product.get("publisher_summary") or product.get("merchandising_summary"))
     publisher = str(product.get("publisher_name") or "").strip() or None
     release_date = parse_release_date(product.get("release_date"))
-    language = _parse_language(product.get("language"))
+    language = parse_language(product.get("language"))
 
     return EnrichmentCandidate(
         provider="audnexus",
@@ -758,7 +733,7 @@ def _query_google(
             title=title,
             authors=authors,
             genres=categories,
-            language=_parse_language(info.get("language")),
+            language=parse_language(info.get("language")),
             description=_strip_html(info.get("description")),
             isbn=_extract_google_isbn(info.get("industryIdentifiers")),
             publisher=str(info.get("publisher") or "").strip() or None,

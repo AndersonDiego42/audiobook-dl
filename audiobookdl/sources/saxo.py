@@ -1,12 +1,10 @@
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, logging
 from audiobookdl.exceptions import BookNotFound, NoSourceFound
-from audiobookdl.utils.audiobook import AESEncryption
+from audiobookdl.utils.audiobook import AESEncryption, parse_language, parse_release_date
 from audiobookdl.utils.concurrency import run_cancellable_pool
 
-from datetime import datetime
 import os
-import pycountry
 import re
 from typing import Any
 from urllib.parse import quote
@@ -163,24 +161,10 @@ class SaxoSource(Source):
         if isinstance(publisher, str) and publisher.strip():
             result.publisher = publisher.strip()
 
-        lang_raw = metadata.get("language")
-        if isinstance(lang_raw, str) and lang_raw.strip():
-            code = lang_raw.strip()
-            lang_obj = (
-                pycountry.languages.get(alpha_2=code.lower())
-                or pycountry.languages.get(name=code)
-            )
-            result.language = lang_obj if lang_obj is not None else code
-
-        release_raw = metadata.get("publishingDate") or metadata.get("releaseDate")
-        if isinstance(release_raw, str) and release_raw.strip():
-            cleaned_date = release_raw.strip()
-            try:
-                result.release_date = datetime.fromisoformat(
-                    cleaned_date.replace("Z", "+00:00")
-                ).date()
-            except ValueError:
-                pass
+        result.language = parse_language(metadata.get("language"))
+        result.release_date = parse_release_date(
+            metadata.get("publishingDate") or metadata.get("releaseDate")
+        )
         return result
 
     def get_cover(self, book_info) -> Cover:

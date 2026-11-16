@@ -11,6 +11,8 @@ from audiobookdl.utils.audiobook import (
     Cover,
     Result,
     Series,
+    parse_language,
+    parse_release_date,
 )
 from audiobookdl.utils.http import DEFAULT_HTTP_TIMEOUT
 
@@ -86,12 +88,6 @@ class PodimoSource(Source[dict]):
             raise DataNotPresent
         raise NoSourceFound
 
-    UUID_REGEX = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{8}"
-
-    def extract_id_from_info_page(self, url: str) -> str:
-        """Extract podcast id from information page"""
-        return self.find_in_page(url, fr'\\"id\\":\\"({self.UUID_REGEX})\"')
-
     def retrieve_id_from_share_link(self, url: str) -> tuple[str, str]:
         """
         Retrieve the kind and id of an item from a share link through `Source._session`.
@@ -99,7 +95,13 @@ class PodimoSource(Source[dict]):
         :param url: the share link url
         :returns: tuple `(kind, id)` of the shared item
         """
-        url_with_id = http.redirect_of(url, amount=2, session=self._session)
+        url_with_id = http.redirect_of(
+            url,
+            amount=5,
+            session=self._session,
+            stop_non_redirect=True,
+            target_pattern=r"https?://open\.podimo\.com/(?:audiobook|podcast)/[^/?#]+",
+        )
         if url_with_id is None:
             raise DataNotPresent
         parsed = parse_url(url_with_id)
@@ -244,6 +246,17 @@ class PodimoSource(Source[dict]):
         for narrator in book_info.get("narrators") or []:
             metadata.add_narrator(narrator["name"])
         metadata.description = book_info.get("description")
+        pub_name = book_info.get("publisherName")
+        if isinstance(pub_name, str) and pub_name.strip():
+            metadata.publisher = pub_name.strip()
+        metadata.release_date = parse_release_date(book_info.get("yearOfBookPublication"))
+        lang_raw = book_info.get("language")
+        if isinstance(lang_raw, dict):
+            metadata.language = parse_language(lang_raw.get("isoLanguage")) or parse_language(
+                lang_raw.get("localisedLanguage")
+            )
+        elif lang_raw:
+            metadata.language = parse_language(lang_raw)
         return metadata
 
     def download_cover(self, cover_url: str | None) -> Cover | None:

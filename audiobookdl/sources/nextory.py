@@ -186,7 +186,7 @@ class NextorySource(Source):
         return self.download_from_id(book_id)
 
     def download_from_id(self, book_id: int) -> Audiobook:
-        book_info = self.find_book_info(book_id, self._get_wantlist())
+        book_info = self.find_book_info(book_id)
         logging.debug(f"nextory book_info keys: {sorted(book_info.keys())}")
         audio_data = self.download_audio_data(book_info)
         if "files" not in audio_data:
@@ -226,17 +226,33 @@ class NextorySource(Source):
             books=books,
         )
 
-    def find_book_info(self, book_id: int, want_to_read_list: list) -> dict:
-        """Find book metadata by id, checking want-to-read first and falling back to product API."""
-        for book in want_to_read_list:
-            if book["id"] == book_id:
-                return book
+    def find_book_info(self, book_id: int, want_to_read_list: list | None = None) -> dict:
+        """Find book metadata by id, checking cached wantlist or product API first."""
+        if want_to_read_list is not None:
+            for book in want_to_read_list:
+                if book.get("id") == book_id:
+                    return book
+        elif self._wantlist_cache is not None:
+            for book in self._wantlist_cache:
+                if book.get("id") == book_id:
+                    return book
+
         try:
             product = self.get_json(f"https://api.nextory.com/library/v1/products/{book_id}")
             if isinstance(product, dict) and product.get("id") is not None:
                 return product
         except RequestError:
             pass
+
+        if want_to_read_list is None and self._wantlist_cache is None:
+            try:
+                fallback_list = self._get_wantlist()
+            except DataNotPresent:
+                fallback_list = []
+            for book in fallback_list:
+                if book.get("id") == book_id:
+                    return book
+
         raise AudiobookDLException(error_description="nextory_want_to_read")
 
     def download_want_to_read_id(self) -> str:

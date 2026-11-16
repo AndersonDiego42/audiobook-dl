@@ -736,4 +736,49 @@ def test_pack_single_track_direct_staging_and_cached_chapter_probing(tmp_path: P
     assert convert_calls[0]["output_path"] is not None
 
 
+def test_pack_book_runs_silence_detection_when_chapters_from_silence_enabled(tmp_path):
+    src_mp3 = tmp_path / "Solo Track.mp3"
+    _create_empty_id3_mp3(src_mp3)
+    out_dir = tmp_path / "out"
+
+    detected = [Chapter(start=0, title="Part 1"), Chapter(start=12000, title="Part 2")]
+
+    def fake_convert(old_path, output_format, *, output_path=None, **kwargs):
+        assert output_path is not None
+        Path(output_path).write_bytes(b"m4b")
+        return output_path, True
+
+    opts = args.build_default_options(
+        output_format="m4b",
+        output_template="{title}",
+        overwrite=True,
+        chapters_from_silence=True,
+    )
+    cached_info = AudioProbeInfo(duration=25.0, bitrate=128_000, codec_name="mp3", format_name="mp3")
+    probe_cache = {str(src_mp3.resolve()): cached_info}
+    meta_calls = []
+
+    def fake_add_meta(audiobook, filepath, options, **kwargs):
+        meta_calls.append(list(audiobook.chapters))
+
+    with (
+        patch("audiobookdl.pack.output.detect_silence_chapters", return_value=detected) as silence_mock,
+        patch("audiobookdl.pack.output.convert_single_file", side_effect=fake_convert),
+        patch("audiobookdl.pack.output_download.add_metadata_to_file", side_effect=fake_add_meta),
+    ):
+        spec = inspect_local_book(
+            str(src_mp3),
+            [str(src_mp3)],
+            opts,
+            output_dir=str(out_dir),
+            probe_cache=probe_cache,
+        )
+        final_path = pack_book(spec, opts, output_dir=str(out_dir), probe_cache=probe_cache)
+
+    assert final_path == str((out_dir / "Solo Track.m4b").resolve())
+    silence_mock.assert_called_once()
+    assert meta_calls == [detected]
+
+
+
 

@@ -8,6 +8,7 @@ from mutagen.flac import FLAC, Picture
 from PIL import Image
 
 from audiobookdl import AudiobookMetadata, Cover
+from audiobookdl.utils.audiobook import TrackTagContext
 from ._cover import normalize_cover_image
 
 VORBIS_EXTENSIONS = ("flac", "ogg", "opus", "oga")
@@ -68,6 +69,7 @@ def add_vorbis_metadata(
     filepath: str,
     metadata: AudiobookMetadata,
     cover: Cover | None = None,
+    track_context: TrackTagContext | None = None,
 ) -> bool:
     """Write VorbisComment metadata tags (and optional cover art) in a single save pass."""
     audio = MutagenFile(filepath)
@@ -97,10 +99,12 @@ def add_vorbis_metadata(
         elif key == "series":
             vals = _as_tag_values(value)
             if vals:
-                tags["ALBUM"] = vals
+                if track_context is None:
+                    tags["ALBUM"] = vals
                 tags["SERIES"] = vals
         elif key == "series_order":
-            tags["TRACKNUMBER"] = [str(value)]
+            if track_context is None:
+                tags["TRACKNUMBER"] = [str(value)]
             tags["SERIES-PART"] = [str(value)]
         elif key == "genres":
             vals = _as_tag_values(value)
@@ -132,6 +136,17 @@ def add_vorbis_metadata(
             vals = _as_tag_values(value)
             if vals:
                 tags[key.upper()] = vals
+
+    if track_context is not None:
+        tags["TITLE"] = [track_context.title]
+        album_name = track_context.album or metadata.title
+        if album_name:
+            tags["ALBUM"] = [album_name]
+        tags["TRACKNUMBER"] = [str(track_context.track_number)]
+        tags["TRACKTOTAL"] = [str(track_context.total_tracks)]
+        tags["TOTALTRACKS"] = [str(track_context.total_tracks)]
+    elif not metadata.series and metadata.title:
+        tags["ALBUM"] = [metadata.title]
 
     picture = _build_vorbis_picture(cover) if cover is not None else None
     if picture is not None:

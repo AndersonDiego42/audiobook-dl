@@ -11,6 +11,7 @@ from audiobookdl import (
     logging,
 )
 from audiobookdl.exceptions import DataNotPresent, GenericAudiobookDLException, NoSourceFound
+from audiobookdl.utils.http import DEFAULT_USER_AGENT, extract_session_cookies
 from rich.markup import escape
 
 import json
@@ -56,7 +57,7 @@ def _split_series_order(raw_series: str) -> tuple[str, int | None]:
 
 class AudiobooksdotcomSource(Source):
     match = [
-        rf"{BASEURL}\d+(/\d)?",
+        rf"{BASEURL}\d+(/\d+)?/?",
         r"https?://(www\.)?audiobooks\.com/audiobook/.+",
         r"https?://(www\.)?audiobooks\.com/browse/library.*",
     ]
@@ -68,15 +69,21 @@ class AudiobooksdotcomSource(Source):
         if not path:
             raise NoSourceFound
 
-        if "/browse/library" in path:
+        clean_path = path.rstrip("/")
+        if "/browse/library" in clean_path:
             self._apply_cookie_user_agent()
             return self.download_library(url)
 
-        if "/book/stream/" in path:
-            book_id = path.split("/")[3]
-        elif "/audiobook/" in path:
-            book_id = path.split("/")[-1]
+        if "/book/stream/" in clean_path:
+            segments = [seg for seg in clean_path.split("/") if seg]
+            if len(segments) < 3:
+                raise NoSourceFound
+            book_id = segments[2]
+        elif "/audiobook/" in clean_path:
+            book_id = clean_path.split("/")[-1]
         else:
+            raise NoSourceFound
+        if not book_id:
             raise NoSourceFound
         return self.download_from_id(book_id)
 
@@ -322,13 +329,25 @@ class AudiobooksdotcomSource(Source):
         cover_url = urljoin(scrape_url, raw_cover_url)
         return Cover(self.get(cover_url), "jpg")
 
+    def _get_ci_session_cookie(self) -> str | None:
+        fallback: str | None = None
+        for cookie in extract_session_cookies(self._session):
+            if cookie.name != "ci_session" or not cookie.value:
+                continue
+            domain = (cookie.domain or "").lower()
+            if domain == "www.audiobooks.com":
+                return str(cookie.value)
+            if not domain or domain == "audiobooks.com" or domain.endswith(".audiobooks.com"):
+                fallback = str(cookie.value)
+        return fallback
+
     def extract_useragent_from_cookies(self) -> str:
         """
         Extracts user agent from cookies in local session.
 
         :returns: User-Agent string
         """
-        raw: str | None = self._session.cookies.get("ci_session", domain="www.audiobooks.com")
+        raw = self._get_ci_session_cookie()
         if not raw:
             raise GenericAudiobookDLException("ci_session missing from cookie")
         decoded_cookie = unquote(raw)
@@ -336,30 +355,68 @@ class AudiobooksdotcomSource(Source):
         if match:
             return match.group(1)
         try:
-            return decoded_cookie.split('"')[11]
-        except IndexError as error:
-            raise GenericAudiobookDLException("Could not extract user_agent from ci_session cookie") from error
+            parsed = json.loads(decoded_cookie)
+            if isinstance(parsed, dict):
+                ua = parsed.get("user_agent") or parsed.get("userAgent")
+                if isinstance(ua, str) and ua.strip():
+                    return ua.strip()
+        except ValueError:
+            pass
+        parts = decoded_cookie.split('"')
+        if len(parts) > 11 and parts[11].strip():
+            return parts[11]
+        existing = self._session.headers.get("User-Agent")
+        if isinstance(existing, str) and existing.strip():
+            return existing.strip()
+        return DEFAULT_USER_AGENT
+
+    def _discover_part_urls(self, book_id: str, part1_url: str) -> list[tuple[int, str]]:
+        """Discover all stream part URLs (`/book/stream/<id>/<n>`) linked from Part 1."""
+        page_text = self._get_page(part1_url).decode("utf-8", errors="replace")
+        parts: dict[int, str] = {1: part1_url}
+        pattern = re.compile(rf"/book/stream/{re.escape(book_id)}/(\d+)(?:[/?#\"'\s]|$)")
+        for match in pattern.finditer(page_text):
+            part_num = int(match.group(1))
+            if part_num >= 1 and part_num not in parts:
+                parts[part_num] = f"{BASEURL}{book_id}/{part_num}"
+        return sorted(parts.items())
 
     def extract_file(self, scrape_url: str) -> list[AudiobookFile]:
         """
-        Extract audio url from html page using the cached page response.
+        Extract audio urls across all discovered stream parts of the book.
 
-        :param scrape_url: Url of page to scrape for audio link
-        :returns: List of audio files with a single file in it
+        :param scrape_url: Url of Part 1 stream page
+        :returns: List of audio files
         """
-        page_text = self._get_page(scrape_url).decode("utf-8", errors="replace")
-        audio_match = re.search(
-            r'(?<=(mp3: "))[^"]+',
-            page_text,
-        )
-        if audio_match is None:
-            logging.debug(f"Could not find audio URL. Page content from {scrape_url} was:\n{escape(page_text)}")
-            raise DataNotPresent
-        audio_url = audio_match.group()
-        return [AudiobookFile(url=audio_url, ext="mp3")]
+        id_match = re.search(r"/book/stream/([^/]+)/", scrape_url)
+        if id_match:
+            part_urls = self._discover_part_urls(id_match.group(1), scrape_url)
+        else:
+            part_urls = [(1, scrape_url)]
+
+        files: list[AudiobookFile] = []
+        multi_part = len(part_urls) > 1
+        for part_num, part_url in part_urls:
+            page_text = self._get_page(part_url).decode("utf-8", errors="replace")
+            audio_match = re.search(
+                r'(?<=(mp3: "))[^"]+',
+                page_text,
+            )
+            if audio_match is None:
+                logging.debug(f"Could not find audio URL. Page content from {part_url} was:\n{escape(page_text)}")
+                raise DataNotPresent
+            audio_url = audio_match.group()
+            files.append(
+                AudiobookFile(
+                    url=audio_url,
+                    ext="mp3",
+                    title=f"Part {part_num}" if multi_part else None,
+                )
+            )
+        return files
 
     def list_library(self) -> list[CatalogBook]:
-        if self._session.cookies.get("ci_session", domain="www.audiobooks.com"):
+        if self._get_ci_session_cookie():
             self._apply_cookie_user_agent()
         entries = self._scrape_library_entries("https://www.audiobooks.com/browse/library")
         return [

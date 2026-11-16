@@ -1,6 +1,7 @@
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, BookId, Chapter, Cover, Result, Series, logging
-from audiobookdl.exceptions import RequestError
+from audiobookdl.exceptions import BookNotFound, RequestError
+from audiobookdl.utils.audiobook import parse_language, parse_release_date
 
 import json
 import lxml.html
@@ -32,7 +33,10 @@ class EverandSource(Source[str]):
         )
 
     def download_series(self, url: str) -> Series[str]:
-        series_id: str = url.rstrip("/").split("/")[-1]
+        series_match = re.search(r"/series/(\d+)", url)
+        if series_match is None:
+            raise BookNotFound
+        series_id: str = series_match.group(1)
         logging.debug(f"{series_id=}")
 
         return Series(
@@ -231,8 +235,10 @@ class EverandSource(Source[str]):
             description = None
 
         isbn = str(book_info.get("isbn") or "").strip() or None
-        language = str(book_info.get("language") or book_info.get("lang") or "").strip() or None
-        release_date = book_info.get("publish_date") or book_info.get("release_date")
+        language = parse_language(book_info.get("language") or book_info.get("lang"))
+        release_date = parse_release_date(
+            book_info.get("publish_date") or book_info.get("release_date")
+        )
 
         return AudiobookMetadata(
             title=EverandSource.clean_title(book_info["title"]),

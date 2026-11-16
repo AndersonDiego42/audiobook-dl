@@ -1,6 +1,7 @@
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover
-from audiobookdl.exceptions import UserNotAuthorized
+from audiobookdl.exceptions import RequestError, UserNotAuthorized
+from audiobookdl.utils.audiobook import parse_language
 from audiobookdl.utils.concurrency import run_cancellable_pool
 
 from html import unescape
@@ -104,7 +105,7 @@ class BlinkistSource(Source):
             narrators=narrators,
             description=description,
             genres=genres,
-            language=book.get("language"),
+            language=parse_language(book.get("language")),
             source="blinkist",
         )
 
@@ -212,5 +213,5 @@ class BlinkistSource(Source):
         try:
             self.get_json("https://www.blinkist.com/api/library")
             return True
-        except UserNotAuthorized:
+        except (UserNotAuthorized, RequestError, ValueError):
             return False

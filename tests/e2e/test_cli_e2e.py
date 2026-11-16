@@ -197,8 +197,12 @@ def test_cli_resume_http_range_and_skip_downloaded(
     assert part1_path.is_file()
     assert not (book_dir / "Part 1.mp3.tmp").exists()
     assert (book_dir / "cover.jpg").read_bytes() == cover
-    assert str(ID3(str(part0_path))["TIT2"]) == "Resume Odyssey"
-    assert str(ID3(str(part1_path))["TIT2"]) == "Resume Odyssey"
+    assert str(ID3(str(part0_path))["TIT2"]) == "Part 1"
+    assert str(ID3(str(part0_path))["TALB"]) == "Resume Odyssey"
+    assert str(ID3(str(part0_path))["TRCK"]) == "1/2"
+    assert str(ID3(str(part1_path))["TIT2"]) == "Part 2"
+    assert str(ID3(str(part1_path))["TALB"]) == "Resume Odyssey"
+    assert str(ID3(str(part1_path))["TRCK"]) == "2/2"
     assert 0.8 <= ffprobe_duration(str(part0_path)) <= 1.2
     assert 0.8 <= ffprobe_duration(str(part1_path)) <= 1.2
 

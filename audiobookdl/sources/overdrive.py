@@ -1,6 +1,6 @@
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, BookId, Chapter, Cover, Result, Series
-from audiobookdl.exceptions import RequestError, UserNotAuthorized
+from audiobookdl.exceptions import DataNotPresent, RequestError, UserNotAuthorized
 
 import json
 import re
@@ -30,7 +30,7 @@ class OverdriveSource(Source):
             chip = self.get_json("https://sentry-read.svc.overdrive.com/chip")
             return bool(isinstance(chip, dict) and (chip.get("identity") or chip.get("loans") is not None))
         except (RequestError, UserNotAuthorized, ValueError):
-            return self.authenticated
+            return False
 
     def _resolve_libby_open_url(self, url: str) -> str:
         """Resolve a `libbyapp.com/open/loan/<id>` URL via Libby's chip API to its listen URL."""
@@ -68,10 +68,13 @@ class OverdriveSource(Source):
             raise UserNotAuthorized(
                 message="OverDrive/Libby session cookies are missing or expired."
             )
-        match = re.search(r"window\.bData = (.+?);", page_html)
-        if match is None:
+        bdata_marker = re.search(r"window\.bData\s*=\s*", page_html)
+        if bdata_marker is None:
             raise UserNotAuthorized
-        book_info = json.loads(match.group(1))
+        try:
+            book_info, _ = json.JSONDecoder().raw_decode(page_html, bdata_marker.end())
+        except json.JSONDecodeError as exc:
+            raise DataNotPresent from exc
         return Audiobook(
             session=self._session,
             files=self.get_files(prefix, book_info),
@@ -187,17 +190,23 @@ class OverdriveSource(Source):
     def get_chapters(self, book_info) -> list[Chapter]:
         part_offsets = self._compute_part_offsets(book_info)
         chapters = []
-        for chapter in book_info["nav"]["toc"]:
+        toc_entries = (book_info.get("nav") or {}).get("toc") or []
+        for chapter in self._flatten_toc(toc_entries):
+            path = str(chapter.get("path") or "")
             timepoint = 0.0
-            if "#" in chapter["path"]:
-                timepoint = float(chapter["path"].split("#")[1])
-            part_result = re.search(r"(?<=(Part))\d+", chapter["path"])
+            if "#" in path:
+                try:
+                    timepoint = float(path.split("#", 1)[1])
+                except ValueError:
+                    timepoint = 0.0
+            part_result = re.search(r"(?<=(Part))\d+", path)
             if part_result is None:
                 continue
             part = int(part_result.group(0)) - 1
             base_offset = part_offsets[part] if 0 <= part < len(part_offsets) else 0.0
             start = int((base_offset + timepoint) * 1000)
-            chapters.append(Chapter(start, chapter["title"]))
+            title = str(chapter.get("title") or "").strip()
+            chapters.append(Chapter(start, title))
         return chapters
 
     @staticmethod

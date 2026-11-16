@@ -783,4 +783,44 @@ def test_storytel_download_counter_is_instance_attribute(tmp_path):
     assert src2._download_counter == 0
 
 
+def test_storytel_library_and_search_urls_route_back_through_source(tmp_path):
+    from audiobookdl.sources import find_compatible_source
+
+    src = _make_source(tmp_path)
+    src._language = "sv"
+    src._session.post = MagicMock(
+        return_value=_mock_resp(
+            200,
+            json_data={
+                "items": {
+                    "1": {"model": {"id": "777", "name": "Lib Book", "authors": [{"name": "A"}]}}
+                }
+            },
+        )
+    )
+    lib_items = src.list_library()
+    assert len(lib_items) == 1
+    assert lib_items[0].url == "https://www.storytel.com/sv/books/777"
+    assert find_compatible_source(lib_items[0].url) is StorytelSource
+    assert StorytelSource.get_id_from_url(lib_items[0].url) == "777"
+
+    # Legacy bare /books/{id} URLs without a language segment also route cleanly
+    assert find_compatible_source("https://www.storytel.com/books/777") is StorytelSource
+    assert StorytelSource.get_id_from_url("https://www.storytel.com/books/777") == "777"
+
+    details = _sample_book_details(consumableId="777", title="Lib Book")
+    src._session.get = MagicMock(
+        side_effect=[
+            _mock_resp(200, json_data=details),
+            _mock_resp(200, content=b"cover"),
+            _mock_resp(302, headers={"Location": "https://cdn.storytel.net/777.mp3"}),
+            _mock_resp(200, json_data={"formats": [{"type": "abook", "chapters": []}]}),
+        ]
+    )
+    downloaded = src.download(lib_items[0].url)
+    assert isinstance(downloaded, Audiobook)
+    assert downloaded.title == "Lib Book"
+
+
+
 

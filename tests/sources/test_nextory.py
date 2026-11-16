@@ -324,3 +324,42 @@ def test_nextory_profile_selection_locale_search_and_chapters(tmp_path):
     meta = src.get_metadata(_book_entry(77))
     assert meta.source == "nextory"
     assert meta.scrape_url == "https://www.nextory.com/book/77"
+
+
+def test_nextory_catalog_download_succeeds_without_want_to_read_list(tmp_path):
+    src = _make_source(tmp_path)
+    product = _book_entry(888, title="Catalog Only Book")
+    audio_data = {"files": [{"uri": "https://cdn.nextory.com/888/master.m3u8", "start_at": 0}]}
+    playlist = b"#EXTM3U\n#EXTINF:5.0,\nseg0.ts\n#EXT-X-ENDLIST\n"
+
+    def fake_get(url, **_kwargs):
+        if url.endswith("/library/v1/products/888"):
+            return _json_resp(product)
+        if url.endswith("/me/product_lists"):
+            raise AssertionError("Should not query want_to_read when product API succeeds")
+        if url.endswith("/packages/audio"):
+            return _json_resp(audio_data)
+        if url.endswith("master.m3u8"):
+            return MagicMock(status_code=200, content=playlist)
+        if url.endswith("888.jpg"):
+            return MagicMock(status_code=200, content=b"cover-bytes")
+        raise AssertionError(f"Unexpected GET {url}")
+
+    src._session.get = MagicMock(side_effect=fake_get)
+    book = src.download("https://www.nextory.com/se/book/catalog-only-888")
+    assert isinstance(book, Audiobook)
+    assert book.title == "Catalog Only Book"
+
+    # Also verify missing product + missing want_to_read list raises nextory_want_to_read instead of DataNotPresent
+    def fake_get_no_wl(url, **_kwargs):
+        if url.endswith("/library/v1/products/999"):
+            return _json_resp({}, status_code=404)
+        if url.endswith("/me/product_lists"):
+            return _json_resp({"product_lists": [{"type": "reading", "id": "r-1"}]})
+        raise AssertionError(f"Unexpected GET {url}")
+
+    src._session.get = MagicMock(side_effect=fake_get_no_wl)
+    with pytest.raises(AudiobookDLException) as exc_info:
+        src.download_from_id(999)
+    assert exc_info.value.error_description == "nextory_want_to_read"
+

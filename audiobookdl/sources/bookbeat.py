@@ -1,10 +1,10 @@
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, Result, Series
 from audiobookdl.exceptions import BookHasNoAudiobook, BookHasNoEbook, MissingBookAccess
+from audiobookdl.utils.audiobook import parse_language, parse_release_date
 from audiobookdl.utils.fs import atomic_write_text
 
 import base64
-from datetime import datetime
 import os
 import re
 from typing import Any
@@ -225,7 +225,7 @@ class BookBeatSource(Source):
         metadata = AudiobookMetadata(
             title=title,
             description=meta.get("summary") or meta.get("description"),
-            language=meta.get("language"),
+            language=parse_language(meta.get("language")),
             source="bookbeat",
             scrape_url=scrape_url,
         )
@@ -256,11 +256,8 @@ class BookBeatSource(Source):
             if isbn:
                 metadata.isbn = str(isbn).strip()
             pub_date = ed.get("published") or ed.get("releaseDate") or meta.get("published")
-            if isinstance(pub_date, str) and pub_date.strip():
-                try:
-                    metadata.release_date = datetime.fromisoformat(pub_date.strip().replace("Z", "+00:00")).date()
-                except ValueError:
-                    pass
+            if pub_date is not None:
+                metadata.release_date = parse_release_date(pub_date)
             contributors = ed.get("contributors") or []
             for contributor in contributors:
                 name = f"{contributor.get('firstname', '')} {contributor.get('lastname', '')}".strip()

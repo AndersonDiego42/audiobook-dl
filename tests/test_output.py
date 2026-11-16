@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import subprocess
 import sys
 import threading
@@ -1114,6 +1115,197 @@ def test_chapter_offset_loudnorm_mono_and_silence_detection():
         (15500, "Chapter 2"),
         (32000, "Chapter 3"),
     ]
+
+
+def test_combine_audiofiles_flac_concat_demuxer_preserves_tmp_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(output, "_require_executable", lambda name: "ffmpeg")
+    user_tmp_dir = tmp_path / "keep_tmp"
+    user_tmp_dir.mkdir()
+    sentinel = user_tmp_dir / "existing.txt"
+    sentinel.write_text("keep me", encoding="utf-8")
+
+    f1 = tmp_path / "p1.flac"
+    f2 = tmp_path / "p2.flac"
+    f1.write_bytes(b"flac1")
+    f2.write_bytes(b"flac2")
+
+    monkeypatch.setattr(
+        output,
+        "_probe_audio_info",
+        lambda path: AudioProbeInfo(
+            duration=24.0 if path.endswith("book.flac") else 12.0,
+            codec_name="flac",
+            sample_rate=44100,
+            channels=2,
+        ),
+    )
+
+    commands = []
+
+    def fake_run(cmd, **kwargs):
+        commands.append(list(cmd))
+        out_path = cmd[-1]
+        with open(out_path, "wb") as fh:
+            fh.write(b"combined-flac")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(output, "run_cancellable_subprocess", fake_run)
+
+    out_flac = tmp_path / "book.flac"
+    combine_audiofiles([str(f1), str(f2)], str(user_tmp_dir), str(out_flac))
+
+    assert out_flac.read_bytes() == b"combined-flac"
+    assert sentinel.read_text(encoding="utf-8") == "keep me"
+    assert len(commands) == 1
+    cmd = commands[0]
+    assert "-f" in cmd and "concat" in cmd
+
+
+def test_combine_audiofiles_mixed_non_mp4_normalizes_parts(tmp_path, monkeypatch):
+    monkeypatch.setattr(output, "_require_executable", lambda name: "ffmpeg")
+    f1 = tmp_path / "p1.flac"
+    f2 = tmp_path / "p2.flac"
+    f1.write_bytes(b"f1")
+    f2.write_bytes(b"f2")
+
+    def fake_probe(path: str) -> AudioProbeInfo:
+        if path.endswith("mixed.flac"):
+            return AudioProbeInfo(duration=12.0, codec_name="flac", sample_rate=48000, channels=2)
+        if path.endswith("p1.flac"):
+            return AudioProbeInfo(duration=5.0, codec_name="flac", sample_rate=44100, channels=1)
+        return AudioProbeInfo(duration=7.0, codec_name="flac", sample_rate=48000, channels=2)
+
+    monkeypatch.setattr(output, "_probe_audio_info", fake_probe)
+
+    commands = []
+
+    def fake_run(cmd, **kwargs):
+        commands.append(list(cmd))
+        with open(cmd[-1], "wb") as fh:
+            fh.write(b"norm-or-out")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(output, "run_cancellable_subprocess", fake_run)
+
+    out_flac = tmp_path / "mixed.flac"
+    combine_audiofiles([str(f1), str(f2)], str(tmp_path / "tmp"), str(out_flac))
+
+    assert out_flac.exists()
+    # 2 normalization encodes + 1 final concat mux
+    assert len(commands) == 3
+    final_cmd = commands[-1]
+    assert "-f" in final_cmd and "concat" in final_cmd
+    assert any("norm_parts" in part or "concat_list.txt" in part for part in final_cmd)
+
+
+def test_combine_audiofiles_exceeding_max_concat_files_uses_binary_ts(tmp_path, monkeypatch):
+    monkeypatch.setattr(output, "_require_executable", lambda name: "ffmpeg")
+    monkeypatch.setattr(
+        output,
+        "_remux_to_mpegts",
+        lambda src, dst, cancel_event=None: open(dst, "wb").write(b"ts") > 0,
+    )
+    monkeypatch.setattr(
+        output,
+        "_probe_audio_info",
+        lambda path: AudioProbeInfo(duration=1.0, codec_name="mp3"),
+    )
+
+    seen_cmds = []
+
+    def fake_run(cmd, **kwargs):
+        seen_cmds.append(list(cmd))
+        with open(cmd[-1], "wb") as fh:
+            fh.write(b"mp3")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(output, "run_cancellable_subprocess", fake_run)
+
+    files = []
+    for i in range(output._MAX_CONCAT_PROTOCOL_FILES + 1):
+        p = tmp_path / f"seg_{i:03d}.mp3"
+        p.write_bytes(b"m")
+        files.append(str(p))
+
+    out_mp3 = tmp_path / "many.mp3"
+    combine_audiofiles(files, str(tmp_path / "tmp"), str(out_mp3))
+
+    assert out_mp3.exists()
+    assert len(seen_cmds) == 1
+    cmd_str = " ".join(seen_cmds[0])
+    assert "concat:" not in cmd_str
+    assert "combined.ts" in cmd_str
+
+
+def test_add_chapters_ffmpeg_applies_faststart_only_to_mp4(tmp_path, monkeypatch):
+    monkeypatch.setattr(ffmpeg_metadata.utils, "find_executable", lambda name: "ffmpeg")
+    monkeypatch.setattr(ffmpeg_metadata, "create_tmp_chapter_file", lambda filepath, chapters: ";FFMETADATA1\n")
+    commands = []
+
+    def fake_run(cmd, **kwargs):
+        commands.append(list(cmd))
+        Path(cmd[-1]).write_bytes(b"tagged")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(ffmpeg_metadata, "run_cancellable_subprocess", fake_run)
+
+    chapters = [Chapter(start=0, title="Ch1"), Chapter(start=5000, title="Ch2")]
+
+    m4b = tmp_path / "book.m4b"
+    m4b.write_bytes(b"orig")
+    ffmpeg_metadata.add_chapters_ffmpeg(str(m4b), chapters)
+    assert "-movflags" in commands[0] and "+faststart" in commands[0]
+
+    mp3 = tmp_path / "book.mp3"
+    mp3.write_bytes(b"orig")
+    ffmpeg_metadata.add_chapters_ffmpeg(str(mp3), chapters)
+    assert "-movflags" not in commands[1]
+
+
+def test_split_audio_by_chapters_normalizes_chapters_and_applies_filters(tmp_path, monkeypatch):
+    monkeypatch.setattr(output, "_require_executable", lambda name: "ffmpeg")
+    master = tmp_path / "master.mp3"
+    master.write_bytes(b"audio")
+    monkeypatch.setattr(
+        output,
+        "_probe_audio_info",
+        lambda path: AudioProbeInfo(duration=20.0, codec_name="mp3", bitrate=128000, sample_rate=44100, channels=2),
+    )
+
+    commands = []
+
+    def fake_run(cmd, **kwargs):
+        commands.append(list(cmd))
+        Path(cmd[-1]).write_bytes(b"part")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(output, "run_cancellable_subprocess", fake_run)
+
+    # Unsorted, duplicate timestamp, and past-EOF chapter (duration = 20000 ms)
+    dirty_chapters = [
+        Chapter(start=10000, title="Ch2"),
+        Chapter(start=0, title="Ch1"),
+        Chapter(start=10000, title="DupCh2"),
+        Chapter(start=25000, title="PastEOF"),
+    ]
+    out_paths = output.split_audio_by_chapters(
+        str(master),
+        str(tmp_path / "split_out"),
+        dirty_chapters,
+        loudnorm=True,
+        mono=True,
+    )
+
+    # Past-EOF dropped and duplicate deduped -> 2 valid chapters
+    assert len(out_paths) == 2
+    assert len(commands) == 2
+    for cmd in commands:
+        assert "-af" in cmd
+        af_val = cmd[cmd.index("-af") + 1]
+        assert "loudnorm" in af_val
+        assert "-ac" in cmd and cmd[cmd.index("-ac") + 1] == "1"
+        assert "-c:a" in cmd and cmd[cmd.index("-c:a") + 1] != "copy"
+
 
 
 

@@ -1,6 +1,6 @@
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover
-from audiobookdl.exceptions import BookNotFound
+from audiobookdl.exceptions import BookNotFound, DataNotPresent
 from audiobookdl.utils.concurrency import run_cancellable_pool
 
 import base64
@@ -40,10 +40,33 @@ class ChirpSource(Source):
                 return f"https://www.chirpbooks.com/player/{match.group(1)}"
         raise BookNotFound
 
+    def _extract_user_id(self, player_url: str) -> int:
+        """Extract the authenticated Chirp user id from player HTML, ignoring book/entity ids."""
+        page_html = self._get_page(player_url).decode("utf-8", errors="replace")
+        for pattern in (
+            r'"currentUser"\s*:\s*\{[^{}]*?"id"\s*:\s*(\d+)',
+            r'"id"\s*:\s*(\d+)\s*,\s*"__typename"\s*:\s*"User"',
+            r'"__typename"\s*:\s*"User"[^{}]*?"id"\s*:\s*(\d+)',
+            r'"user(?:Id|_id)"\s*:\s*(\d+)',
+            r'data-user-id=["\'](\d+)["\']',
+        ):
+            match = re.search(pattern, page_html)
+            if match:
+                return int(match.group(1))
+        for match in re.finditer(r'"id"\s*:\s*(\d+)', page_html):
+            snippet = page_html[match.end() : match.end() + 80]
+            if re.search(
+                r'^\s*,\s*"__typename"\s*:\s*"(?:Audiobook|Author|Narrator|Series|Chapter)"',
+                snippet,
+            ):
+                continue
+            return int(match.group(1))
+        raise DataNotPresent
+
     def download(self, url: str) -> Audiobook:
         player_url = self._resolve_player_url(url)
         book_id = int(self.find_elem_in_page(player_url, "div.user-audiobook", "data-audiobook-id"))
-        user_id = int(self.find_in_page(player_url, r'"id":(\d+)', 1))
+        user_id = self._extract_user_id(player_url)
         tracks = self._get_tracks(book_id)
         key, iv = self._create_key(player_url, user_id)
         return Audiobook(
@@ -58,7 +81,7 @@ class ChirpSource(Source):
         title = self.find_elem_in_page(url, "title")
         metadata = AudiobookMetadata(title, source="chirp", scrape_url=url)
         for credit in self.find_elems_in_page(url, ".credit"):
-            text = (credit.text or "").strip()
+            text = " ".join(credit.text_content().split())
             if text.startswith("Written by"):
                 metadata.add_author(text[11:].strip())
             elif text.startswith("Narrated by"):

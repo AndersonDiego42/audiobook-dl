@@ -310,3 +310,69 @@ def test_get_source_classes_discovers_valid_plugin_entry_points(tmp_path, monkey
     assert _PluginSource in classes
     assert _InvalidPlugin not in classes
 
+
+def test_load_cookie_file_ignores_empty_and_expired_jars_but_accepts_session_cookies(tmp_path):
+    empty_file = tmp_path / "empty.txt"
+    empty_file.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    src_empty = _make_source(tmp_path / "e")
+    src_empty.load_cookie_file(str(empty_file))
+    assert src_empty.authenticated is False
+
+    expired_file = tmp_path / "expired.txt"
+    expired_file.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".example.com\tTRUE\t/\tFALSE\t1\told_tok\tdead\n",
+        encoding="utf-8",
+    )
+    src_expired = _make_source(tmp_path / "x")
+    src_expired.load_cookie_file(str(expired_file))
+    assert src_expired.authenticated is False
+    assert src_expired._session.cookies.get("old_tok") is None
+
+    session_file = tmp_path / "session.txt"
+    session_file.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".example.com\tTRUE\t/\tFALSE\t0\tsess_tok\talive\n",
+        encoding="utf-8",
+    )
+    src_sess = _make_source(tmp_path / "s")
+    src_sess.load_cookie_file(str(session_file))
+    assert src_sess.authenticated is True
+    assert src_sess._session.cookies.get("sess_tok") == "alive"
+
+
+def test_get_stream_files_supports_ext_x_map_and_ext_x_byterange(tmp_path):
+    playlist = (
+        b"#EXTM3U\n"
+        b'#EXT-X-MAP:URI="init.mp4",BYTERANGE="720@0"\n'
+        b"#EXTINF:5.0,\n"
+        b"#EXT-X-BYTERANGE:1024@720\n"
+        b"book.m4s\n"
+        b"#EXTINF:5.0,\n"
+        b"#EXT-X-BYTERANGE:512\n"
+        b"book.m4s\n"
+        b"#EXT-X-ENDLIST\n"
+    )
+    source = _make_source(tmp_path)
+    init_bytes = b"FTYP_MOOV_INIT"
+
+    def fake_get(url, headers=None, **_kwargs):
+        if url.endswith("prog.m3u8"):
+            return MagicMock(status_code=200, content=playlist)
+        if url.endswith("init.mp4"):
+            assert headers and headers.get("Range") == "bytes=0-719"
+            return MagicMock(status_code=206, content=init_bytes)
+        raise AssertionError(f"Unexpected GET {url}")
+
+    source._session.get = MagicMock(side_effect=fake_get)
+    files = source.get_stream_files("https://cdn.example.com/hls/prog.m3u8")
+
+    assert len(files) == 2
+    assert files[0].headers["Range"] == "bytes=720-1743"
+    assert files[1].headers["Range"] == "bytes=1744-2255"
+    assert files[0].init_section == init_bytes
+    assert files[1].init_section == init_bytes
+    # Initialization section was fetched only once for both segments
+    assert source._session.get.call_count == 2
+
+

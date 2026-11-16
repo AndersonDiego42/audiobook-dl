@@ -4,6 +4,7 @@ import re
 import threading
 import time
 from typing import Any
+from urllib.parse import urljoin
 import requests
 
 from audiobookdl.exceptions import DownloadCancelled, GenericAudiobookDLException
@@ -170,25 +171,38 @@ def redirect_of(
     url: str,
     amount: int = 1,
     session: requests.Session | None = None,
+    *,
+    stop_non_redirect: bool = False,
+    target_pattern: str | None = None,
 ) -> str | None:
     """
     Get the location where a url redirects to.
 
     :param url: the http endpoint
-    :param amount: the amount of times the function is allowed to redirect
+    :param amount: maximum redirect hops to follow
     :param session: optional `requests.Session` to preserve proxies, headers, and TLS settings
+    :param stop_non_redirect: return the last redirected URL if a non-redirect response occurs after >= 1 hop
+    :param target_pattern: optional regex; stop immediately once a redirected URL matches it
     :returns: the redirected location
     """
     getter = session.get if session is not None else requests.get
+    hops = 0
     for _ in range(amount):
         response = getter(
             url,
             allow_redirects=False,
             timeout=DEFAULT_HTTP_TIMEOUT,
         )
-        if response.status_code not in [301, 302]:
-            return None
-        if "location" not in response.headers:
-            return None
-        url = response.headers["location"]
+        if response.status_code not in (301, 302, 303, 307, 308):
+            return url if (stop_non_redirect and hops > 0) else None
+        location = response.headers.get("location") or response.headers.get("Location")
+        if not location:
+            return url if (stop_non_redirect and hops > 0) else None
+        next_url = urljoin(url, location)
+        hops += 1
+        if next_url == url:
+            return next_url
+        url = next_url
+        if target_pattern and re.search(target_pattern, url):
+            return url
     return url

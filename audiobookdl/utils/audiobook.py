@@ -4,7 +4,8 @@ import requests
 from typing import Generic, Optional, TypeVar, Any
 from collections.abc import Callable, Sequence, MutableMapping
 import json
-from attrs import define, Factory
+from attrs import define, Factory, field
+from dateutil.parser import parse as _dateutil_parse
 import pycountry
 
 
@@ -49,6 +50,121 @@ class AudiobookFile:
     expected_status_code: int = 200
     # Optional lazy URL resolver invoked when downloading starts
     url_resolver: Callable[[], str] | None = None
+    # Optional HLS fMP4 initialization section (#EXT-X-MAP) prepended before segment frames
+    init_section: bytes | None = None
+
+
+_LANGUAGE_ALIASES: dict[str, str] = {
+    "dansk": "dan",
+    "svenska": "swe",
+    "norsk": "nor",
+    "bokmål": "nob",
+    "bokmal": "nob",
+    "nynorsk": "nno",
+    "deutsch": "deu",
+    "français": "fra",
+    "francais": "fra",
+    "español": "spa",
+    "espanol": "spa",
+    "português": "por",
+    "portugues": "por",
+    "italiano": "ita",
+    "nederlands": "nld",
+    "polski": "pol",
+    "suomi": "fin",
+    "íslenska": "isl",
+    "islenska": "isl",
+    "türkçe": "tur",
+    "turkce": "tur",
+    "русский": "rus",
+    "العربية": "ara",
+}
+
+
+def parse_language(raw: Any) -> Optional["pycountry.db.Language"]:  # type: ignore
+    """Normalize an ISO-639 code, BCP-47 locale tag, or language name to a `pycountry` Language."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, pycountry.db.Data) and hasattr(raw, "alpha_3"):
+        return raw
+    text = str(raw).strip()
+    if not text:
+        return None
+
+    base = re.split(r"[-_]", text, maxsplit=1)[0].strip()
+    candidates = [text] if base == text or not base else [text, base]
+
+    for candidate in candidates:
+        lower = candidate.lower()
+        if len(candidate) == 2:
+            found = pycountry.languages.get(alpha_2=lower)
+            if found is not None:
+                return found
+        elif len(candidate) == 3:
+            found = (
+                pycountry.languages.get(alpha_3=lower)
+                or pycountry.languages.get(bibliographic=lower)
+            )
+            if found is not None:
+                return found
+        else:
+            alias_alpha3 = _LANGUAGE_ALIASES.get(lower)
+            if alias_alpha3 is not None:
+                found = pycountry.languages.get(alpha_3=alias_alpha3)
+                if found is not None:
+                    return found
+            found = (
+                pycountry.languages.get(name=candidate)
+                or pycountry.languages.get(name=candidate.title())
+            )
+            if found is not None:
+                return found
+            try:
+                return pycountry.languages.lookup(candidate)
+            except LookupError:
+                pass
+    return None
+
+
+def parse_release_date(raw: Any) -> date | None:
+    """Parse a release date (`YYYY-MM-DD`, `YYYY-MM`, `YYYY`, `int`, `date`, or natural text)."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, date) and not isinstance(raw, datetime):
+        return raw
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, int):
+        if 1 <= raw <= 9999:
+            return date(raw, 1, 1)
+        return None
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    m_full = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})", cleaned)
+    if m_full:
+        try:
+            return date(int(m_full.group(1)), int(m_full.group(2)), int(m_full.group(3)))
+        except ValueError:
+            pass
+    m_ym = re.match(r"^(\d{4})-(\d{1,2})$", cleaned)
+    if m_ym:
+        try:
+            return date(int(m_ym.group(1)), int(m_ym.group(2)), 1)
+        except ValueError:
+            pass
+    m_y = re.match(r"^(\d{4})$", cleaned)
+    if m_y:
+        year = int(m_y.group(1))
+        if 1 <= year <= 9999:
+            return date(year, 1, 1)
+        return None
+    try:
+        return _dateutil_parse(cleaned, default=datetime(1900, 1, 1)).date()
+    except (ValueError, OverflowError, TypeError):
+        return None
 
 
 @define
@@ -60,12 +176,12 @@ class AudiobookMetadata:
     authors: list[str] = Factory(list)
     narrators: list[str] = Factory(list)
     genres: list[str] = Factory(list)
-    language: Optional["pycountry.db.Language"] = None # type: ignore
+    language: Optional["pycountry.db.Language"] = field(default=None, converter=parse_language) # type: ignore
     description: str | None = None
     isbn: str | None = None
     asin: str | None = None
     publisher: str | None = None
-    release_date: date | None = None
+    release_date: date | None = field(default=None, converter=parse_release_date)
     source: str | None = None
 
     def add_author(self, author: str):
@@ -213,9 +329,19 @@ class AudiobookMetadata:
 def add_if_value_exists(metadata: AudiobookMetadata, l: list[tuple[str, Any]]):
     def add(key: str):
         value = getattr(metadata, key, None)
-        if value:
+        if value is not None and value != "" and value != []:
             l.append((key, value))
     return add
+
+
+@define(frozen=True)
+class TrackTagContext:
+    """Per-track tag overrides used when tagging multi-file or split-chapter outputs."""
+
+    title: str
+    track_number: int
+    total_tracks: int
+    album: str | None = None
 
 
 @define
@@ -255,41 +381,6 @@ def is_ebook_extension(ext: str | None) -> bool:
     if not ext:
         return False
     return ext.lstrip(".").lower() in EBOOK_EXTENSIONS
-
-
-def parse_release_date(raw: Any) -> date | None:
-    """Parse a release date (`YYYY-MM-DD`, `YYYY-MM`, `YYYY`, `int`, or `date`) cleanly."""
-    if isinstance(raw, date) and not isinstance(raw, datetime):
-        return raw
-    if isinstance(raw, datetime):
-        return raw.date()
-    if isinstance(raw, int) and not isinstance(raw, bool):
-        if 1 <= raw <= 9999:
-            return date(raw, 1, 1)
-        return None
-    if not isinstance(raw, str):
-        return None
-    cleaned = raw.strip()
-    if not cleaned:
-        return None
-    m_full = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})", cleaned)
-    if m_full:
-        try:
-            return date(int(m_full.group(1)), int(m_full.group(2)), int(m_full.group(3)))
-        except ValueError:
-            pass
-    m_ym = re.match(r"^(\d{4})-(\d{1,2})$", cleaned)
-    if m_ym:
-        try:
-            return date(int(m_ym.group(1)), int(m_ym.group(2)), 1)
-        except ValueError:
-            pass
-    m_y = re.match(r"^(\d{4})$", cleaned)
-    if m_y:
-        year = int(m_y.group(1))
-        if 1 <= year <= 9999:
-            return date(year, 1, 1)
-    return None
 
 
 def is_ebook(audiobook: Audiobook) -> bool:

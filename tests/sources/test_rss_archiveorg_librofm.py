@@ -1,6 +1,7 @@
 """Tests for RssSource, ArchiveOrgSource, and LibrofmSource."""
 
 import json
+from datetime import date
 from unittest.mock import MagicMock
 
 import pytest
@@ -57,6 +58,7 @@ def test_rss_source_parses_reverse_chronological_podcast_and_builds_chapters(tmp
     assert book.title == "Serialized Odyssey"
     assert book.metadata.authors == ["Homer"]
     assert book.metadata.description == "Epic tale."
+    assert book.metadata.language is not None and book.metadata.language.alpha_3 == "eng"
     assert book.metadata.source == "rss"
     assert book.cover is not None and book.cover.image == b"img-bytes"
     # Reverse chronological pubDates reordered chronologically
@@ -108,6 +110,8 @@ def test_archiveorg_source_dedupes_derived_formats_builds_chapters_and_searches(
     assert book.title == "The Time Machine"
     assert book.metadata.authors == ["H. G. Wells"]
     assert book.metadata.publisher == "Public Domain Audio"
+    assert book.metadata.language is not None and book.metadata.language.alpha_3 == "eng"
+    assert book.metadata.release_date == date(2020, 5, 1)
     assert [f.url for f in book.files] == [
         "https://archive.org/download/time_machine_librivox/01_chap.mp3",
         "https://archive.org/download/time_machine_librivox/02_chap.mp3",
@@ -188,3 +192,27 @@ def test_librofm_source_login_library_search_and_download_manifest(tmp_path):
     src.request = (lambda *_a, **_kw: bad_resp)  # type: ignore[method-assign]
     with pytest.raises(UserNotAuthorized):
         src._login("https://libro.fm/audiobooks/9780593152393", "bad", "bad")
+
+
+def test_archiveorg_select_audio_files_deduplicates_derivatives_and_m4b_chapters(tmp_path):
+    src = ArchiveOrgSource(_opts(tmp_path))
+
+    # 1. Deduplicate _128kb / _vbr / _64kb derivatives against original stem
+    deriv_files = [
+        {"name": "ch01_64kb.mp3", "format": "64Kbps MP3"},
+        {"name": "ch01_128kb.mp3", "format": "128Kbps MP3"},
+        {"name": "ch01_vbr.mp3", "format": "VBR MP3", "source": "derivative", "original": "ch01.mp3"},
+        {"name": "ch01.mp3", "format": "VBR MP3", "source": "original"},
+    ]
+    selected_deriv = src._select_audio_files(deriv_files)
+    assert [f["name"] for f in selected_deriv] == ["ch01.mp3"]
+
+    # 2. Avoid downloading full-book .m4b AND chapter .mp3s together
+    mixed_files = [
+        {"name": "FullBook.m4b", "format": "M4B"},
+        {"name": "Chapter01.mp3", "format": "VBR MP3", "track": "1"},
+        {"name": "Chapter02.mp3", "format": "VBR MP3", "track": "2"},
+    ]
+    selected_mixed = src._select_audio_files(mixed_files)
+    assert [f["name"] for f in selected_mixed] == ["FullBook.m4b"]
+

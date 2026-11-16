@@ -1,8 +1,8 @@
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, logging
 from audiobookdl.exceptions import RequestError, UserNotAuthorized
+from audiobookdl.utils.audiobook import parse_language, parse_release_date
 
-from datetime import datetime
 import json
 import lxml.html
 import re
@@ -105,18 +105,24 @@ class YourCloudLibrarySource(Source):
             description=description,
             publisher=publisher,
             isbn=str(isbn_raw).strip() if isbn_raw else None,
-            language=book_info.get("language"),
+            language=parse_language(book_info.get("language")),
             source="yourcloudlibrary",
             scrape_url=url,
         )
-        if book_info.get("series") is not None and len(book_info["series"]) >= 1:
-            metadata.series = book_info["series"][0]
-        pub_date = book_info.get("publish_date") or book_info.get("release_date")
-        if isinstance(pub_date, str) and pub_date.strip():
-            try:
-                metadata.release_date = datetime.fromisoformat(pub_date.strip().replace("Z", "+00:00")).date()
-            except ValueError:
-                pass
+        raw_series = book_info.get("series")
+        if isinstance(raw_series, (list, tuple)):
+            first = next((item for item in raw_series if item), None)
+            if isinstance(first, dict):
+                metadata.series = str(first.get("name") or first.get("title") or "").strip() or None
+            elif first is not None:
+                metadata.series = str(first).strip() or None
+        elif isinstance(raw_series, dict):
+            metadata.series = str(raw_series.get("name") or raw_series.get("title") or "").strip() or None
+        elif isinstance(raw_series, str):
+            metadata.series = raw_series.strip() or None
+        metadata.release_date = parse_release_date(
+            book_info.get("publish_date") or book_info.get("release_date")
+        )
         return metadata
 
     def download_cover(self, meta) -> Cover:

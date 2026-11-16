@@ -703,3 +703,150 @@ def test_cover_square_padding_and_max_size_normalization():
     assert ext == "jpg"
     with Image.open(BytesIO(data)) as out_img:
         assert out_img.size == (128, 128)
+
+
+def test_audiobook_metadata_normalizes_language_and_release_date_and_serializes_cleanly(tmp_path):
+    from audiobookdl.output import output as out_mod
+    from audiobookdl.utils.audiobook import parse_language, parse_release_date
+
+    # parse_language resolves 2-letter, 3-letter, bibliographic, locale, English, and localized names
+    assert parse_language("en") == pycountry.languages.get(alpha_3="eng")
+    assert parse_language("en-US") == pycountry.languages.get(alpha_3="eng")
+    assert parse_language("eng") == pycountry.languages.get(alpha_3="eng")
+    assert parse_language("ger") == pycountry.languages.get(alpha_3="deu")
+    assert parse_language("English") == pycountry.languages.get(alpha_3="eng")
+    assert parse_language("Dansk") == pycountry.languages.get(alpha_3="dan")
+    assert parse_language("Svenska") == pycountry.languages.get(alpha_3="swe")
+    assert parse_language("   ") is None
+    assert parse_language("UnknownLanguageToken") is None
+
+    # parse_release_date handles ISO timestamps, partial dates, human dates, ints, and invalid inputs
+    assert parse_release_date("2024") == date(2024, 1, 1)
+    assert parse_release_date("2024-06") == date(2024, 6, 1)
+    assert parse_release_date("2024-06-15T12:30:00Z") == date(2024, 6, 15)
+    assert parse_release_date("May 4, 2021") == date(2021, 5, 4)
+    assert parse_release_date("Tue, 02 Jan 2024 10:00:00 GMT") == date(2024, 1, 2)
+    assert parse_release_date(1998) == date(1998, 1, 1)
+    assert parse_release_date("not-a-date") is None
+
+    # Field converters enforce contract both at construction and post-init assignment
+    meta = AudiobookMetadata(
+        title="Contract Book",
+        authors=["Author A"],
+        language="en",
+        release_date="May 4, 2021",
+    )
+    assert meta.language == pycountry.languages.get(alpha_3="eng")
+    assert meta.release_date == date(2021, 5, 4)
+
+    meta.language = "Dansk"
+    meta.release_date = "2020-05"
+    assert meta.language == pycountry.languages.get(alpha_3="dan")
+    assert meta.release_date == date(2020, 5, 1)
+
+    # Unparseable sentinels coerce to None rather than leaving raw str to crash taggers
+    meta.language = "Multi-Language"
+    meta.release_date = "TBD"
+    assert meta.language is None
+    assert meta.release_date is None
+
+    # Downstream taggers, OPF sidecar, and output template consume normalized metadata safely
+    tagged_meta = AudiobookMetadata(
+        title="Taggable Book",
+        authors=["Author A"],
+        language="en",
+        release_date="2022-03-14",
+    )
+    assert out_mod.gen_output_location("{title} [{language}] ({year})", tagged_meta, "") == "Taggable Book [eng] (2022)"
+    opf_path = tmp_path / "contract.opf"
+    sidecars.write_sidecar_opf(tagged_meta, str(opf_path))
+    opf_xml = opf_path.read_text(encoding="utf-8")
+    assert "<dc:language>en</dc:language>" in opf_xml
+    assert "<dc:date>2022-03-14</dc:date>" in opf_xml
+
+    mp3_path = tmp_path / "contract.mp3"
+    _create_silent_audio(mp3_path, ["-c:a", "libmp3lame"])
+    id3.add_id3_metadata(str(mp3_path), tagged_meta)
+    assert list(ID3(str(mp3_path))["TLAN"].text) == ["eng"]
+    assert str(ID3(str(mp3_path))["TDRC"]) == "2022-03-14"
+
+    m4b_path = tmp_path / "contract.m4b"
+    _create_silent_audio(m4b_path, ["-c:a", "aac", "-f", "mp4"])
+    mp4.add_mp4_metadata(str(m4b_path), tagged_meta)
+    assert MP4(str(m4b_path))["----:com.apple.iTunes:Language"] == [MP4FreeForm(b"eng")]
+    assert MP4(str(m4b_path))["\xa9day"] == ["2022-03-14"]
+
+    from audiobookdl.output.metadata.reader import read_track_tags
+
+    reloaded = read_track_tags(str(m4b_path))
+    assert reloaded.metadata.language == pycountry.languages.get(alpha_3="eng")
+    assert reloaded.metadata.release_date == date(2022, 3, 14)
+
+
+def test_series_order_zero_included_and_roundtripped(tmp_path):
+    from audiobookdl.output.metadata.reader import read_track_tags
+
+    meta = AudiobookMetadata(
+        title="Prequel Story",
+        series="Grand Saga",
+        series_order=0,
+        description="First line; contains semicolon; end",
+    )
+    props = dict(meta.all_properties())
+    assert props["series_order"] == 0
+
+    mp3_path = tmp_path / "prequel.mp3"
+    _create_silent_audio(mp3_path, ["-c:a", "libmp3lame"])
+    output_metadata.add_metadata(str(mp3_path), meta)
+    id3_tags = ID3(str(mp3_path))
+    assert str(id3_tags["COMM::eng"]) == "First line; contains semicolon; end"
+    assert str(id3_tags["COMM::eng"].encoding) == "Encoding.UTF8" or id3_tags["COMM::eng"].encoding == 3
+    mp3_reloaded = read_track_tags(str(mp3_path))
+    assert mp3_reloaded.metadata.series == "Grand Saga"
+    assert mp3_reloaded.metadata.series_order == 0
+    assert mp3_reloaded.metadata.description == "First line; contains semicolon; end"
+
+    m4b_path = tmp_path / "prequel.m4b"
+    _create_silent_audio(m4b_path, ["-c:a", "aac", "-f", "mp4"])
+    output_metadata.add_metadata(str(m4b_path), meta)
+    m4b_reloaded = read_track_tags(str(m4b_path))
+    assert m4b_reloaded.metadata.series == "Grand Saga"
+    assert m4b_reloaded.metadata.series_order == 0
+    assert m4b_reloaded.metadata.description == "First line; contains semicolon; end"
+
+    flac_path = tmp_path / "prequel.flac"
+    _create_silent_audio(flac_path, ["-c:a", "flac"])
+    output_metadata.add_metadata(str(flac_path), meta)
+    flac_reloaded = read_track_tags(str(flac_path))
+    assert flac_reloaded.metadata.series == "Grand Saga"
+    assert flac_reloaded.metadata.series_order == 0
+    assert flac_reloaded.metadata.description == "First line; contains semicolon; end"
+
+
+def test_add_metadata_with_track_context_writes_track_and_preserves_series(tmp_path):
+    from audiobookdl.output.metadata.reader import read_track_tags
+    from audiobookdl.utils.audiobook import TrackTagContext
+
+    meta = AudiobookMetadata(
+        title="Full Novel",
+        authors=["Author One"],
+        series="Saga Name",
+        series_order=2,
+    )
+    track_ctx = TrackTagContext(title="Chapter 2", track_number=2, total_tracks=5)
+
+    for ext, codec_args in [
+        ("mp3", ["-c:a", "libmp3lame"]),
+        ("m4b", ["-c:a", "aac", "-f", "mp4"]),
+        ("flac", ["-c:a", "flac"]),
+    ]:
+        path = tmp_path / f"part2.{ext}"
+        _create_silent_audio(path, codec_args)
+        output_metadata.add_metadata(str(path), meta, track_context=track_ctx)
+        info = read_track_tags(str(path))
+        assert info.title == "Chapter 2"
+        assert info.album == "Full Novel"
+        assert info.track_number == 2
+        assert info.metadata.series == "Saga Name"
+        assert info.metadata.series_order == 2
+

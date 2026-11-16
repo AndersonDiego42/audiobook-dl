@@ -69,6 +69,21 @@ def _is_supported_audio(path: str) -> bool:
     return bool(ext and ext in SUPPORTED_PACK_EXTENSIONS)
 
 
+_FOLDER_SIDECAR_FILES = frozenset({"metadata.json", "metadata.opf", "audiobook.json"})
+
+
+def _has_book_sidecar(directory: str) -> bool:
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return False
+    for name in names:
+        lower = name.lower()
+        if lower in _FOLDER_SIDECAR_FILES or lower.endswith(".cue"):
+            return True
+    return False
+
+
 def _split_folder_units(walk_root: str, audio_paths: list[str]) -> list[tuple[str, list[str], str]]:
     """Split audio files inside `walk_root` into `(source_root, tracks, output_path)` book units."""
     if len(audio_paths) == 1:
@@ -78,13 +93,24 @@ def _split_folder_units(walk_root: str, audio_paths: list[str]) -> list[tuple[st
     all_m4b = all(os.path.splitext(p)[1].lower() in (".m4b", ".m4a") for p in audio_paths)
     if all_m4b:
         albums = set()
+        has_track_num = False
         for p in audio_paths:
             tag = read_track_tags(p)
             alb = (tag.album or "").strip().lower()
             if alb:
                 albums.add(alb)
-        # Multiple standalone .m4b books placed together in one folder
-        if len(albums) != 1:
+            if tag.track_number is not None:
+                has_track_num = True
+        # Multiple standalone .m4b/.m4a books in one folder (distinct album tags)
+        if len(albums) > 1:
+            return [(p, [p], p) for p in audio_paths]
+        # Completely untagged standalone .m4b files without track numbers, .m4a parts, or folder sidecars
+        if (
+            not albums
+            and not has_track_num
+            and not any(os.path.splitext(p)[1].lower() == ".m4a" for p in audio_paths)
+            and not _has_book_sidecar(walk_root)
+        ):
             return [(p, [p], p) for p in audio_paths]
 
     return [(walk_root, audio_paths, walk_root)]

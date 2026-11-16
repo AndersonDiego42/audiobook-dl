@@ -368,3 +368,30 @@ def test_podimo_main_m3u8_chapters_search_and_library(tmp_path):
     lib = src.list_library()
     assert len(lib) == 1
     assert lib[0].url == "https://open.podimo.com/audiobook/ab2"
+
+
+def test_podimo_one_hop_and_307_share_redirects_and_extended_metadata(tmp_path):
+    src = _make_source(tmp_path)
+    src._session.get = MagicMock(
+        return_value=MagicMock(
+            status_code=307,
+            headers={"Location": "https://open.podimo.com/audiobook/ab-307"},
+        )
+    )
+    assert src.retrieve_id_from_share_link("https://share.podimo.com/s/onehop") == ("audiobook", "ab-307")
+
+    meta = src.format_audiobook_metadata(
+        {
+            "title": "Podimo Rich",
+            "authors": [{"name": "A"}],
+            "narrators": [{"name": "N"}],
+            "description": "Desc",
+            "yearOfBookPublication": 2022,
+            "publisherName": "Podimo Publishing",
+            "language": {"isoLanguage": "da", "localisedLanguage": "Dansk"},
+        }
+    )
+    assert meta.publisher == "Podimo Publishing"
+    assert meta.release_date == date(2022, 1, 1)
+    assert meta.language is not None and meta.language.alpha_3 == "dan"
+

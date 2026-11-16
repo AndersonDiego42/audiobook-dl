@@ -146,6 +146,23 @@ def _segment_extension(uri: str) -> str:
     return os.path.splitext(path)[1][1:]
 
 
+def _parse_hls_byterange(raw: str, default_offset: int | None = None) -> tuple[int, int]:
+    """Parse an HLS `BYTERANGE` value (`len@offset` or `len`) into `(start, end)` inclusive."""
+    text = raw.strip()
+    if "@" in text:
+        length_str, offset_str = text.split("@", 1)
+        length = int(length_str)
+        start = int(offset_str)
+    else:
+        if default_offset is None:
+            raise ValueError(f"HLS BYTERANGE {raw!r} omits offset with no prior segment offset")
+        length = int(text)
+        start = default_offset
+    if length <= 0 or start < 0:
+        raise ValueError(f"Invalid HLS BYTERANGE {raw!r}")
+    return start, start + length - 1
+
+
 def get_stream_files(
     self,
     url: str,
@@ -174,13 +191,45 @@ def get_stream_files(
 
     media_sequence = playlist.media_sequence or 0
     files = []
+    init_cache: dict[tuple[str, str | None], bytes] = {}
+    last_byterange_end: dict[str, int] = {}
+
     for idx, seg in enumerate(playlist.segments):
         seg_ext = extension if extension is not None else _segment_extension(seg.absolute_uri)
+        seg_headers = dict(base_headers)
+
+        raw_byterange = getattr(seg, "byterange", None)
+        if raw_byterange:
+            prev_end = last_byterange_end.get(seg.absolute_uri)
+            start, end = _parse_hls_byterange(str(raw_byterange), default_offset=prev_end)
+            last_byterange_end[seg.absolute_uri] = end + 1
+            seg_headers["Range"] = f"bytes={start}-{end}"
+
+        init_bytes: bytes | None = None
+        init_section = getattr(seg, "init_section", None)
+        if init_section is not None and getattr(init_section, "absolute_uri", None):
+            init_uri = str(init_section.absolute_uri)
+            init_range = getattr(init_section, "byterange", None)
+            cache_key = (init_uri, str(init_range) if init_range else None)
+            if cache_key not in init_cache:
+                init_headers = dict(base_headers)
+                if init_range:
+                    init_start, init_end = _parse_hls_byterange(str(init_range), default_offset=0)
+                    init_headers["Range"] = f"bytes={init_start}-{init_end}"
+                    resp = self.request("GET", init_uri, headers=init_headers)
+                    if resp.status_code not in (200, 206):
+                        _raise_for_failed_response(init_uri, resp)
+                    init_cache[cache_key] = resp.content
+                else:
+                    init_cache[cache_key] = self.get(init_uri, headers=init_headers)
+            init_bytes = init_cache[cache_key]
+
         current = AudiobookFile(
             url=seg.absolute_uri,
             ext=seg_ext,
-            headers=dict(base_headers),
+            headers=seg_headers,
             expected_content_type=expected_content_type,
+            init_section=init_bytes,
         )
         if seg.key is not None and getattr(seg.key, "method", None) not in (None, "NONE"):
             if seg.key.iv is not None:

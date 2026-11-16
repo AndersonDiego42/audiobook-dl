@@ -60,7 +60,7 @@ svg_headphone_path = "M8.25 12.371h-.625c-1.38 0-2.5 1.121-2.5 2.505v3.12a2.503 
 
 class StorytelSource(Source):
     match = [
-        r"https?://(?:www.)?(?:storytel|mofibo).com/(?P<language>\w+)(?:/(?P<language2>\w+))?/(?P<list_type>(?:books|series|authors|narrators|publishers|categories))/.+",
+        r"https?://(?:www\.)?(?:storytel|mofibo)\.com/(?:(?P<language>\w+)(?:/(?P<language2>\w+))?/)?(?P<list_type>(?:books|series|authors|narrators|publishers|categories))/.+",
         # The user's own bookshelf ("want to read"); dispatched in download().
         # Allows one or two locale segments (e.g. /se/ or /se/sv/).
         r"https?://(?:www\.)?(?:storytel|mofibo)\.com/\w+(?:/\w+)?/(?:want-to-read|bookshelf)/?$",
@@ -208,13 +208,14 @@ class StorytelSource(Source):
 
         if m := re.match(self.match[0], url):
             language, language2, list_type = m.groups()
+            effective_lang = language or getattr(self, "_language", None) or "en"
             logging.debug(f"download: {url=}, {list_type=}, {language=}, {language2=}")
             # individual books
             if list_type == "books":
                 return self.download_book_from_url(url)
             # use API when possible
             elif list_type in ("series", "authors", "narrators"):
-                return self.download_lists_api(url, list_type, language)
+                return self.download_lists_api(url, list_type, effective_lang)
             # some lists are not avaialble via the API, use website scrapting
             else:
                 return self.download_books_from_website(url)
@@ -431,7 +432,10 @@ class StorytelSource(Source):
         parsed = parse_url(url)
         if parsed.path is None:
             raise DataNotPresent
-        return parsed.path.split("-")[-1]
+        segment = parsed.path.rstrip("/").split("/")[-1]
+        if not segment:
+            raise DataNotPresent
+        return segment.split("-")[-1]
 
     @staticmethod
     def _update_metadata(
@@ -765,6 +769,25 @@ class StorytelSource(Source):
     supports_library = True
     supports_search = True
 
+    def _book_url(self, book_id: str, model: dict[str, Any] | None = None) -> str:
+        """Build a routable Storytel book URL using `shareUrl` or a locale-prefixed fallback."""
+        if isinstance(model, dict):
+            share_url = model.get("shareUrl")
+            if isinstance(share_url, str) and share_url.strip():
+                cleaned = self._clean_share_url(share_url.strip())
+                if re.match(self.match[0], cleaned):
+                    return cleaned
+            raw_lang = model.get("language")
+        else:
+            raw_lang = None
+        model_lang = (
+            raw_lang.strip()
+            if isinstance(raw_lang, str) and re.fullmatch(r"\w+", raw_lang.strip())
+            else None
+        )
+        lang = getattr(self, "_language", None) or model_lang or "en"
+        return f"https://www.storytel.com/{lang}/books/{book_id}"
+
     def search(self, query: str) -> list[CatalogBook]:
         cleaned = query.strip()
         if not cleaned:
@@ -794,11 +817,10 @@ class StorytelSource(Source):
             author_names = [
                 str(a.get("name") or "") for a in authors_raw if isinstance(a, dict) and a.get("name")
             ]
-            url = model.get("shareUrl") or f"https://www.storytel.com/books/{book_id}"
             results.append(
                 CatalogBook(
                     title=title,
-                    url=str(url),
+                    url=self._book_url(str(book_id), model),
                     author=", ".join(author_names),
                     source="storytel",
                 )
@@ -821,7 +843,7 @@ class StorytelSource(Source):
             results.append(
                 CatalogBook(
                     title=title,
-                    url=f"https://www.storytel.com/books/{book_id}",
+                    url=self._book_url(str(book_id), model),
                     author=", ".join(a for a in author_names if a),
                     source="storytel",
                 )

@@ -95,6 +95,8 @@ def add_chapters_ffmpeg(
         logging.log("ffmpeg not found; skipping chapter embedding")
         return
     stem, ext = os.path.splitext(filepath)
+    container_ext = ext.lstrip(".").lower()
+    faststart_args = ["-movflags", "+faststart"] if container_ext in utils.MP4_CONTAINERS else []
     tmp_chapter_file = f"{filepath}.chapters.tmp.txt"
     tmp_media_file = f"{stem}.tmp{ext or '.mp4'}"
     capture = not logging.is_ffmpeg_output()
@@ -109,6 +111,7 @@ def add_chapters_ffmpeg(
              "-c", "copy",
              "-map", "0",
              "-metadata:s:a:0", "title=",
+             *faststart_args,
              tmp_media_file],
             capture_output=capture,
             cancel_event=cancel_event,
@@ -130,6 +133,7 @@ def add_chapters_ffmpeg(
                  *_build_fallback_codec_args(filepath, audio_bitrate),
                  "-map", "0",
                  "-metadata:s:a:0", "title=",
+                 *faststart_args,
                  tmp_media_file],
                 capture_output=capture,
                 cancel_event=cancel_event,

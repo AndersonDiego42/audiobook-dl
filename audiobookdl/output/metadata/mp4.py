@@ -2,6 +2,7 @@ import os
 from datetime import date
 
 from audiobookdl import AudiobookMetadata, Cover
+from audiobookdl.utils.audiobook import TrackTagContext
 from ._cover import normalize_cover_image
 from mutagen.mp4 import MP4, MP4Cover, MP4FreeForm
 
@@ -56,6 +57,7 @@ def add_mp4_metadata(
     filepath: str,
     metadata: AudiobookMetadata,
     cover: Cover | None = None,
+    track_context: TrackTagContext | None = None,
 ) -> bool:
     """Add mp4 metadata tags (and optional cover art) in a single save pass."""
     mp4_cover = _build_mp4_cover(cover) if cover is not None else None
@@ -73,8 +75,20 @@ def add_mp4_metadata(
         elif key == "language":
             atom, val = _freeform_atom("Language", value.alpha_3)
             audio[atom] = val
+        elif key == "series":
+            atom, val = _freeform_atom("SERIES", str(value))
+            audio[atom] = val
+            if track_context is None:
+                audio["\xa9alb"] = [str(value)]
         elif key == "series_order":
-            if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 65535:
+            atom, val = _freeform_atom("SERIES-PART", str(value))
+            audio[atom] = val
+            if (
+                track_context is None
+                and isinstance(value, int)
+                and not isinstance(value, bool)
+                and 0 <= value <= 65535
+            ):
                 audio["trkn"] = [(value, 0)]
         elif key in MP4_TEXT_ATOMS:
             audio[MP4_TEXT_ATOMS[key]] = value if isinstance(value, list) else [str(value)]
@@ -82,6 +96,14 @@ def add_mp4_metadata(
             freeform_name = MP4_FREEFORM_NAMES.get(key, key.capitalize())
             atom, val = _freeform_atom(freeform_name, str(value))
             audio[atom] = val
+    if track_context is not None:
+        audio["\xa9nam"] = [track_context.title]
+        album_name = track_context.album or metadata.title
+        if album_name:
+            audio["\xa9alb"] = [album_name]
+        audio["trkn"] = [(track_context.track_number, track_context.total_tracks)]
+    elif not metadata.series and metadata.title:
+        audio["\xa9alb"] = [metadata.title]
     if mp4_cover is not None:
         audio["covr"] = [mp4_cover]
     audio.save(padding=lambda _info: 16384)

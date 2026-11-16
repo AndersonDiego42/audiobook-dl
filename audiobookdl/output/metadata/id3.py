@@ -1,21 +1,50 @@
 import os
 from audiobookdl import logging, Chapter, AudiobookMetadata, Cover
+from audiobookdl.utils.audiobook import TrackTagContext
 from ._chapters import build_bounded_chapters
 from ._cover import normalize_cover_image
 
 from mutagen import File as MutagenFile
 from mutagen.easyid3 import EasyID3, EasyID3KeyError
 from mutagen.mp3 import MP3
-from mutagen.id3 import ID3, APIC, CHAP, TIT2, CTOC, CTOCFlags, WCOM, ID3NoHeaderError
+from mutagen.id3 import ID3, APIC, CHAP, COMM, TIT2, CTOC, CTOCFlags, WCOM, ID3NoHeaderError
 from requests import utils
 
 from typing import Any
 from collections.abc import Sequence
 
-EasyID3.RegisterTextKey("comment", "COMM")
+def _comment_get(id3: Any, key: str) -> list[str]:
+    comments = [
+        str(t)
+        for frame in id3.getall("COMM")
+        for t in getattr(frame, "text", [])
+        if str(t)
+    ]
+    if comments:
+        return comments
+    raise EasyID3KeyError(key)
+
+
+def _comment_set(id3: Any, key: str, value: Sequence[str]) -> None:
+    id3.delall("COMM")
+    texts = [str(v) for v in value if str(v)]
+    if texts:
+        id3.add(COMM(encoding=3, lang="eng", desc="", text=texts))
+
+
+def _comment_delete(id3: Any, key: str) -> None:
+    id3.delall("COMM")
+
+
+EasyID3.RegisterKey("comment", _comment_get, _comment_set, _comment_delete)
 EasyID3.RegisterTextKey("year", "TYER")
-EasyID3.RegisterTextKey("originalreleaseyear", "TORY")
-for _easy_key, _txxx_desc in (("isbn", "ISBN"), ("asin", "ASIN"), ("source", "Source")):
+for _easy_key, _txxx_desc in (
+    ("isbn", "ISBN"),
+    ("asin", "ASIN"),
+    ("source", "Source"),
+    ("series_tag", "SERIES"),
+    ("series_part", "SERIES-PART"),
+):
     EasyID3.RegisterTXXXKey(_easy_key, _txxx_desc)
 
 def commercialurl_get(id3: Any, key: str) -> list[str]:
@@ -64,7 +93,11 @@ def is_id3_file(filepath: str) -> bool:
     return ext in ID3_FORMATS
 
 
-def add_id3_metadata(filepath: str, metadata: AudiobookMetadata) -> None:
+def add_id3_metadata(
+    filepath: str,
+    metadata: AudiobookMetadata,
+    track_context: TrackTagContext | None = None,
+) -> None:
     """Add ID3 metadata tags to the given audio file"""
     audio = MP3(filepath, ID3=EasyID3)
     # Adding tags
@@ -79,12 +112,26 @@ def add_id3_metadata(filepath: str, metadata: AudiobookMetadata) -> None:
         elif key == "narrators":
             audio["composer"] = value
             audio["performer"] = value
+        elif key == "series":
+            audio["series_tag"] = value
+            if track_context is None:
+                audio["album"] = value
         elif key == "series_order":
-            audio["tracknumber"] = str(value)
+            audio["series_part"] = str(value)
+            if track_context is None:
+                audio["tracknumber"] = str(value)
         elif key in ID3_CONVERT:
             audio[ID3_CONVERT[key]] = value
         elif key in EasyID3.valid_keys.keys():
             audio[key] = value
+    if track_context is not None:
+        audio["title"] = track_context.title
+        album_name = track_context.album or metadata.title
+        if album_name:
+            audio["album"] = album_name
+        audio["tracknumber"] = f"{track_context.track_number}/{track_context.total_tracks}"
+    elif not metadata.series and metadata.title:
+        audio["album"] = metadata.title
     audio.save(v2_version=4)
 
 

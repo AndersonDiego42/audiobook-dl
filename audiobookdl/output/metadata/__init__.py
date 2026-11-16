@@ -1,6 +1,7 @@
 from . import id3, mp4, ffmpeg, vorbis
 from audiobookdl import logging, Chapter, AudiobookMetadata, Cover
 from audiobookdl.utils import program_in_path
+from audiobookdl.utils.audiobook import TrackTagContext
 
 import os
 import threading
@@ -10,18 +11,19 @@ def add_metadata(
     filepath: str,
     metadata: AudiobookMetadata,
     cover: Cover | None = None,
+    track_context: TrackTagContext | None = None,
 ) -> bool:
     """Adds metadata (and optional cover art where supported inline) to `filepath`.
 
     Returns ``True`` if ``cover`` was embedded in the same save pass.
     """
     if id3.is_id3_file(filepath):
-        id3.add_id3_metadata(filepath, metadata)
+        id3.add_id3_metadata(filepath, metadata, track_context=track_context)
         return False
     elif mp4.is_mp4_file(filepath):
-        return mp4.add_mp4_metadata(filepath, metadata, cover=cover)
+        return mp4.add_mp4_metadata(filepath, metadata, cover=cover, track_context=track_context)
     elif vorbis.is_vorbis_file(filepath):
-        return vorbis.add_vorbis_metadata(filepath, metadata, cover=cover)
+        return vorbis.add_vorbis_metadata(filepath, metadata, cover=cover, track_context=track_context)
     else:
         logging.debug("Could not add any metadata")
         return False

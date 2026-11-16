@@ -20,7 +20,7 @@ import re
 import os
 import weakref
 from dataclasses import dataclass
-from http.cookiejar import MozillaCookieJar
+from http.cookiejar import CookieJar, MozillaCookieJar
 from typing import TYPE_CHECKING, Any, TypeVar, Generic
 from ssl import SSLContext
 import urllib3
@@ -142,13 +142,26 @@ class Source(Generic[T]):
 
 
     def load_cookie_file(self, cookie_file: str):
-        """Loads cookies from a cookie file into session"""
+        """Loads non-expired cookies from a cookie file into session"""
         if self.supports_cookies:
             logging.debug(f"Loading cookies from '{cookie_file}'")
             cookie_jar = MozillaCookieJar()
             cookie_jar.load(cookie_file, ignore_discard=True, ignore_expires=True)
-            update_session_cookies(self._session, cookie_jar)
-            self.__authenticated = True
+            valid_jar = CookieJar()
+            valid_count = 0
+            for cookie in cookie_jar:
+                # Netscape format serializes session cookies with expires=0.
+                is_expired = bool(
+                    cookie.expires is not None and cookie.expires > 0 and cookie.is_expired()
+                )
+                if not is_expired:
+                    valid_jar.set_cookie(cookie)
+                    valid_count += 1
+            if valid_count > 0:
+                update_session_cookies(self._session, valid_jar)
+                self.__authenticated = True
+            else:
+                logging.debug(f"No valid non-expired cookies found in '{cookie_file}'")
 
     def cached_cookie_path(self) -> str:
         """Return the per-source, per-profile persistent session cookie jar file path."""

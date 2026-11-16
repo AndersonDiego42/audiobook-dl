@@ -12,6 +12,7 @@ from lxml import etree
 from .source import Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover
 from audiobookdl.exceptions import BookNotFound
+from audiobookdl.utils.audiobook import parse_language
 
 _AUDIO_MIME_TO_EXT = {
     "audio/mpeg": "mp3",
@@ -215,10 +216,7 @@ class RssSource(Source):
             meta.description = desc
         lang = _find_child_text(container, ("language",))
         if lang:
-            try:
-                meta.add_language(lang)
-            except Exception:
-                pass
+            meta.language = parse_language(lang)
         cover = self._extract_cover(container, url)
 
         files: list[AudiobookFile] = []

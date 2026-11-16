@@ -16,10 +16,9 @@ from mutagen import File as MutagenFile
 from mutagen.flac import FLAC, Picture
 from mutagen.id3 import ID3
 from mutagen.mp4 import MP4, MP4Cover
-import pycountry
 
 from audiobookdl import AudiobookMetadata, Chapter, Cover
-from audiobookdl.utils.audiobook import parse_release_date
+from audiobookdl.utils.audiobook import parse_language, parse_release_date
 
 
 _AUDIO_COVER_CANDIDATES = (
@@ -92,17 +91,7 @@ def _parse_series_order(raw: Any) -> int | None:
     return int(num) if num.is_integer() else None
 
 
-def _parse_language(raw: Any) -> Any:
-    text = str(raw or "").strip()
-    if not text:
-        return None
-    try:
-        return pycountry.languages.lookup(text)
-    except LookupError:
-        return None
-
-
-def _clean_text_list(values: Any) -> list[str]:
+def _clean_text_list(values: Any, *, split_semicolons: bool = True) -> list[str]:
     if values is None:
         return []
     if isinstance(values, (str, bytes)):
@@ -116,7 +105,8 @@ def _clean_text_list(values: Any) -> list[str]:
         raw_items = [str(values)]
     out: list[str] = []
     for item in raw_items:
-        for part in re.split(r"\s*;\s*", item.strip()):
+        parts = re.split(r"\s*;\s*", item.strip()) if split_semicolons else [item.strip()]
+        for part in parts:
             cleaned = part.strip()
             if cleaned and cleaned not in out:
                 out.append(cleaned)
@@ -124,7 +114,7 @@ def _clean_text_list(values: Any) -> list[str]:
 
 
 def _first_text(values: Any) -> str | None:
-    items = _clean_text_list(values)
+    items = _clean_text_list(values, split_semicolons=False)
     return items[0] if items else None
 
 
@@ -209,7 +199,7 @@ def _read_id3_tags(filepath: str) -> TrackTagInfo:
 
     lang_raw = _first_text(_frame_texts("TLAN"))
     if lang_raw:
-        meta.language = _parse_language(lang_raw)
+        meta.language = parse_language(lang_raw)
 
     apics = tags.getall("APIC")
     if apics:
@@ -280,7 +270,7 @@ def _read_mp4_tags(filepath: str) -> TrackTagInfo:
 
     lang_raw = _decode_mp4_freeform(freeform_ci.get("language"))
     if lang_raw:
-        meta.language = _parse_language(lang_raw)
+        meta.language = parse_language(lang_raw)
 
     covr = tags.get("covr")
     if covr:
@@ -304,7 +294,7 @@ def _read_vorbis_tags(filepath: str) -> TrackTagInfo:
     if tags:
         for k, v in tags.items():
             key_lower = str(k).lower()
-            tag_ci[key_lower] = _clean_text_list(v)
+            tag_ci[key_lower] = _clean_text_list(v, split_semicolons=False)
 
     info.track_number = _parse_int_prefix(_first_text(tag_ci.get("tracknumber")))
     info.disc_number = _parse_int_prefix(_first_text(tag_ci.get("discnumber")))
@@ -331,7 +321,7 @@ def _read_vorbis_tags(filepath: str) -> TrackTagInfo:
 
     lang_raw = _first_text(tag_ci.get("language"))
     if lang_raw:
-        meta.language = _parse_language(lang_raw)
+        meta.language = parse_language(lang_raw)
 
     if isinstance(audio, FLAC) and getattr(audio, "pictures", None):
         pics = audio.pictures
@@ -445,7 +435,7 @@ def _parse_metadata_json(path: str) -> tuple[AudiobookMetadata | None, list[Chap
     if rel_date_raw:
         meta.release_date = parse_release_date(str(rel_date_raw))
     if payload.get("language"):
-        meta.language = _parse_language(payload["language"])
+        meta.language = parse_language(payload["language"])
 
     chapters: list[Chapter] = []
     raw_chapters = payload.get("chapters")
@@ -511,7 +501,7 @@ def _parse_opf_file(path: str, base_dir: str) -> tuple[AudiobookMetadata | None,
         elif lname == "date" and text and meta.release_date is None:
             meta.release_date = parse_release_date(text)
         elif lname == "language" and text and meta.language is None:
-            meta.language = _parse_language(text)
+            meta.language = parse_language(text)
         elif lname == "subject" and text:
             if text not in meta.genres:
                 meta.add_genre(text)

@@ -166,3 +166,50 @@ def test_scan_local_library_closes_batch_connection_and_dedupes_via_index(tmp_pa
         res2 = scan_local_library([str(lib_root)], archive)
         assert res2.matched == 1
         assert archive._conn is None
+
+
+def test_split_folder_units_groups_m4a_parts_and_splits_distinct_m4b(tmp_path):
+    from audiobookdl.utils.library_scanner import _split_folder_units
+
+    # Untagged multi-part .m4a should stay grouped as 1 multi-file book
+    m4a_dir = tmp_path / "M4ABook"
+    m4a_dir.mkdir()
+    m4a_1 = m4a_dir / "01.m4a"
+    m4a_2 = m4a_dir / "02.m4a"
+    m4a_1.write_bytes(b"a1")
+    m4a_2.write_bytes(b"a2")
+
+    with patch("audiobookdl.utils.library_scanner.read_track_tags", return_value=TrackTagInfo()):
+        units = _split_folder_units(str(m4a_dir), [str(m4a_1), str(m4a_2)])
+    assert len(units) == 1
+    assert units[0][1] == [str(m4a_1), str(m4a_2)]
+
+    # Untracked standalone .m4b without sidecars/album/track_number splits into individual books
+    m4b_dir = tmp_path / "M4BShelf"
+    m4b_dir.mkdir()
+    m4b_1 = m4b_dir / "book1.m4b"
+    m4b_2 = m4b_dir / "book2.m4b"
+    m4b_1.write_bytes(b"b1")
+    m4b_2.write_bytes(b"b2")
+
+    with patch("audiobookdl.utils.library_scanner.read_track_tags", return_value=TrackTagInfo()):
+        m4b_units = _split_folder_units(str(m4b_dir), [str(m4b_1), str(m4b_2)])
+    assert len(m4b_units) == 2
+
+    # Adding track numbers keeps multi-part .m4b grouped as 1 book
+    with patch(
+        "audiobookdl.utils.library_scanner.read_track_tags",
+        return_value=TrackTagInfo(track_number=1),
+    ):
+        grouped_m4b = _split_folder_units(str(m4b_dir), [str(m4b_1), str(m4b_2)])
+    assert len(grouped_m4b) == 1
+
+    # Distinct album tags split even when track numbers are present
+    tags = {
+        str(m4b_1): TrackTagInfo(track_number=1, album="Alpha"),
+        str(m4b_2): TrackTagInfo(track_number=1, album="Beta"),
+    }
+    with patch("audiobookdl.utils.library_scanner.read_track_tags", side_effect=lambda p: tags[p]):
+        distinct_m4b = _split_folder_units(str(m4b_dir), [str(m4b_1), str(m4b_2)])
+    assert len(distinct_m4b) == 2
+

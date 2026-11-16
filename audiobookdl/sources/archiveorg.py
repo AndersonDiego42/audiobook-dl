@@ -10,6 +10,7 @@ from urllib.parse import quote
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover
 from audiobookdl.exceptions import BookNotFound, RequestError
+from audiobookdl.utils.audiobook import parse_language, parse_release_date
 
 # Higher value = preferred container/encoding when Archive.org stores derived variants for one stem.
 _FORMAT_PRIORITY: dict[str, int] = {
@@ -77,7 +78,7 @@ class ArchiveOrgSource(Source):
 
     def _select_audio_files(self, raw_files: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Deduplicate derived transcodes per stem, picking highest-priority audio per track."""
-        by_stem: dict[str, tuple[int, dict[str, Any]]] = {}
+        by_stem: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
         for entry in raw_files:
             if not isinstance(entry, dict):
                 continue
@@ -86,18 +87,57 @@ class ArchiveOrgSource(Source):
                 continue
             ext = os.path.splitext(name)[1].lstrip(".").lower()
             fmt = str(entry.get("format") or "").strip().lower()
-            if fmt in ("64kbps mp3", "128kbps mp3") and name.lower().endswith("_64kb.mp3"):
+            name_lower = name.lower()
+            if fmt == "64kbps mp3" or name_lower.endswith("_64kb.mp3"):
                 priority = 20
+            elif fmt == "128kbps mp3" or name_lower.endswith("_128kb.mp3"):
+                priority = 30
             else:
                 priority = _FORMAT_PRIORITY.get(fmt) or _FORMAT_PRIORITY.get(ext, 0)
             if priority <= 0:
                 continue
-            base_stem = re.sub(r"_64kb$", "", os.path.splitext(name)[0], flags=re.IGNORECASE).lower()
+            raw_stem = os.path.splitext(name)[0]
+            orig_name = str(entry.get("original") or "").strip()
+            if orig_name:
+                orig_ext = os.path.splitext(orig_name)[1].lstrip(".").lower()
+                if orig_ext in _FORMAT_PRIORITY:
+                    raw_stem = os.path.splitext(orig_name)[0]
+            base_stem = re.sub(r"_(?:64kb|128kb|vbr)$", "", raw_stem, flags=re.IGNORECASE).lower()
+            source_rank = 0 if str(entry.get("source") or "").strip().lower() == "derivative" else 1
+            rank = (priority, source_rank)
             existing = by_stem.get(base_stem)
-            if existing is None or priority > existing[0]:
-                by_stem[base_stem] = (priority, entry)
+            if existing is None or rank > existing[0]:
+                by_stem[base_stem] = (rank, entry)
 
         selected = [pair[1] for pair in by_stem.values()]
+
+        # If an item has both a whole-book .m4b and multiple chapter tracks (.mp3/.ogg/.flac),
+        # keep only the .m4b container so the book is not downloaded twice.
+        m4b_items = [
+            e for e in selected
+            if os.path.splitext(str(e.get("name") or ""))[1].lstrip(".").lower() == "m4b"
+            or str(e.get("format") or "").strip().lower() == "m4b"
+        ]
+        other_items = [e for e in selected if e not in m4b_items]
+        if len(m4b_items) >= 1 and len(other_items) >= 2:
+            def _track_nums(items: list[dict[str, Any]]) -> set[int]:
+                nums: set[int] = set()
+                for item in items:
+                    raw_t = str(item.get("track") or "").split("/", 1)[0].strip()
+                    if raw_t.isdigit():
+                        nums.add(int(raw_t))
+                return nums
+
+            m4b_tracks = _track_nums(m4b_items)
+            other_tracks = _track_nums(other_items)
+            is_disjoint_sequence = bool(
+                m4b_tracks
+                and other_tracks
+                and not (m4b_tracks & other_tracks)
+                and (max(m4b_tracks) < min(other_tracks) or max(other_tracks) < min(m4b_tracks))
+            )
+            if not is_disjoint_sequence:
+                selected = m4b_items
 
         def _track_key(item: dict[str, Any]) -> tuple[int, int, tuple[Any, ...]]:
             raw_track = str(item.get("track") or "").split("/", 1)[0].strip()
@@ -211,21 +251,13 @@ class ArchiveOrgSource(Source):
         if isinstance(raw_lang, list) and raw_lang:
             raw_lang = raw_lang[0]
         if raw_lang:
-            try:
-                meta.add_language(str(raw_lang))
-            except Exception:
-                pass
+            meta.language = parse_language(raw_lang)
 
         raw_date = md.get("date") or md.get("year")
         if isinstance(raw_date, list) and raw_date:
             raw_date = raw_date[0]
         if raw_date:
-            from dateutil.parser import parse as parse_dt
-
-            try:
-                meta.release_date = parse_dt(str(raw_date)).date()
-            except Exception:
-                pass
+            meta.release_date = parse_release_date(raw_date)
 
         if md.get("publisher"):
             pub = md["publisher"][0] if isinstance(md["publisher"], list) else md["publisher"]

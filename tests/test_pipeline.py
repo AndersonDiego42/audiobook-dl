@@ -712,7 +712,7 @@ def test_search_service_librivox_and_list_service_library_storytel(tmp_path, mon
     assert len(st_results) == 1
     assert st_results[0].title == "Shelf Book"
     assert st_results[0].author == "A. Writer"
-    assert st_results[0].url == "https://www.storytel.com/books/99"
+    assert st_results[0].url == "https://www.storytel.com/en/books/99"
 
 
 def test_apply_runtime_options_media_type_precedence():

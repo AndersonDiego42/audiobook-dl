@@ -1,6 +1,9 @@
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover
 from audiobookdl.exceptions import RequestError
+from audiobookdl.utils.audiobook import parse_language, parse_release_date
+
+from datetime import date
 
 import lxml.html
 import re
@@ -88,9 +91,9 @@ class LibrivoxSource(Source):
         authors: list[str] = []
         narrators: list[str] = []
         genres: list[str] = []
-        language: str | None = None
+        language: Any = None
         description: str | None = None
-        release_date: str | None = None
+        release_date: date | None = None
 
         if isinstance(api_book, dict):
             if api_book.get("title"):
@@ -116,10 +119,10 @@ class LibrivoxSource(Source):
                     if g_name and g_name not in genres:
                         genres.append(g_name)
             if api_book.get("language"):
-                language = str(api_book["language"]).strip() or None
+                language = parse_language(api_book["language"])
             description = _strip_html(api_book.get("description"))
             if api_book.get("copyright_year"):
-                release_date = str(api_book["copyright_year"]).strip() or None
+                release_date = parse_release_date(api_book["copyright_year"])
 
         if not authors:
             for elem in tree.cssselect(".book-page-author a, .product-details a[href*='/author/']"):

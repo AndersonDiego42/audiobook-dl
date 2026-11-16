@@ -44,6 +44,8 @@ def decrypt_file(
     path: str,
     encryption_method: AudiobookFileEncryption,
     output_path: str | None = None,
+    *,
+    prefix: bytes = b"",
 ) -> None:
     """Decrypt encrypted file in place, or atomically into `output_path` when provided."""
     if isinstance(encryption_method, AESEncryption):
@@ -52,6 +54,7 @@ def decrypt_file(
             encryption_method.key,
             encryption_method.iv,
             output_path=output_path,
+            prefix=prefix,
         )
     else:
         raise ValueError(f"Unsupported encryption method: {type(encryption_method).__name__}")
@@ -62,6 +65,8 @@ def decrypt_file_aes(
     key: bytes,
     iv: bytes,
     output_path: str | None = None,
+    *,
+    prefix: bytes = b"",
 ) -> None:
     """Stream-decrypt a PKCS7-padded AES-CBC file via a sibling temp file and replace atomically."""
     target = output_path or path
@@ -69,6 +74,8 @@ def decrypt_file_aes(
     decryptor = AESStreamDecryptor(key, iv)
     try:
         with open(path, "rb") as src, open(tmp_path, "wb") as dst:
+            if prefix:
+                dst.write(prefix)
             while True:
                 chunk = src.read(DECRYPT_CHUNK_SIZE)
                 if not chunk:

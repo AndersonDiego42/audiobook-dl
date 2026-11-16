@@ -67,6 +67,7 @@ def test_blinkist_source_parses_api_fixtures(tmp_path):
             "id": "b1",
             "title": "Blink Book",
             "author": "Jane Doe",
+            "language": "en",
             "cover": {"default": {"src": "https://cdn.blinkist.com/cover.jpg"}},
         },
         "chapters": [{"id": "c1"}, {"id": "c2"}],
@@ -88,6 +89,7 @@ def test_blinkist_source_parses_api_fixtures(tmp_path):
     book = src.download("https://www.blinkist.com/en/nc/reader/blink-slug?lang=en")
     assert book.metadata.title == "Blink Book"
     assert book.metadata.authors == ["Jane Doe"]
+    assert book.metadata.language is not None and book.metadata.language.alpha_3 == "eng"
     assert [f.url for f in book.files] == [
         "https://cdn.blinkist.com/c1.m4a",
         "https://cdn.blinkist.com/c2.m4a",
@@ -108,6 +110,7 @@ def test_bookbeat_source_login_and_download(tmp_path):
     }
     book_meta = {
         "title": "BookBeat Novel",
+        "language": "sv",
         "cover": "https://cdn.bookbeat.com/42.jpg",
         "editions": [
             {
@@ -146,9 +149,11 @@ def test_bookbeat_source_login_and_download(tmp_path):
     )
     src.login("https://www.bookbeat.com/book/42", username="u", password="p")
     book = src.download("https://www.bookbeat.com/book/42")
+    assert isinstance(book, Audiobook)
     assert book.metadata.title == "BookBeat Novel"
     assert book.metadata.authors == ["Ada Lovelace"]
     assert book.metadata.narrators == ["Grace Hopper"]
+    assert book.metadata.language is not None and book.metadata.language.alpha_3 == "swe"
     assert [c.start for c in book.chapters] == [0, 15000]
     assert book.files[0].url == "https://cdn.bookbeat.com/42.mp4"
 
@@ -160,6 +165,7 @@ def test_ereolen_source_parses_graphql_and_hls_fixtures(tmp_path):
             "work": {
                 "titles": {"full": ["Danish Audiobook"]},
                 "creators": [{"display": "Author A"}],
+                "mainLanguages": [{"isoCode": "dan", "display": "Dansk"}],
                 "manifestations": {
                     "all": [
                         {
@@ -191,6 +197,7 @@ def test_ereolen_source_parses_graphql_and_hls_fixtures(tmp_path):
     book = src.download("https://ereolen.dk/work/work-of:870970-basis:12345")
     assert book.metadata.title == "Danish Audiobook"
     assert book.metadata.authors == ["Author A"]
+    assert book.metadata.language is not None and book.metadata.language.alpha_3 == "dan"
     assert len(book.files) == 1
     assert book.files[0].url == "https://audio.api.streaming.pubhub.dk/v1/stream/hls/ord-99/part0.ts"
 
@@ -223,6 +230,7 @@ def test_overdrive_source_parses_bdata_fixture(tmp_path):
         ]
     )
     book = src.download("https://sample.listen.overdrive.com/")
+    assert isinstance(book, Audiobook)
     assert book.metadata.title == "Overdrive Title"
     assert book.metadata.authors == ["Writer X"]
     assert book.metadata.narrators == ["Voice Y"]
@@ -324,6 +332,8 @@ def test_saxo_source_login_search_and_download(tmp_path):
                     "authors": ["S Author"],
                     "readBy": ["S Narrator"],
                     "seriesName": "S Series",
+                    "language": "Dansk",
+                    "publishingDate": "2023-09-10T00:00:00Z",
                     "image": {"highQualityImageUrl": "https://saxo.com/c.jpg"},
                 },
             }
@@ -347,6 +357,8 @@ def test_saxo_source_login_search_and_download(tmp_path):
     book = src.download("https://www.saxo.com/dk/book_9781234567890")
     assert book.metadata.title == "Saxo Book"
     assert book.metadata.series == "S Series"
+    assert book.metadata.language is not None and book.metadata.language.alpha_3 == "dan"
+    assert book.metadata.release_date == date(2023, 9, 10)
     assert book.files[0].url == "https://stream.saxo.com/ch01.mp3"
     assert book.files[0].encryption_method is not None
 
@@ -442,6 +454,8 @@ def test_everand_source_parses_external_audiobook_and_cleans_title(tmp_path):
             "title": "Martian, The",
             "author": {"name": "Andy Weir"},
             "narrators": [{"name": "R.C. Bray"}],
+            "language": "English",
+            "publish_date": "May 4, 2021",
             "cover_url": "https://covers.everand.com/martian.jpg",
         },
         "jwt_token": {"token": None},
@@ -470,6 +484,8 @@ def test_everand_source_parses_external_audiobook_and_cleans_title(tmp_path):
     assert isinstance(book, Audiobook)
     assert book.metadata.title == "The Martian"
     assert book.metadata.authors == ["Andy Weir"]
+    assert book.metadata.language is not None and book.metadata.language.alpha_3 == "eng"
+    assert book.metadata.release_date == date(2021, 5, 4)
     assert book.files[0].url == "https://cdn.example.com/1.mp3"
 
 
@@ -507,15 +523,19 @@ def test_nextory_source_wantlist_and_book_metadata(tmp_path):
     playlist = b"#EXTM3U\n#EXTINF:10.0,\nseg0.ts\n#EXT-X-ENDLIST\n"
 
     src = NextorySource(_opts(tmp_path))
-    src._session.get = MagicMock(
-        side_effect=[
-            _json_resp({"product_lists": [{"type": "want_to_read", "id": "wl-1"}]}),
-            _json_resp({"products": wantlist}),
-            _json_resp(audio_data),
-            MagicMock(status_code=200, content=playlist),
-            MagicMock(status_code=200, content=b"nextory-cover"),
-        ]
-    )
+
+    def fake_nextory_get(url, **_kwargs):
+        if url.endswith("/library/v1/products/555"):
+            return _json_resp(wantlist[0])
+        if url.endswith("/packages/audio"):
+            return _json_resp(audio_data)
+        if url.endswith("master.m3u8"):
+            return MagicMock(status_code=200, content=playlist)
+        if url.endswith("555.jpg"):
+            return MagicMock(status_code=200, content=b"nextory-cover")
+        raise AssertionError(f"Unexpected GET {url}")
+
+    src._session.get = MagicMock(side_effect=fake_nextory_get)
     book = src.download("https://nextory.com/se/book/nextory-book-555")
     assert isinstance(book, Audiobook)
     assert book.metadata.title == "Nextory Book"
@@ -587,6 +607,7 @@ def test_overdrive_handles_short_toc_and_cumulative_offsets(tmp_path):
         ]
     )
     book = src.download("https://sample.listen.overdrive.com/")
+    assert isinstance(book, Audiobook)
     assert [f.title for f in book.files] == ["Opening", "Finale", "Part 3"]
     assert [(c.start, c.title) for c in book.chapters] == [
         (0, "Opening"),
@@ -843,6 +864,7 @@ def test_section7_adapters_metadata_catalog_search_and_library(tmp_path):
         ]
     )
     book = ab.download("https://www.audiobooks.com/audiobook/rich/99")
+    assert isinstance(book, Audiobook)
     assert book.metadata.authors == ["Author One"]
     assert book.metadata.narrators == ["Reader One"]
     assert book.metadata.series == "Galaxy Saga"
@@ -907,6 +929,7 @@ def test_section7_adapters_metadata_catalog_search_and_library(tmp_path):
         ]
     )
     bb_book = bb.download("https://www.bookbeat.com/book/catalog-9?ref=share")
+    assert isinstance(bb_book, Audiobook)
     assert bb_book.metadata.title == "Catalog Book"
     assert bb._get_or_create_device_id() == bb._get_or_create_device_id()
     bb._session.get = MagicMock(return_value=_json_resp({"_embedded": {"books": [{"bookid": 5, "title": "Found", "author": "BB Auth"}]}}))
@@ -1083,7 +1106,8 @@ def test_section7_adapters_metadata_catalog_search_and_library(tmp_path):
     )
     st_hits = st.search("Story")
     assert st_hits[0].title == "Story Hit"
-    assert st_hits[0].url == "https://www.storytel.com/books/500"
+    assert st_hits[0].url == "https://www.storytel.com/en/books/500"
+    assert find_compatible_source(st_hits[0].url) is StorytelSource
 
     # 11. yourcloudlibrary: broader URL support + list_library()
     assert find_compatible_source("https://ebook.yourcloudlibrary.com/library/lib1/audiobook/bk-2") is YourCloudLibrarySource
@@ -1190,6 +1214,7 @@ def test_p1_adapter_fixes_overdrive_bookbeat_ycl_ereolen_saxo(tmp_path):
         "YCL Pub",
         "https://audio.yourcloudlibrary.com/listen/bk99",
     )
+    assert ycl_meta.language is not None and ycl_meta.language.alpha_3 == "eng"
 
     # 4. eReolen & Saxo: list_library() & search()
     eo = EreolenSource(_opts(tmp_path))
@@ -1206,3 +1231,212 @@ def test_p1_adapter_fixes_overdrive_bookbeat_ycl_ereolen_saxo(tmp_path):
     sx_hits = sx.search("Saxo Search")
     assert sx_hits[0].title == "Saxo Search"
     assert sx_hits[0].author == "S Auth"
+
+
+def test_source_metadata_language_and_release_date_serialize_to_all_output_formats(tmp_path):
+    """Verify normalized source metadata feeds OPF, JSON, templates, and LibriVox/M4B tagging."""
+    import json as _json
+    from audiobookdl.output import output as out_mod
+    from audiobookdl.output.metadata import sidecars
+
+    lv = LibrivoxSource(_opts(tmp_path))
+    lv._session.get = MagicMock(
+        side_effect=[
+            MagicMock(
+                status_code=200,
+                content=(
+                    b'<html><body><div class="content-wrap"><h1>The Odyssey</h1></div>'
+                    b'<div class="book-page-book-cover"><img src="https://librivox.org/cover.jpg"/></div>'
+                    b'<a href="https://librivox.org/rss/42">RSS</a>'
+                    b'<div class="chapter-download"><a class="chapter-name" href="https://archive.org/1.mp3">Ch 1</a></div>'
+                    b"</body></html>"
+                ),
+            ),
+            _json_resp(
+                {
+                    "books": [
+                        {
+                            "title": "The Odyssey",
+                            "language": "English",
+                            "copyright_year": "1914",
+                            "authors": [{"first_name": "Homer", "last_name": ""}],
+                        }
+                    ]
+                }
+            ),
+            MagicMock(status_code=200, content=b"jpg-bytes"),
+        ]
+    )
+    lv_book = lv.download("https://librivox.org/the-odyssey")
+    assert lv_book.metadata.language is not None and lv_book.metadata.language.alpha_3 == "eng"
+    assert lv_book.metadata.release_date == date(1914, 1, 1)
+    assert out_mod.gen_output_location("{title} [{language}] ({year})", lv_book.metadata, "") == "The Odyssey [eng] (1914)"
+    opf_path = tmp_path / "lv.opf"
+    sidecars.write_sidecar_opf(lv_book.metadata, str(opf_path))
+    assert "<dc:language>en</dc:language>" in opf_path.read_text(encoding="utf-8")
+    assert _json.loads(lv_book.metadata.as_json())["language"] == "eng"
+
+
+def test_section23_adapter_scraping_routing_and_auth_fixes(tmp_path):
+    from audiobookdl.exceptions import UserNotAuthorized
+    from audiobookdl.sources import find_compatible_source
+
+    # 1. OverDrive: semicolons inside bData, nested TOC chapters, and verify_auth false-positive fix
+    od_bdata = {
+        "title": {"main": "Tom &amp; Jerry; A Story"},
+        "description": "Part 1; Part 2 &quot;quoted&quot;",
+        "creator": [{"role": "author", "name": "A. Author"}],
+        "-odread-furbish-uri": "cover.jpg",
+        "spine": [
+            {"path": "Part01.mp3", "audio-duration": 10.0},
+            {"path": "Part02.mp3", "audio-duration": 20.0},
+        ],
+        "nav": {
+            "toc": [
+                {
+                    "title": "Book I",
+                    "path": "Part01.mp3#0",
+                    "contents": [
+                        {"title": "Nested Ch 1", "path": "Part01.mp3#2.5"},
+                        {"title": "Nested Ch 2", "path": "Part02.mp3#5.0"},
+                    ],
+                }
+            ]
+        },
+    }
+    od_html = f'<script>window.bData = {json.dumps(od_bdata)}; var x = 1;</script>'.encode()
+    od = OverdriveSource(_opts(tmp_path))
+    od._session.get = MagicMock(
+        side_effect=[
+            MagicMock(status_code=200, content=od_html),
+            MagicMock(status_code=200, content=b"od-cover"),
+        ]
+    )
+    od_book = od.download("https://sample.listen.overdrive.com/")
+    assert od_book.metadata.title == "Tom &amp; Jerry; A Story"
+    assert [(c.start, c.title) for c in od_book.chapters] == [
+        (0, "Book I"),
+        (2500, "Nested Ch 1"),
+        (15000, "Nested Ch 2"),
+    ]
+    # verify_auth must return False on 401/UserNotAuthorized even when cookies are loaded
+    od._session.cookies.set("session", "expired", domain="libbyapp.com")
+    od.load_cookie_file = MagicMock()
+    od._Source__authenticated = True  # type: ignore[attr-defined]
+    od._session.get = MagicMock(return_value=MagicMock(status_code=401, content=b"unauthorized"))
+    assert od.verify_auth() is False
+
+    # 2. Chirp: ignores earlier non-user "id" in HTML and extracts text inside nested <a> credits
+    user_id = 98765
+    key = b"0123456789abcdef"
+    iv = base64.b64encode(b"xxxxxxx98765")
+    track_url = "https://cdn.chirp.test/track01.mp3"
+    encrypted_b64 = base64.b64encode(
+        AES.new(key, AES.MODE_CBC, iv).encrypt(pad(track_url.encode("utf-8"), AES.block_size))
+    ).decode("ascii")
+    chirp_html = (
+        f'<html><head><title>Chirp Fixed</title></head><body>'
+        f'<div class="user-audiobook" data-audiobook-id="77" data-dk="{key.decode()}"></div>'
+        f'<span class="credit">Written by <a href="/a">Alice Smith</a></span>'
+        f'<span class="credit">Narrated by <span>Bob Jones</span></span>'
+        f'<img class="cover-image" src="https://cdn.chirp.test/cover.jpg"/>'
+        f'<script>{{"id":999999,"__typename":"Audiobook","currentUser":{{"id":{user_id},"__typename":"User"}}}}</script>'
+        f"</body></html>"
+    ).encode()
+    ch = ChirpSource(_opts(tmp_path))
+    ch._session.get = MagicMock(
+        side_effect=[
+            MagicMock(status_code=200, content=chirp_html),
+            MagicMock(status_code=200, content=b"chirp-cover"),
+        ]
+    )
+    ch._session.post = MagicMock(
+        side_effect=[
+            _json_resp({"data": {"audiobook": {"tracks": [{"partNumber": 1, "chapterNumber": 1, "durationMs": 4000, "displayName": "Intro"}]}}}),
+            _json_resp({"data": {"audiobook": {"track": {"webPlayerMediaUrl": encrypted_b64}}}}),
+        ]
+    )
+    ch_book = ch.download("https://www.chirpbooks.com/player/77")
+    assert ch_book.metadata.authors == ["Alice Smith"]
+    assert ch_book.metadata.narrators == ["Bob Jones"]
+    assert ch_book.files[0].url == track_url
+
+    # 3. Audiobooks.com: trailing slash, multi-part /book/stream/<id>/<n>, dotted domain & opaque ci_session
+    ab = AudiobooksdotcomSource(_opts(tmp_path))
+    ab._session.cookies.set("ci_session", "opaque-modern-token-value", domain=".audiobooks.com")
+    part1_html = (
+        '<h2 id="bookTitle">Multi AB</h2>'
+        '<img class="bookimage" src="https://cdn.audiobooks.com/c.jpg"/>'
+        '<a href="/book/stream/12345/2">Part 2</a>'
+        '<script>var cfg = {mp3: "https://cdn.audiobooks.com/p1.mp3"};</script>'
+    )
+    part2_html = '<script>var cfg = {mp3: "https://cdn.audiobooks.com/p2.mp3"};</script>'
+
+    def fake_ab_get(url, **_kwargs):
+        if url.endswith("/book/stream/12345/1"):
+            return MagicMock(status_code=200, content=part1_html.encode())
+        if url.endswith("/book/stream/12345/2"):
+            return MagicMock(status_code=200, content=part2_html.encode())
+        if url == "https://cdn.audiobooks.com/c.jpg":
+            return MagicMock(status_code=200, content=b"ab-cover")
+        raise AssertionError(f"Unexpected GET {url}")
+
+    ab._session.get = MagicMock(side_effect=fake_ab_get)
+    ab_book = ab.download("https://www.audiobooks.com/audiobook/multi-ab/12345/")
+    assert [f.url for f in ab_book.files] == [
+        "https://cdn.audiobooks.com/p1.mp3",
+        "https://cdn.audiobooks.com/p2.mp3",
+    ]
+    assert [f.title for f in ab_book.files] == ["Part 1", "Part 2"]
+    assert find_compatible_source("https://www.audiobooks.com/book/stream/12345/12/") is AudiobooksdotcomSource
+
+    # 4. eReolen: _login with empty url defaults to ereolen.dk & non-greedy user token regex
+    eo = EreolenSource(_opts(tmp_path))
+    login_html = (
+        b'<form id="borchk-login-form" action="/borchk"></form>'
+        b'<input id="libraryid-input" value="710100"/>'
+        b'<input id="libraryname-input" value="DemoLib"/>'
+    )
+    tokens_js = b'window.setToken("user", "tok_abc"); window.setToken("other", "ignored");'
+    eo_urls: list[str] = []
+
+    def fake_eo_get(url, **_kwargs):
+        eo_urls.append(url)
+        if url == "https://ereolen.dk/login":
+            return MagicMock(status_code=200, content=login_html)
+        if url == "https://ereolen.dk/dpl-react/user-tokens":
+            return MagicMock(status_code=200, content=tokens_js)
+        if "pubhub-openplatform.dbc.dk/v1/user/loans" in url:
+            return _json_resp({"loans": []})
+        raise AssertionError(f"Unexpected GET {url}")
+
+    eo._session.get = MagicMock(side_effect=fake_eo_get)
+    eo._session.post = MagicMock(return_value=MagicMock(status_code=200, content=b"ok"))
+    eo.login("", username="u", password="p")
+    assert eo_urls[0] == "https://ereolen.dk/login"
+    assert eo._session.headers["Authorization"] == "Bearer tok_abc"
+    assert eo.verify_auth() is True
+    eo._session.get = MagicMock(return_value=MagicMock(status_code=401, content=b""))
+    assert eo.verify_auth() is False
+
+    # 5. YourCloudLibrary: string series is not sliced to first character
+    ycl = YourCloudLibrarySource(_opts(tmp_path))
+    ycl_meta = ycl.get_metadata(
+        {"title": "Final Empire", "authors": ["B. Sanderson"], "narrators": [], "series": "Mistborn"}
+    )
+    assert ycl_meta.series == "Mistborn"
+
+    # 6. Everand: download_series extracts numeric id before slug
+    ev = EverandSource(_opts(tmp_path))
+    ev._session.get = MagicMock(
+        side_effect=[
+            MagicMock(status_code=200, content=b"<html><h1>My Series</h1></html>"),
+            _json_resp({"compilation": {"modules": [{"documents": [{"id": 11}, {"id": 22}]}]}}),
+        ]
+    )
+    ev_series = ev.download("https://www.everand.com/series/12345/Series-Title-Slug")
+    assert isinstance(ev_series, Series)
+    assert ev_series.title == "My Series"
+    assert [b.id for b in ev_series.books] == [11, 22]
+    assert "https://www.everand.com/series/12345/data" in ev._session.get.call_args_list[1].args[0]
+

@@ -1,3 +1,4 @@
+from pathlib import Path
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -1295,5 +1296,274 @@ def test_parse_byte_rate_and_token_bucket_rate_limiter():
     cancel.set()
     with pytest.raises(DownloadCancelled):
         limiter.acquire(1024, cancel_event=cancel)
+
+
+def test_download_file_handles_custom_byterange_206_and_init_section(tmp_path):
+    from audiobookdl.utils.audiobook import AESEncryption
+
+    init_bytes = b"INIT_HEADER_"
+    seg_payload = b"SEGMENT_AUDIO_FRAMES"
+    session = MagicMock()
+    session.get.return_value = _mock_response(
+        status_code=206,
+        headers={"Content-Length": str(len(seg_payload))},
+        chunks=[seg_payload],
+    )
+    book = Audiobook(
+        session=session,
+        metadata=AudiobookMetadata(title="fMP4 HLS"),
+        files=[
+            AudiobookFile(
+                url="https://cdn.example.com/book.m4s",
+                ext="m4s",
+                headers={"Range": "bytes=720-739"},
+                init_section=init_bytes,
+            )
+        ],
+    )
+    out_dir = tmp_path / "fmp4_unenc"
+    out_dir.mkdir()
+    out_path = download_file((book, str(out_dir), 0, lambda _: None, None), resume=True)
+    assert open(out_path, "rb").read() == init_bytes + seg_payload
+    assert session.get.call_args.kwargs["headers"]["Range"] == "bytes=720-739"
+
+    # Encrypted fMP4 segment also prepends unencrypted init_section before decrypted payload
+    key = b"0123456789abcdef"
+    iv = b"fedcba9876543210"
+    ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(pad(seg_payload, AES.block_size))
+    session.get.return_value = _mock_response(
+        status_code=206,
+        headers={"Content-Length": str(len(ciphertext))},
+        chunks=[ciphertext],
+    )
+    enc_book = Audiobook(
+        session=session,
+        metadata=AudiobookMetadata(title="fMP4 HLS Enc"),
+        files=[
+            AudiobookFile(
+                url="https://cdn.example.com/enc.m4s",
+                ext="m4s",
+                headers={"Range": "bytes=100-131"},
+                encryption_method=AESEncryption(key=key, iv=iv),
+                init_section=init_bytes,
+            )
+        ],
+    )
+    out_enc_dir = tmp_path / "fmp4_enc"
+    out_enc_dir.mkdir()
+    enc_out_path = download_file((enc_book, str(out_enc_dir), 0, lambda _: None, None), resume=False)
+    assert open(enc_out_path, "rb").read() == init_bytes + seg_payload
+
+
+
+def test_aes_cbc_multipart_resume_does_not_mix_plaintext_and_ciphertext(tmp_path):
+    key = b"0123456789abcdef"
+    iv = b"abcdef9876543210"
+    plaintext = b"Chapter 1 secret audio stream payload!!"
+    ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(pad(plaintext, 16))
+    enc = AESEncryption(key=key, iv=iv)
+
+    part1 = AudiobookFile(url="https://example.com/p1.mp3", ext="mp3", encryption_method=enc)
+    part2 = AudiobookFile(url="https://example.com/p2.mp3", ext="mp3", encryption_method=enc)
+
+    class _FakeResp:
+        def __init__(self, payload: bytes, headers: dict[str, str]):
+            self.status_code = 200
+            self.headers = headers
+            self._payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size=1):
+            for i in range(0, len(self._payload), chunk_size):
+                yield self._payload[i : i + chunk_size]
+
+        def close(self):
+            return None
+
+    seen_headers = []
+
+    def fake_get(url, stream=True, headers=None, timeout=None):
+        seen_headers.append(dict(headers or {}))
+        return _FakeResp(
+            ciphertext,
+            {
+                "Content-Length": str(len(ciphertext)),
+                "Accept-Ranges": "bytes",
+            },
+        )
+
+    session = MagicMock()
+    session.get.side_effect = fake_get
+    audiobook = Audiobook(
+        session=session,
+        metadata=AudiobookMetadata(title="AES Resume Book"),
+        files=[part1, part2],
+    )
+    out_dir = tmp_path / "book_dir"
+    out_dir.mkdir()
+    out_path = out_dir / "Part 0.mp3"
+    # Pre-seed stale plaintext partial .tmp file from an interrupted non-resume run
+    tmp_partial = out_dir / "Part 0.mp3.tmp"
+    tmp_partial.write_bytes(b"stale-plaintext-prefix")
+
+    downloaded = download_file(
+        (audiobook, str(out_dir), 0, lambda _: None, None),
+        resume=True,
+    )
+
+    assert downloaded == str(out_path)
+    assert out_path.read_bytes() == plaintext
+    assert not tmp_partial.exists()
+    assert not list(out_dir.glob("*.inline.*.tmp"))
+    assert all("Range" not in h for h in seen_headers)
+
+
+def test_download_audiobook_forwards_loudnorm_mono_and_silence_split(tmp_path, monkeypatch):
+    from audiobookdl import Chapter
+    from audiobookdl.output import download as dl_mod
+    from audiobookdl.output import output as out_mod
+
+    src_mp3 = tmp_path / "book.mp3"
+    src_mp3.write_bytes(b"fake-mp3")
+
+    monkeypatch.setattr(dl_mod, "download_files_with_cli_output", lambda *a, **kw: [str(src_mp3)])
+    monkeypatch.setattr(dl_mod, "add_metadata_to_file", lambda *a, **kw: None)
+    monkeypatch.setattr(dl_mod, "add_metadata_to_dir", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        out_mod,
+        "detect_silence_chapters",
+        lambda *a, **kw: [Chapter(0, "Chapter 1"), Chapter(10000, "Chapter 2")],
+    )
+
+    split_calls = []
+    out_dir = tmp_path / "out_dir"
+
+    def fake_split(master_path, output_dir, chapters, **kwargs):
+        split_calls.append(kwargs)
+        target_dir = Path(output_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        p1 = target_dir / "01 - Chapter 1.mp3"
+        p2 = target_dir / "02 - Chapter 2.mp3"
+        p1.write_bytes(b"c1")
+        p2.write_bytes(b"c2")
+        return [str(p1), str(p2)]
+
+    monkeypatch.setattr(out_mod, "split_audio_by_chapters", fake_split)
+
+    session = MagicMock()
+    audiobook = Audiobook(
+        session=session,
+        metadata=AudiobookMetadata(title="Silence Split Book"),
+        files=[AudiobookFile(url="https://example.com/single.mp3", ext="mp3")],
+    )
+    opts = DownloadOptions(
+        split_chapters=True,
+        chapters_from_silence=True,
+        loudnorm=True,
+        mono=True,
+    )
+    download_audiobook(audiobook, str(out_dir), opts)
+
+    assert len(split_calls) == 1
+    assert split_calls[0]["loudnorm"] is True
+    assert split_calls[0]["mono"] is True
+    assert (out_dir / "01 - Chapter 1.mp3").exists()
+
+
+def test_download_audiobook_combine_silence_chapters_embeds_cover_after_combine(tmp_path, monkeypatch):
+    from audiobookdl import Chapter
+    from audiobookdl.output import download as dl_mod
+    from audiobookdl.output import output as out_mod
+
+    p1 = tmp_path / "p1.mp3"
+    p2 = tmp_path / "p2.mp3"
+    p1.write_bytes(b"a")
+    p2.write_bytes(b"b")
+
+    monkeypatch.setattr(dl_mod, "download_files_with_cli_output", lambda *a, **kw: [str(p1), str(p2)])
+    monkeypatch.setattr(
+        out_mod,
+        "combine_audiofiles",
+        lambda files, tmp, out, **kwargs: (open(out, "wb").write(b"m4b") and False),
+    )
+    monkeypatch.setattr(
+        out_mod,
+        "detect_silence_chapters",
+        lambda *a, **kw: [Chapter(0, "Chapter 1"), Chapter(5000, "Chapter 2")],
+    )
+    add_meta_calls = []
+    monkeypatch.setattr(
+        dl_mod,
+        "add_metadata_to_file",
+        lambda ab, fp, opts, **kwargs: add_meta_calls.append(kwargs),
+    )
+
+    session = MagicMock()
+    audiobook = Audiobook(
+        session=session,
+        metadata=AudiobookMetadata(title="Combined Silence"),
+        files=[
+            AudiobookFile(url="https://example.com/1.mp3", ext="mp3"),
+            AudiobookFile(url="https://example.com/2.mp3", ext="mp3"),
+        ],
+        cover=Cover(b"img", "jpg"),
+    )
+    opts = DownloadOptions(
+        combine=True,
+        output_format="m4b",
+        chapters_from_silence=True,
+    )
+    download_audiobook(audiobook, str(tmp_path / "out"), opts)
+
+    assert len(add_meta_calls) == 1
+    assert add_meta_calls[0]["cover_embedded"] is False
+
+
+def test_add_metadata_to_dir_passes_track_context_and_cover(tmp_path, monkeypatch):
+    from audiobookdl.output import download as dl_mod
+    from audiobookdl.output import metadata as meta_mod
+
+    f1 = tmp_path / "01 - Opening.mp3"
+    f2 = tmp_path / "02 - Closing.mp3"
+    f1.write_bytes(b"1")
+    f2.write_bytes(b"2")
+
+    calls = []
+
+    def fake_add_metadata(filepath, meta, cover=None, track_context=None):
+        calls.append((filepath, meta, cover, track_context))
+        return True
+
+    monkeypatch.setattr(meta_mod, "add_metadata", fake_add_metadata)
+    cover = Cover(b"cover-bytes", "jpg")
+    ab = Audiobook(
+        session=MagicMock(),
+        metadata=AudiobookMetadata(title="Dir Book", authors=["Author"]),
+        files=[AudiobookFile(url="u1", ext="mp3"), AudiobookFile(url="u2", ext="mp3")],
+        cover=cover,
+    )
+    dl_mod.add_metadata_to_dir(
+        ab,
+        [str(f1), str(f2)],
+        str(tmp_path),
+        DownloadOptions(),
+    )
+
+    assert len(calls) == 2
+    assert calls[0][2] is cover
+    assert calls[0][3].track_number == 1
+    assert calls[0][3].total_tracks == 2
+    assert calls[0][3].album == "Dir Book"
+    assert calls[1][3].track_number == 2
+    assert calls[1][3].total_tracks == 2
+
 
 

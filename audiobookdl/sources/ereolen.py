@@ -1,6 +1,7 @@
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, logging, utils
-from audiobookdl.exceptions import BookHasNoAudiobook, DataNotPresent, RequestError
+from audiobookdl.exceptions import BookHasNoAudiobook, DataNotPresent, RequestError, UserNotAuthorized
+from audiobookdl.utils.audiobook import parse_language
 
 import re
 from typing import Any
@@ -95,7 +96,7 @@ class EreolenSource(Source):
         return list(cls.library_domains)
 
     def _login(self, url: str, username: str, password: str):
-        hostname = urlparse(url).hostname
+        hostname = urlparse(url).hostname or "ereolen.dk"
         login_page_url = f"https://{hostname}/login"
         login_path = self.find_elem_in_page(login_page_url, "#borchk-login-form", "action")
         library_id = self.find_elem_in_page(login_page_url, "#libraryid-input", "value")
@@ -115,7 +116,7 @@ class EreolenSource(Source):
         )
         user_token = self.find_in_page(
             f"https://{hostname}/dpl-react/user-tokens",
-            '"user", "(.+)"',
+            r'"user",\s*"([^"]+)"',
             1,
         )
         self._session.headers.update(
@@ -124,6 +125,15 @@ class EreolenSource(Source):
             }
         )
         logging.debug(f"user_token={logging.mask_secret(user_token)}")
+
+    def verify_auth(self, url: str = "") -> bool:
+        if not self._session.cookies and not self.authenticated and "Authorization" not in self._session.headers:
+            return False
+        try:
+            payload = self.get_json("https://pubhub-openplatform.dbc.dk/v1/user/loans?")
+            return isinstance(payload, dict) and isinstance(payload.get("loans"), list)
+        except (UserNotAuthorized, RequestError, ValueError):
+            return False
 
     @staticmethod
     def _extract_isbn(manifestation: dict[str, Any]) -> str | None:
@@ -206,10 +216,12 @@ class EreolenSource(Source):
             for g in (work_meta.get("genreAndForm") or [])
             if isinstance(g, str) and g.strip()
         ]
-        language: str | None = None
+        language = None
         langs = work_meta.get("mainLanguages") or []
         if isinstance(langs, list) and langs and isinstance(langs[0], dict):
-            language = langs[0].get("isoCode") or langs[0].get("display")
+            language = parse_language(langs[0].get("isoCode")) or parse_language(
+                langs[0].get("display")
+            )
 
         return AudiobookMetadata(
             title=title,

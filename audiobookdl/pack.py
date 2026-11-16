@@ -653,6 +653,20 @@ def pack_book(
             spec.audiobook.chapters, chapter_offset_ms
         )
 
+    may_silence_chapters = (
+        not options.no_chapters
+        and bool(getattr(options, "chapters_from_silence", False))
+        and not spec.audiobook.chapters
+    )
+    if may_silence_chapters and len(spec.track_paths) == 1:
+        detected = output.detect_silence_chapters(
+            spec.track_paths[0], cancel_event=cancel_event
+        )
+        if detected:
+            if chapter_offset_ms != 0:
+                detected = output.apply_chapter_offset(detected, chapter_offset_ms)
+            spec.audiobook.chapters = detected
+
     use_loudnorm = bool(getattr(options, "loudnorm", False))
     use_mono = bool(getattr(options, "mono", False))
     extra_filter_kwargs: dict[str, Any] = {}

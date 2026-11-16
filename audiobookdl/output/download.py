@@ -10,7 +10,13 @@ from audiobookdl.output.encryption import AESStreamDecryptor
 from audiobookdl.output.metadata import id3
 from audiobookdl.output.metadata._chapters import resolve_audio_duration_ms
 from audiobookdl.output.metadata._cover import apply_cover_postprocessing
-from audiobookdl.utils.audiobook import AESEncryption, AudiobookMetadata, is_ebook, is_ebook_extension
+from audiobookdl.utils.audiobook import (
+    AESEncryption,
+    AudiobookMetadata,
+    TrackTagContext,
+    is_ebook,
+    is_ebook_extension,
+)
 from mutagen import File as MutagenFile
 from audiobookdl.utils.concurrency import run_cancellable_pool
 from audiobookdl.utils.http import (
@@ -122,8 +128,16 @@ def download_audiobook(
     """Download, convert, combine, and add metadata to files from `Audiobook` object"""
     # Check if file/dir exists and should be skipped or confirmed before overwriting
     ebook = is_ebook(audiobook)
-    splitting = (not ebook) and bool(getattr(options, "split_chapters", False) and len(audiobook.chapters) > 1)
-    is_single_file = (len(audiobook.files) == 1 or (options.combine and not ebook)) and not splitting
+    wants_split = (not ebook) and bool(getattr(options, "split_chapters", False))
+    may_silence_chapters = bool(
+        not ebook
+        and getattr(options, "chapters_from_silence", False)
+        and not audiobook.chapters
+        and not options.no_chapters
+    )
+    splitting = wants_split and len(audiobook.chapters) > 1
+    expected_split_output = splitting or (wants_split and may_silence_chapters)
+    is_single_file = (len(audiobook.files) == 1 or (options.combine and not ebook)) and not expected_split_output
     target_path = ""
     if audiobook.files:
         initial_ext = audiobook.files[0].ext.lstrip(".").lower()
@@ -148,7 +162,7 @@ def download_audiobook(
                 )
                 logging.log(msg)
                 return
-        elif options.resume:
+        elif options.resume and not expected_split_output:
             if _all_output_parts_exist(audiobook, output_dir, options.output_format):
                 msg = (
                     f"Resuming: skipping already downloaded [blue]{audiobook.title}[/], all files already exist."
@@ -168,7 +182,7 @@ def download_audiobook(
             overwrite=options.overwrite,
         )
 
-    use_staging_dir = (not options.resume) and (len(audiobook.files) > 1 or splitting)
+    use_staging_dir = (not options.resume) and (len(audiobook.files) > 1 or expected_split_output)
     stage_dir: str | None = None
     work_output_dir = output_dir
     download_output_dir = output_dir
@@ -218,6 +232,7 @@ def download_audiobook(
         probe_cache: dict[str, Any] = {}
         chapters_embedded = False
         cover_embedded = False
+        chapter_offset_ms = int(getattr(options, "chapter_offset_ms", 0) or 0)
         if not ebook:
             if audiobook.cover is not None and (
                 getattr(options, "square_cover", False)
@@ -228,22 +243,21 @@ def download_audiobook(
                     square=bool(getattr(options, "square_cover", False)),
                     max_size=getattr(options, "max_cover_size", None),
                 )
-            chapter_offset_ms = int(getattr(options, "chapter_offset_ms", 0) or 0)
             if audiobook.chapters and chapter_offset_ms != 0:
                 audiobook.chapters = output.apply_chapter_offset(
                     audiobook.chapters, chapter_offset_ms
                 )
-            if (
-                getattr(options, "chapters_from_silence", False)
-                and not audiobook.chapters
-                and not options.no_chapters
-                and len(filepaths) == 1
-            ):
+            if may_silence_chapters and len(filepaths) == 1:
                 detected = output.detect_silence_chapters(
                     filepaths[0], cancel_event=cancel_event
                 )
                 if detected:
+                    if chapter_offset_ms != 0:
+                        detected = output.apply_chapter_offset(detected, chapter_offset_ms)
                     audiobook.chapters = detected
+
+        # Re-evaluate after silence chapter detection on single-file inputs
+        splitting = wants_split and len(audiobook.chapters) > 1
 
         chapters_for_ffmpeg = (
             audiobook.chapters
@@ -272,7 +286,7 @@ def download_audiobook(
         if use_mono:
             audio_filter_kwargs["mono"] = True
 
-        if splitting:
+        if splitting or (wants_split and may_silence_chapters and len(filepaths) > 1):
             if len(filepaths) > 1:
                 master_ext = (
                     "m4a"
@@ -294,22 +308,37 @@ def download_audiobook(
                         probe_cache=probe_cache,
                         **audio_filter_kwargs,
                     )
-                    split_result = output.split_audio_by_chapters(
-                        master_path,
-                        work_output_dir,
-                        audiobook.chapters,
-                        output_format=output_format,
-                        cancel_event=cancel_event,
-                        audio_bitrate=options.audio_bitrate,
-                        probe_cache=probe_cache,
-                    )
-                for src_part in filepaths:
-                    if src_part not in split_result and os.path.exists(src_part):
-                        try:
-                            os.remove(src_part)
-                        except OSError:
-                            pass
-                filepaths = split_result
+                    if not audiobook.chapters and may_silence_chapters:
+                        detected = output.detect_silence_chapters(
+                            master_path, cancel_event=cancel_event
+                        )
+                        if detected:
+                            if chapter_offset_ms != 0:
+                                detected = output.apply_chapter_offset(detected, chapter_offset_ms)
+                            audiobook.chapters = detected
+                    splitting = wants_split and len(audiobook.chapters) > 1
+                    if splitting:
+                        split_result = output.split_audio_by_chapters(
+                            master_path,
+                            work_output_dir,
+                            audiobook.chapters,
+                            output_format=output_format,
+                            cancel_event=cancel_event,
+                            audio_bitrate=options.audio_bitrate,
+                            probe_cache=probe_cache,
+                        )
+                        for src_part in filepaths:
+                            if src_part not in split_result and os.path.exists(src_part):
+                                try:
+                                    os.remove(src_part)
+                                except OSError:
+                                    pass
+                        filepaths = split_result
+                    else:
+                        # Silence detection yielded <= 1 chapter: promote combined master as single file
+                        fallback_path = os.path.join(work_output_dir, f"01 - {os.path.basename(output_dir)}.{output_format}")
+                        shutil.move(master_path, fallback_path)
+                        filepaths = [fallback_path]
             elif len(filepaths) == 1:
                 src_single = filepaths[0]
                 filepaths = output.split_audio_by_chapters(
@@ -320,6 +349,7 @@ def download_audiobook(
                     cancel_event=cancel_event,
                     audio_bitrate=options.audio_bitrate,
                     probe_cache=probe_cache,
+                    **audio_filter_kwargs,
                 )
                 if src_single not in filepaths and os.path.exists(src_single):
                     os.remove(src_single)
@@ -333,6 +363,9 @@ def download_audiobook(
                 out_parent,
                 f".{os.path.basename(output_path)}.tmp.{uuid.uuid4().hex[:8]}.{output_format}",
             )
+            # Defer MP4 cover embedding when post-combine silence chapter remux will run
+            defer_cover_for_silence = may_silence_chapters and cover_for_ffmpeg is not None
+            combine_cover = None if defer_cover_for_silence else cover_for_ffmpeg
             try:
                 chapters_embedded = bool(
                     output.combine_audiofiles(
@@ -343,7 +376,7 @@ def download_audiobook(
                         chapters=chapters_for_ffmpeg,
                         audio_bitrate=options.audio_bitrate,
                         metadata=audiobook.metadata,
-                        cover=cover_for_ffmpeg,
+                        cover=combine_cover,
                         probe_cache=probe_cache,
                         faststart=True,
                         **audio_filter_kwargs,
@@ -351,18 +384,18 @@ def download_audiobook(
                 )
                 os.replace(staged_combined_path, output_path)
                 staged_combined_path = None
-                cover_embedded = cover_for_ffmpeg is not None
+                if not use_staging_dir and os.path.isdir(work_output_dir):
+                    shutil.rmtree(work_output_dir, ignore_errors=True)
+                cover_embedded = combine_cover is not None
                 current_format = output_format
                 filepaths = [output_path]
-                if (
-                    getattr(options, "chapters_from_silence", False)
-                    and not audiobook.chapters
-                    and not options.no_chapters
-                ):
+                if may_silence_chapters and not audiobook.chapters:
                     detected = output.detect_silence_chapters(
                         output_path, cancel_event=cancel_event
                     )
                     if detected:
+                        if chapter_offset_ms != 0:
+                            detected = output.apply_chapter_offset(detected, chapter_offset_ms)
                         audiobook.chapters = detected
             except DownloadCancelled:
                 if os.path.isdir(work_output_dir) and (use_staging_dir or not options.resume):
@@ -382,6 +415,7 @@ def download_audiobook(
                 cancel_event=cancel_event,
                 audio_bitrate=options.audio_bitrate,
                 probe_cache=probe_cache,
+                **audio_filter_kwargs,
             )
             current_format = output_format
         if cancel_event is not None and cancel_event.is_set():
@@ -410,9 +444,17 @@ def download_audiobook(
                     output_format,
                     cancel_event=cancel_event,
                     audio_bitrate=options.audio_bitrate,
+                    **audio_filter_kwargs,
                 )
         if cancel_event is not None and cancel_event.is_set():
             raise DownloadCancelled
+        # If single-file split was expected after silence detection yielded <= 1 chapter, promote cleanly to file
+        if wants_split and may_silence_chapters and not splitting and stage_dir is not None and len(filepaths) == 1:
+            final_single_path = f"{output_dir}.{output_format}"
+            os.makedirs(os.path.dirname(os.path.abspath(final_single_path)) or os.getcwd(), exist_ok=True)
+            os.replace(filepaths[0], final_single_path)
+            filepaths = [final_single_path]
+            is_single_file = True
         # Add metadata & commit staged directory atomically
         if len(filepaths) == 1 and not splitting:
             add_metadata_to_file(
@@ -433,7 +475,7 @@ def download_audiobook(
                 probe_cache=probe_cache,
             )
 
-        if stage_dir is not None and not is_single_file:
+        if stage_dir is not None and not is_single_file and os.path.isdir(stage_dir):
             _atomic_replace_dir(stage_dir, output_dir)
             stage_dir = None
     finally:
@@ -618,9 +660,35 @@ def add_metadata_to_file(
             f"{stem}.cue",
         )
     # Fallback cover write if container/mock did not embed it alongside metadata or chapters
-    if needs_cover and not cover_written_with_other:
+    if needs_cover and not cover_written_with_other and audiobook.cover is not None:
         logging.book_update("Embedding cover")
         metadata.embed_cover(filepath, audiobook.cover)
+
+
+def _resolve_dir_track_context(
+    audiobook: Audiobook,
+    filepath: str,
+    track_number: int,
+    total_tracks: int,
+    options: DownloadOptions,
+) -> TrackTagContext:
+    """Resolve per-file title and track numbering for multi-file/split directory outputs."""
+    track_title = ""
+    is_split_output = bool(getattr(options, "split_chapters", False)) and len(audiobook.chapters) > 1
+    if (is_split_output or len(audiobook.files) != total_tracks) and track_number - 1 < len(audiobook.chapters):
+        track_title = (audiobook.chapters[track_number - 1].title or "").strip()
+    elif track_number - 1 < len(audiobook.files):
+        track_title = (audiobook.files[track_number - 1].title or "").strip()
+    if not track_title:
+        stem = os.path.splitext(os.path.basename(filepath))[0]
+        cleaned = re.sub(r"^\s*\d+\s*[-._]+\s*", "", stem).strip()
+        track_title = cleaned or stem or audiobook.metadata.title
+    return TrackTagContext(
+        title=track_title,
+        track_number=track_number,
+        total_tracks=total_tracks,
+        album=audiobook.metadata.title or track_title,
+    )
 
 
 def add_metadata_to_dir(
@@ -640,9 +708,24 @@ def add_metadata_to_dir(
     """
     logging.book_update("Adding metadata")
     file_list = list(filepaths)
-    for filepath in file_list:
-        if not is_ebook_extension(os.path.splitext(filepath)[1]):
-            metadata.add_metadata(filepath, audiobook.metadata)
+    audio_files = [
+        fp for fp in file_list if not is_ebook_extension(os.path.splitext(fp)[1])
+    ]
+    audio_total = len(audio_files)
+    for idx, filepath in enumerate(audio_files, start=1):
+        track_ctx = _resolve_dir_track_context(
+            audiobook, filepath, idx, audio_total, options
+        )
+        embedded_cover = bool(
+            metadata.add_metadata(
+                filepath,
+                audiobook.metadata,
+                cover=audiobook.cover,
+                track_context=track_ctx,
+            )
+        )
+        if audiobook.cover is not None and not embedded_cover:
+            metadata.embed_cover(filepath, audiobook.cover)
     cover_sidecar_name: str | None = None
     if audiobook.cover:
         logging.book_update("Adding cover")
@@ -909,17 +992,26 @@ def download_file(
     attempt = 0
     reset_stale_tmp = False
     decrypted_inline = False
+    inline_dec_tmp: str | None = None
+    allow_ciphertext_range = not isinstance(file.encryption_method, AESEncryption) or len(audiobook.files) == 1
     while attempt < DOWNLOAD_ATTEMPTS:
         if cancel_event is not None and cancel_event.is_set():
             raise DownloadCancelled
         advanced = 0.0
         request = None
         decrypted_inline = False
+        inline_dec_tmp = None
         request_headers = dict(file.headers) if file.headers else {}
         has_custom_range = any(str(k).lower() == "range" for k in request_headers)
         existing_bytes = 0
         sent_range = False
-        if resume and not has_custom_range and os.path.exists(filepath_tmp):
+        if (
+            resume
+            and allow_ciphertext_range
+            and not has_custom_range
+            and file.init_section is None
+            and os.path.exists(filepath_tmp)
+        ):
             existing_bytes = os.path.getsize(filepath_tmp)
             if existing_bytes > 0:
                 request_headers["Range"] = f"bytes={existing_bytes}-"
@@ -965,7 +1057,7 @@ def download_file(
                 invalid_content_type = content_type not in expected
             else:
                 invalid_content_type = expected and expected != content_type
-            if sent_range and file.expected_status_code == 200:
+            if (sent_range or has_custom_range) and file.expected_status_code == 200:
                 invalid_status_code = request.status_code not in (200, 206)
             else:
                 invalid_status_code = bool(
@@ -1045,8 +1137,8 @@ def download_file(
                         update_progress(initial_progress)
                         advanced += initial_progress
 
-            # Stream AES-CBC decryption inline when writing from byte 0 without needing
-            # range-based ciphertext resume (no resume, multi-segment HLS streams, or Accept-Ranges: none).
+            # Stream AES-CBC decryption inline into an isolated temp path when reading
+            # from byte 0 so `filepath_tmp` only ever contains raw un-decrypted bytes.
             stream_decryptor: AESStreamDecryptor | None = None
             accept_ranges = (_get_header_ci(request.headers, "Accept-Ranges") or "").strip().lower()
             can_inline_aes = (
@@ -1064,8 +1156,10 @@ def download_file(
                     file.encryption_method.iv,
                 )
                 decrypted_inline = True
+                inline_dec_tmp = f"{filepath}.inline.{uuid.uuid4().hex[:8]}.tmp"
 
             # Download file to tmp file
+            write_target = inline_dec_tmp if inline_dec_tmp is not None else filepath_tmp
             bytes_written = 0
             pending_bytes = 0
             last_flush = time.monotonic()
@@ -1084,7 +1178,13 @@ def download_file(
                 last_flush = time.monotonic()
 
             try:
-                with open(filepath_tmp, open_mode) as f:
+                with open(write_target, open_mode) as f:
+                    if (
+                        file.init_section
+                        and open_mode == "wb"
+                        and (stream_decryptor is not None or not file.encryption_method)
+                    ):
+                        f.write(file.init_section)
                     for chunk in request.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
                         if cancel_event is not None and cancel_event.is_set():
                             raise DownloadCancelled
@@ -1130,6 +1230,11 @@ def download_file(
                 advanced = 1.0
             break
         except requests.exceptions.RequestException as error:
+            if inline_dec_tmp and os.path.exists(inline_dec_tmp):
+                try:
+                    os.remove(inline_dec_tmp)
+                except OSError:
+                    pass
             # Undo this attempt's progress before retrying so the bar stays accurate
             update_progress(-advanced)
             if attempt + 1 >= DOWNLOAD_ATTEMPTS:
@@ -1142,9 +1247,21 @@ def download_file(
             _sleep_or_cancel(delay, cancel_event)
             attempt += 1
         except DownloadCancelled:
+            if inline_dec_tmp and os.path.exists(inline_dec_tmp):
+                try:
+                    os.remove(inline_dec_tmp)
+                except OSError:
+                    pass
             if not resume and os.path.exists(filepath_tmp):
                 try:
                     os.remove(filepath_tmp)
+                except OSError:
+                    pass
+            raise
+        except Exception:
+            if inline_dec_tmp and os.path.exists(inline_dec_tmp):
+                try:
+                    os.remove(inline_dec_tmp)
                 except OSError:
                     pass
             raise
@@ -1157,7 +1274,12 @@ def download_file(
     if file.encryption_method and not decrypted_inline:
         dec_tmp = f"{filepath}.dec.{uuid.uuid4().hex[:8]}.tmp"
         try:
-            encryption.decrypt_file(filepath_tmp, file.encryption_method, output_path=dec_tmp)
+            encryption.decrypt_file(
+                filepath_tmp,
+                file.encryption_method,
+                output_path=dec_tmp,
+                prefix=file.init_section or b"",
+            )
             if not is_ebook_extension(ext):
                 try:
                     output.verify_audio_integrity(dec_tmp)
@@ -1176,6 +1298,27 @@ def download_file(
             os.remove(filepath_tmp)
         except OSError:
             pass
+    elif inline_dec_tmp is not None:
+        try:
+            if not is_ebook_extension(ext):
+                try:
+                    output.verify_audio_integrity(inline_dec_tmp)
+                except FailedCombining as exc:
+                    raise GenericAudiobookDLException(
+                        f"Downloaded file '{os.path.basename(filepath)}' failed media integrity verification"
+                    ) from exc
+            os.replace(inline_dec_tmp, filepath)
+            if os.path.exists(filepath_tmp):
+                try:
+                    os.remove(filepath_tmp)
+                except OSError:
+                    pass
+        finally:
+            if os.path.exists(inline_dec_tmp):
+                try:
+                    os.remove(inline_dec_tmp)
+                except OSError:
+                    pass
     else:
         if not is_ebook_extension(ext):
             try:
@@ -1228,7 +1371,7 @@ def download_files(
     rate_bps = parse_byte_rate(limit_rate)
     if rate_bps is not None:
         worker_kwargs["rate_limiter"] = TokenBucketRateLimiter(rate_bps)
-    worker_fn = partial(download_file, **worker_kwargs) if worker_kwargs else download_file
+    worker_fn: Callable[[Any], str] = partial(download_file, **worker_kwargs) if worker_kwargs else download_file
     workers = (
         min(MAX_DOWNLOAD_WORKERS, max(1, max_workers))
         if max_workers
