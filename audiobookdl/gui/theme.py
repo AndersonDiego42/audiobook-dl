@@ -505,6 +505,8 @@ def apply_theme_to_widget_tree(widget: tk.Misc, palette: ThemePalette) -> None:
 
 def apply_theme_to_window(window: tk.Toplevel, palette: ThemePalette) -> None:
     """Apply `palette` to a `Toplevel` dialog, its classic Tk children, and Windows title bar."""
+    if hasattr(window, "_palette"):
+        window._palette = palette  # type: ignore[attr-defined]
     apply_theme_to_widget_tree(window, palette)
     _apply_windows_titlebar_theme(window, is_dark=(palette.mode == "dark"))
 
@@ -513,19 +515,9 @@ def apply_theme(root: tk.Misc, style: ttk.Style, theme_mode: str | None) -> Them
     """Apply `theme_mode` (`'system'`, `'light'`, `'dark'`) to `style`, `root`, and all child widgets."""
     palette = resolve_palette(theme_mode)
     available = style.theme_names()
-    if palette.mode == "dark":
-        if "clam" in available:
-            style.theme_use("clam")
-        _configure_clam_palette(style, palette)
-    else:
-        if "vista" in available:
-            style.theme_use("vista")
-            _configure_semantic_labels(style, palette)
-            _configure_accent_button(style, palette)
-        else:
-            if "clam" in available:
-                style.theme_use("clam")
-            _configure_clam_palette(style, palette)
+    if "clam" in available:
+        style.theme_use("clam")
+    _configure_clam_palette(style, palette)
 
     configure_hidpi_scaling(root, style)
 

@@ -988,6 +988,61 @@ def test_pack_job_persistence_and_retry_across_restart(tmp_path: Path, monkeypat
         root2.destroy()
 
 
+def test_pack_extended_metadata_and_chapter_overrides(tmp_path: Path):
+    from audiobookdl.gui.controller import PackJobRequest
+
+    book_dir = tmp_path / "Extended Book"
+    book_dir.mkdir()
+    t1 = book_dir / "01.mp3"
+    t2 = book_dir / "02.mp3"
+    _create_empty_id3_mp3(t1)
+    _create_empty_id3_mp3(t2)
+
+    out_dir = tmp_path / "out"
+    opts = args.build_default_options(output_template="{author}/{title}")
+    custom_chapters = [Chapter(0, "Prelude"), Chapter(45_000, "Chapter One"), Chapter(120_000, "Finale")]
+    overrides = PackOverrides(
+        title="Custom Extended",
+        authors=["Author One"],
+        genres=["Sci-Fi", "Adventure"],
+        publisher="Orbit Press",
+        release_date="2021-05-11",
+        language="en",
+        description="Extended description body",
+        chapters=custom_chapters,
+    )
+
+    fake_probe = AudioProbeInfo(duration=90.0, bitrate=128_000, codec_name="mp3", format_name="mp3")
+    with patch("audiobookdl.pack.probe_audio_info", return_value=fake_probe):
+        spec = inspect_local_book(
+            str(book_dir),
+            [str(t1), str(t2)],
+            opts,
+            output_dir=str(out_dir),
+            overrides=overrides,
+        )
+    assert spec.audiobook.metadata.genres == ["Sci-Fi", "Adventure"]
+    assert spec.audiobook.metadata.publisher == "Orbit Press"
+    assert spec.audiobook.metadata.release_date == date(2021, 5, 11)
+    assert spec.audiobook.metadata.language is not None and spec.audiobook.metadata.language.alpha_2 == "en"
+    assert spec.audiobook.metadata.description == "Extended description body"
+    assert [(c.start, c.title) for c in spec.audiobook.chapters] == [
+        (0, "Prelude"),
+        (45_000, "Chapter One"),
+        (120_000, "Finale"),
+    ]
+
+    req = PackJobRequest(paths=[str(book_dir)], overrides=overrides, output_format="m4b")
+    restored = PackJobRequest.from_dict(req.to_dict())
+    assert restored is not None and restored.overrides is not None
+    assert restored.overrides.genres == ["Sci-Fi", "Adventure"]
+    assert restored.overrides.publisher == "Orbit Press"
+    assert restored.overrides.release_date == "2021-05-11"
+    assert restored.overrides.description == "Extended description body"
+    assert restored.overrides.chapters is not None and len(restored.overrides.chapters) == 3
+
+
+
 
 
 

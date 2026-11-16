@@ -72,11 +72,14 @@ class AudiobookshelfDialog(tk.Toplevel):
         ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(2, 8))
 
         ttk.Label(body, textvariable=self._status_var, style="Muted.TLabel").grid(
-            row=5, column=0, columnspan=3, sticky="w", pady=(0, 8)
+            row=5, column=0, columnspan=3, sticky="w", pady=(0, 4)
         )
+        self._loading_bar = ttk.Progressbar(body, mode="indeterminate")
+        self._loading_bar.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        self._loading_bar.grid_remove()
 
         btns = ttk.Frame(body)
-        btns.grid(row=6, column=0, columnspan=3, sticky="ew")
+        btns.grid(row=7, column=0, columnspan=3, sticky="ew")
         ttk.Button(btns, text="Cancel", command=self.destroy).pack(side=tk.RIGHT)
         ttk.Button(btns, text="Save", command=self._save).pack(side=tk.RIGHT, padx=(0, 6))
 
@@ -97,11 +100,15 @@ class AudiobookshelfDialog(tk.Toplevel):
             self._status_var.set("Server URL and API Token are required.")
             return
         self._test_btn.configure(state="disabled")
+        self._loading_bar.grid()
+        self._loading_bar.start(12)
         self._status_var.set("Connecting to Audiobookshelf...")
 
         def _done(username: str, libs: list[tuple[str, str]], error: str | None) -> None:
             if not self.winfo_exists():
                 return
+            self._loading_bar.stop()
+            self._loading_bar.grid_remove()
             self._test_btn.configure(state="normal")
             if error is not None:
                 self._status_var.set(f"Connection failed: {error}")

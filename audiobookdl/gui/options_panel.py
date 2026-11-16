@@ -6,9 +6,21 @@ from typing import Any
 from collections.abc import Callable
 
 from audiobookdl.gui.formatting import MEDIA_TYPE_OPTIONS, OUTPUT_FORMATS, OVERWRITE_OPTIONS
+from audiobookdl.gui.theme import ThemePalette
+from audiobookdl.gui.widgets import attach_tooltip
+from audiobookdl.options_schema import OPTIONS_BY_NAME
 from audiobookdl.utils import AUDIO_BITRATE_PRESETS
+from audiobookdl.utils.http import parse_byte_rate
 
 OptionWidget = ttk.Entry | ttk.Checkbutton | ttk.Combobox | ttk.Spinbox
+
+
+def _option_help(name: str) -> str:
+    spec = OPTIONS_BY_NAME.get(name)
+    if spec is None or not spec.cli_flags:
+        return ""
+    raw_help = spec.cli_flags[0].help
+    return raw_help() if callable(raw_help) else str(raw_help or "")
 
 
 class OptionsPanel(ttk.LabelFrame):
@@ -21,13 +33,20 @@ class OptionsPanel(ttk.LabelFrame):
         *,
         on_m4b_toggled: Callable[[], None],
         on_format_selected: Callable[[tk.Event | None], None],
+        palette_provider: Callable[[], ThemePalette] | None = None,
     ) -> None:
         super().__init__(master, text="Options", padding=(8, 4))
         self._vars = vars_owner
         self._on_m4b_toggled = on_m4b_toggled
         self._on_format_selected = on_format_selected
+        self._palette_provider = palette_provider
         self._widgets: list[OptionWidget] = []
+        self._panel_enabled = True
+        self._dependency_traces_wired = False
         self._build_widgets()
+        self._attach_tooltips()
+        self._wire_dependencies()
+        self.sync_dependency_states()
 
     def _build_widgets(self) -> None:
         self.columnconfigure(0, weight=1)
@@ -57,7 +76,12 @@ class OptionsPanel(ttk.LabelFrame):
         format_combo.grid(row=0, column=3, sticky="w", padx=(0, 12))
         format_combo.bind("<<ComboboxSelected>>", self._on_format_selected)
 
-        cb_combine = ttk.Checkbutton(general_tab, text="Combine parts", variable=self._vars.combine_var)
+        cb_combine = ttk.Checkbutton(
+            general_tab,
+            text="Combine parts",
+            variable=self._vars.combine_var,
+            command=self._on_combine_clicked,
+        )
         cb_combine.grid(row=0, column=4, sticky="w", padx=(0, 12))
 
         cb_skip = ttk.Checkbutton(
@@ -171,6 +195,7 @@ class OptionsPanel(ttk.LabelFrame):
             sidecars_tab,
             text="Split chapters",
             variable=self._vars.split_chapters_var,
+            command=self._on_split_chapters_clicked,
         )
         cb_split_chapters.grid(row=0, column=1, sticky="w", padx=(0, 14))
 
@@ -319,6 +344,72 @@ class OptionsPanel(ttk.LabelFrame):
             text="Defaults: 6 workers, unlimited bandwidth (e.g. 2M), TLS impersonate via curl_cffi (e.g. chrome)",
             style="Muted.TLabel",
         ).grid(row=3, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        self._validation_var = tk.StringVar(value="")
+        self._validation_label = ttk.Label(
+            self,
+            textvariable=self._validation_var,
+            style="Error.TLabel",
+        )
+        self._validation_label.grid(row=1, column=0, sticky="w", padx=(4, 0), pady=(2, 0))
+        self._validation_label.grid_remove()
+
+        self._cb_m4b = cb_m4b
+        self._format_combo = format_combo
+        self._cb_combine = cb_combine
+        self._bitrate_combo = bitrate_combo
+        self._cb_enrich = cb_enrich
+        self._cb_enrich_interactive = cb_enrich_interactive
+        self._enrich_providers_entry = enrich_providers_entry
+        self._cb_cover_only = cb_cover_only
+        self._cb_no_chapters = cb_no_chapters
+        self._cb_split_chapters = cb_split_chapters
+        self._cb_silence_chapters = cb_silence_chapters
+        self._chapter_offset_entry = chapter_offset_entry
+        self._cb_cue = cb_cue
+        self._cb_loudnorm = cb_loudnorm
+        self._cb_mono = cb_mono
+        self._max_cover_entry = max_cover_entry
+        self._limit_rate_entry = limit_rate_entry
+
+        self._tooltip_bindings: list[tuple[tk.Misc, str]] = [
+            (cb_m4b, "Combine and convert output into a single .m4b audiobook with chapters"),
+            (format_combo, _option_help("output_format")),
+            (cb_combine, _option_help("combine")),
+            (cb_skip, _option_help("skip_downloaded")),
+            (cb_resume, _option_help("resume")),
+            (overwrite_combo, _option_help("overwrite")),
+            (cb_archive, _option_help("download_archive")),
+            (cb_cover_only, _option_help("cover")),
+            (media_combo, _option_help("media_type")),
+            (bitrate_combo, _option_help("audio_bitrate")),
+            (cb_enrich, _option_help("enrich_metadata")),
+            (cb_enrich_interactive, _option_help("enrich_interactive")),
+            (enrich_providers_entry, _option_help("enrich_providers")),
+            (cb_debug, _option_help("debug")),
+            (self.notify_cb, "Show a desktop notification when downloads finish"),
+            (cb_no_chapters, _option_help("no_chapters")),
+            (cb_split_chapters, _option_help("split_chapters")),
+            (cb_silence_chapters, _option_help("chapters_from_silence")),
+            (chapter_offset_entry, _option_help("chapter_offset_ms")),
+            (cb_json, _option_help("write_json_metadata")),
+            (cb_opf, _option_help("write_opf")),
+            (cb_cue, _option_help("write_cue")),
+            (cb_write_cover, _option_help("write_cover")),
+            (cb_abs_meta, _option_help("write_abs_metadata")),
+            (cb_upload_abs, _option_help("upload_to_abs")),
+            (cb_square_cover, _option_help("square_cover")),
+            (max_cover_entry, _option_help("max_cover_size")),
+            (cb_loudnorm, _option_help("loudnorm")),
+            (cb_mono, _option_help("mono")),
+            (remove_chars_entry, _option_help("remove_chars")),
+            (max_workers_spin, _option_help("max_workers")),
+            (book_delay_spin, _option_help("book_delay")),
+            (timeout_spin, _option_help("timeout")),
+            (limit_rate_entry, _option_help("limit_rate")),
+            (self._impersonate_combo, _option_help("impersonate")),
+            (proxy_entry, _option_help("proxy")),
+            (post_exec_entry, _option_help("post_exec")),
+        ]
 
         self._widgets = [
             cb_m4b,
@@ -359,10 +450,106 @@ class OptionsPanel(ttk.LabelFrame):
             cb_debug,
         ]
 
+    def _attach_tooltips(self) -> None:
+        for widget, help_text in self._tooltip_bindings:
+            attach_tooltip(widget, help_text, palette_provider=self._palette_provider)
+
+    def _wire_dependencies(self) -> None:
+        if self._dependency_traces_wired:
+            return
+        self._dependency_traces_wired = True
+        for var in (
+            self._vars.enrich_metadata_var,
+            self._vars.cover_only_var,
+            self._vars.no_chapters_var,
+            self._vars.split_chapters_var,
+            self._vars.combine_var,
+        ):
+            var.trace_add("write", lambda *_args: self.sync_dependency_states())
+        for entry in (
+            self._chapter_offset_entry,
+            self._max_cover_entry,
+            self._limit_rate_entry,
+        ):
+            entry.bind("<KeyRelease>", lambda _e: self._validate_inline_fields(), add="+")
+            entry.bind("<FocusOut>", lambda _e: self._validate_inline_fields(), add="+")
+
+    def _on_split_chapters_clicked(self) -> None:
+        if self._vars.split_chapters_var.get() and self._vars.combine_var.get():
+            self._vars.combine_var.set(False)
+        self.sync_dependency_states()
+
+    def _on_combine_clicked(self) -> None:
+        if self._vars.combine_var.get() and self._vars.split_chapters_var.get():
+            self._vars.split_chapters_var.set(False)
+        self.sync_dependency_states()
+
+    def _validate_inline_fields(self) -> None:
+        errors: list[str] = []
+        raw_offset = self._vars.chapter_offset_ms_var.get().strip()
+        if raw_offset:
+            try:
+                int(raw_offset)
+            except ValueError:
+                errors.append("Offset (ms) must be a whole integer")
+        raw_max_cover = self._vars.max_cover_size_var.get().strip()
+        if raw_max_cover:
+            try:
+                if int(raw_max_cover) < 1:
+                    errors.append("Max cover must be >= 1")
+            except ValueError:
+                errors.append("Max cover must be a positive integer")
+        raw_rate = self._vars.limit_rate_var.get().strip()
+        if raw_rate:
+            try:
+                parse_byte_rate(raw_rate)
+            except ValueError:
+                errors.append("Limit rate is invalid (e.g. 2M, 500K)")
+        if errors:
+            self._validation_var.set(" • ".join(errors))
+            self._validation_label.grid()
+        else:
+            self._validation_var.set("")
+            self._validation_label.grid_remove()
+
+    def sync_dependency_states(self) -> None:
+        """Update enabled/disabled states for dependent controls when idle."""
+        if not self._panel_enabled:
+            return
+        cover_only = bool(self._vars.cover_only_var.get())
+        no_chapters = bool(self._vars.no_chapters_var.get())
+        enrich_on = bool(self._vars.enrich_metadata_var.get())
+        split_on = bool(self._vars.split_chapters_var.get())
+
+        def _set_widget(widget: OptionWidget, enabled: bool, *, readonly_combo: bool = False) -> None:
+            if not enabled:
+                widget.configure(state="disabled")
+            elif readonly_combo:
+                widget.configure(state="readonly")
+            else:
+                widget.configure(state="normal")
+
+        _set_widget(self._cb_enrich_interactive, enrich_on)
+        _set_widget(self._enrich_providers_entry, enrich_on)
+
+        _set_widget(self._cb_m4b, not cover_only)
+        _set_widget(self._format_combo, not cover_only, readonly_combo=True)
+        _set_widget(self._bitrate_combo, not cover_only, readonly_combo=True)
+        _set_widget(self._cb_loudnorm, not cover_only)
+        _set_widget(self._cb_mono, not cover_only)
+        _set_widget(self._cb_combine, (not cover_only) and (not split_on))
+        _set_widget(self._cb_split_chapters, (not cover_only) and (not no_chapters))
+        _set_widget(self._cb_silence_chapters, (not cover_only) and (not no_chapters))
+        _set_widget(self._chapter_offset_entry, not no_chapters)
+        _set_widget(self._cb_cue, not no_chapters)
+
     def set_enabled(self, enabled: bool) -> None:
         """Enable or disable interactive option controls cleanly."""
+        self._panel_enabled = enabled
         for widget in self._widgets:
             if isinstance(widget, ttk.Combobox) and widget is not self._impersonate_combo:
                 widget.configure(state="readonly" if enabled else "disabled")
             else:
                 widget.configure(state="normal" if enabled else "disabled")
+        if enabled:
+            self.sync_dependency_states()

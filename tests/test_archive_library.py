@@ -1,5 +1,6 @@
 import sqlite3
 import tkinter as tk
+from typing import cast
 
 import pytest
 import requests
@@ -8,7 +9,7 @@ from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, args
 from audiobookdl.__main__ import main as cli_main
 from audiobookdl.gui.app import AudiobookDLApp
 from audiobookdl.pipeline import process_audiobook
-from audiobookdl.sources.source import CatalogBook
+from audiobookdl.sources.source import CatalogBook, Source
 from audiobookdl.utils.archive import (
     DownloadArchive,
     make_book_key,
@@ -173,9 +174,10 @@ def test_skip_downloaded_uses_default_downloads_db_and_records_metadata(tmp_path
         skip_downloaded=True,
         profile="Personal",
     )
-    assert process_audiobook(_Src(), book, opts) is True
+    src = cast(Source, _Src())
+    assert process_audiobook(src, book, opts) is True
     # Second run skips via default downloads.db even when output file isn't on disk
-    assert process_audiobook(_Src(), book, opts) is False
+    assert process_audiobook(src, book, opts) is False
 
     archive = DownloadArchive(str(tmp_path / "downloads.db"))
     entry = archive.list_entries()[0]
@@ -220,11 +222,13 @@ def test_cli_library_subcommand_list_tag_hide_trash_restore(tmp_path, capsys):
 
     with pytest.raises(SystemExit):
         cli_main(["library", "--config", str(cfg_path), "--download-archive", str(db_path), "trash", str(entry_id)])
-    assert archive.get_entry(entry_id).status == "trashed"
+    trashed = archive.get_entry(entry_id)
+    assert trashed is not None and trashed.status == "trashed"
 
     with pytest.raises(SystemExit):
         cli_main(["library", "--config", str(cfg_path), "--download-archive", str(db_path), "restore", str(entry_id)])
-    assert archive.get_entry(entry_id).status == "downloaded"
+    restored = archive.get_entry(entry_id)
+    assert restored is not None and restored.status == "downloaded"
 
 
 def test_gui_archive_dialog_tags_hide_trash_and_queue(tmp_path):
@@ -429,4 +433,43 @@ def test_resolve_archive_path_precedence(tmp_path):
     assert resolve_archive_path(cfg) == str(tmp_path / "configured.db")
     cfg.download_archive = None
     assert resolve_archive_path(cfg) == default_archive_path(db_dir)
+
+
+def test_lookup_catalog_statuses_badges(tmp_path):
+    db_path = tmp_path / "catalog_status.db"
+    archive = DownloadArchive(str(db_path), persistent=True)
+    try:
+        b_dl = CatalogBook(title="Downloaded Book", url="https://example.com/dl", author="Auth A", source="librivox")
+        b_pend = CatalogBook(title="Pending Book", url="https://example.com/pend", author="Auth B", source="librivox")
+        b_hid = CatalogBook(title="Hidden Book", url="https://example.com/hid", author="Auth C", source="librivox")
+        b_dl_hid = CatalogBook(title="Hidden DL", url="https://example.com/dlh", author="Auth D", source="librivox")
+        b_trash = CatalogBook(title="Trashed Book", url="https://example.com/trash", author="Auth E", source="librivox")
+        b_new = CatalogBook(title="Fresh Book", url="https://example.com/new", author="Auth F", source="librivox")
+        b_title_match = CatalogBook(title="Local Title Match", url="https://example.com/alt-url", author="Auth G", source="librivox")
+
+        archive.record("librivox", b_dl.url, title=b_dl.title, author=b_dl.author, url=b_dl.url, status="downloaded")
+        archive.record("librivox", b_pend.url, title=b_pend.title, author=b_pend.author, url=b_pend.url, status="pending")
+        hid_id = archive.record("librivox", b_hid.url, title=b_hid.title, author=b_hid.author, url=b_hid.url, status="pending")
+        archive.add_tags(hid_id, ["hidden"])
+        dl_hid_id = archive.record("librivox", b_dl_hid.url, title=b_dl_hid.title, author=b_dl_hid.author, url=b_dl_hid.url, status="downloaded")
+        archive.add_tags(dl_hid_id, ["hidden"])
+        archive.record("librivox", b_trash.url, title=b_trash.title, author=b_trash.author, url=b_trash.url, status="trashed")
+        archive.record("local", "local-1", title="Local Title Match", author="Auth G", status="downloaded")
+
+        badges = archive.lookup_catalog_statuses(
+            "librivox",
+            [b_dl, b_pend, b_hid, b_dl_hid, b_trash, b_new, b_title_match],
+        )
+        assert badges == [
+            "Downloaded",
+            "Pending",
+            "Hidden",
+            "Downloaded (Hidden)",
+            "Trashed",
+            "",
+            "Downloaded",
+        ]
+    finally:
+        archive.close()
+
 

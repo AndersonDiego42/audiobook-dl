@@ -1,10 +1,11 @@
 """Main Tkinter desktop window coordinator and launcher entry point for audiobook-dl."""
 
 import argparse
-from collections import deque
+from collections import Counter, deque
 import dataclasses
 import importlib.resources
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,7 @@ from audiobookdl.config import (
     normalize_profile_name,
 )
 from audiobookdl.exceptions import DownloadCancelled
+from audiobookdl.gui.accounts_dialog import AccountsOverviewDialog
 from audiobookdl.gui.archive_dialog import ArchiveLedgerDialog
 from audiobookdl.gui.auth_panel import ServiceAuthPanel
 from audiobookdl.gui.catalog_dialog import CatalogBrowserDialog
@@ -39,6 +41,7 @@ from audiobookdl.gui.options_panel import OptionsPanel
 from audiobookdl.gui.pack_dialog import PackDialog
 from audiobookdl.gui.preview_dialog import ChoiceDialog, PreviewDialog
 from audiobookdl.gui.queue_panel import ActivityQueuePanel
+from audiobookdl.gui.sync_dialog import LibrarySyncDialog
 from audiobookdl.gui.theme import (
     THEME_LABELS,
     THEME_MODES,
@@ -52,17 +55,38 @@ from audiobookdl.gui.theme import (
     scale_px,
 )
 from audiobookdl.gui.widgets import (
+    CollapsibleSection,
     ScrollableFrame,
+    attach_tooltip,
     attach_url_context_menu,
     bind_text_tab_navigation,
 )
-from audiobookdl.options_schema import GUI_OPTION_SPECS, PERSISTED_GUI_OPTION_SPECS
+from audiobookdl.options_schema import GUI_OPTION_SPECS, OPTIONS_BY_NAME, PERSISTED_GUI_OPTION_SPECS
+from audiobookdl.pack import SUPPORTED_PACK_EXTENSIONS
 from audiobookdl.pipeline import DownloadSummary
-from audiobookdl.sources import ServiceInfo, get_available_services
+from audiobookdl.sources import ServiceInfo, detect_service_key, get_available_services
 from audiobookdl.sources.source import Source
 from audiobookdl.utils import read_asset_file
-from audiobookdl.utils.archive import resolve_archive_path
-from audiobookdl.utils.audiobook import Audiobook, BookId, Result, Series
+from audiobookdl.utils.archive import DownloadArchive, resolve_archive_path
+from audiobookdl.utils.audiobook import Audiobook, AudiobookMetadata, BookId, Result, Series
+
+TEMPLATE_TOKENS: tuple[tuple[str, str], ...] = (
+    ("{title}", "Title"),
+    ("{author}", "Author"),
+    ("{narrator}", "Narrator"),
+    ("{series}", "Series"),
+    ("{series_order_padded}", "Series Order (01)"),
+    ("{year}", "Release Year"),
+    ("{source}", "Service"),
+    ("{isbn}", "ISBN"),
+    ("{asin}", "ASIN"),
+    ("{series?{series}/}", "Conditional Series Folder"),
+)
+SAMPLE_STANDALONE_METADATA = AudiobookMetadata(
+    title="Project Hail Mary",
+    authors=["Andy Weir"],
+    source="audible",
+)
 from audiobookdl.utils.updater import UpdateInfo
 
 
@@ -141,7 +165,15 @@ class AudiobookDLApp:
         self._abs_dialog: Any | None = None
         self._catalog_dialog: CatalogBrowserDialog | None = None
         self._pack_dialog: PackDialog | None = None
-        self._output_widgets: list[ttk.Entry | ttk.Button | ttk.Combobox] = []
+        self._sync_dialog: LibrarySyncDialog | None = None
+        self._accounts_dialog: AccountsOverviewDialog | None = None
+        self._auto_sync_enabled = False
+        self._auto_sync_minutes = 30
+        self._auto_sync_targets: list[tuple[str, str]] = []
+        self._auto_sync_after_id: str | None = None
+        self._clipboard_after_id: str | None = None
+        self._last_seen_clipboard = ""
+        self._output_widgets: list[ttk.Entry | ttk.Button | ttk.Combobox | ttk.Menubutton] = []
 
         self._init_variables()
         self._ffmpeg_assistant = FFmpegAssistant(
@@ -160,6 +192,7 @@ class AudiobookDLApp:
         self._set_running_state(False)
 
         self._poll_after_id: str | None = None
+        self._url_debounce_after_id: str | None = None
         self._modal_prompt_active = False
         self._deferred_modal_events: deque[tuple] = deque()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -175,6 +208,7 @@ class AudiobookDLApp:
         self._theme_mode = normalize_theme_mode(mode)
         self._theme_var.set(self._theme_mode)
         self._palette = apply_theme(self.root, self._style, self._theme_mode)
+        self._queue_panel.apply_theme_palette(self._palette)
         for child in self.root.winfo_children():
             if isinstance(child, tk.Toplevel):
                 apply_theme_to_window(child, self._palette)
@@ -203,6 +237,7 @@ class AudiobookDLApp:
             value=TEMPLATE_TO_PRESET_LABEL.get(saved_template, "Custom")
         )
         self.template_preview_var = tk.StringVar(value="")
+        self.template_standalone_preview_var = tk.StringVar(value="")
 
         first_label = self._services[0].label if self._services else ""
         self.service_label_var = tk.StringVar(value=first_label)
@@ -235,6 +270,7 @@ class AudiobookDLApp:
         notify_default = True if cfg.gui.notify_on_complete is None else bool(cfg.gui.notify_on_complete)
         self.notify_on_complete_var = tk.BooleanVar(value=notify_default)
 
+        self.clipboard_monitor_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Ready")
         self.batch_var = tk.StringVar(value="")
         self.metrics_var = tk.StringVar(value="")
@@ -250,7 +286,7 @@ class AudiobookDLApp:
         self._scroll_frame.pack(fill=tk.BOTH, expand=True)
         container = self._scroll_frame.content_frame
         container.columnconfigure(0, weight=1)
-        container.rowconfigure(5, weight=1)
+        container.rowconfigure(1, weight=1)
 
         # Header
         header = ttk.Frame(container)
@@ -267,18 +303,26 @@ class AudiobookDLApp:
         assert self._ffmpeg_assistant.locate_btn is not None
         self.ffmpeg_locate_btn = self._ffmpeg_assistant.locate_btn
 
+        self._paned = ttk.PanedWindow(container, orient=tk.VERTICAL)
+        self._paned.grid(row=1, column=0, sticky="nsew")
+
+        top_pane = ttk.Frame(self._paned)
+        top_pane.columnconfigure(0, weight=1)
+        self._top_pane = top_pane
+        self._paned.add(top_pane, weight=0)
+
         # URLs
-        url_frame = ttk.LabelFrame(container, text="Audiobook URL(s)", padding=(10, 6))
-        url_frame.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        url_frame = ttk.LabelFrame(top_pane, text="Audiobook URL(s)", padding=(10, 6))
+        url_frame.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         url_frame.columnconfigure(0, weight=1)
+        self._url_frame = url_frame
 
         self.urls_text = tk.Text(url_frame, height=2, width=40, wrap="word")
         self.urls_text.grid(row=0, column=0, sticky="ew")
+        self.urls_text.tag_configure("warning_line", foreground=self._palette.warning, underline=True)
         bind_text_tab_navigation(self.urls_text)
         self.urls_text.bind("<Control-Return>", lambda _e: self.start_download())
-        self.urls_text.bind("<KeyRelease>", self._on_urls_changed)
-        self.urls_text.bind("<<Paste>>", lambda _e: self.root.after(10, self._on_urls_changed))
-        self.urls_text.bind("<ButtonRelease-1>", lambda _e: self.root.after(10, self._on_urls_changed))
+        self.urls_text.bind("<<Modified>>", self._on_urls_modified)
         self._url_menu = attach_url_context_menu(
             self.urls_text,
             on_paste=self._paste_urls_from_clipboard,
@@ -291,7 +335,7 @@ class AudiobookDLApp:
         url_footer.columnconfigure(0, weight=1)
         ttk.Label(
             url_footer,
-            text="One URL per line \u2022 Right-click: Paste & Queue \u2022 Ctrl+Enter to start",
+            text="One URL per line \u2022 Right-click: Paste & Queue \u2022 Ctrl+Enter / F5 to start",
             style="Muted.TLabel",
         ).grid(row=0, column=0, sticky="w")
         url_btn_row = ttk.Frame(url_footer)
@@ -305,8 +349,8 @@ class AudiobookDLApp:
         ttk.Button(url_btn_row, text="Clear", command=self._clear_urls).pack(side=tk.LEFT)
 
         # Output Location
-        out_frame = ttk.LabelFrame(container, text="Output", padding=(10, 6))
-        out_frame.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+        out_frame = ttk.LabelFrame(top_pane, text="Output", padding=(10, 6))
+        out_frame.grid(row=1, column=0, sticky="ew", pady=(0, 6))
         out_frame.columnconfigure(1, weight=1)
 
         ttk.Label(out_frame, text="Folder:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
@@ -323,6 +367,20 @@ class AudiobookDLApp:
         tpl_row.columnconfigure(0, weight=1)
         tpl_entry = ttk.Entry(tpl_row, textvariable=self.template_var)
         tpl_entry.grid(row=0, column=0, sticky="ew")
+        self._tpl_entry = tpl_entry
+        token_btn = ttk.Menubutton(tpl_row, text="Insert Token")
+        token_menu = tk.Menu(token_btn, tearoff=0)
+        for tok, desc in TEMPLATE_TOKENS:
+
+            def _insert_cb(t: str = tok) -> None:
+                self._insert_template_token(t)
+
+            token_menu.add_command(
+                label=f"{tok}  \u2014  {desc}",
+                command=_insert_cb,
+            )
+        token_btn.configure(menu=token_menu)
+        token_btn.grid(row=0, column=1, padx=(6, 0))
         self.preset_combo = ttk.Combobox(
             tpl_row,
             textvariable=self.template_preset_var,
@@ -330,13 +388,30 @@ class AudiobookDLApp:
             state="readonly",
             width=16,
         )
-        self.preset_combo.grid(row=0, column=1, padx=(8, 0))
+        self.preset_combo.grid(row=0, column=2, padx=(6, 0))
         self.preset_combo.bind("<<ComboboxSelected>>", self._on_preset_selected)
 
-        ttk.Label(out_frame, text="Preview:").grid(row=2, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(out_frame, text="Series:").grid(row=2, column=0, sticky="w", padx=(0, 8))
         ttk.Label(out_frame, textvariable=self.template_preview_var, style="Muted.TLabel").grid(
             row=2, column=1, columnspan=2, sticky="w"
         )
+        ttk.Label(out_frame, text="Standalone:").grid(row=3, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(
+            out_frame, textvariable=self.template_standalone_preview_var, style="Muted.TLabel"
+        ).grid(row=3, column=1, columnspan=2, sticky="w")
+
+        tpl_spec = OPTIONS_BY_NAME.get("output_template")
+        if tpl_spec and tpl_spec.cli_flags:
+            raw_help = tpl_spec.cli_flags[0].help
+            tpl_help = raw_help() if callable(raw_help) else str(raw_help or "")
+            if tpl_help:
+                attach_tooltip(tpl_entry, tpl_help, palette_provider=lambda: self._palette)
+        attach_tooltip(
+            out_entry,
+            "Destination folder where downloaded or packed audiobooks are written",
+            palette_provider=lambda: self._palette,
+        )
+
         for var in (
             self.output_dir_var,
             self.template_var,
@@ -349,11 +424,18 @@ class AudiobookDLApp:
             var.trace_add("write", lambda *_args: self._update_template_preview())
         self.template_var.trace_add("write", lambda *_args: self._sync_preset_from_template())
         self._update_template_preview()
-        self._output_widgets = [out_entry, out_browse, tpl_entry, self.preset_combo]
+        self._output_widgets = [out_entry, out_browse, tpl_entry, token_btn, self.preset_combo]
 
-        # Service & Authentication
+        # Service & Authentication (Collapsible)
+        self._auth_section = CollapsibleSection(
+            top_pane,
+            "Service & Authentication",
+            collapsed=False,
+            on_toggle=lambda _c: self._sync_paned_reqheight(),
+        )
+        self._auth_section.grid(row=2, column=0, sticky="ew", pady=(0, 6))
         self._auth_panel = ServiceAuthPanel(
-            container,
+            self._auth_section.content,
             self.root,
             self._controller,
             self._services,
@@ -372,24 +454,44 @@ class AudiobookDLApp:
             build_verify_options=lambda: self._try_build_options(urls_override=[]),
             is_running_provider=lambda: self._is_running,
             on_log=lambda msg: self._queue_panel.append_log(msg),
+            on_manage_accounts=self._show_accounts_dialog,
         )
-        self._auth_panel.grid(row=3, column=0, sticky="ew", pady=(0, 6))
+        self._auth_panel.grid(row=0, column=0, sticky="ew")
         self.service_combo = self._auth_panel.service_combo
         self.user_entry = self._auth_panel.user_entry
 
-        # Options
+        # Options (Collapsible)
+        self._options_section = CollapsibleSection(
+            top_pane,
+            "Options",
+            collapsed=False,
+            on_toggle=lambda _c: self._sync_paned_reqheight(),
+        )
+        self._options_section.grid(row=3, column=0, sticky="ew", pady=(0, 6))
         self._options_panel = OptionsPanel(
-            container,
+            self._options_section.content,
             self,
             on_m4b_toggled=self._on_m4b_toggled,
             on_format_selected=self._on_format_selected,
+            palette_provider=lambda: self._palette,
         )
-        self._options_panel.grid(row=4, column=0, sticky="ew", pady=(0, 6))
+        self._options_panel.grid(row=0, column=0, sticky="ew")
         self.options_notebook = self._options_panel.options_notebook
+
+        for summary_var in (
+            self.service_label_var,
+            self.profile_var,
+            self.saved_badge_var,
+            self.output_format_var,
+            self.combine_var,
+            self.enrich_metadata_var,
+        ):
+            summary_var.trace_add("write", lambda *_args: self._update_section_summaries())
+        self._update_section_summaries()
 
         # Actions, Progress & Queue
         self._queue_panel = ActivityQueuePanel(
-            container,
+            self._paned,
             self.root,
             self._controller,
             status_var=self.status_var,
@@ -406,8 +508,12 @@ class AudiobookDLApp:
             on_preview_url=lambda u: self.preview_metadata(url_override=u),
             on_send_to_urls=self._send_urls_to_input,
             on_open_path=self._open_path_in_os,
+            palette=self._palette,
         )
-        self._queue_panel.grid(row=5, column=0, sticky="nsew")
+        self._paned.add(self._queue_panel, weight=1)
+        self._paned.configure(height=scale_px(self.root, 640))
+        self._top_pane.bind("<Configure>", lambda _e: self._sync_paned_reqheight(), add="+")
+        self._queue_panel.bind("<Configure>", lambda _e: self._sync_paned_reqheight(), add="+")
         self.download_btn = self._queue_panel.download_btn
         self.pause_btn = self._queue_panel.pause_btn
         self.cancel_btn = self._queue_panel.cancel_btn
@@ -417,13 +523,17 @@ class AudiobookDLApp:
         self.log_text = self._queue_panel.log_text
         self.queue_tree = self._queue_panel.queue_tree
 
-        # Optional drag-and-drop URL support when tkinterdnd2 is available on host Tk.
+        # Optional drag-and-drop URL & local folder/audio file support when tkinterdnd2 is available.
         if hasattr(self.urls_text, "drop_target_register") and hasattr(self.urls_text, "dnd_bind"):
             try:
-                self.urls_text.drop_target_register("DND_Text")  # type: ignore[attr-defined]
+                self.urls_text.drop_target_register("DND_Text", "DND_Files")  # type: ignore[attr-defined]
                 self.urls_text.dnd_bind("<<Drop>>", self._on_url_drop)  # type: ignore[attr-defined]
             except Exception:
-                pass
+                try:
+                    self.urls_text.drop_target_register("DND_Text")  # type: ignore[attr-defined]
+                    self.urls_text.dnd_bind("<<Drop>>", self._on_url_drop)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
 
     def _build_menu_bar(self) -> None:
         menubar = tk.Menu(self.root)
@@ -440,11 +550,15 @@ class AudiobookDLApp:
         view_menu = tk.Menu(menubar, tearoff=0)
         theme_menu = tk.Menu(view_menu, tearoff=0)
         for mode in THEME_MODES:
+
+            def _theme_cb(m: str = mode) -> None:
+                self.set_theme(m)
+
             theme_menu.add_radiobutton(
                 label=THEME_LABELS[mode],
                 variable=self._theme_var,
                 value=mode,
-                command=lambda m=mode: self.set_theme(m),
+                command=_theme_cb,
             )
         view_menu.add_cascade(label="Theme", menu=theme_menu)
         view_menu.add_separator()
@@ -458,25 +572,50 @@ class AudiobookDLApp:
         tools_menu.add_command(label="Save Credentials", command=self.save_current_credentials)
         tools_menu.add_command(label="Test Login", command=self.verify_current_auth)
         tools_menu.add_command(
+            label="Manage All Accounts & Services...",
+            command=self._show_accounts_dialog,
+        )
+        tools_menu.add_command(
             label="Import Browser Cookies...",
             command=lambda: self._auth_panel.show_cookie_import_dialog(),
+            accelerator="Ctrl+Shift+I",
         )
         tools_menu.add_command(
-            label="Browse Library / Search...", command=self._show_catalog_browser_dialog
+            label="Browse Library / Search...",
+            command=self._show_catalog_browser_dialog,
+            accelerator="Ctrl+B",
         )
         tools_menu.add_command(
-            label="Sync Libraries...", command=self._sync_libraries
+            label="Sync Libraries...",
+            command=self._show_library_sync_dialog,
+            accelerator="Ctrl+Shift+S",
         )
-        tools_menu.add_command(label="Pack Local Audiobooks...", command=self._show_pack_dialog)
+        tools_menu.add_command(
+            label="Pack Local Audiobooks...",
+            command=self._show_pack_dialog,
+            accelerator="Ctrl+K",
+        )
+        tools_menu.add_command(
+            label="Preview Metadata...",
+            command=self.preview_metadata,
+            accelerator="Ctrl+P",
+        )
         tools_menu.add_command(label="Locate FFmpeg Folder...", command=self.browse_ffmpeg_dir)
         tools_menu.add_command(
             label="Reset FFmpeg Folder to System PATH", command=self.reset_ffmpeg_dir
         )
         tools_menu.add_command(
-            label="Library & Download Ledger...", command=self._show_archive_ledger_dialog
+            label="Library & Download Ledger...",
+            command=self._show_archive_ledger_dialog,
+            accelerator="Ctrl+L",
         )
         tools_menu.add_command(
             label="Audiobookshelf Integration...", command=self._show_audiobookshelf_dialog
+        )
+        tools_menu.add_checkbutton(
+            label="Monitor Clipboard for URLs",
+            variable=self.clipboard_monitor_var,
+            command=self._toggle_clipboard_monitor,
         )
         tools_menu.add_separator()
         tools_menu.add_command(label="Retry Failed Jobs", command=self._retry_failed_queue_items)
@@ -504,6 +643,13 @@ class AudiobookDLApp:
         self.root.configure(menu=menubar)
         self.root.bind("<Control-o>", lambda _e: self._browse_url_file())
         self.root.bind("<Control-q>", lambda _e: self._on_close())
+        self.root.bind("<Control-b>", lambda _e: self._show_catalog_browser_dialog())
+        self.root.bind("<Control-l>", lambda _e: self._show_archive_ledger_dialog())
+        self.root.bind("<Control-p>", lambda _e: self.preview_metadata())
+        self.root.bind("<Control-k>", lambda _e: self._show_pack_dialog())
+        self.root.bind("<Control-I>", lambda _e: self._auth_panel.show_cookie_import_dialog())
+        self.root.bind("<Control-S>", lambda _e: self._show_library_sync_dialog())
+        self.root.bind("<F5>", lambda _e: self.start_download())
 
     def browse_ffmpeg_dir(self) -> bool:
         """Let the user choose a folder containing `ffmpeg` and persist it in config."""
@@ -529,13 +675,77 @@ class AudiobookDLApp:
         """Toggle pause/resume state for remaining queued jobs."""
         self._queue_panel.toggle_pause(is_running=self._is_running)
 
+    @staticmethod
+    def _split_dropped_tokens(raw_data: str) -> list[str]:
+        tokens: list[str] = []
+        for match in re.finditer(r"\{([^}]+)\}|(\S+)", raw_data):
+            val = (match.group(1) or match.group(2) or "").strip()
+            if val:
+                tokens.append(val)
+        return tokens
+
     def _on_url_drop(self, event: Any) -> None:
         dropped = getattr(event, "data", "")
         if not dropped:
             return
-        urls = parse_url_text(str(dropped).strip("{}"))
-        if urls:
-            self._append_urls_to_input(urls)
+        tokens = self._split_dropped_tokens(str(dropped))
+        local_paths: list[str] = []
+        url_tokens: list[str] = []
+        for tok in tokens:
+            if os.path.isdir(tok) or (
+                os.path.isfile(tok)
+                and os.path.splitext(tok)[1].lstrip(".").lower() in SUPPORTED_PACK_EXTENSIONS
+            ):
+                local_paths.append(tok)
+            else:
+                url_tokens.append(tok)
+        if local_paths:
+            self._show_pack_dialog(initial_paths=local_paths)
+        if url_tokens:
+            self._append_urls_to_input(url_tokens)
+
+    def _toggle_clipboard_monitor(self) -> None:
+        if self._clipboard_after_id is not None:
+            try:
+                self.root.after_cancel(self._clipboard_after_id)
+            except tk.TclError:
+                pass
+            self._clipboard_after_id = None
+        if self.clipboard_monitor_var.get():
+            try:
+                self._last_seen_clipboard = str(self.root.clipboard_get() or "")
+            except tk.TclError:
+                self._last_seen_clipboard = ""
+            self.status_var.set("Clipboard URL monitor enabled")
+            self._clipboard_after_id = self.root.after(1200, self._poll_clipboard)
+        else:
+            self.status_var.set("Clipboard URL monitor disabled")
+
+    def _poll_clipboard(self) -> None:
+        self._clipboard_after_id = None
+        if not self.clipboard_monitor_var.get():
+            return
+        try:
+            if not self.root.winfo_exists():
+                return
+            raw = str(self.root.clipboard_get() or "")
+        except tk.TclError:
+            raw = ""
+        if raw and raw != self._last_seen_clipboard:
+            self._last_seen_clipboard = raw
+            candidates = [
+                u for u in parse_url_text(raw)
+                if u.lower().startswith(("http://", "https://")) and detect_service_key(u)
+            ]
+            if candidates:
+                added = self._append_urls_to_input(candidates)
+                if added:
+                    self.status_var.set(f"Captured {len(added)} URL(s) from clipboard")
+        try:
+            if self.root.winfo_exists() and self.clipboard_monitor_var.get():
+                self._clipboard_after_id = self.root.after(1200, self._poll_clipboard)
+        except tk.TclError:
+            pass
 
     def _append_urls_to_input(self, urls: Sequence[str]) -> list[str]:
         existing = parse_url_text(self.urls_text.get("1.0", tk.END))
@@ -548,8 +758,97 @@ class AudiobookDLApp:
             self._on_urls_changed()
         return added
 
+    def _sync_paned_reqheight(self) -> None:
+        if not hasattr(self, "_paned") or not hasattr(self, "_top_pane"):
+            return
+        try:
+            top_h = self._top_pane.winfo_reqheight()
+            bottom_h = self._queue_panel.winfo_reqheight()
+            total_h = max(scale_px(self.root, 420), top_h + bottom_h + scale_px(self.root, 8))
+            if int(float(self._paned.cget("height") or 0)) != total_h:
+                self._paned.configure(height=total_h)
+        except tk.TclError:
+            pass
+
+    def _on_urls_modified(self, _event: tk.Event | None = None) -> None:
+        try:
+            if not self.urls_text.edit_modified():
+                return
+            self.urls_text.edit_modified(False)
+        except tk.TclError:
+            return
+        if self._url_debounce_after_id is not None:
+            try:
+                self.root.after_cancel(self._url_debounce_after_id)
+            except tk.TclError:
+                pass
+        self._url_debounce_after_id = self.root.after(100, self._on_urls_changed)
+
     def _on_urls_changed(self, _event: tk.Event | None = None) -> None:
-        self._auth_panel.on_urls_changed(parse_url_text(self.urls_text.get("1.0", tk.END)))
+        self._url_debounce_after_id = None
+        raw_text = self.urls_text.get("1.0", tk.END)
+        urls = parse_url_text(raw_text)
+        self._auth_panel.on_urls_changed(urls)
+
+        # Update dynamic URL frame title and highlight unrecognized lines
+        self.urls_text.tag_remove("warning_line", "1.0", tk.END)
+        counts: Counter[str] = Counter()
+        valid_count = 0
+        for line_no, raw_line in enumerate(raw_text.splitlines(), start=1):
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            tokens = stripped.split()
+            line_valid = True
+            for tok in tokens:
+                is_http = tok.lower().startswith(("http://", "https://"))
+                svc_key = detect_service_key(tok)
+                if is_http:
+                    valid_count += 1
+                    label = self._auth_panel.service_label_for_url(tok) if svc_key else "Generic"
+                    counts[label] += 1
+                else:
+                    line_valid = False
+            if not line_valid:
+                self.urls_text.tag_add("warning_line", f"{line_no}.0", f"{line_no}.end")
+
+        if hasattr(self, "_url_frame"):
+            if valid_count == 0:
+                self._url_frame.configure(text="Audiobook URL(s)")
+            else:
+                breakdown = ", ".join(f"{cnt} {lbl}" for lbl, cnt in counts.most_common(3))
+                self._url_frame.configure(
+                    text=f"Audiobook URL(s) \u2014 {valid_count} URL{'s' if valid_count != 1 else ''} ({breakdown})"
+                )
+
+    def _insert_template_token(self, token: str) -> None:
+        entry = self._tpl_entry
+        if str(entry.cget("state")) == "disabled":
+            return
+        try:
+            pos: str = str(entry.index(tk.INSERT))
+        except tk.TclError:
+            pos = tk.END
+        entry.insert(pos, token)
+        entry.focus_set()
+
+    def _update_section_summaries(self) -> None:
+        if hasattr(self, "_auth_section"):
+            svc = self.service_label_var.get() or "Service"
+            prof = self.profile_var.get() or DEFAULT_PROFILE
+            badge = f" [{self.saved_badge_var.get()}]" if self.saved_badge_var.get() else ""
+            self._auth_section.set_summary(f"{svc} ({prof}){badge}")
+        if hasattr(self, "_options_section"):
+            fmt = self.output_format_var.get() or "Original"
+            flags: list[str] = []
+            if self.combine_var.get():
+                flags.append("Combine")
+            if self.enrich_metadata_var.get():
+                flags.append("Enrich")
+            if self.cover_only_var.get():
+                flags.append("Cover only")
+            suffix = f" ({', '.join(flags)})" if flags else ""
+            self._options_section.set_summary(f"Format: {fmt}{suffix}")
 
     def _reload_config(self) -> None:
         try:
@@ -618,9 +917,53 @@ class AudiobookDLApp:
             self.root,
             self._archive_ledger_path(),
             on_queue_urls=_on_queue_urls,
+            on_open_path=self._open_path_in_os,
+            on_pack_paths=lambda paths: self._show_pack_dialog(initial_paths=paths),
+            on_upload_abs=self._upload_archive_entry_to_abs,
             palette=self._palette,
         )
         return self._archive_dialog
+
+    def _upload_archive_entry_to_abs(self, entry: Any) -> None:
+        if not entry.output_path:
+            return
+        self.status_var.set(f"Uploading '{entry.title}' to Audiobookshelf...")
+        self._queue_panel.append_log(f"Uploading to Audiobookshelf: {entry.title}")
+        authors = [a.strip() for a in (entry.author or "").split(";") if a.strip()]
+        self._controller.start_abs_upload(
+            entry.output_path,
+            title=entry.title,
+            authors=authors,
+            series=entry.series,
+        )
+        self._schedule_poll_soon()
+
+    def _show_accounts_dialog(self) -> AccountsOverviewDialog:
+        existing = self._raise_existing_dialog(self._accounts_dialog)
+        if existing is not None:
+            return existing
+
+        def _on_select(svc_key: str, prof: str) -> None:
+            svc = next((s for s in self._services if s.key == svc_key), None)
+            if svc is not None:
+                self.service_label_var.set(svc.label)
+                self.profile_var.set(prof)
+                self._auth_panel.load_service_into_form()
+                self._auth_panel.update_field_states()
+
+        def _on_import_cookies(svc_key: str) -> None:
+            self._auth_panel.show_cookie_import_dialog(svc_key_override=svc_key)
+
+        self._accounts_dialog = AccountsOverviewDialog(
+            self.root,
+            self._controller,
+            self._services,
+            on_import_cookies=lambda sk: _on_import_cookies(sk),
+            on_select_account=_on_select,
+            on_credentials_changed=lambda: self._auth_panel.load_service_into_form(),
+            palette=self._palette,
+        )
+        return self._accounts_dialog
 
     def _show_audiobookshelf_dialog(self):
         from audiobookdl.config import load_config
@@ -658,7 +1001,14 @@ class AudiobookDLApp:
                 return
             chosen_profile = normalize_profile_name(dialog.selected_profile)
             options.profile = None if chosen_profile == DEFAULT_PROFILE else chosen_profile
-            self._controller.start_catalog_fetch(mode, svc.key, query_text, options, dialog)
+            self._controller.start_catalog_fetch(
+                mode,
+                svc.key,
+                query_text,
+                options,
+                dialog,
+                archive_path=self._archive_ledger_path(),
+            )
 
         def _on_add_urls(urls_to_add: list[str]) -> None:
             added = self._append_urls_to_input(urls_to_add)
@@ -684,15 +1034,43 @@ class AudiobookDLApp:
         def _on_sync_from_dialog(svc_key: str) -> None:
             self._sync_libraries(services=[svc_key] if svc_key else ())
 
+        def _status_resolver(svc_key: str, books: Sequence[Any]) -> list[str]:
+            archive_path = self._archive_ledger_path()
+            if not os.path.exists(archive_path):
+                return [""] * len(books)
+            from audiobookdl.utils.archive import DownloadArchive
+
+            with DownloadArchive(archive_path, persistent=True) as archive:
+                return archive.lookup_catalog_statuses(svc_key, list(books))
+
+        def _on_download_urls(urls_to_download: list[str], svc_key: str, prof: str) -> None:
+            norm_prof = normalize_profile_name(prof)
+            if not self._is_running and svc_key:
+                svc = next((s for s in self._services if s.key == svc_key), None)
+                if svc is not None and self.service_label_var.get() != svc.label:
+                    self.service_label_var.set(svc.label)
+                    self.profile_var.set(norm_prof)
+                    self._auth_panel.load_service_into_form()
+                    self._auth_panel.update_field_states()
+                elif self.profile_var.get() != norm_prof:
+                    self.profile_var.set(norm_prof)
+                    self._auth_panel.load_service_into_form()
+            self._start_or_enqueue_urls(
+                urls_to_download,
+                profile_override=None if norm_prof == DEFAULT_PROFILE else norm_prof,
+            )
+
         self._catalog_dialog = CatalogBrowserDialog(
             self.root,
             self._services,
             self._auth_panel.selected_service(),
             on_fetch=_on_fetch,
             on_add_urls=_on_add_urls,
+            on_download_urls=_on_download_urls,
             on_save_to_library=_on_save_to_library,
             on_sync_libraries=_on_sync_from_dialog,
             profile_resolver=_profile_resolver,
+            status_resolver=_status_resolver,
             selected_profile=normalize_profile_name(self.profile_var.get()),
             palette=self._palette,
         )
@@ -703,7 +1081,7 @@ class AudiobookDLApp:
             icon_ref = importlib.resources.files("audiobookdl").joinpath("assets/icon.ico")
             with importlib.resources.as_file(icon_ref) as icon_path:
                 if icon_path.is_file():
-                    self.root.iconbitmap(default=str(icon_path))
+                    self.root.iconbitmap(default=str(icon_path))  # type: ignore[no-untyped-call]
         except Exception:
             pass
 
@@ -751,16 +1129,23 @@ class AudiobookDLApp:
         ext = "m4b" if fmt in ("", "Original") else fmt
         remove_chars = self.remove_chars_var.get()
         try:
-            rendered = output.gen_output_location(full_tpl, SAMPLE_PREVIEW_METADATA, remove_chars)
+            rendered_series = output.gen_output_location(
+                full_tpl, SAMPLE_PREVIEW_METADATA, remove_chars
+            )
+            rendered_standalone = output.gen_output_location(
+                full_tpl, SAMPLE_STANDALONE_METADATA, remove_chars
+            )
             if self.cover_only_var.get():
                 suffix = ".jpg"
             elif self.split_chapters_var.get() or not self.combine_var.get():
                 suffix = f"/01.{ext}"
             else:
                 suffix = f".{ext}"
-            self.template_preview_var.set(f"{rendered}{suffix}")
+            self.template_preview_var.set(f"{rendered_series}{suffix}")
+            self.template_standalone_preview_var.set(f"{rendered_standalone}{suffix}")
         except Exception as exc:
             self.template_preview_var.set(f"(invalid template: {exc})")
+            self.template_standalone_preview_var.set("")
 
     def _browse_url_file(self) -> None:
         path = filedialog.askopenfilename(
@@ -883,7 +1268,23 @@ class AudiobookDLApp:
                 widget.configure(state="disabled" if running else "normal")
         self._options_panel.set_enabled(not running)
         self._auth_panel.set_running_state(running)
-        self._queue_panel.set_running_state(running, is_previewing=self._is_previewing)
+        self._queue_panel.set_running_state(
+            running,
+            is_previewing=self._is_previewing,
+            is_syncing=self._is_syncing,
+        )
+        if running:
+            self._schedule_poll_soon()
+
+    def _set_syncing_state(self, syncing: bool) -> None:
+        self._is_syncing = syncing
+        self._queue_panel.set_running_state(
+            self._is_running,
+            is_previewing=self._is_previewing,
+            is_syncing=syncing,
+        )
+        if syncing:
+            self._schedule_poll_soon()
 
     def _try_build_options(
         self,
@@ -983,15 +1384,23 @@ class AudiobookDLApp:
         urls: list[str],
         *,
         allow_existing: bool = False,
+        profile_override: str | None = None,
     ) -> bool:
         """Append new URLs (or retried URLs when `allow_existing=True`) to the active queue."""
         if not self._auth_panel.validate_cookie_file():
             return True
         if self._try_build_options(urls_override=[]) is None:
             return True
+
+        def _build_for_url(u: str) -> args.DownloadOptions:
+            opts = self.build_options(urls_override=[u])
+            if profile_override:
+                opts.profile = profile_override
+            return opts
+
         has_active_run, added_jobs, new_total = self._controller.enqueue_additional_urls(
             urls,
-            lambda u: self.build_options(urls_override=[u]),
+            _build_for_url,
             allow_existing=allow_existing,
         )
         if not has_active_run:
@@ -1044,6 +1453,32 @@ class AudiobookDLApp:
         if queued_jobs:
             self._controller.save_queue_state()
 
+    def _build_retry_download_spec(
+        self,
+        base_opts: args.DownloadOptions,
+        rec: dict[str, Any],
+    ) -> tuple[str, args.DownloadOptions, list[int] | None, None]:
+        url = str(rec.get("url") or "").strip()
+        opts = self.build_options(urls_override=[url])
+        profile = str(rec.get("profile") or "").strip()
+        if profile:
+            opts.profile = profile
+        job_overrides = rec.get("job_overrides")
+        if isinstance(job_overrides, dict):
+            explicit = set(getattr(opts, "_explicit_fields", set()))
+            for attr in ("output_format", "combine", "output_template", "split_chapters", "media_type"):
+                if attr in job_overrides:
+                    setattr(opts, attr, job_overrides[attr])
+                    explicit.add(attr)
+            opts._explicit_fields = frozenset(explicit)
+        raw_indices = rec.get("selected_indices")
+        selected_indices = (
+            [int(i) for i in raw_indices if isinstance(i, int) and not isinstance(i, bool)]
+            if isinstance(raw_indices, list)
+            else None
+        )
+        return (url, opts, selected_indices, None)
+
     def _retry_failed_queue_items(self, job_ids: Sequence[str] | None = None) -> None:
         target_ids = list(job_ids) if job_ids is not None else list(self.queue_tree.get_children())
         retry_records = self._controller.retryable_jobs(target_ids)
@@ -1051,7 +1486,8 @@ class AudiobookDLApp:
             self.status_var.set("No failed or cancelled jobs to retry")
             return
 
-        download_urls: list[str] = []
+        download_recs: list[dict[str, Any]] = []
+        seen_download_keys: set[tuple[str, str, tuple[int, ...] | None]] = set()
         pack_requests: list[PackJobRequest] = []
         for rec in retry_records:
             if rec.get("job_kind", "download") == "pack":
@@ -1060,26 +1496,31 @@ class AudiobookDLApp:
                     pack_requests.append(parsed)
             else:
                 url = str(rec.get("url") or "").strip()
-                if url and url not in download_urls:
-                    download_urls.append(url)
+                if not url:
+                    continue
+                prof = str(rec.get("profile") or "").strip()
+                raw_idx = rec.get("selected_indices")
+                idx_key = (
+                    tuple(int(i) for i in raw_idx if isinstance(i, int))
+                    if isinstance(raw_idx, list)
+                    else None
+                )
+                dedup_key = (url, prof, idx_key)
+                if dedup_key not in seen_download_keys:
+                    seen_download_keys.add(dedup_key)
+                    download_recs.append(rec)
 
-        if not download_urls and not pack_requests:
+        if not download_recs and not pack_requests:
             self.status_var.set("No failed or cancelled jobs to retry")
             return
 
         if self._is_running:
             if self._controller.cancel_event.is_set():
                 return
-            if download_urls and not pack_requests:
-                self._enqueue_additional_urls(download_urls, allow_existing=True)
-                return
             base_opts = self._try_build_options(urls_override=[])
             if base_opts is None:
                 return
-            dl_specs = [
-                (u, self.build_options(urls_override=[u]), None, None)
-                for u in download_urls
-            ]
+            dl_specs = [self._build_retry_download_spec(base_opts, rec) for rec in download_recs]
             pack_pairs = []
             for req in pack_requests:
                 fmt = req.output_format or base_opts.output_format or "m4b"
@@ -1101,23 +1542,17 @@ class AudiobookDLApp:
             )
             return
 
-        if download_urls and not pack_requests:
-            options = self._try_build_options()
-            if options is None:
-                return
-            if not self._ffmpeg_assistant.ensure_available(options):
-                return
-            self._save_run_preferences(options)
-            job_specs = [
-                (u, self.build_options(urls_override=[u]), None, None)
-                for u in download_urls
-            ]
-            self._start_new_run(job_specs)
-            return
-
         base_opts = self._try_build_options(urls_override=[])
         if base_opts is None:
             return
+        if download_recs and not pack_requests:
+            if not self._ffmpeg_assistant.ensure_available(base_opts):
+                return
+            self._save_run_preferences(base_opts)
+            dl_specs = [self._build_retry_download_spec(base_opts, rec) for rec in download_recs]
+            self._start_new_run(dl_specs)
+            return
+
         pack_pairs = []
         for req in pack_requests:
             fmt = req.output_format or base_opts.output_format or "m4b"
@@ -1126,13 +1561,10 @@ class AudiobookDLApp:
             if not self._ffmpeg_assistant.ensure_available(opts):
                 return
             pack_pairs.append((req, opts))
-        if download_urls and not self._ffmpeg_assistant.ensure_available(base_opts):
+        if download_recs and not self._ffmpeg_assistant.ensure_available(base_opts):
             return
         self._save_run_preferences(base_opts)
-        dl_specs = [
-            (u, self.build_options(urls_override=[u]), None, None)
-            for u in download_urls
-        ]
+        dl_specs = [self._build_retry_download_spec(base_opts, rec) for rec in download_recs]
         was_appended, run_id, queued_jobs, new_total = self._controller.start_or_enqueue_jobs(
             download_specs=dl_specs,
             pack_requests=pack_pairs,
@@ -1147,10 +1579,15 @@ class AudiobookDLApp:
             append_log_msg=f"--- Added {len(queued_jobs)} retry job(s) to queue (total {new_total}) ---",
         )
 
-    def _show_pack_dialog(self) -> PackDialog | None:
+    def _show_pack_dialog(self, *, initial_paths: Sequence[str] = ()) -> PackDialog | None:
         """Open the modal Local Audiobook Repackager dialog."""
         existing = self._raise_existing_dialog(self._pack_dialog)
         if existing is not None:
+            if initial_paths:
+                for p in initial_paths:
+                    if os.path.exists(p):
+                        existing._append_path(p)
+                existing._start_scan()
             return existing
         options = self._try_build_options(urls_override=[])
         if options is None:
@@ -1164,24 +1601,119 @@ class AudiobookDLApp:
             options,
             output_dir=output_dir,
             on_submit=self._on_pack_submitted,
+            initial_paths=initial_paths,
             palette=self._palette,
         )
         return self._pack_dialog
 
-    def _sync_libraries(self, *, services: Sequence[str] = (), scan_only: bool = False) -> None:
-        """Run one library synchronization cycle in the background."""
+    def _show_library_sync_dialog(self) -> LibrarySyncDialog:
+        existing = self._raise_existing_dialog(self._sync_dialog)
+        if existing is not None:
+            return existing
+
+        def _run_sync(targets: list[tuple[str, str]], mode: str) -> None:
+            self._auto_sync_targets = list(targets)
+            if mode == "enqueue":
+                self._sync_and_enqueue_targets(targets)
+            elif mode == "dry_run":
+                self._sync_libraries(
+                    services=[s for s, _p in targets],
+                    scan_only=True,
+                    dry_run=True,
+                )
+            else:
+                self._sync_libraries(
+                    services=[s for s, _p in targets],
+                    scan_only=True,
+                )
+
+        def _on_schedule_changed(enabled: bool, minutes: int) -> None:
+            self._configure_auto_sync_timer(enabled, minutes)
+
+        self._sync_dialog = LibrarySyncDialog(
+            self.root,
+            self._controller.config_snapshot(),
+            self._services,
+            auto_sync_enabled=self._auto_sync_enabled,
+            auto_sync_minutes=self._auto_sync_minutes,
+            on_run_sync=_run_sync,
+            on_auto_sync_changed=_on_schedule_changed,
+            palette=self._palette,
+        )
+        return self._sync_dialog
+
+    def _configure_auto_sync_timer(self, enabled: bool, minutes: int) -> None:
+        self._auto_sync_enabled = enabled
+        self._auto_sync_minutes = max(1, int(minutes))
+        if self._auto_sync_after_id is not None:
+            try:
+                self.root.after_cancel(self._auto_sync_after_id)
+            except tk.TclError:
+                pass
+            self._auto_sync_after_id = None
+        if enabled:
+            delay_ms = self._auto_sync_minutes * 60 * 1000
+            self._auto_sync_after_id = self.root.after(delay_ms, self._on_auto_sync_tick)
+
+    def _on_auto_sync_tick(self) -> None:
+        self._auto_sync_after_id = None
+        if not self._auto_sync_enabled:
+            return
+        if not self._is_running and not self._is_syncing and not self._is_previewing:
+            targets = list(self._auto_sync_targets)
+            if targets:
+                self._sync_and_enqueue_targets(targets)
+            else:
+                self._sync_libraries()
+        self._configure_auto_sync_timer(True, self._auto_sync_minutes)
+
+    def _sync_and_enqueue_targets(self, targets: Sequence[tuple[str, str]]) -> None:
+        if self._is_running:
+            self.status_var.set("Wait for active downloads before syncing libraries")
+            return
         if self._is_syncing:
             self.status_var.set("Library sync already in progress")
             return
         options = self._try_build_options(urls_override=[])
         if options is None:
             return
-        self._is_syncing = True
+        self._set_syncing_state(True)
+        self.status_var.set("Scanning libraries for pending books...")
+        self._queue_panel.append_log("--- Scanning libraries for pending books ---")
+        sync_opts = args.SyncOptions(
+            services=[s for s, _p in targets],
+            scan_only=True,
+            output_template=options.output_template,
+            output_format=options.output_format,
+            archive_path=self._archive_ledger_path(),
+            config_location=self._controller.config_location,
+        )
+        self._controller.start_sync_enqueue_discovery(targets, sync_opts)
+
+    def _sync_libraries(
+        self,
+        *,
+        services: Sequence[str] = (),
+        scan_only: bool = False,
+        dry_run: bool = False,
+    ) -> None:
+        """Run one library synchronization cycle in the background."""
+        if self._is_running:
+            self.status_var.set("Wait for active downloads before syncing libraries")
+            return
+        if self._is_syncing:
+            self.status_var.set("Library sync already in progress")
+            return
+        options = self._try_build_options(urls_override=[])
+        if options is None:
+            return
+        self._set_syncing_state(True)
         self.status_var.set("Syncing libraries...")
         self._queue_panel.append_log("--- Starting library sync ---")
         sync_opts = args.SyncOptions(
             services=list(services),
             scan_only=scan_only,
+            dry_run=dry_run,
             output_template=options.output_template,
             output_format=options.output_format,
             archive_path=self._archive_ledger_path(),
@@ -1190,7 +1722,7 @@ class AudiobookDLApp:
         self._controller.start_library_sync(sync_opts)
 
     def _handle_sync_done(self, cycle: Any, exc: Exception | None) -> None:
-        self._is_syncing = False
+        self._set_syncing_state(False)
         if exc is not None:
             self.status_var.set("Library sync failed")
             self._queue_panel.append_log(f"[ERROR] Library sync failed: {exc}")
@@ -1198,6 +1730,10 @@ class AudiobookDLApp:
             return
         if cycle is None:
             self.status_var.set("Library sync finished")
+            return
+        if getattr(cycle, "cancelled", False):
+            self.status_var.set("Library sync cancelled")
+            self._queue_panel.append_log("--- Library sync cancelled ---")
             return
         msg = (
             f"Discovered {cycle.books_discovered}, new {cycle.newly_added}, "
@@ -1240,6 +1776,43 @@ class AudiobookDLApp:
             append_log_msg=f"--- Added {len(queued_jobs)} local pack job(s) to queue ---",
         )
 
+    def _start_or_enqueue_urls(
+        self,
+        urls: list[str],
+        *,
+        profile_override: str | None = None,
+    ) -> None:
+        if self._is_previewing or not urls:
+            return
+        if self._is_running:
+            if self._controller.cancel_event.is_set():
+                return
+            if self._enqueue_additional_urls(urls, profile_override=profile_override):
+                return
+
+        if not self._auth_panel.validate_cookie_file():
+            return
+        if not self._auth_panel.warn_mixed_service_credentials(urls):
+            return
+
+        options = self._try_build_options(urls_override=urls)
+        if options is None:
+            return
+        if not self._ffmpeg_assistant.ensure_available(options):
+            return
+        self._save_run_preferences(options)
+
+        unique_urls = list(dict.fromkeys(urls))
+        job_specs: list[
+            tuple[str, args.DownloadOptions, list[int] | None, tuple[Source, Result] | None]
+        ] = []
+        for u in unique_urls:
+            job_opts = self.build_options(urls_override=[u])
+            if profile_override:
+                job_opts.profile = profile_override
+            job_specs.append((u, job_opts, None, None))
+        self._start_new_run(job_specs)
+
     def start_download(self) -> None:
         if self._is_previewing:
             return
@@ -1262,28 +1835,13 @@ class AudiobookDLApp:
             self.urls_text.focus_set()
             return
 
-        if not self._auth_panel.validate_cookie_file():
-            return
-        if not self._auth_panel.warn_mixed_service_credentials(urls):
-            return
-
-        options = self._try_build_options()
-        if options is None:
-            return
-        if not self._ffmpeg_assistant.ensure_available(options):
-            return
-        self._save_run_preferences(options)
-
-        unique_urls = list(dict.fromkeys(urls))
-        job_specs = [
-            (u, self.build_options(urls_override=[u]), None, None)
-            for u in unique_urls
-        ]
-        self._start_new_run(job_specs)
+        self._start_or_enqueue_urls(urls)
 
     def _set_previewing_state(self, previewing: bool) -> None:
         self._is_previewing = previewing
         self._queue_panel.set_previewing_state(previewing, is_running=self._is_running)
+        if previewing:
+            self._schedule_poll_soon()
 
     def preview_metadata(self, url_override: str | None = None) -> None:
         """Fetch book or series metadata for `url_override` or the first entered URL."""
@@ -1382,6 +1940,16 @@ class AudiobookDLApp:
 
         cached_series_opts = self.build_options() if isinstance(result, Series) else None
         dir_stems_cache: dict[str, set[str]] = {}
+        archive_titles_cache: set[str] | None = None
+        if isinstance(result, Series) and cached_series_opts and cached_series_opts.download_archive:
+            if os.path.exists(cached_series_opts.download_archive):
+                with DownloadArchive(cached_series_opts.download_archive, persistent=True) as archive:
+                    archive_titles_cache = {
+                        e.title.strip().casefold()
+                        for e in archive.list_entries(limit=5000, include_hidden=True)
+                        if e.status == "downloaded" and e.title and e.title.strip()
+                    }
+        series_title = result.title if isinstance(result, Series) else None
         dialog = PreviewDialog(
             self.root,
             url,
@@ -1393,6 +1961,8 @@ class AudiobookDLApp:
                 book,
                 options=cached_series_opts,
                 dir_stems_cache=dir_stems_cache,
+                archive_titles_cache=archive_titles_cache,
+                series_title=series_title,
             ),
             on_confirm=self._enqueue_from_preview,
             palette=self._palette,
@@ -1408,14 +1978,35 @@ class AudiobookDLApp:
         *,
         options: args.DownloadOptions | None = None,
         dir_stems_cache: dict[str, set[str]] | None = None,
+        archive_titles_cache: set[str] | None = None,
+        series_title: str | None = None,
     ) -> bool:
-        """Return True when `book` already appears on disk at the configured output path."""
-        if not isinstance(book, Audiobook):
+        """Return True when `book` already appears on disk or in the archive ledger."""
+        meta: AudiobookMetadata | None = None
+        book_title = ""
+        if isinstance(book, Audiobook):
+            meta = book.metadata
+            book_title = meta.title.strip()
+        else:
+            raw_title = getattr(book, "title", None)
+            if not raw_title and isinstance(getattr(book, "id", None), dict):
+                raw_title = book.id.get("title") or book.id.get("name")
+            if raw_title:
+                book_title = str(raw_title).strip()
+                meta = AudiobookMetadata(title=book_title, series=series_title)
+        if archive_titles_cache and book_title and book_title.casefold() in archive_titles_cache:
+            return True
+        if meta is None:
             return False
         try:
             opts = options if options is not None else self.build_options()
             template = opts.output_template or "{title}"
-            target = output.gen_output_location(template, book.metadata, opts.remove_chars)
+            if not isinstance(book, Audiobook):
+                # Skip template evaluation if it relies on fields unavailable on BookId
+                # (e.g. {author} would render empty and risk false positives).
+                if "{author" in template or "{narrator" in template:
+                    return False
+            target = output.gen_output_location(template, meta, opts.remove_chars)
             if os.path.exists(target):
                 return True
             if opts.output_format and os.path.exists(f"{target}.{opts.output_format}"):
@@ -1471,12 +2062,38 @@ class AudiobookDLApp:
             self._queue_panel.append_log("Cancelling metadata preview...")
             self._controller.cancel_preview()
             return
+        if self._is_syncing and not self._is_running:
+            self.status_var.set("Cancelling library sync...")
+            self.cancel_btn.configure(state="disabled")
+            self._queue_panel.append_log("Cancelling library sync...")
+            self._controller.cancel_library_sync()
+            return
         if not self._is_running:
             return
         self.status_var.set("Cancelling...")
         self.cancel_btn.configure(state="disabled")
         self.download_btn.configure(state="disabled")
         self._controller.cancel_active_run()
+
+    def _schedule_poll_soon(self, delay_ms: int = 10) -> None:
+        self._cancel_poll_timer()
+        if self._auto_sync_after_id is not None:
+            try:
+                self.root.after_cancel(self._auto_sync_after_id)
+            except tk.TclError:
+                pass
+            self._auto_sync_after_id = None
+        if self._clipboard_after_id is not None:
+            try:
+                self.root.after_cancel(self._clipboard_after_id)
+            except tk.TclError:
+                pass
+            self._clipboard_after_id = None
+        try:
+            if self.root.winfo_exists():
+                self._poll_after_id = self.root.after(delay_ms, self._poll_queue)
+        except tk.TclError:
+            self._poll_after_id = None
 
     def _poll_queue(self) -> None:
         self._poll_after_id = None
@@ -1500,13 +2117,16 @@ class AudiobookDLApp:
             self._handle_event(self._deferred_modal_events.popleft())
         if self._is_running:
             self._queue_panel.update_metrics_display(is_running=True)
-        if processed >= self._controller.MAX_QUEUE_BATCH and self._poll_after_id is not None:
-            self._cancel_poll_timer()
-            try:
-                if self.root.winfo_exists():
-                    self._poll_after_id = self.root.after(10, self._poll_queue)
-            except tk.TclError:
-                self._poll_after_id = None
+        if processed >= self._controller.MAX_QUEUE_BATCH:
+            self._schedule_poll_soon(10)
+        elif (
+            processed == 0
+            and not self._is_running
+            and not self._is_previewing
+            and not self._is_syncing
+            and not self._deferred_modal_events
+        ):
+            self._schedule_poll_soon(250)
 
     def _cancel_poll_timer(self) -> None:
         after_id = getattr(self, "_poll_after_id", None)
@@ -1520,6 +2140,18 @@ class AudiobookDLApp:
     def _on_root_destroy(self, event: tk.Event) -> None:
         if getattr(event, "widget", None) is self.root:
             self._cancel_poll_timer()
+        if self._auto_sync_after_id is not None:
+            try:
+                self.root.after_cancel(self._auto_sync_after_id)
+            except tk.TclError:
+                pass
+            self._auto_sync_after_id = None
+        if self._clipboard_after_id is not None:
+            try:
+                self.root.after_cancel(self._clipboard_after_id)
+            except tk.TclError:
+                pass
+            self._clipboard_after_id = None
 
     def _handle_event(self, item: tuple) -> None:
         if self._queue_panel.handle_activity_event(item):
@@ -1565,7 +2197,7 @@ class AudiobookDLApp:
             _, service_label, ok, auth_exc = item
             self._auth_panel.handle_auth_verified(service_label, ok, auth_exc)
         elif kind == "catalog_loaded":
-            _, req_id, dialog, books, cat_exc = item
+            _, req_id, dialog, payload, cat_exc = item
             if req_id != self._controller.catalog_request_id:
                 return
             catalog_dialog: CatalogBrowserDialog = dialog
@@ -1578,7 +2210,11 @@ class AudiobookDLApp:
                 catalog_dialog.set_error_status("Error loading items")
                 messagebox.showerror("Catalog Error", str(cat_exc), parent=catalog_dialog)
             else:
-                catalog_dialog.populate_items(books)
+                if isinstance(payload, tuple) and len(payload) == 2:
+                    books, statuses = payload
+                else:
+                    books, statuses = payload, None
+                catalog_dialog.populate_items(books, statuses=statuses)
         elif kind == "ffmpeg_install_done":
             _, ok, detail = item
             self._ffmpeg_assistant.handle_install_done(ok, detail)
@@ -1588,10 +2224,73 @@ class AudiobookDLApp:
         elif kind == "sync_done":
             _, cycle, sync_exc = item
             self._handle_sync_done(cycle, sync_exc)
+        elif kind == "sync_enqueue_ready":
+            _, pending_groups, stats, sync_exc = item
+            self._handle_sync_enqueue_ready(pending_groups, stats, sync_exc)
+        elif kind == "abs_upload_done":
+            _, book_title, ok, err_msg = item
+            if ok:
+                self.status_var.set(f"Uploaded '{book_title}' to Audiobookshelf")
+                self._queue_panel.append_log(f"Uploaded '{book_title}' to Audiobookshelf")
+            else:
+                self.status_var.set("Audiobookshelf upload failed")
+                self._queue_panel.append_log(f"[ERROR] Audiobookshelf upload failed: {err_msg}")
+                messagebox.showerror("Audiobookshelf Upload Failed", str(err_msg), parent=self.root)
         elif kind == "done":
             _, run_id, summary, exc = item
             if run_id == self._queue_panel.current_ui_run_id:
                 self._finish_run(summary, exc)
+
+    def _handle_sync_enqueue_ready(
+        self,
+        pending_groups: Sequence[tuple[str, str, list[str]]],
+        stats: dict[str, Any],
+        exc: Exception | None,
+    ) -> None:
+        self._set_syncing_state(False)
+        if exc is not None:
+            self.status_var.set("Library sync failed")
+            self._queue_panel.append_log(f"[ERROR] Library sync failed: {exc}")
+            messagebox.showerror("Library Sync Failed", str(exc), parent=self.root)
+            return
+        if stats.get("cancelled"):
+            self.status_var.set("Library sync cancelled")
+            self._queue_panel.append_log("--- Library sync cancelled ---")
+            return
+        for err in stats.get("errors") or ():
+            self._queue_panel.append_log(f"[WARN] {err}")
+        if self._archive_dialog is not None:
+            self._archive_dialog.refresh_if_open()
+        total_urls = sum(len(urls) for _svc, _prof, urls in pending_groups)
+        if total_urls == 0:
+            discovered = stats.get("discovered", 0)
+            self.status_var.set(f"Sync complete: {discovered} discovered, 0 pending")
+            self._queue_panel.append_log(f"--- Library sync finished: {discovered} discovered, 0 pending ---")
+            return
+        base_opts = self._try_build_options(urls_override=[])
+        if base_opts is None:
+            return
+        if not self._ffmpeg_assistant.ensure_available(base_opts):
+            return
+        dl_specs: list[tuple[str, args.DownloadOptions, list[int] | None, None]] = []
+        for _svc, prof, urls in pending_groups:
+            for u in urls:
+                opts = self.build_options(urls_override=[u])
+                if prof:
+                    opts.profile = prof
+                dl_specs.append((u, opts, None, None))
+        was_appended, run_id, queued_jobs, new_total = self._controller.start_or_enqueue_jobs(
+            download_specs=dl_specs
+        )
+        self._register_enqueued_batch(
+            was_appended=was_appended,
+            run_id=run_id,
+            queued_jobs=queued_jobs,
+            new_total=new_total,
+            start_header=f"--- Sync queued {len(queued_jobs)} pending book(s) ---",
+            append_status=f"Queued +{len(queued_jobs)} synced book(s) (total {new_total})",
+            append_log_msg=f"--- Added {len(queued_jobs)} synced book(s) to queue (total {new_total}) ---",
+        )
 
     def _handle_update_checked(self, info: UpdateInfo | None, interactive: bool) -> None:
         if info is None:
@@ -1631,8 +2330,17 @@ class AudiobookDLApp:
             exc,
             notify_enabled=self.notify_on_complete_var.get(),
         )
+        if self._archive_dialog is not None:
+            self._archive_dialog.refresh_if_open()
 
-    def _on_close(self) -> None:
+    def _on_close(self, *, force: bool = False) -> None:
+        if not force and (self._is_running or self._is_syncing):
+            if not messagebox.askyesno(
+                "Operation in Progress",
+                "A download or library sync is currently active. Cancel and exit anyway?",
+                parent=self.root,
+            ):
+                return
         try:
             geom = self.root.geometry()
             self._controller.save_window_preferences(
@@ -1647,6 +2355,18 @@ class AudiobookDLApp:
         except OSError:
             pass
         self._cancel_poll_timer()
+        if self._auto_sync_after_id is not None:
+            try:
+                self.root.after_cancel(self._auto_sync_after_id)
+            except tk.TclError:
+                pass
+            self._auto_sync_after_id = None
+        if self._clipboard_after_id is not None:
+            try:
+                self.root.after_cancel(self._clipboard_after_id)
+            except tk.TclError:
+                pass
+            self._clipboard_after_id = None
         self._controller.shutdown(
             is_running=self._is_running,
             is_previewing=self._is_previewing,

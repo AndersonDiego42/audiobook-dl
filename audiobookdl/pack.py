@@ -18,6 +18,7 @@ import uuid
 import requests
 
 from audiobookdl import Audiobook, AudiobookMetadata, Chapter, Cover, args, logging
+from audiobookdl.utils.audiobook import parse_language, parse_release_date
 from audiobookdl.config import Config, load_config
 from audiobookdl.exceptions import AudiobookDLException, DownloadCancelled, GenericAudiobookDLException
 from audiobookdl.output import download as output_download
@@ -66,6 +67,12 @@ class PackOverrides:
     isbn: str | None = None
     asin: str | None = None
     cover_path: str | None = None
+    genres: list[str] = field(default_factory=list)
+    publisher: str | None = None
+    release_date: str | None = None
+    language: str | None = None
+    description: str | None = None
+    chapters: list[Chapter] | None = None
 
 
 @dataclass
@@ -366,6 +373,20 @@ def aggregate_book_metadata(
             meta.isbn = overrides.isbn.strip() or None
         if overrides.asin is not None:
             meta.asin = overrides.asin.strip() or None
+        if overrides.genres:
+            meta.genres = list(overrides.genres)
+        if overrides.publisher is not None:
+            meta.publisher = overrides.publisher.strip() or None
+        if overrides.release_date is not None:
+            parsed_rd = parse_release_date(overrides.release_date)
+            if parsed_rd is not None:
+                meta.release_date = parsed_rd
+        if overrides.language is not None:
+            parsed_lang = parse_language(overrides.language)
+            if parsed_lang is not None:
+                meta.language = parsed_lang
+        if overrides.description is not None:
+            meta.description = overrides.description.strip() or None
 
     if not meta.title:
         meta.title = "Audiobook"
@@ -499,6 +520,9 @@ def inspect_local_book(
         cache,
         no_chapters=bool(getattr(options, "no_chapters", False)),
     )
+    if overrides is not None and overrides.chapters is not None and not getattr(options, "no_chapters", False):
+        chapters = [Chapter(start=c.start, title=c.title) for c in overrides.chapters]
+        chapters_source = "edited"
 
     output_format = (getattr(options, "output_format", None) or "m4b").lstrip(".").lower()
     output_path = resolve_pack_output_path(
@@ -759,6 +783,9 @@ def scope_overrides_for_batch(
         narrators=list(overrides.narrators),
         series=overrides.series,
         cover_path=overrides.cover_path,
+        genres=list(overrides.genres),
+        publisher=overrides.publisher,
+        language=overrides.language,
     )
 
 

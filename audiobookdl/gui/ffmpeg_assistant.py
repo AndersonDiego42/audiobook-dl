@@ -45,6 +45,14 @@ class FFmpegAssistant:
         self._status_label.bind("<Button-1>", lambda _e: self.show_guidance())
         self._status_label.bind("<Return>", lambda _e: self.show_guidance())
         self._status_label.bind("<space>", lambda _e: self.show_guidance())
+        self._status_label.bind(
+            "<FocusIn>",
+            lambda _e: self._status_label.configure(relief="solid", borderwidth=1) if self._status_label else None,
+        )
+        self._status_label.bind(
+            "<FocusOut>",
+            lambda _e: self._status_label.configure(relief="flat", borderwidth=0) if self._status_label else None,
+        )
 
         self.locate_btn = ttk.Button(
             box,

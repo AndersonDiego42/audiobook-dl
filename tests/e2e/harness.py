@@ -387,7 +387,7 @@ class GuiHarness:
             except tk.TclError:
                 pass
             try:
-                self.app._on_close()
+                self.app._on_close(force=True)
             except tk.TclError:
                 pass
             if self.app.controller.worker is not None and self.app.controller.worker.is_alive():

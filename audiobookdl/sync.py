@@ -163,6 +163,8 @@ def run_sync_once(
     *,
     config: Config | None = None,
     cancel_event: threading.Event | None = None,
+    interaction: logging.InteractionHandler | None = None,
+    sink: logging.LogSink | None = None,
 ) -> SyncCycleResult:
     """Perform one sync cycle: poll account libraries, update ledger, download new pending items."""
     resolved_config = config if config is not None else load_config(sync_opts.config_location)
@@ -185,7 +187,10 @@ def run_sync_once(
         stats = ProfileSyncStats(service=svc, profile=prof)
         try:
             dl_opts = _build_sync_download_options(sync_opts, resolved_config, archive_path, prof)
-            books = list_service_library(svc, dl_opts, resolved_config)
+            if interaction is not None:
+                books = list_service_library(svc, dl_opts, resolved_config, interaction=interaction)
+            else:
+                books = list_service_library(svc, dl_opts, resolved_config)
             stats.discovered = len(books)
             cycle.books_discovered += len(books)
 
@@ -212,11 +217,16 @@ def run_sync_once(
             cycle.pending_count += len(pending_urls)
 
             if pending_urls and not sync_opts.scan_only and not sync_opts.dry_run:
-                dl_summary = Downloader(
-                    config=resolved_config,
-                    options=dl_opts,
-                    cancel_event=cancel_event,
-                ).download(pending_urls)
+                dl_kwargs: dict[str, Any] = {
+                    "config": resolved_config,
+                    "options": dl_opts,
+                    "cancel_event": cancel_event,
+                }
+                if sink is not None:
+                    dl_kwargs["sink"] = sink
+                if interaction is not None:
+                    dl_kwargs["interaction"] = interaction
+                dl_summary = Downloader(**dl_kwargs).download(pending_urls)
                 stats.downloaded = dl_summary.books_completed
                 stats.failed = dl_summary.failed
                 cycle.downloaded += dl_summary.books_completed

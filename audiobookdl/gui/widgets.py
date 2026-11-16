@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 import queue
+import re
 import sys
 import threading
 import tkinter as tk
@@ -9,7 +10,11 @@ from tkinter import ttk
 from typing import Any
 from collections.abc import Callable, Sequence
 
-from audiobookdl.gui.theme import scale_px
+from audiobookdl.gui.theme import ThemePalette, resolve_palette, scale_px
+
+
+_SORT_CHUNK_RE = re.compile(r"(\d+)")
+_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
 
 @dataclass(frozen=True)
@@ -21,6 +26,43 @@ class TreeColumnSpec:
     width: int
     stretch: bool = True
     anchor: str = "w"
+    sortable: bool = True
+    sort_kind: str = "text"  # "text" | "number" | "duration" | "date"
+
+
+def _natural_text_sort_key(raw: str) -> tuple[Any, ...]:
+    parts = _SORT_CHUNK_RE.split(raw.strip().casefold())
+    key: list[Any] = []
+    for part in parts:
+        if not part:
+            continue
+        if part.isdigit():
+            key.append((0, int(part), part))
+        else:
+            key.append((1, 0, part))
+    return tuple(key)
+
+
+def _column_sort_key(raw: Any, sort_kind: str) -> tuple[int, Any]:
+    text = str(raw or "").strip()
+    if not text or text in ("-", "--"):
+        return (1, "")
+    if sort_kind == "number":
+        m = _NUMBER_RE.search(text.replace(",", ""))
+        if m:
+            return (0, float(m.group(0)))
+        return (1, text.casefold())
+    if sort_kind == "duration":
+        parts = text.split(":")
+        if len(parts) in (2, 3) and all(p.replace(".", "", 1).isdigit() for p in parts):
+            total = 0.0
+            for p in parts:
+                total = total * 60.0 + float(p)
+            return (0, total)
+        return (1, text.casefold())
+    if sort_kind == "date":
+        return (0, text.casefold())
+    return (0, _natural_text_sort_key(text))
 
 
 import typing
@@ -116,7 +158,7 @@ def populate_grouped_tree(
 
 
 class ScrolledTreeview(ttk.Frame):
-    """Frame containing a `ttk.Treeview` paired with a vertical `ttk.Scrollbar`."""
+    """Frame containing a `ttk.Treeview`, vertical `ttk.Scrollbar`, column sorting, and empty overlay."""
 
     def __init__(
         self,
@@ -128,10 +170,18 @@ class ScrolledTreeview(ttk.Frame):
         show_tree: bool = False,
         tree_heading: str = "",
         tree_width: int = 28,
+        enable_sorting: bool = True,
     ) -> None:
         super().__init__(parent)
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
+
+        self._columns = tuple(columns)
+        self._col_specs = {spec.key: spec for spec in self._columns}
+        self._col_index = {spec.key: idx for idx, spec in enumerate(self._columns)}
+        self._sort_col: str | None = None
+        self._sort_desc = False
+        self._enable_sorting = enable_sorting
 
         tree_kwargs: dict[str, Any] = {
             "columns": tuple(spec.key for spec in columns),
@@ -151,18 +201,118 @@ class ScrolledTreeview(ttk.Frame):
                 stretch=False,
             )
         for spec in columns:
-            self.tree.heading(spec.key, text=spec.heading)
-            self.tree.column(
+            if enable_sorting and spec.sortable:
+
+                def _sort_cb(k: str = spec.key) -> None:
+                    self.sort_by_column(k)
+
+                self.tree.heading(
+                    spec.key,
+                    text=spec.heading,
+                    command=_sort_cb,
+                )
+            else:
+                self.tree.heading(spec.key, text=spec.heading)
+            self.tree.column(  # type: ignore[call-overload]
                 spec.key,
                 width=scale_px(self, spec.width),
                 stretch=spec.stretch,
-                anchor=spec.anchor,  # type: ignore[arg-type]
+                anchor=spec.anchor,
             )
 
         self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=self.scrollbar.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
         self.scrollbar.grid(row=0, column=1, sticky="ns")
+
+        self._empty_overlay: ttk.Frame | None = None
+        self._empty_label: ttk.Label | None = None
+        self._empty_btn: ttk.Button | None = None
+        self._empty_cmd: Callable[[], None] | None = None
+
+    def set_empty_state(
+        self,
+        visible: bool,
+        message: str = "",
+        *,
+        action_text: str = "",
+        action_command: Callable[[], None] | None = None,
+    ) -> None:
+        """Show or hide a centered empty-state message and optional CTA button over the table."""
+        if not visible:
+            if self._empty_overlay is not None:
+                self._empty_overlay.place_forget()
+            return
+        if self._empty_overlay is None:
+            self._empty_overlay = ttk.Frame(self.tree, padding=scale_px(self, 12))
+            self._empty_label = ttk.Label(
+                self._empty_overlay,
+                text="",
+                style="Muted.TLabel",
+                justify="center",
+            )
+            self._empty_label.pack(pady=(0, 6))
+            self._empty_btn = ttk.Button(
+                self._empty_overlay,
+                text="",
+                command=self._invoke_empty_action,
+            )
+        assert self._empty_label is not None
+        self._empty_label.configure(text=message)
+        self._empty_cmd = action_command
+        if self._empty_btn is not None:
+            if action_text and action_command is not None:
+                self._empty_btn.configure(text=action_text)
+                self._empty_btn.pack()
+            else:
+                self._empty_btn.pack_forget()
+        self._empty_overlay.place(relx=0.5, rely=0.52, anchor="center")
+
+    def _invoke_empty_action(self) -> None:
+        if self._empty_cmd is not None:
+            self._empty_cmd()
+
+    def clear_sort_indicator(self) -> None:
+        """Reset column sort indicators without altering current row order."""
+        self._sort_col = None
+        self._sort_desc = False
+        for spec in self._columns:
+            self.tree.heading(spec.key, text=spec.heading)
+
+    def sort_by_column(self, col_key: str, *, descending: bool | None = None) -> None:
+        """Sort rows by `col_key`, preserving parent group hierarchy when present."""
+        spec = self._col_specs.get(col_key)
+        col_idx = self._col_index.get(col_key)
+        if spec is None or col_idx is None or not spec.sortable:
+            return
+        if descending is None:
+            descending = not self._sort_desc if self._sort_col == col_key else False
+        self._sort_col = col_key
+        self._sort_desc = descending
+
+        for s in self._columns:
+            suffix = ""
+            if s.key == col_key:
+                suffix = " \u25bc" if descending else " \u25b2"
+            self.tree.heading(s.key, text=f"{s.heading}{suffix}")
+
+        def _sort_children(parent_iid: str) -> None:
+            children = list(self.tree.get_children(parent_iid))
+            if not children:
+                return
+            for child in children:
+                if self.tree.get_children(child):
+                    _sort_children(child)
+            scored: list[tuple[tuple[int, Any], str]] = []
+            for iid in children:
+                vals = self.tree.item(iid, "values")
+                raw_val = vals[col_idx] if isinstance(vals, (tuple, list)) and col_idx < len(vals) else ""
+                scored.append((_column_sort_key(raw_val, spec.sort_kind), iid))
+            scored.sort(key=lambda pair: pair[0], reverse=descending)
+            for pos, (_key, iid) in enumerate(scored):
+                self.tree.move(iid, parent_iid, pos)
+
+        _sort_children("")
 
 
 class ScrollableFrame(ttk.Frame):
@@ -277,9 +427,25 @@ class ScrollableFrame(ttk.Frame):
         elif widget_bottom > view_bottom:
             self.canvas.yview_moveto(min(1.0, (widget_bottom + 8 - canvas_h) / content_h))
 
+    @staticmethod
+    def _matches_inner_scrollable(widget: tk.Misc, scrollable: tk.Misc) -> bool:
+        cur: tk.Misc | None = widget
+        while cur is not None:
+            if cur is scrollable:
+                return True
+            if isinstance(cur, (ttk.Scrollbar, tk.Scrollbar)) and getattr(cur, "master", None) is getattr(
+                scrollable, "master", None
+            ):
+                return True
+            cur = getattr(cur, "master", None)
+        return False
+
     def on_mousewheel(self, event: tk.Event) -> None:
         """Scroll the main canvas unless an inner scrollable widget handles the wheel."""
         widget = getattr(event, "widget", None)
+        delta = getattr(event, "delta", 0)
+        event_num = getattr(event, "num", None)
+        scroll_up = (delta > 0) if delta else (event_num == 4)
         if widget is not None:
             try:
                 if widget.winfo_toplevel() is not self.winfo_toplevel():
@@ -290,24 +456,25 @@ class ScrollableFrame(ttk.Frame):
                 return
             if self._inner_scrollables is not None:
                 for scrollable in self._inner_scrollables():
-                    if widget is scrollable:
+                    if self._matches_inner_scrollable(widget, scrollable):
                         try:
-                            if scrollable.yview() != (0.0, 1.0):  # type: ignore[attr-defined]
-                                return
+                            lo, hi = scrollable.yview()  # type: ignore[attr-defined]
+                            if (lo, hi) != (0.0, 1.0):
+                                if (scroll_up and lo > 0.0) or (not scroll_up and hi < 1.0):
+                                    return
                         except Exception:
                             return
         first, last = self.canvas.yview()
         if first <= 0.0 and last >= 1.0:
             return
-        delta = getattr(event, "delta", 0)
         if delta:
             step = -1 if delta > 0 else 1
             if sys.platform != "darwin" and abs(delta) >= 120:
                 step = int(-delta / 120)
             self.canvas.yview_scroll(step, "units")
-        elif getattr(event, "num", None) == 4:
+        elif event_num == 4:
             self.canvas.yview_scroll(-1, "units")
-        elif getattr(event, "num", None) == 5:
+        elif event_num == 5:
             self.canvas.yview_scroll(1, "units")
 
 
@@ -447,3 +614,190 @@ class MainThreadCallbackQueue:
                 self._queue.get_nowait()
             except queue.Empty:
                 break
+
+
+class Tooltip:
+    """Theme-aware hover and focus tooltip for Tkinter/ttk widgets."""
+
+    def __init__(
+        self,
+        widget: tk.Misc,
+        text: str,
+        *,
+        delay_ms: int = 400,
+        palette_provider: Callable[[], ThemePalette] | None = None,
+    ) -> None:
+        self._widget = widget
+        self._text = text
+        self._delay_ms = delay_ms
+        self._palette_provider = palette_provider
+        self._after_id: str | None = None
+        self._tip_window: tk.Toplevel | None = None
+
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._cancel_and_hide, add="+")
+        widget.bind("<ButtonPress>", self._cancel_and_hide, add="+")
+        widget.bind("<FocusIn>", self._schedule_focus, add="+")
+        widget.bind("<FocusOut>", self._cancel_and_hide, add="+")
+        widget.bind("<Destroy>", self._on_destroy, add="+")
+
+    def set_text(self, text: str) -> None:
+        self._text = text
+
+    def _schedule(self, _event: tk.Event | None = None) -> None:
+        self._cancel_timer()
+        if not self._text:
+            return
+        try:
+            if self._widget.winfo_exists():
+                self._after_id = self._widget.after(self._delay_ms, self.show)
+        except tk.TclError:
+            self._after_id = None
+
+    def _schedule_focus(self, _event: tk.Event | None = None) -> None:
+        # Show briefly delayed on keyboard focus navigation only if mapped
+        try:
+            if self._widget.winfo_ismapped():
+                self._schedule()
+        except tk.TclError:
+            pass
+
+    def _cancel_timer(self) -> None:
+        if self._after_id is not None:
+            try:
+                self._widget.after_cancel(self._after_id)
+            except tk.TclError:
+                pass
+            self._after_id = None
+
+    def _cancel_and_hide(self, _event: tk.Event | None = None) -> None:
+        self._cancel_timer()
+        self.hide()
+
+    def _on_destroy(self, event: tk.Event) -> None:
+        if getattr(event, "widget", None) is self._widget:
+            self._cancel_and_hide()
+
+    def show(self) -> None:
+        self._after_id = None
+        if self._tip_window is not None or not self._text:
+            return
+        try:
+            if not self._widget.winfo_exists() or not self._widget.winfo_ismapped():
+                return
+            x = self._widget.winfo_rootx() + scale_px(self._widget, 12)
+            y = self._widget.winfo_rooty() + self._widget.winfo_height() + scale_px(self._widget, 4)
+        except tk.TclError:
+            return
+        palette = self._palette_provider() if self._palette_provider is not None else resolve_palette("system")
+        tip = tk.Toplevel(self._widget)
+        tip.wm_overrideredirect(True)
+        tip.wm_geometry(f"+{x}+{y}")
+        frame = tk.Frame(
+            tip,
+            background=palette.surface,
+            highlightbackground=palette.border,
+            highlightthickness=1,
+            padx=scale_px(self._widget, 8),
+            pady=scale_px(self._widget, 4),
+        )
+        frame.pack(fill=tk.BOTH, expand=True)
+        label = tk.Label(
+            frame,
+            text=self._text,
+            justify="left",
+            wraplength=scale_px(self._widget, 320),
+            background=palette.surface,
+            foreground=palette.fg,
+        )
+        label.pack()
+        self._tip_window = tip
+
+    def hide(self) -> None:
+        tip = self._tip_window
+        self._tip_window = None
+        if tip is not None:
+            try:
+                tip.destroy()
+            except tk.TclError:
+                pass
+
+
+def attach_tooltip(
+    widget: tk.Misc,
+    text: str,
+    *,
+    palette_provider: Callable[[], ThemePalette] | None = None,
+) -> Tooltip | None:
+    """Attach a `Tooltip` to `widget` if `text` is non-empty."""
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+    return Tooltip(widget, cleaned, palette_provider=palette_provider)
+
+
+class CollapsibleSection(ttk.Frame):
+    """Collapsible container with a header toggle and compact summary badge when collapsed."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        title: str,
+        *,
+        collapsed: bool = False,
+        on_toggle: Callable[[bool], None] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.columnconfigure(0, weight=1)
+        self._title = title
+        self._collapsed = collapsed
+        self._on_toggle = on_toggle
+
+        self._header = ttk.Frame(self)
+        self._header.grid(row=0, column=0, sticky="ew")
+        self._header.columnconfigure(1, weight=1)
+
+        self._toggle_btn = ttk.Button(
+            self._header,
+            text="",
+            command=self.toggle,
+        )
+        self._toggle_btn.grid(row=0, column=0, sticky="w")
+
+        self.summary_var = tk.StringVar(value="")
+        self._summary_label = ttk.Label(
+            self._header,
+            textvariable=self.summary_var,
+            style="Muted.TLabel",
+        )
+        self._summary_label.grid(row=0, column=1, sticky="w", padx=(8, 0))
+
+        self.content = ttk.Frame(self)
+        self.content.columnconfigure(0, weight=1)
+        self._apply_state(notify=False)
+
+    @property
+    def is_collapsed(self) -> bool:
+        return self._collapsed
+
+    def set_summary(self, summary: str) -> None:
+        self.summary_var.set(summary)
+
+    def toggle(self, collapsed: bool | None = None) -> bool:
+        target = (not self._collapsed) if collapsed is None else bool(collapsed)
+        if target != self._collapsed:
+            self._collapsed = target
+            self._apply_state(notify=True)
+        return self._collapsed
+
+    def _apply_state(self, *, notify: bool) -> None:
+        prefix = "\u25b8" if self._collapsed else "\u25be"
+        self._toggle_btn.configure(text=f"{prefix} {self._title}")
+        if self._collapsed:
+            self.content.grid_remove()
+            self._summary_label.grid()
+        else:
+            self.content.grid(row=1, column=0, sticky="ew", pady=(2, 0))
+            self._summary_label.grid_remove()
+        if notify and self._on_toggle is not None:
+            self._on_toggle(self._collapsed)

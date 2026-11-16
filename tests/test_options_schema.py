@@ -176,6 +176,8 @@ def test_schema_driven_merge_and_preset_precedence(tmp_path):
             "post_exec": "echo done",
             "loudnorm": True,
             "mono": True,
+            "chapters_from_silence": True,
+            "chapter_offset_ms": -250,
             "square_cover": True,
             "max_cover_size": 1000,
             "download_archive": str(tmp_path / "arch.sqlite"),
@@ -189,6 +191,7 @@ def test_schema_driven_merge_and_preset_precedence(tmp_path):
             "write_cover": True,
             "write_opf": True,
             "write_abs_metadata": True,
+            "upload_to_abs": True,
             "write_cue": True,
             "enrich_metadata": True,
             "enrich_providers": "itunes,google",
@@ -275,3 +278,20 @@ def test_gui_cli_parity_bindings_converters():
 
     parsed = args.parse_arguments(["--impersonate", "chrome", "https://example.com/book"])
     assert parsed.impersonate == "chrome"
+
+
+def test_persisted_gui_roundtrip_silence_offset_and_abs(tmp_path):
+    from audiobookdl.config import load_config
+
+    cfg_path = tmp_path / "persisted.toml"
+    save_output_preferences(
+        config_location=str(cfg_path),
+        chapters_from_silence=True,
+        chapter_offset_ms=-350,
+        upload_to_abs=True,
+    )
+    loaded = load_config(str(cfg_path))
+    assert loaded.chapters_from_silence is True
+    assert loaded.chapter_offset_ms == -350
+    assert loaded.upload_to_abs is True
+    assert validate_config_value("chapter_offset_ms", "int", True)[0] is None

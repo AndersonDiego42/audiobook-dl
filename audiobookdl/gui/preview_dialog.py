@@ -7,6 +7,7 @@ from tkinter.scrolledtext import ScrolledText
 from typing import Any
 from collections.abc import Callable, Sequence
 
+from audiobookdl.gui.chapter_editor import ChapterEditorFrame
 from audiobookdl.gui.formatting import (
     apply_audiobook_metadata_edits,
     describe_series_book,
@@ -18,13 +19,14 @@ from audiobookdl.gui.formatting import (
 from audiobookdl.gui.theme import (
     LIGHT_PALETTE,
     ThemePalette,
+    apply_theme_to_widget_tree,
     apply_theme_to_window,
     make_bold_font,
     scale_px,
 )
 from audiobookdl.gui.widgets import MainThreadCallbackQueue, ScrolledTreeview, TreeColumnSpec
 from audiobookdl.sources.source import Source
-from audiobookdl.utils.audiobook import Audiobook, BookId, Cover, Result, Series
+from audiobookdl.utils.audiobook import Audiobook, AudiobookMetadata, BookId, Cover, Result, Series
 from audiobookdl.utils.enrichment import (
     EnrichmentCandidate,
     apply_candidate_to_audiobook,
@@ -32,7 +34,20 @@ from audiobookdl.utils.enrichment import (
 )
 
 
-_EDITABLE_PREVIEW_LABELS = frozenset({"Title", "Author(s)", "Narrator(s)", "Series"})
+_EDITABLE_PREVIEW_LABELS = frozenset(
+    {
+        "Title",
+        "Author(s)",
+        "Narrator(s)",
+        "Series",
+        "Genre(s)",
+        "Publisher",
+        "Released",
+        "Language",
+        "ISBN",
+        "ASIN",
+    }
+)
 
 
 class ChoiceDialog(tk.Toplevel):
@@ -107,7 +122,7 @@ class _EnrichmentPickerDialog(tk.Toplevel):
 
     _COLUMNS = (
         TreeColumnSpec("provider", "Provider", width=90, stretch=False, anchor="w"),
-        TreeColumnSpec("score", "Match", width=64, stretch=False, anchor="center"),
+        TreeColumnSpec("score", "Match", width=64, stretch=False, anchor="center", sort_kind="number"),
         TreeColumnSpec("title", "Title", width=200, stretch=True, anchor="w"),
         TreeColumnSpec("authors", "Author(s)", width=150, stretch=True, anchor="w"),
         TreeColumnSpec("narrators", "Narrator(s)", width=140, stretch=True, anchor="w"),
@@ -119,17 +134,19 @@ class _EnrichmentPickerDialog(tk.Toplevel):
         parent: tk.Misc,
         candidates: Sequence[EnrichmentCandidate],
         *,
+        current_metadata: AudiobookMetadata | None = None,
         palette: ThemePalette | None = None,
     ) -> None:
         super().__init__(parent)
         self.selected_candidate: EnrichmentCandidate | None = None
         self._candidates = list(candidates)
+        self._current_metadata = current_metadata
         self._palette = palette or LIGHT_PALETTE
 
         self.title("Select Enrichment Match")
         self.transient(parent)  # type: ignore[arg-type]
         self.grab_set()
-        self.minsize(scale_px(self, 760), scale_px(self, 340))
+        self.minsize(scale_px(self, 780), scale_px(self, 440))
         self.bind("<Escape>", lambda _e: self.destroy())
 
         body = ttk.Frame(self, padding=scale_px(self, 12))
@@ -139,10 +156,10 @@ class _EnrichmentPickerDialog(tk.Toplevel):
 
         ttk.Label(
             body,
-            text="Choose a metadata match (only missing fields, cover, and chapters will be filled):",
+            text="Choose a metadata match (missing fields, cover, and chapters will be filled):",
         ).grid(row=0, column=0, sticky="w", pady=(0, 8))
 
-        table = ScrolledTreeview(body, self._COLUMNS, selectmode="browse", height=10)
+        table = ScrolledTreeview(body, self._COLUMNS, selectmode="browse", height=8)
         table.grid(row=1, column=0, sticky="nsew")
         self._tree = table.tree
 
@@ -171,20 +188,58 @@ class _EnrichmentPickerDialog(tk.Toplevel):
                     " | ".join(extras),
                 ),
             )
+
+        diff_frame = ttk.LabelFrame(body, text="Current vs Selected Match", padding=scale_px(self, 6))
+        diff_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        diff_frame.columnconfigure(0, weight=1)
+        self._diff_text = tk.Text(diff_frame, height=6, wrap="word", state="disabled")
+        self._diff_text.grid(row=0, column=0, sticky="ew")
+
+        self._tree.bind("<<TreeviewSelect>>", self._render_candidate_diff)
         if self._candidates:
             self._tree.selection_set("0")
             self._tree.focus("0")
+            self._render_candidate_diff()
 
         self._tree.bind("<Double-1>", lambda _e: self._apply_selected())
         self._tree.bind("<Return>", lambda _e: self._apply_selected())
 
         btns = ttk.Frame(body)
-        btns.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        btns.grid(row=3, column=0, sticky="ew", pady=(10, 0))
         ttk.Button(btns, text="Apply Selected", command=self._apply_selected).pack(side=tk.RIGHT)
         ttk.Button(btns, text="Cancel", command=self.destroy).pack(side=tk.RIGHT, padx=(0, 6))
 
         apply_theme_to_window(self, self._palette)
         self._tree.focus_set()
+
+    def _render_candidate_diff(self, _event: tk.Event | None = None) -> None:
+        sel = self._tree.selection()
+        if not sel:
+            return
+        idx = int(sel[0])
+        if not (0 <= idx < len(self._candidates)):
+            return
+        cand = self._candidates[idx]
+        cur = self._current_metadata
+        pairs = [
+            ("Title", cur.title if cur else "", cand.title),
+            ("Authors", cur.author if cur else "", "; ".join(cand.authors)),
+            ("Narrators", cur.narrator if cur else "", "; ".join(cand.narrators)),
+            ("Series", (cur.series or "") if cur else "", cand.series or ""),
+            ("Publisher", (cur.publisher or "") if cur else "", cand.publisher or ""),
+            (
+                "Release",
+                str(cur.release_date) if (cur and cur.release_date) else "",
+                str(cand.release_date) if cand.release_date else "",
+            ),
+            ("Genres", cur.genre if cur else "", "; ".join(cand.genres)),
+            ("ISBN / ASIN", f"{cur.isbn or '-'} / {cur.asin or '-'}" if cur else "", f"{cand.isbn or '-'} / {cand.asin or '-'}"),
+        ]
+        lines = [f"{label}:  [{cur_v or 'empty'}]  ->  [{cand_v or 'empty'}]" for label, cur_v, cand_v in pairs]
+        self._diff_text.configure(state="normal")
+        self._diff_text.delete("1.0", tk.END)
+        self._diff_text.insert("1.0", "\n".join(lines))
+        self._diff_text.configure(state="disabled")
 
     def _apply_selected(self) -> None:
         sel = self._tree.selection()
@@ -248,6 +303,14 @@ class PreviewDialog(tk.Toplevel):
         self._narrators_var = tk.StringVar()
         self._series_var = tk.StringVar()
         self._series_order_var = tk.StringVar()
+        self._genres_var = tk.StringVar()
+        self._publisher_var = tk.StringVar()
+        self._release_date_var = tk.StringVar()
+        self._language_var = tk.StringVar()
+        self._isbn_var = tk.StringVar()
+        self._asin_var = tk.StringVar()
+        self._desc_text: ScrolledText | None = None
+        self._chapter_editor: ChapterEditorFrame | None = None
 
         self._check_vars: list[tk.BooleanVar] = []
         self._filter_var = tk.StringVar()
@@ -350,6 +413,11 @@ class PreviewDialog(tk.Toplevel):
 
     def _apply_audiobook_edits(self, audiobook: Audiobook) -> bool:
         try:
+            desc = (
+                self._desc_text.get("1.0", tk.END).strip()
+                if self._desc_text is not None
+                else None
+            )
             apply_audiobook_metadata_edits(
                 audiobook,
                 title=self._title_var.get(),
@@ -359,7 +427,16 @@ class PreviewDialog(tk.Toplevel):
                 series_order_text=self._series_order_var.get(),
                 cover=self._pending_cover,
                 update_cover=self._cover_modified,
+                genres_text=self._genres_var.get(),
+                publisher=self._publisher_var.get(),
+                release_date_text=self._release_date_var.get(),
+                language_text=self._language_var.get(),
+                isbn=self._isbn_var.get(),
+                asin=self._asin_var.get(),
+                description=desc,
             )
+            if self._chapter_editor is not None:
+                audiobook.chapters = self._chapter_editor.get_chapters()
             return True
         except ValueError as exc:
             messagebox.showwarning("Invalid Metadata", str(exc), parent=self)
@@ -369,6 +446,7 @@ class PreviewDialog(tk.Toplevel):
         top = ttk.Frame(body)
         top.grid(row=0, column=0, sticky="nsew")
         top.columnconfigure(1, weight=1)
+        top.rowconfigure(0, weight=1)
         body.rowconfigure(0, weight=1)
 
         cover_frame = ttk.Frame(top)
@@ -392,51 +470,100 @@ class PreviewDialog(tk.Toplevel):
         self._clear_cover_btn.pack(side=tk.LEFT)
         self._refresh_cover_preview()
 
-        meta = audiobook.metadata
-        self._title_var.set(meta.title)
-        self._authors_var.set(format_multi_metadata_values(meta.authors))
-        self._narrators_var.set(format_multi_metadata_values(meta.narrators))
-        self._series_var.set(meta.series or "")
-        self._series_order_var.set("" if meta.series_order is None else str(meta.series_order))
+        self._sync_editable_vars_from_audiobook(audiobook)
 
-        meta_frame = ttk.Frame(top)
-        meta_frame.grid(row=0, column=1, sticky="nsew")
+        right_nb = ttk.Notebook(top)
+        right_nb.grid(row=0, column=1, sticky="nsew")
+
+        meta_frame = ttk.Frame(right_nb, padding=scale_px(self, 8))
         meta_frame.columnconfigure(1, weight=1)
+        meta_frame.columnconfigure(3, weight=1)
+        right_nb.add(meta_frame, text="Metadata")
 
-        editable_rows: tuple[tuple[str, tk.StringVar, int | None], ...] = (
-            ("Title", self._title_var, None),
-            ("Author(s)", self._authors_var, None),
-            ("Narrator(s)", self._narrators_var, None),
-            ("Series", self._series_var, None),
-            ("Order", self._series_order_var, 10),
+        full_rows: tuple[tuple[str, tk.StringVar], ...] = (
+            ("Title", self._title_var),
+            ("Author(s)", self._authors_var),
+            ("Narrator(s)", self._narrators_var),
         )
         row_idx = 0
-        for label, var, entry_width in editable_rows:
+        for label, var in full_rows:
             ttk.Label(
                 meta_frame,
                 text=f"{label}:",
                 font=make_bold_font(self, 9),
-            ).grid(row=row_idx, column=0, sticky="w", padx=(0, 8), pady=3)
-            if entry_width is not None:
-                entry = ttk.Entry(meta_frame, textvariable=var, width=entry_width)
-                entry.grid(row=row_idx, column=1, sticky="w", pady=3)
-            else:
-                entry = ttk.Entry(meta_frame, textvariable=var)
-                entry.grid(row=row_idx, column=1, sticky="ew", pady=3)
+            ).grid(row=row_idx, column=0, sticky="w", padx=(0, 8), pady=2)
+            ttk.Entry(meta_frame, textvariable=var).grid(
+                row=row_idx, column=1, columnspan=3, sticky="ew", pady=2
+            )
+            row_idx += 1
+
+        ttk.Label(meta_frame, text="Series:", font=make_bold_font(self, 9)).grid(
+            row=row_idx, column=0, sticky="w", padx=(0, 8), pady=2
+        )
+        ttk.Entry(meta_frame, textvariable=self._series_var).grid(
+            row=row_idx, column=1, sticky="ew", padx=(0, 8), pady=2
+        )
+        ttk.Label(meta_frame, text="Order:", font=make_bold_font(self, 9)).grid(
+            row=row_idx, column=2, sticky="w", padx=(0, 6), pady=2
+        )
+        ttk.Entry(meta_frame, textvariable=self._series_order_var, width=10).grid(
+            row=row_idx, column=3, sticky="w", pady=2
+        )
+        row_idx += 1
+
+        paired_rows: tuple[tuple[str, tk.StringVar, str, tk.StringVar], ...] = (
+            ("Genre(s)", self._genres_var, "Language", self._language_var),
+            ("Publisher", self._publisher_var, "Released", self._release_date_var),
+            ("ISBN", self._isbn_var, "ASIN", self._asin_var),
+        )
+        for l1, v1, l2, v2 in paired_rows:
+            ttk.Label(meta_frame, text=f"{l1}:", font=make_bold_font(self, 9)).grid(
+                row=row_idx, column=0, sticky="w", padx=(0, 8), pady=2
+            )
+            ttk.Entry(meta_frame, textvariable=v1).grid(
+                row=row_idx, column=1, sticky="ew", padx=(0, 8), pady=2
+            )
+            ttk.Label(meta_frame, text=f"{l2}:", font=make_bold_font(self, 9)).grid(
+                row=row_idx, column=2, sticky="w", padx=(0, 6), pady=2
+            )
+            ttk.Entry(meta_frame, textvariable=v2).grid(
+                row=row_idx, column=3, sticky="ew", pady=2
+            )
             row_idx += 1
 
         ttk.Label(
             meta_frame,
-            text="Separate multiple authors or narrators with ';'",
+            text="Separate multiple authors, narrators, or genres with ';'",
             style="Muted.TLabel",
-        ).grid(row=row_idx, column=1, sticky="w", pady=(0, 6))
+        ).grid(row=row_idx, column=1, columnspan=3, sticky="w", pady=(0, 4))
+        row_idx += 1
+
+        ttk.Label(meta_frame, text="Description:", font=make_bold_font(self, 9)).grid(
+            row=row_idx, column=0, sticky="nw", padx=(0, 8), pady=(2, 2)
+        )
+        self._desc_text = ScrolledText(meta_frame, height=4, width=40, wrap="word")
+        self._desc_text.grid(row=row_idx, column=1, columnspan=3, sticky="nsew", pady=(2, 4))
+        meta_frame.rowconfigure(row_idx, weight=1)
+        if audiobook.metadata.description:
+            self._desc_text.insert("1.0", audiobook.metadata.description.strip())
         row_idx += 1
 
         self._readonly_frame = ttk.Frame(meta_frame)
-        self._readonly_frame.grid(row=row_idx, column=0, columnspan=2, sticky="nsew")
+        self._readonly_frame.grid(row=row_idx, column=0, columnspan=4, sticky="ew")
         self._readonly_frame.columnconfigure(1, weight=1)
-        meta_frame.rowconfigure(row_idx, weight=1)
         self._render_readonly_metadata(audiobook)
+
+        chapters_tab = ttk.Frame(right_nb, padding=scale_px(self, 6))
+        chapters_tab.columnconfigure(0, weight=1)
+        chapters_tab.rowconfigure(0, weight=1)
+        right_nb.add(chapters_tab, text="Chapters")
+        self._chapter_editor = ChapterEditorFrame(
+            chapters_tab,
+            palette=self._palette,
+            on_change=lambda chs: self._on_chapters_edited(audiobook, chs),
+        )
+        self._chapter_editor.grid(row=0, column=0, sticky="nsew")
+        self._chapter_editor.set_chapters(audiobook.chapters, source_label=self._source.name)
 
         btn_bar = ttk.Frame(body)
         btn_bar.grid(row=1, column=0, sticky="ew", pady=(12, 0))
@@ -463,13 +590,16 @@ class PreviewDialog(tk.Toplevel):
         ttk.Button(btn_bar, text=action_text, command=_confirm_book).pack(side=tk.RIGHT)
         ttk.Button(btn_bar, text="Close", command=self.destroy).pack(side=tk.RIGHT, padx=(0, 6))
 
+    def _on_chapters_edited(self, audiobook: Audiobook, chapters: list[Any]) -> None:
+        audiobook.chapters = chapters
+        self._render_readonly_metadata(audiobook)
+
     def _render_readonly_metadata(self, audiobook: Audiobook) -> None:
         if self._readonly_frame is None:
             return
         for child in self._readonly_frame.winfo_children():
             child.destroy()
 
-        meta = audiobook.metadata
         readonly_rows = [
             (label, value)
             for label, value in format_audiobook_preview(audiobook)
@@ -490,18 +620,13 @@ class PreviewDialog(tk.Toplevel):
             ).grid(row=row_idx, column=1, sticky="nw", pady=2)
             row_idx += 1
 
-        if meta.description:
-            ttk.Label(
-                self._readonly_frame,
-                text="Description:",
-                font=make_bold_font(self, 9),
-            ).grid(row=row_idx, column=0, sticky="nw", padx=(0, 8), pady=(6, 2))
-            desc_box = ScrolledText(self._readonly_frame, height=4, width=40, wrap="word")
-            desc_box.grid(row=row_idx, column=1, sticky="nsew", pady=(6, 2))
-            desc_box.insert("1.0", meta.description.strip())
-            desc_box.configure(state="disabled")
-            self._readonly_frame.rowconfigure(row_idx, weight=1)
-        apply_theme_to_window(self._readonly_frame, self._palette)
+        apply_theme_to_widget_tree(self._readonly_frame, self._palette)
+
+    def _is_alive(self) -> bool:
+        try:
+            return bool(self.winfo_exists())
+        except tk.TclError:
+            return False
 
     def _sync_editable_vars_from_audiobook(self, audiobook: Audiobook) -> None:
         meta = audiobook.metadata
@@ -510,6 +635,19 @@ class PreviewDialog(tk.Toplevel):
         self._narrators_var.set(format_multi_metadata_values(meta.narrators))
         self._series_var.set(meta.series or "")
         self._series_order_var.set("" if meta.series_order is None else str(meta.series_order))
+        self._genres_var.set(format_multi_metadata_values(meta.genres))
+        self._publisher_var.set(meta.publisher or "")
+        self._release_date_var.set(str(meta.release_date) if meta.release_date is not None else "")
+        lang_val = ""
+        if meta.language is not None:
+            lang_val = getattr(meta.language, "name", None) or str(meta.language)
+        self._language_var.set(lang_val)
+        self._isbn_var.set(meta.isbn or "")
+        self._asin_var.set(meta.asin or "")
+        if self._desc_text is not None:
+            self._desc_text.delete("1.0", tk.END)
+            if meta.description:
+                self._desc_text.insert("1.0", meta.description.strip())
 
     def _start_enrichment(self, audiobook: Audiobook) -> None:
         if not self._apply_audiobook_edits(audiobook):
@@ -548,6 +686,8 @@ class PreviewDialog(tk.Toplevel):
         candidates: list[EnrichmentCandidate],
         exc: Exception | None,
     ) -> None:
+        if not self._is_alive():
+            return
         if self._enrich_btn is not None:
             self._enrich_btn.configure(state="normal")
         self._enrich_status_var.set("")
@@ -562,8 +702,15 @@ class PreviewDialog(tk.Toplevel):
             )
             return
 
-        picker = _EnrichmentPickerDialog(self, candidates, palette=self._palette)
+        picker = _EnrichmentPickerDialog(
+            self,
+            candidates,
+            current_metadata=audiobook.metadata,
+            palette=self._palette,
+        )
         self.wait_window(picker)
+        if not self._is_alive():
+            return
         chosen = picker.selected_candidate
         if chosen is None:
             return
@@ -609,6 +756,8 @@ class PreviewDialog(tk.Toplevel):
         chapters_updated: bool,
         exc: Exception | None,
     ) -> None:
+        if not self._is_alive():
+            return
         if self._enrich_btn is not None:
             self._enrich_btn.configure(state="normal")
         if exc is not None:
@@ -621,6 +770,8 @@ class PreviewDialog(tk.Toplevel):
             self._cover_modified = True
             self._refresh_cover_preview()
         self._render_readonly_metadata(audiobook)
+        if self._chapter_editor is not None:
+            self._chapter_editor.set_chapters(audiobook.chapters, source_label="enriched")
         updates = list(fields)
         if cover_updated:
             updates.append("cover")
@@ -655,8 +806,12 @@ class PreviewDialog(tk.Toplevel):
             side=tk.LEFT, padx=(0, 4)
         )
         ttk.Button(toolbar, text="Deselect All", command=lambda: self._set_all(False)).pack(
-            side=tk.LEFT, padx=(0, 8)
+            side=tk.LEFT, padx=(0, 4)
         )
+        deselect_existing_btn = ttk.Button(
+            toolbar, text="Deselect Existing", command=self._deselect_existing
+        )
+        deselect_existing_btn.pack(side=tk.LEFT, padx=(0, 8))
         ttk.Label(toolbar, text="Filter:").pack(side=tk.LEFT, padx=(0, 4))
         ttk.Entry(toolbar, textvariable=self._filter_var, width=22).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Label(
@@ -688,10 +843,14 @@ class PreviewDialog(tk.Toplevel):
             tree = scrolled_tree.tree
             self._tree = tree
 
+            has_existing = False
             for idx, book in enumerate(series.books):
                 label = f"{idx + 1}. {describe_series_book(idx, book)}"
-                if self._skip_downloaded and self._series_book_exists(book):
+                if self._series_book_exists(book):
                     label = f"{label} [Exists]"
+                    has_existing = True
+                    if self._skip_downloaded:
+                        self._check_vars[idx].set(False)
                 self._item_labels.append(label)
                 tree.insert(
                     "",
@@ -699,8 +858,12 @@ class PreviewDialog(tk.Toplevel):
                     iid=str(idx),
                     values=("[x]" if self._check_vars[idx].get() else "[ ]", label),
                 )
+            self._update_selected_count(book_count)
+            if not has_existing:
+                deselect_existing_btn.configure(state="disabled")
 
             tree.bind("<Button-1>", self._on_tree_click)
+            tree.bind("<Double-1>", self._on_tree_double_click)
             tree.bind("<space>", self._on_tree_key)
             tree.bind("<Return>", self._on_tree_key)
             self._filter_var.trace_add("write", self._apply_filter)
@@ -741,6 +904,13 @@ class PreviewDialog(tk.Toplevel):
         for idx_item in range(len(self._item_labels)):
             self._tree.set(str(idx_item), "selected", "[x]" if self._check_vars[idx_item].get() else "[ ]")
 
+    def _deselect_existing(self) -> None:
+        for idx_item, label_item in enumerate(self._item_labels):
+            if label_item.endswith("[Exists]"):
+                self._check_vars[idx_item].set(False)
+        self._sync_tree_marks()
+        self._update_selected_count()
+
     def _set_all(self, val: bool) -> None:
         query = self._filter_var.get().strip().lower()
         if query:
@@ -768,26 +938,47 @@ class PreviewDialog(tk.Toplevel):
     def _on_tree_click(self, event: tk.Event) -> str | None:
         if self._tree is None:
             return None
+        region = self._tree.identify_region(event.x, event.y)
+        if region not in ("cell", "tree"):
+            return None
         row_iid = self._tree.identify_row(event.y)
         if not row_iid:
             return None
-        idx_row = int(row_iid)
         self._tree.focus(row_iid)
         self._tree.selection_set(row_iid)
-        self._check_vars[idx_row].set(not self._check_vars[idx_row].get())
-        self._toggle_series_item(idx_row, bool(getattr(event, "state", 0) & 0x0001))
-        return "break"
+        if self._tree.identify_column(event.x) == "#1":
+            idx_row = int(row_iid)
+            self._check_vars[idx_row].set(not self._check_vars[idx_row].get())
+            self._toggle_series_item(idx_row, bool(getattr(event, "state", 0) & 0x0001))
+            return "break"
+        return None
+
+    def _on_tree_double_click(self, event: tk.Event) -> str | None:
+        if self._tree is None:
+            return None
+        if self._tree.identify_region(event.x, event.y) not in ("cell", "tree"):
+            return None
+        row_iid = self._tree.identify_row(event.y)
+        if not row_iid:
+            return None
+        if self._tree.identify_column(event.x) != "#1":
+            idx_row = int(row_iid)
+            self._check_vars[idx_row].set(not self._check_vars[idx_row].get())
+            self._toggle_series_item(idx_row, bool(getattr(event, "state", 0) & 0x0001))
+            return "break"
+        return None
 
     def _on_tree_key(self, event: tk.Event) -> str:
         if self._tree is None:
             return "break"
+        visible = self._tree.get_children()
+        if not visible:
+            return "break"
         focused = self._tree.focus()
-        if not focused:
-            visible = self._tree.get_children()
-            if not visible:
-                return "break"
+        if not focused or focused not in visible:
             focused = visible[0]
             self._tree.focus(focused)
+            self._tree.selection_set(focused)
         idx_row = int(focused)
         self._check_vars[idx_row].set(not self._check_vars[idx_row].get())
         self._toggle_series_item(idx_row, bool(getattr(event, "state", 0) & 0x0001))
@@ -805,3 +996,12 @@ class PreviewDialog(tk.Toplevel):
                 visible_pos += 1
             else:
                 self._tree.detach(iid)
+        visible = self._tree.get_children()
+        focused = self._tree.focus()
+        if focused not in visible:
+            if visible:
+                self._tree.focus(visible[0])
+                self._tree.selection_set(visible[0])
+            else:
+                self._tree.focus("")
+                self._tree.selection_set(())

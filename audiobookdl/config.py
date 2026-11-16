@@ -84,6 +84,8 @@ class Config:
     post_exec: str | None = None
     loudnorm: bool | None = None
     mono: bool | None = None
+    chapters_from_silence: bool | None = None
+    chapter_offset_ms: int | None = None
     square_cover: bool | None = None
     max_cover_size: int | None = None
     download_archive: str | None = None
@@ -97,6 +99,7 @@ class Config:
     write_cover: bool | None = None
     write_opf: bool | None = None
     write_abs_metadata: bool | None = None
+    upload_to_abs: bool | None = None
     write_cue: bool | None = None
     enrich_metadata: bool | None = None
     enrich_providers: str | None = None

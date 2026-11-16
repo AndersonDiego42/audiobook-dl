@@ -41,7 +41,7 @@ from audiobookdl.pipeline import (
     verify_service_auth,
 )
 from audiobookdl.sources.source import Source
-from audiobookdl.utils.audiobook import Audiobook, Result
+from audiobookdl.utils.audiobook import Audiobook, Chapter, Result
 from audiobookdl.utils.enrichment import (
     EnrichmentCandidate,
     apply_candidate_to_audiobook,
@@ -78,6 +78,16 @@ class PackJobRequest:
                 "isbn": ov.isbn,
                 "asin": ov.asin,
                 "cover_path": ov.cover_path,
+                "genres": list(ov.genres),
+                "publisher": ov.publisher,
+                "release_date": ov.release_date,
+                "language": ov.language,
+                "description": ov.description,
+                "chapters": (
+                    [{"start": ch.start, "title": ch.title} for ch in ov.chapters]
+                    if ov.chapters is not None
+                    else None
+                ),
             }
         fmt = output_format if output_format is not None else self.output_format
         return {
@@ -106,8 +116,17 @@ class PackJobRequest:
         if isinstance(raw_ov, Mapping):
             authors = [str(a).strip() for a in (raw_ov.get("authors") or []) if str(a).strip()]
             narrators = [str(n).strip() for n in (raw_ov.get("narrators") or []) if str(n).strip()]
+            genres = [str(g).strip() for g in (raw_ov.get("genres") or []) if str(g).strip()]
             raw_order = raw_ov.get("series_order")
             series_order = raw_order if isinstance(raw_order, int) and not isinstance(raw_order, bool) else None
+            raw_ch = raw_ov.get("chapters")
+            parsed_chapters: list[Chapter] | None = None
+            if isinstance(raw_ch, list):
+                parsed_chapters = [
+                    Chapter(start=int(c["start"]), title=str(c["title"]))
+                    for c in raw_ch
+                    if isinstance(c, Mapping) and "start" in c and "title" in c
+                ]
             cand = PackOverrides(
                 title=str(raw_ov["title"]).strip() if raw_ov.get("title") else None,
                 authors=authors,
@@ -117,6 +136,12 @@ class PackJobRequest:
                 isbn=str(raw_ov["isbn"]).strip() if raw_ov.get("isbn") else None,
                 asin=str(raw_ov["asin"]).strip() if raw_ov.get("asin") else None,
                 cover_path=str(raw_ov["cover_path"]).strip() if raw_ov.get("cover_path") else None,
+                genres=genres,
+                publisher=str(raw_ov["publisher"]).strip() if raw_ov.get("publisher") else None,
+                release_date=str(raw_ov["release_date"]).strip() if raw_ov.get("release_date") else None,
+                language=str(raw_ov["language"]).strip() if raw_ov.get("language") else None,
+                description=str(raw_ov["description"]).strip() if raw_ov.get("description") else None,
+                chapters=parsed_chapters,
             )
             if any((
                 cand.title,
@@ -127,6 +152,12 @@ class PackJobRequest:
                 cand.isbn is not None,
                 cand.asin is not None,
                 cand.cover_path,
+                cand.genres,
+                cand.publisher,
+                cand.release_date,
+                cand.language,
+                cand.description,
+                cand.chapters is not None,
             )):
                 overrides = cand
         raw_out_dir = raw.get("output_dir")
@@ -315,6 +346,10 @@ class GuiController:
         self.preview_cancel_event = threading.Event()
         self.interaction: GuiInteractionHandler | None = None
         self.preview_interaction: GuiInteractionHandler | None = None
+        self.sync_cancel_event: threading.Event | None = None
+        self.sync_interaction: GuiInteractionHandler | None = None
+        self._aux_interactions_lock = threading.Lock()
+        self._aux_interactions: set[GuiInteractionHandler] = set()
 
         self.pending_jobs: deque[QueuedJob | None] = deque()
         self.queue_lock = threading.Lock()
@@ -493,6 +528,15 @@ class GuiController:
             output_path = str(rec.get("output_path") or "").strip()
             if output_path:
                 entry["output_path"] = output_path
+            profile = str(rec.get("profile") or "").strip()
+            if profile:
+                entry["profile"] = profile
+            selected_indices = rec.get("selected_indices")
+            if isinstance(selected_indices, list):
+                entry["selected_indices"] = [int(i) for i in selected_indices if isinstance(i, int)]
+            job_overrides = rec.get("job_overrides")
+            if isinstance(job_overrides, dict) and job_overrides:
+                entry["job_overrides"] = dict(job_overrides)
             if job_kind == "pack":
                 pack_payload = rec.get("pack_request")
                 if not isinstance(pack_payload, dict):
@@ -560,6 +604,17 @@ class GuiController:
                     "service": service,
                     "job_kind": job_kind,
                 }
+                profile = str(item.get("profile") or "").strip()
+                if profile:
+                    rec["profile"] = profile
+                raw_indices = item.get("selected_indices")
+                if isinstance(raw_indices, list):
+                    rec["selected_indices"] = [
+                        int(i) for i in raw_indices if isinstance(i, int) and not isinstance(i, bool)
+                    ]
+                raw_overrides = item.get("job_overrides")
+                if isinstance(raw_overrides, dict) and raw_overrides:
+                    rec["job_overrides"] = dict(raw_overrides)
                 if pack_dict is not None:
                     rec["pack_request"] = pack_dict
                 self.queue_records[job_id] = rec
@@ -619,6 +674,18 @@ class GuiController:
             "service": service_label,
             "job_kind": "pack" if is_pack else "download",
         }
+        profile = getattr(job.options, "profile", None)
+        if isinstance(profile, str) and profile.strip():
+            rec["profile"] = profile.strip()
+        if job.selected_indices is not None:
+            rec["selected_indices"] = [int(i) for i in job.selected_indices]
+        job_overrides: dict[str, Any] = {}
+        for attr in ("output_format", "combine", "output_template", "split_chapters", "media_type"):
+            val = getattr(job.options, attr, None)
+            if val is not None:
+                job_overrides[attr] = val
+        if job_overrides:
+            rec["job_overrides"] = job_overrides
         if job.pack_request is not None:
             rec["pack_request"] = job.pack_request.to_dict(
                 output_format=getattr(job.options, "output_format", None) or job.pack_request.output_format
@@ -938,6 +1005,49 @@ class GuiController:
             pending_list[pos], pending_list[target] = pending_list[target], pending_list[pos]
             self.pending_jobs = deque(pending_list)
             return neighbor_id
+
+    def move_pending_job_to_edge(self, job_id: str, *, to_top: bool) -> list[str] | None:
+        """Move `job_id` to the front or back of `pending_jobs`; return new pending job ID order."""
+        with self.queue_cond:
+            pending_list = list(self.pending_jobs)
+            pos = next(
+                (i for i, job in enumerate(pending_list) if job is not None and job.job_id == job_id),
+                None,
+            )
+            if pos is None:
+                return None
+            job = pending_list.pop(pos)
+            assert job is not None
+            non_null = [j for j in pending_list if j is not None]
+            has_sentinel = any(j is None for j in pending_list)
+            if to_top:
+                reordered = [job, *non_null]
+            else:
+                reordered = [*non_null, job]
+            self.pending_jobs = deque(reordered + ([None] if has_sentinel else []))
+            return [j.job_id for j in reordered]
+
+    def move_pending_job_to_target(self, job_id: str, target_job_id: str) -> list[str] | None:
+        """Move pending `job_id` to the position currently occupied by `target_job_id`."""
+        if job_id == target_job_id:
+            return None
+        with self.queue_cond:
+            pending_list = list(self.pending_jobs)
+            pos_src = next(
+                (i for i, job in enumerate(pending_list) if job is not None and job.job_id == job_id),
+                None,
+            )
+            pos_dst = next(
+                (i for i, job in enumerate(pending_list) if job is not None and job.job_id == target_job_id),
+                None,
+            )
+            if pos_src is None or pos_dst is None:
+                return None
+            job = pending_list.pop(pos_src)
+            assert job is not None
+            pending_list.insert(pos_dst, job)
+            self.pending_jobs = deque(pending_list)
+            return [j.job_id for j in pending_list if j is not None]
 
     def retryable_urls(self, ordered_ids: Sequence[str]) -> list[str]:
         with self.queue_lock:
@@ -1275,6 +1385,21 @@ class GuiController:
         threading.Thread(target=_worker, daemon=True).start()
         return request_id
 
+    def _register_aux_interaction(self, interaction: GuiInteractionHandler) -> None:
+        with self._aux_interactions_lock:
+            self._aux_interactions.add(interaction)
+
+    def _unregister_aux_interaction(self, interaction: GuiInteractionHandler) -> None:
+        with self._aux_interactions_lock:
+            self._aux_interactions.discard(interaction)
+
+    def release_auxiliary_interactions(self) -> None:
+        """Unblock any pending auxiliary interaction prompts (auth test, catalog fetch)."""
+        with self._aux_interactions_lock:
+            handlers = list(self._aux_interactions)
+        for handler in handlers:
+            handler.release_all()
+
     def start_auth_verification(
         self,
         service_key: str,
@@ -1283,7 +1408,9 @@ class GuiController:
     ) -> None:
         """Verify credentials for `service_key` on a background thread."""
         cfg = self.config_snapshot()
-        interaction = GuiInteractionHandler(self.event_queue, threading.Event())
+        cancel_ev = threading.Event()
+        interaction = GuiInteractionHandler(self.event_queue, cancel_ev)
+        self._register_aux_interaction(interaction)
 
         def _worker() -> None:
             try:
@@ -1291,6 +1418,10 @@ class GuiController:
                 self.event_queue.put(("auth_verified", service_label, ok, None))
             except Exception as exc:
                 self.event_queue.put(("auth_verified", service_label, False, exc))
+            finally:
+                cancel_ev.set()
+                interaction.release_all()
+                self._unregister_aux_interaction(interaction)
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -1301,12 +1432,16 @@ class GuiController:
         query_text: str,
         options: args.DownloadOptions,
         dialog: Any,
+        *,
+        archive_path: str | None = None,
     ) -> int:
         """Search a service catalog or list its library on a background thread."""
         self.catalog_request_id += 1
         request_id = self.catalog_request_id
         cfg = self.config_snapshot()
-        interaction = GuiInteractionHandler(self.event_queue, threading.Event())
+        cancel_ev = threading.Event()
+        interaction = GuiInteractionHandler(self.event_queue, cancel_ev)
+        self._register_aux_interaction(interaction)
 
         def _worker() -> None:
             try:
@@ -1325,12 +1460,29 @@ class GuiController:
                         cfg,
                         interaction=interaction,
                     )
-                self.event_queue.put(("catalog_loaded", request_id, dialog, books, None))
+                statuses: list[str] | None = None
+                if books and archive_path and os.path.exists(archive_path):
+                    from audiobookdl.utils.archive import DownloadArchive
+
+                    with DownloadArchive(archive_path, persistent=True) as archive:
+                        statuses = archive.lookup_catalog_statuses(service_key, books)
+                self.event_queue.put(("catalog_loaded", request_id, dialog, (books, statuses), None))
             except Exception as exc:
-                self.event_queue.put(("catalog_loaded", request_id, dialog, [], exc))
+                self.event_queue.put(("catalog_loaded", request_id, dialog, ([], None), exc))
+            finally:
+                cancel_ev.set()
+                interaction.release_all()
+                self._unregister_aux_interaction(interaction)
 
         threading.Thread(target=_worker, daemon=True).start()
         return request_id
+
+    def cancel_library_sync(self) -> None:
+        """Signal any active library synchronization pass to cancel and unblock prompts."""
+        if self.sync_cancel_event is not None:
+            self.sync_cancel_event.set()
+        if self.sync_interaction is not None:
+            self.sync_interaction.release_all()
 
     def start_library_sync(self, sync_opts: args.SyncOptions) -> None:
         """Run one library synchronization cycle (`audiobookdl.sync.run_sync_once`) on a worker thread."""
@@ -1339,19 +1491,152 @@ class GuiController:
         cfg = self.config_snapshot()
         ffmpeg_dir = cfg.ffmpeg_dir.strip() or None if cfg.ffmpeg_dir else None
         cancel_ev = threading.Event()
+        interaction = GuiInteractionHandler(self.event_queue, cancel_ev)
+        self.sync_cancel_event = cancel_ev
+        self.sync_interaction = interaction
         ctx = logging.JobContext(
             ffmpeg_dir=ffmpeg_dir,
             sink=self.sink,
+            interaction=interaction,
             cancel_event=cancel_ev,
         )
 
         def _worker() -> None:
             try:
                 with logging.job_context(ctx):
-                    cycle = run_sync_once(sync_opts, config=cfg, cancel_event=cancel_ev)
+                    cycle = run_sync_once(
+                        sync_opts,
+                        config=cfg,
+                        cancel_event=cancel_ev,
+                        interaction=interaction,
+                        sink=self.sink,
+                    )
                 self.event_queue.put(("sync_done", cycle, None))
             except Exception as exc:
                 self.event_queue.put(("sync_done", None, exc))
+            finally:
+                if self.sync_cancel_event is cancel_ev:
+                    self.sync_cancel_event = None
+                if self.sync_interaction is interaction:
+                    self.sync_interaction = None
+                interaction.release_all()
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def start_sync_enqueue_discovery(
+        self,
+        targets: Sequence[tuple[str, str]],
+        sync_opts: args.SyncOptions,
+    ) -> None:
+        """Discover pending library URLs across `targets` and emit `sync_enqueue_ready`."""
+        from audiobookdl.config import DEFAULT_PROFILE
+        from audiobookdl.sync import _build_sync_download_options
+        from audiobookdl.utils.archive import DownloadArchive, make_catalog_book_key, resolve_archive_path
+
+        cfg = self.config_snapshot()
+        cancel_ev = threading.Event()
+        interaction = GuiInteractionHandler(self.event_queue, cancel_ev)
+        self.sync_cancel_event = cancel_ev
+        self.sync_interaction = interaction
+
+        def _worker() -> None:
+            discovered = 0
+            newly_added = 0
+            skipped = 0
+            pending_by_profile: list[tuple[str, str, list[str]]] = []
+            errors: list[str] = []
+            try:
+                archive_path = resolve_archive_path(cfg, sync_opts.archive_path)
+                archive = DownloadArchive(archive_path)
+                for svc, prof in targets:
+                    if cancel_ev.is_set():
+                        break
+                    try:
+                        dl_opts = _build_sync_download_options(sync_opts, cfg, archive_path, prof)
+                        books = list_service_library(svc, dl_opts, cfg, interaction=interaction)
+                        discovered += len(books)
+                        if books:
+                            ins, _upd = archive.upsert_catalog_items(svc, books, profile=prof)
+                            newly_added += ins
+                        urls: list[str] = []
+                        for book in books:
+                            if not book.url:
+                                continue
+                            item_source = (book.source or svc).strip().lower() or svc
+                            book_key = make_catalog_book_key(item_source, book)
+                            entry = archive.get_entry_by_key(item_source, book_key)
+                            if entry is not None and (
+                                entry.status in ("downloaded", "trashed") or entry.is_hidden
+                            ):
+                                skipped += 1
+                                continue
+                            if book.url not in urls:
+                                urls.append(book.url)
+                        if urls:
+                            pending_by_profile.append(
+                                (svc, "" if prof == DEFAULT_PROFILE else prof, urls)
+                            )
+                    except Exception as exc:
+                        errors.append(f"{svc} ({prof}): {exc}")
+                self.event_queue.put(
+                    (
+                        "sync_enqueue_ready",
+                        pending_by_profile,
+                        {
+                            "discovered": discovered,
+                            "newly_added": newly_added,
+                            "skipped": skipped,
+                            "errors": errors,
+                            "cancelled": cancel_ev.is_set(),
+                        },
+                        None,
+                    )
+                )
+            except Exception as exc:
+                self.event_queue.put(("sync_enqueue_ready", [], {}, exc))
+            finally:
+                if self.sync_cancel_event is cancel_ev:
+                    self.sync_cancel_event = None
+                if self.sync_interaction is interaction:
+                    self.sync_interaction = None
+                interaction.release_all()
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def start_abs_upload(
+        self,
+        local_path: str,
+        *,
+        title: str,
+        authors: Sequence[str] = (),
+        series: str | None = None,
+    ) -> None:
+        """Upload a local archive entry to the configured Audiobookshelf server."""
+        from audiobookdl.integrations.audiobookshelf import AudiobookshelfClient
+        from audiobookdl.utils.audiobook import AudiobookMetadata
+
+        cfg = self.config_snapshot()
+        abs_cfg = cfg.audiobookshelf
+
+        def _worker() -> None:
+            if not abs_cfg.url or not abs_cfg.api_key or not abs_cfg.library_id:
+                self.event_queue.put(
+                    ("abs_upload_done", title, False, "Configure Audiobookshelf URL, token, and library ID first.")
+                )
+                return
+            client = AudiobookshelfClient(abs_cfg.url, abs_cfg.api_key, session=self.get_http_session())
+            try:
+                meta = AudiobookMetadata(
+                    title=title,
+                    authors=[a for a in authors if a],
+                    series=series,
+                )
+                client.upload_book(local_path, library_id=abs_cfg.library_id, metadata=meta)
+                if abs_cfg.auto_scan:
+                    client.scan_library(abs_cfg.library_id)
+                self.event_queue.put(("abs_upload_done", title, True, None))
+            except Exception as exc:
+                self.event_queue.put(("abs_upload_done", title, False, str(exc)))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -1428,11 +1713,34 @@ class GuiController:
         handler: Callable[[tuple], None],
         max_batch: int = MAX_QUEUE_BATCH,
     ) -> int:
-        """Drain up to `max_batch` events, coalescing consecutive progress and queue-save updates."""
+        """Drain up to `max_batch` events, coalescing consecutive logs, progress, and queue saves."""
         pending_progress: tuple | None = None
         pending_metrics: tuple | None = None
+        pending_logs: list[tuple[str, str]] = []
         processed = 0
         self._save_defer_depth += 1
+
+        def _flush_logs() -> None:
+            if not pending_logs:
+                return
+            if len(pending_logs) == 1:
+                lvl, msg = pending_logs[0]
+                pending_logs.clear()
+                handler(("log", lvl, msg))
+                return
+            batch = list(pending_logs)
+            pending_logs.clear()
+            handler(("log_batch", batch))
+
+        def _flush_progress() -> None:
+            nonlocal pending_progress, pending_metrics
+            if pending_progress is not None:
+                handler(pending_progress)
+                pending_progress = None
+            if pending_metrics is not None:
+                handler(pending_metrics)
+                pending_metrics = None
+
         try:
             while processed < max_batch:
                 try:
@@ -1440,23 +1748,23 @@ class GuiController:
                 except queue.Empty:
                     break
                 processed += 1
+                if item[0] == "log":
+                    _flush_progress()
+                    pending_logs.append((str(item[1]), str(item[2])))
+                    continue
                 if item[0] == "progress_advance":
+                    _flush_logs()
                     pending_progress = item
                     continue
                 if item[0] == "progress_metrics":
+                    _flush_logs()
                     pending_metrics = item
                     continue
-                if pending_progress is not None:
-                    handler(pending_progress)
-                    pending_progress = None
-                if pending_metrics is not None:
-                    handler(pending_metrics)
-                    pending_metrics = None
+                _flush_logs()
+                _flush_progress()
                 handler(item)
-            if pending_progress is not None:
-                handler(pending_progress)
-            if pending_metrics is not None:
-                handler(pending_metrics)
+            _flush_logs()
+            _flush_progress()
         finally:
             self._save_defer_depth -= 1
             if self._save_defer_depth == 0 and self._save_deferred:
@@ -1474,6 +1782,8 @@ class GuiController:
             self.preview_cancel_event.set()
             if self.preview_interaction is not None:
                 self.preview_interaction.release_all()
+        self.cancel_library_sync()
+        self.release_auxiliary_interactions()
         drained_jobs: list[QueuedJob] = []
         with self.queue_cond:
             for item in self.pending_jobs:

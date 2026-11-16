@@ -44,6 +44,7 @@ class ServiceAuthPanel(ttk.LabelFrame):
         build_verify_options: Callable[[], args.DownloadOptions | None],
         is_running_provider: Callable[[], bool],
         on_log: Callable[[str], None],
+        on_manage_accounts: Callable[[], object] | None = None,
     ) -> None:
         super().__init__(master, text="Service & Authentication", padding=(10, 6))
         self._window = root
@@ -71,6 +72,7 @@ class ServiceAuthPanel(ttk.LabelFrame):
         self._build_verify_options = build_verify_options
         self._is_running_provider = is_running_provider
         self._on_log = on_log
+        self._on_manage_accounts = on_manage_accounts
 
         self._build_widgets()
 
@@ -161,15 +163,15 @@ class ServiceAuthPanel(ttk.LabelFrame):
         ttk.Label(self, text="Library:").grid(row=3, column=0, sticky="w", padx=(0, 8))
         self.lib_entry = ttk.Entry(self, textvariable=self.library_var, width=14)
         self.lib_entry.grid(row=3, column=1, sticky="ew", padx=(0, 10))
-
-        auth_actions = ttk.Frame(self)
-        auth_actions.grid(row=3, column=2, columnspan=3, sticky="ew")
         self.remember_cb = ttk.Checkbutton(
-            auth_actions,
+            self,
             text="Remember login",
             variable=self.remember_login_var,
         )
-        self.remember_cb.pack(side=tk.LEFT)
+        self.remember_cb.grid(row=3, column=2, columnspan=3, sticky="w")
+
+        auth_actions = ttk.Frame(self)
+        auth_actions.grid(row=4, column=1, columnspan=4, sticky="ew", pady=(4, 0))
         self.forget_auth_btn = ttk.Button(
             auth_actions, text="Forget", command=self.forget_current_credentials
         )
@@ -182,6 +184,11 @@ class ServiceAuthPanel(ttk.LabelFrame):
             auth_actions, text="Test Login", command=self.verify_current_auth
         )
         self.test_auth_btn.pack(side=tk.RIGHT, padx=(0, 4))
+        if self._on_manage_accounts is not None:
+            self.manage_accounts_btn = ttk.Button(
+                auth_actions, text="All Accounts...", command=self._on_manage_accounts
+            )
+            self.manage_accounts_btn.pack(side=tk.RIGHT, padx=(0, 4))
 
     def selected_service(self) -> ServiceInfo | None:
         return self._services_by_label.get(self.service_label_var.get())
@@ -209,9 +216,15 @@ class ServiceAuthPanel(ttk.LabelFrame):
         if detected and detected != self._last_detected_service:
             self._last_detected_service = detected
             service = self._services_by_key.get(detected)
+            current = self.selected_service()
+            if service and current is not None and current.key == service.key:
+                return
             if service and self.service_label_var.get() != service.label:
                 self.service_label_var.set(service.label)
-                self.profile_var.set(DEFAULT_PROFILE)
+                configured_profiles = list_source_profiles(self._controller.config, service.key)
+                current_profile = normalize_profile_name(self.profile_var.get())
+                if current_profile not in configured_profiles:
+                    self.profile_var.set(DEFAULT_PROFILE)
                 self.load_service_into_form()
                 self.update_field_states()
 
@@ -322,13 +335,21 @@ class ServiceAuthPanel(ttk.LabelFrame):
         if chosen:
             self.cookie_file_var.set(chosen)
 
-    def show_cookie_import_dialog(self) -> None:
+    def show_cookie_import_dialog(self, svc_key_override: str | None = None) -> None:
         """Open or raise the interactive browser-cookie importer dialog."""
         if self._cookie_dialog is not None and self._cookie_dialog.winfo_exists():
+            if svc_key_override:
+                svc = self._services_by_key.get(svc_key_override)
+                if svc is not None and "cookies" in svc.auth_methods:
+                    self._cookie_dialog._service_var.set(svc.label)
             self._cookie_dialog.lift()
             self._cookie_dialog.focus_set()
             return
-        selected = self.selected_service()
+        selected = (
+            self._services_by_key.get(svc_key_override)
+            if svc_key_override
+            else self.selected_service()
+        )
         initial_key = selected.key if (selected and "cookies" in selected.auth_methods) else ""
         initial_path = self.cookie_file_var.get().strip() if initial_key else ""
         self._cookie_dialog = CookieImportDialog(

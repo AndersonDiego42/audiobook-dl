@@ -6,6 +6,8 @@ from contextlib import contextmanager
 import http.client
 import json
 import threading
+import time
+from typing import Any
 import urllib.error
 import urllib.request
 
@@ -149,6 +151,7 @@ def test_web_ui_server_endpoints_auth_and_download_queue(tmp_path, monkeypatch):
 
         _, lib_entries = _http_json(f"{base}/api/library?limit=10", headers=auth_hdr)
         assert isinstance(lib_entries, list)
+        assert not (tmp_path / "db" / "downloads.db").exists()
 
 
 def test_web_ui_catalog_sync_and_error_responses(tmp_path, monkeypatch):
@@ -195,20 +198,34 @@ def test_web_ui_catalog_sync_and_error_responses(tmp_path, monkeypatch):
             _http_json(f"{base}/api/catalog", method="POST", payload={"mode": "search"}, headers=hdr)
         assert exc_info.value.code == 400
 
-        # Sync endpoint success -> 200
+        # Sync endpoint starts asynchronously -> 202 and completes in background
         status, sync_res = _http_json(f"{base}/api/sync", method="POST", payload={}, headers=hdr)
-        assert status == 200
-        assert sync_res["profiles_checked"] == 2
-        assert sync_res["downloaded"] == 1
+        assert status == 202
+        assert sync_res["syncing"] is True
+        deadline = time.monotonic() + 3.0
+        snap = {}
+        while time.monotonic() < deadline:
+            _, snap = _http_json(f"{base}/api/status", headers=hdr)
+            if not snap["syncing"] and snap.get("last_sync") is not None:
+                break
+            time.sleep(0.02)
+        assert snap["last_sync"]["profiles_checked"] == 2
+        assert snap["last_sync"]["downloaded"] == 1
 
-        # Sync endpoint failure -> 400
+        # Sync endpoint failure surfaces via status.last_sync_error
         monkeypatch.setattr(
             "audiobookdl.web.run_sync_once",
             lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("sync boom")),
         )
-        with pytest.raises(urllib.error.HTTPError) as exc_info:
-            _http_json(f"{base}/api/sync", method="POST", payload={}, headers=hdr)
-        assert exc_info.value.code == 400
+        status, _ = _http_json(f"{base}/api/sync", method="POST", payload={}, headers=hdr)
+        assert status == 202
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            _, snap = _http_json(f"{base}/api/status", headers=hdr)
+            if not snap["syncing"] and snap.get("last_sync_error"):
+                break
+            time.sleep(0.02)
+        assert "sync boom" in (snap.get("last_sync_error") or "")
 
         # Unknown GET and POST routes -> 404
         with pytest.raises(urllib.error.HTTPError) as exc_info:
@@ -337,3 +354,158 @@ def test_web_ui_security_csrf_413_400_and_path_traversal(tmp_path, monkeypatch):
         )
         assert status == 202 and ok_res["queued"] == 1
         assert (out_dir / "subdir" / "nested").is_dir() or ok_res["queued"] == 1
+
+
+def test_web_ui_sse_queue_controls_interactive_prompts_and_option_parity(tmp_path, monkeypatch):
+    from audiobookdl import output
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    cfg_path.write_text(
+        '[sources.storytel.profiles.work]\nusername = "worker@example.com"\n',
+        encoding="utf-8",
+    )
+    serve_opts = args.ServeOptions(
+        host="127.0.0.1",
+        port=0,
+        token="sse-secret",
+        config_location=str(cfg_path),
+        output_dir=str(tmp_path / "out"),
+    )
+    server = create_web_server(serve_opts)
+    state = server.dashboard_state  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        headers = {"Authorization": "Bearer sse-secret"}
+
+        # 1. /api/services includes per-service profiles
+        st_svc, svcs = _http_json(f"{base}/api/services", headers=headers)
+        assert st_svc == 200
+        storytel = next(s for s in svcs if s["key"] == "storytel")
+        assert "work" in storytel["profiles"]
+
+        # 2. build_download_options supports output_preset, enrich_metadata, profile
+        built = state.build_download_options(
+            ["https://www.storytel.com/books/12345"],
+            {"output_preset": "audiobookshelf", "enrich_metadata": True, "profile": "work"},
+        )
+        assert output.OUTPUT_TEMPLATE_PRESETS["audiobookshelf"] in built.output_template
+        assert built.enrich_metadata is True
+        assert built.profile == "work"
+
+        # 3. Connect to SSE /api/events and read snapshot + log + prompt events
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5.0)
+        try:
+            conn.request("GET", "/api/events", headers=headers)
+            resp = conn.getresponse()
+            assert resp.status == 200
+            assert "text/event-stream" in (resp.getheader("Content-Type") or "")
+
+            def _read_sse_event() -> tuple[str, dict[str, Any]]:
+                ev_name = ""
+                data_buf = ""
+                while True:
+                    raw_line = resp.fp.readline().decode("utf-8")
+                    if raw_line in ("\n", "\r\n", ""):
+                        if data_buf:
+                            return ev_name, json.loads(data_buf)
+                        continue
+                    line = raw_line.rstrip("\r\n")
+                    if line.startswith(":"):
+                        continue
+                    if line.startswith("event:"):
+                        ev_name = line[6:].strip()
+                    elif line.startswith("data:"):
+                        data_buf += line[5:].strip()
+
+            first_ev, first_payload = _read_sse_event()
+            assert first_ev == "snapshot"
+            assert "queue" in first_payload
+
+            # Emit log event and interactive prompt while SSE subscriber is active
+            state.controller.event_queue.put(("log", "INFO", "SSE test message"))
+            ev2, p2 = _read_sse_event()
+            assert ev2 == "log"
+            assert any("SSE test message" in ln for ln in p2["lines"])
+
+            holder: dict[str, Any] = {"value": None}
+            done = threading.Event()
+            state.controller.event_queue.put(("prompt_input", "Enter OTP", True, holder, done))
+            ev3, p3 = _read_sse_event()
+            assert ev3 == "prompt"
+            prompt_id = p3["prompt"]["id"]
+            assert p3["prompt"]["kind"] == "input"
+            assert p3["prompt"]["hidden"] is True
+
+            # Respond via HTTP POST /api/prompt/respond
+            st_resp, res_resp = _http_json(
+                f"{base}/api/prompt/respond",
+                method="POST",
+                payload={"id": prompt_id, "value": "998877"},
+                headers=headers,
+            )
+            assert st_resp == 200 and res_resp == {"resolved": True}
+            assert done.wait(timeout=2.0)
+            assert holder["value"] == "998877"
+        finally:
+            conn.close()
+
+        # 4. Queue move, remove, and retry endpoints
+        from audiobookdl.gui.controller import GuiInteractionHandler, QueuedJob
+
+        inter = GuiInteractionHandler(state.controller.event_queue, state.controller.cancel_event)
+        j1 = QueuedJob("j1", 1, "https://librivox.org/b1", state.build_download_options(["https://librivox.org/b1"]), inter)
+        j2 = QueuedJob("j2", 1, "https://librivox.org/b2", state.build_download_options(["https://librivox.org/b2"]), inter)
+        j_fail = QueuedJob("j_fail", 1, "https://librivox.org/f1", state.build_download_options(["https://librivox.org/f1"]), inter)
+        with state.controller.queue_cond:
+            state.controller.pending_jobs.extend([j1, j2])
+        state.controller.register_queue_record(j1, "LibriVox", persist=False)
+        state.controller.register_queue_record(j2, "LibriVox", persist=False)
+        state.controller.register_queue_record(j_fail, "LibriVox", persist=False)
+        state.controller.update_queue_record("j_fail", "Failed", "timeout")
+
+        st_mv, res_mv = _http_json(
+            f"{base}/api/queue/move",
+            method="POST",
+            payload={"job_id": "j2", "direction": "up"},
+            headers=headers,
+        )
+        assert st_mv == 200 and res_mv == {"moved": True}
+        pending_ids = [j.job_id for j in state.controller.pending_jobs if j is not None]
+        assert pending_ids[:2] == ["j2", "j1"]
+
+        st_rm, res_rm = _http_json(
+            f"{base}/api/queue/remove",
+            method="POST",
+            payload={"job_id": "j1"},
+            headers=headers,
+        )
+        assert st_rm == 200 and res_rm["removed"] is True
+
+        # Mock start_new_run so retry doesn't hit network
+        retried_calls: list[Any] = []
+        monkeypatch.setattr(state.controller, "start_or_enqueue_jobs", lambda **kw: (retried_calls.append(kw) or False, 2, [], 1))
+        st_rt, res_rt = _http_json(
+            f"{base}/api/queue/retry",
+            method="POST",
+            payload={"job_ids": ["j_fail"]},
+            headers=headers,
+        )
+        assert st_rt == 202 and len(retried_calls) == 1
+
+        # 5. POST /api/sync returns 409 Conflict when already syncing
+        with state._lock:
+            state.is_syncing = True
+        try:
+            with pytest.raises(urllib.error.HTTPError) as exc_info:
+                _http_json(f"{base}/api/sync", method="POST", payload={}, headers=headers)
+            assert exc_info.value.code == 409
+        finally:
+            with state._lock:
+                state.is_syncing = False
+    finally:
+        server.shutdown()
+        state.shutdown()
+        server.server_close()
+

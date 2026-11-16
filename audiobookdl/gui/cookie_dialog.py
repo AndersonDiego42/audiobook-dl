@@ -177,10 +177,14 @@ class CookieImportDialog(tk.Toplevel):
             style="Muted.TLabel",
             wraplength=scale_px(self, 580),
         )
-        self._status_label.grid(row=6, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        self._status_label.grid(row=6, column=0, columnspan=3, sticky="w", pady=(0, 4))
+
+        self._loading_bar = ttk.Progressbar(body, mode="indeterminate")
+        self._loading_bar.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        self._loading_bar.grid_remove()
 
         btn_row = ttk.Frame(body)
-        btn_row.grid(row=7, column=0, columnspan=3, sticky="ew")
+        btn_row.grid(row=8, column=0, columnspan=3, sticky="ew")
         ttk.Button(btn_row, text="Close", command=self.destroy).pack(side=tk.RIGHT)
         self._save_btn = ttk.Button(
             btn_row,
@@ -259,6 +263,8 @@ class CookieImportDialog(tk.Toplevel):
         self._scan_btn.configure(state="disabled")
         self._service_combo.configure(state="disabled")
         self._browser_combo.configure(state="disabled")
+        self._loading_bar.grid()
+        self._loading_bar.start(12)
         self._set_status(f"Scanning {self._browser_var.get()} cookies...", "Muted.TLabel")
 
         self._cb_queue.begin_task()
@@ -284,6 +290,8 @@ class CookieImportDialog(tk.Toplevel):
         if not self.winfo_exists():
             return
         self._is_scanning = False
+        self._loading_bar.stop()
+        self._loading_bar.grid_remove()
         self._scan_btn.configure(state="normal")
         self._service_combo.configure(state="readonly")
         self._browser_combo.configure(state="readonly")

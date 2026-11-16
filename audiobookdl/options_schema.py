@@ -91,6 +91,12 @@ def _validate_bool(key: str, raw: Any) -> tuple[bool | None, str | None]:
     return raw, None
 
 
+def _validate_int(key: str, raw: Any) -> tuple[int | None, str | None]:
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return raw, None
+    return None, f"Warning: invalid '{key}' in config (expected integer); ignoring"
+
+
 def _validate_positive_int(key: str, raw: Any) -> tuple[int | None, str | None]:
     if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 1:
         return raw, None
@@ -183,6 +189,7 @@ def _validate_limit_rate(key: str, raw: Any) -> tuple[str | None, str | None]:
 _CONFIG_VALIDATORS: Mapping[str, Callable[[str, Any], tuple[Any, str | None]]] = {
     "str": _validate_str,
     "bool": _validate_bool,
+    "int": _validate_int,
     "positive_int": _validate_positive_int,
     "non_negative_float": _validate_non_negative_float,
     "positive_float": _validate_positive_float,
@@ -227,6 +234,12 @@ def _serialize_optional_bool(val: Any) -> tuple[bool, Any]:
     if val is None:
         return False, None
     return True, bool(val)
+
+
+def _serialize_int(val: Any) -> tuple[bool, Any]:
+    if val is None:
+        return False, None
+    return True, int(val)
 
 
 def _serialize_positive_int(val: Any) -> tuple[bool, Any]:
@@ -906,10 +919,16 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
                 help="Upload completed audiobooks to the configured Audiobookshelf server",
             ),
         ),
+        config_key="upload_to_abs",
+        config_kind="bool",
+        toml_serializer=_serialize_bool,
+        merge_from_config=True,
+        merge_only_if_default=True,
         gui=GuiBinding(
             var_attr="upload_to_abs_var",
             var_type="bool",
             gui_default=False,
+            persisted_in_output_prefs=True,
         ),
     ),
     OptionSpec(
@@ -1208,10 +1227,16 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
                 help="Detect long pauses via FFmpeg silencedetect when no chapter markers exist",
             ),
         ),
+        config_key="chapters_from_silence",
+        config_kind="bool",
+        toml_serializer=_serialize_bool,
+        merge_from_config=True,
+        merge_only_if_default=True,
         gui=GuiBinding(
             var_attr="chapters_from_silence_var",
             var_type="bool",
             gui_default=False,
+            persisted_in_output_prefs=True,
         ),
     ),
     OptionSpec(
@@ -1224,12 +1249,18 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
                 help="Shift non-initial chapter timestamps by N milliseconds",
             ),
         ),
+        config_key="chapter_offset_ms",
+        config_kind="int",
+        toml_serializer=_serialize_int,
+        merge_from_config=True,
+        merge_only_if_default=True,
         gui=GuiBinding(
             var_attr="chapter_offset_ms_var",
             var_type="str",
             gui_default="0",
             from_config=_gui_init_int_str,
             to_option=_gui_read_int,
+            persisted_in_output_prefs=True,
         ),
     ),
     OptionSpec(

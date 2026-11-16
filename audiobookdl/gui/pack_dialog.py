@@ -7,15 +7,17 @@ import os
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 from audiobookdl import args
 from audiobookdl.exceptions import AudiobookDLException
+from audiobookdl.gui.chapter_editor import ChapterEditorFrame
 from audiobookdl.gui.controller import GuiController, PackJobRequest
 from audiobookdl.gui.formatting import format_duration
 from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, apply_theme_to_window, scale_px
 from audiobookdl.gui.widgets import MainThreadCallbackQueue, ScrolledTreeview, TreeColumnSpec
 from audiobookdl.pack import PackBookSpec, PackOverrides, scope_overrides_for_batch
+from audiobookdl.utils.audiobook import Chapter, parse_language, parse_release_date
 
 
 class PackDialog(tk.Toplevel):
@@ -24,9 +26,9 @@ class PackDialog(tk.Toplevel):
     _PREVIEW_COLUMNS = (
         TreeColumnSpec("title", "Title", width=180, stretch=True),
         TreeColumnSpec("authors", "Author", width=130, stretch=True),
-        TreeColumnSpec("tracks", "Tracks", width=60, stretch=False, anchor="e"),
-        TreeColumnSpec("chapters", "Chapters", width=70, stretch=False, anchor="e"),
-        TreeColumnSpec("duration", "Duration", width=80, stretch=False, anchor="e"),
+        TreeColumnSpec("tracks", "Tracks", width=60, stretch=False, anchor="e", sort_kind="number"),
+        TreeColumnSpec("chapters", "Chapters", width=70, stretch=False, anchor="e", sort_kind="number"),
+        TreeColumnSpec("duration", "Duration", width=80, stretch=False, anchor="e", sort_kind="duration"),
         TreeColumnSpec("output", "Target Path", width=220, stretch=True),
     )
 
@@ -38,6 +40,7 @@ class PackDialog(tk.Toplevel):
         *,
         output_dir: str,
         on_submit: Callable[[list[PackJobRequest], str], None],
+        initial_paths: Sequence[str] = (),
         palette: ThemePalette | None = None,
     ) -> None:
         super().__init__(parent)
@@ -48,6 +51,7 @@ class PackDialog(tk.Toplevel):
         self._palette = palette or LIGHT_PALETTE
         self._paths: list[str] = []
         self._preview_specs: list[PackBookSpec] = []
+        self._edited_chapters: list[Chapter] | None = None
         self._scan_token = 0
         self._is_scanning = False
         self._cb_queue = MainThreadCallbackQueue(self)
@@ -55,8 +59,8 @@ class PackDialog(tk.Toplevel):
         self.title("Pack Local Audiobooks")
         self.transient(parent)  # type: ignore[arg-type]
         self.grab_set()
-        self.geometry(f"{scale_px(self, 820)}x{scale_px(self, 620)}")
-        self.minsize(scale_px(self, 640), scale_px(self, 480))
+        self.geometry(f"{scale_px(self, 860)}x{scale_px(self, 680)}")
+        self.minsize(scale_px(self, 640), scale_px(self, 520))
 
         self.recursive_var = tk.BooleanVar(value=False)
         self.delete_source_var = tk.BooleanVar(value=False)
@@ -69,11 +73,22 @@ class PackDialog(tk.Toplevel):
         self.asin_var = tk.StringVar()
         self.isbn_var = tk.StringVar()
         self.cover_path_var = tk.StringVar()
+        self.genres_var = tk.StringVar()
+        self.publisher_var = tk.StringVar()
+        self.release_date_var = tk.StringVar()
+        self.language_var = tk.StringVar()
+        self.description_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Add one or more local folders or audio tracks to preview.")
 
         self._build_ui()
         apply_theme_to_window(self, self._palette)
         self.bind("<Escape>", lambda _e: self.destroy())
+        if initial_paths:
+            for p in initial_paths:
+                if p and os.path.exists(p):
+                    self._append_path(p)
+            if self._paths:
+                self._start_scan()
 
     def _build_ui(self) -> None:
         body = ttk.Frame(self, padding=scale_px(self, 12))
@@ -105,6 +120,7 @@ class PackDialog(tk.Toplevel):
             opts_row,
             text="Recursive subfolders (each folder with tracks = 1 book)",
             variable=self.recursive_var,
+            command=self._on_scan_option_changed,
         ).pack(side=tk.LEFT, padx=(0, 14))
         ttk.Checkbutton(
             opts_row,
@@ -120,12 +136,16 @@ class PackDialog(tk.Toplevel):
             width=7,
         )
         format_combo.pack(side=tk.LEFT)
+        format_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_scan_option_changed())
 
-        # Row 1: Optional Metadata Overrides
-        meta_frame = ttk.LabelFrame(body, text="Optional Metadata Overrides", padding=scale_px(self, 8))
-        meta_frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        # Row 1: Optional Metadata Overrides (Basic & Extended tabs)
+        meta_nb = ttk.Notebook(body)
+        meta_nb.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+
+        meta_frame = ttk.Frame(meta_nb, padding=scale_px(self, 8))
         meta_frame.columnconfigure(1, weight=1)
         meta_frame.columnconfigure(3, weight=1)
+        meta_nb.add(meta_frame, text="Metadata Overrides")
 
         ttk.Label(meta_frame, text="Title:").grid(row=0, column=0, sticky="w", padx=(0, 6))
         ttk.Entry(meta_frame, textvariable=self.title_var).grid(row=0, column=1, sticky="ew", padx=(0, 12))
@@ -159,6 +179,24 @@ class PackDialog(tk.Toplevel):
         ttk.Entry(cover_row, textvariable=self.cover_path_var).grid(row=0, column=0, sticky="ew", padx=(0, 6))
         ttk.Button(cover_row, text="Browse...", command=self._browse_cover).grid(row=0, column=1)
 
+        ext_frame = ttk.Frame(meta_nb, padding=scale_px(self, 8))
+        ext_frame.columnconfigure(1, weight=1)
+        ext_frame.columnconfigure(3, weight=1)
+        meta_nb.add(ext_frame, text="Extended Metadata")
+
+        ttk.Label(ext_frame, text="Genre(s):").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Entry(ext_frame, textvariable=self.genres_var).grid(row=0, column=1, sticky="ew", padx=(0, 12))
+        ttk.Label(ext_frame, text="Publisher:").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        ttk.Entry(ext_frame, textvariable=self.publisher_var).grid(row=0, column=3, sticky="ew")
+
+        ttk.Label(ext_frame, text="Released:").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
+        ttk.Entry(ext_frame, textvariable=self.release_date_var).grid(row=1, column=1, sticky="ew", padx=(0, 12), pady=(6, 0))
+        ttk.Label(ext_frame, text="Language:").grid(row=1, column=2, sticky="w", padx=(0, 6), pady=(6, 0))
+        ttk.Entry(ext_frame, textvariable=self.language_var).grid(row=1, column=3, sticky="ew", pady=(6, 0))
+
+        ttk.Label(ext_frame, text="Description:").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
+        ttk.Entry(ext_frame, textvariable=self.description_var).grid(row=2, column=1, columnspan=3, sticky="ew", pady=(6, 0))
+
         # Row 2: Scan Bar
         scan_bar = ttk.Frame(body)
         scan_bar.grid(row=2, column=0, sticky="ew", pady=(0, 6))
@@ -168,11 +206,40 @@ class PackDialog(tk.Toplevel):
         ttk.Label(scan_bar, textvariable=self.status_var, style="Secondary.TLabel").grid(
             row=0, column=1, sticky="w"
         )
+        self._loading_bar = ttk.Progressbar(scan_bar, mode="indeterminate", length=120)
+        self._loading_bar.grid(row=0, column=2, sticky="e", padx=(8, 0))
+        self._loading_bar.grid_remove()
 
-        # Row 3: Preview Tree
-        scrolled_tree = ScrolledTreeview(body, self._PREVIEW_COLUMNS, selectmode="browse", height=8)
-        scrolled_tree.grid(row=3, column=0, sticky="nsew")
-        self._tree = scrolled_tree.tree
+        # Row 3: Preview Tree & Chapters Editor Notebook
+        preview_nb = ttk.Notebook(body)
+        preview_nb.grid(row=3, column=0, sticky="nsew")
+
+        books_tab = ttk.Frame(preview_nb, padding=4)
+        books_tab.columnconfigure(0, weight=1)
+        books_tab.rowconfigure(0, weight=1)
+        preview_nb.add(books_tab, text="Detected Books")
+
+        self._scrolled_tree = ScrolledTreeview(books_tab, self._PREVIEW_COLUMNS, selectmode="browse", height=7)
+        self._scrolled_tree.grid(row=0, column=0, sticky="nsew")
+        self._tree = self._scrolled_tree.tree
+        self._tree.bind("<<TreeviewSelect>>", self._on_book_selected)
+        self._scrolled_tree.set_empty_state(
+            True,
+            "Add a local folder or audio tracks above to preview.",
+            action_text="Add Folder...",
+            action_command=self._add_folder,
+        )
+
+        chapters_tab = ttk.Frame(preview_nb, padding=4)
+        chapters_tab.columnconfigure(0, weight=1)
+        chapters_tab.rowconfigure(0, weight=1)
+        preview_nb.add(chapters_tab, text="Chapters")
+        self._chapter_editor = ChapterEditorFrame(
+            chapters_tab,
+            palette=self._palette,
+            on_change=self._on_chapters_edited,
+        )
+        self._chapter_editor.grid(row=0, column=0, sticky="nsew")
 
         # Row 4: Footer Actions
         btn_bar = ttk.Frame(body)
@@ -213,16 +280,76 @@ class PackDialog(tk.Toplevel):
                 self._append_path(item)
             self._start_scan()
 
+    def _invalidate_preview(self, message: str) -> None:
+        self._scan_token += 1
+        self._is_scanning = False
+        self._loading_bar.stop()
+        self._loading_bar.grid_remove()
+        self._scan_btn.configure(state="normal")
+        self._pack_btn.configure(state="normal")
+        self._preview_specs.clear()
+        self._edited_chapters = None
+        self._chapter_editor.set_chapters([])
+        for iid in self._tree.get_children():
+            self._tree.delete(iid)
+        self._scrolled_tree.set_empty_state(
+            True,
+            message,
+            action_text="Add Folder...",
+            action_command=self._add_folder,
+        )
+        self.status_var.set(message)
+
+    def _on_book_selected(self, _event: tk.Event | None = None) -> None:
+        sel = self._tree.selection()
+        if not sel:
+            return
+        try:
+            idx = int(sel[0])
+        except ValueError:
+            return
+        if 0 <= idx < len(self._preview_specs):
+            spec = self._preview_specs[idx]
+            dur_ms = round(spec.total_duration_seconds * 1000) if spec.total_duration_seconds > 0 else None
+            self._chapter_editor.set_chapters(
+                spec.audiobook.chapters,
+                total_duration_ms=dur_ms,
+                source_label=spec.chapters_source,
+            )
+
+    def _on_chapters_edited(self, chapters: list[Chapter]) -> None:
+        self._edited_chapters = chapters
+        sel = self._tree.selection()
+        if sel:
+            try:
+                idx = int(sel[0])
+                if 0 <= idx < len(self._preview_specs):
+                    self._preview_specs[idx].audiobook.chapters = chapters
+                    self._preview_specs[idx].chapters_source = "edited"
+                    vals = list(self._tree.item(sel[0], "values"))
+                    if len(vals) >= 4:
+                        vals[3] = len(chapters)
+                        self._tree.item(sel[0], values=tuple(vals))
+            except ValueError:
+                pass
+
+    def _on_scan_option_changed(self) -> None:
+        if self._paths:
+            self._start_scan()
+        else:
+            self._invalidate_preview("Add one or more local folders or audio tracks to preview.")
+
     def _remove_selected_paths(self) -> None:
         selected = list(self._paths_listbox.curselection())
+        if not selected:
+            return
         for idx in reversed(selected):
             self._paths_listbox.delete(idx)
             del self._paths[idx]
         if not self._paths:
-            self._preview_specs.clear()
-            for iid in self._tree.get_children():
-                self._tree.delete(iid)
-            self.status_var.set("Add one or more local folders or audio tracks to preview.")
+            self._invalidate_preview("Add one or more local folders or audio tracks to preview.")
+        else:
+            self._start_scan()
 
     def _browse_cover(self) -> None:
         chosen = filedialog.askopenfilename(
@@ -255,7 +382,34 @@ class PackDialog(tk.Toplevel):
         asin = self.asin_var.get().strip() or None
         isbn = self.isbn_var.get().strip() or None
         cover_path = self.cover_path_var.get().strip() or None
-        if not any((title, authors, narrators, series, series_order is not None, asin, isbn, cover_path)):
+        genres = self._split_multi_value(self.genres_var.get())
+        publisher = self.publisher_var.get().strip() or None
+        raw_release = self.release_date_var.get().strip()
+        if raw_release and parse_release_date(raw_release) is None:
+            raise ValueError(f"Invalid release date {raw_release!r} (use YYYY-MM-DD or YYYY)")
+        raw_lang = self.language_var.get().strip()
+        if raw_lang and parse_language(raw_lang) is None:
+            raise ValueError(f"Unrecognized language {raw_lang!r}")
+        description = self.description_var.get().strip() or None
+        chapters = self._edited_chapters
+        if not any(
+            (
+                title,
+                authors,
+                narrators,
+                series,
+                series_order is not None,
+                asin,
+                isbn,
+                cover_path,
+                genres,
+                publisher,
+                raw_release,
+                raw_lang,
+                description,
+                chapters is not None,
+            )
+        ):
             return None
         return PackOverrides(
             title=title,
@@ -266,6 +420,12 @@ class PackDialog(tk.Toplevel):
             asin=asin,
             isbn=isbn,
             cover_path=cover_path,
+            genres=genres,
+            publisher=publisher,
+            release_date=raw_release or None,
+            language=raw_lang or None,
+            description=description,
+            chapters=chapters,
         )
 
     def _clone_options_for_pack(self) -> args.DownloadOptions:
@@ -288,6 +448,10 @@ class PackDialog(tk.Toplevel):
         token = self._scan_token
         self._is_scanning = True
         self._scan_btn.configure(state="disabled")
+        self._pack_btn.configure(state="disabled")
+        self._scrolled_tree.set_empty_state(False)
+        self._loading_bar.grid()
+        self._loading_bar.start(12)
         self.status_var.set("Scanning tracks and reading metadata...")
         paths_snapshot = list(self._paths)
         recursive = bool(self.recursive_var.get())
@@ -297,19 +461,24 @@ class PackDialog(tk.Toplevel):
             if not self.winfo_exists() or token != self._scan_token:
                 return
             self._is_scanning = False
+            self._loading_bar.stop()
+            self._loading_bar.grid_remove()
             self._scan_btn.configure(state="normal")
+            self._pack_btn.configure(state="normal")
             for iid in self._tree.get_children():
                 self._tree.delete(iid)
             if e is not None:
                 self._preview_specs.clear()
+                self._scrolled_tree.set_empty_state(True, f"Scan error: {e}")
                 self.status_var.set(f"Scan error: {e}")
                 return
             self._preview_specs = s or []
-            for spec in self._preview_specs:
+            for idx, spec in enumerate(self._preview_specs):
                 dur = format_duration(spec.total_duration_seconds) if spec.total_duration_seconds > 0 else "-"
                 self._tree.insert(
                     "",
                     tk.END,
+                    iid=str(idx),
                     values=(
                         spec.audiobook.title,
                         spec.audiobook.metadata.author or "(Unknown)",
@@ -321,8 +490,13 @@ class PackDialog(tk.Toplevel):
                 )
             count = len(self._preview_specs)
             if count == 0:
+                self._chapter_editor.set_chapters([])
+                self._scrolled_tree.set_empty_state(True, "No audiobooks found in selected paths.")
                 self.status_var.set("No audiobooks found in selected paths.")
             else:
+                self._tree.selection_set("0")
+                self._on_book_selected()
+                self._scrolled_tree.set_empty_state(False)
                 self.status_var.set(f"Ready: {count} audiobook{'s' if count != 1 else ''} detected.")
 
         self._cb_queue.begin_task()

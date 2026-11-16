@@ -25,6 +25,8 @@ from audiobookdl.utils.audiobook import (
     BookId,
     Cover,
     is_ebook,
+    parse_language,
+    parse_release_date,
 )
 from audiobookdl.utils.enrichment import EnrichmentCandidate
 
@@ -176,6 +178,13 @@ def apply_audiobook_metadata_edits(
     series_order_text: str,
     cover: Cover | None = None,
     update_cover: bool = False,
+    genres_text: str | None = None,
+    publisher: str | None = None,
+    release_date_text: str | None = None,
+    language_text: str | None = None,
+    isbn: str | None = None,
+    asin: str | None = None,
+    description: str | None = None,
 ) -> None:
     """Validate and apply inline metadata/cover edits onto `audiobook`."""
     cleaned_title = title.strip()
@@ -192,13 +201,88 @@ def apply_audiobook_metadata_edits(
         except ValueError as exc:
             raise ValueError(f"Series order must be a whole number, got '{order_raw}'.") from exc
 
+    parsed_date = audiobook.metadata.release_date
+    if release_date_text is not None:
+        raw_date = release_date_text.strip()
+        if not raw_date:
+            parsed_date = None
+        else:
+            parsed_date = parse_release_date(raw_date)
+            if parsed_date is None:
+                raise ValueError(f"Invalid release date '{raw_date}' (use YYYY-MM-DD or YYYY).")
+
+    parsed_lang = audiobook.metadata.language
+    if language_text is not None:
+        raw_lang = language_text.strip()
+        if not raw_lang:
+            parsed_lang = None
+        else:
+            parsed_lang = parse_language(raw_lang)
+            if parsed_lang is None:
+                raise ValueError(f"Unrecognized language '{raw_lang}' (e.g. 'en' or 'English').")
+
     audiobook.metadata.title = cleaned_title
     audiobook.metadata.authors = parse_multi_metadata_values(authors_text)
     audiobook.metadata.narrators = parse_multi_metadata_values(narrators_text)
     audiobook.metadata.series = series_text.strip() or None
     audiobook.metadata.series_order = parsed_order
+    if genres_text is not None:
+        audiobook.metadata.genres = parse_multi_metadata_values(genres_text)
+    if publisher is not None:
+        audiobook.metadata.publisher = publisher.strip() or None
+    if release_date_text is not None:
+        audiobook.metadata.release_date = parsed_date
+    if language_text is not None:
+        audiobook.metadata.language = parsed_lang
+    if isbn is not None:
+        audiobook.metadata.isbn = isbn.strip() or None
+    if asin is not None:
+        audiobook.metadata.asin = asin.strip() or None
+    if description is not None:
+        audiobook.metadata.description = description.strip() or None
     if update_cover:
         audiobook.cover = cover
+
+
+def format_timestamp_ms(ms: int) -> str:
+    """Format milliseconds as `HH:MM:SS.mmm` or `MM:SS.mmm`."""
+    clamped = max(0, int(ms))
+    total_secs, rem_ms = divmod(clamped, 1000)
+    hours, rem_secs = divmod(total_secs, 3600)
+    minutes, secs = divmod(rem_secs, 60)
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}.{rem_ms:03d}"
+    return f"{minutes:02d}:{secs:02d}.{rem_ms:03d}"
+
+
+def parse_timestamp_ms(raw: str) -> int:
+    """Parse `HH:MM:SS(.mmm)`, `MM:SS(.mmm)`, or seconds string into milliseconds."""
+    text = raw.strip()
+    if not text:
+        raise ValueError("Timestamp cannot be empty.")
+    parts = text.split(":")
+    try:
+        if len(parts) == 1:
+            sec = float(parts[0])
+            if sec < 0:
+                raise ValueError("Timestamp cannot be negative.")
+            return round(sec * 1000)
+        if len(parts) == 2:
+            mins = int(parts[0])
+            sec = float(parts[1])
+            if mins < 0 or sec < 0 or sec >= 60:
+                raise ValueError(f"Invalid timestamp '{text}'.")
+            return round((mins * 60 + sec) * 1000)
+        if len(parts) == 3:
+            hrs = int(parts[0])
+            mins = int(parts[1])
+            sec = float(parts[2])
+            if hrs < 0 or mins < 0 or mins >= 60 or sec < 0 or sec >= 60:
+                raise ValueError(f"Invalid timestamp '{text}'.")
+            return round((hrs * 3600 + mins * 60 + sec) * 1000)
+    except ValueError as exc:
+        raise ValueError(f"Invalid timestamp '{text}' (use MM:SS.mmm or HH:MM:SS.mmm).") from exc
+    raise ValueError(f"Invalid timestamp '{text}'.")
 
 
 def load_cover_from_file(path: str) -> Cover:

@@ -574,6 +574,125 @@ class DownloadArchive:
                     updated += 1
         return inserted, updated
 
+    def lookup_catalog_statuses(
+        self,
+        source: str,
+        books: Sequence[CatalogBook],
+    ) -> list[str]:
+        """Return display badge labels (`'Downloaded'`, `'Pending'`, `'Hidden'`, `'Trashed'`, or `''`) for `books`."""
+        if not books:
+            return []
+        default_source = (source or "").strip().lower()
+        target_sources = {
+            (b.source or default_source).strip().lower()
+            for b in books
+            if (b.source or default_source).strip()
+        }
+        if default_source:
+            target_sources.add(default_source)
+        if target_sources:
+            # Include locally scanned entries so title/author matching still finds local books.
+            target_sources.add("local")
+        with self._connection() as conn:
+            if target_sources:
+                placeholders = ",".join("?" for _ in target_sources)
+                rows = conn.execute(
+                    f"""
+                    SELECT d.id, d.source, d.book_key, d.url, d.title, d.author, d.status,
+                           EXISTS (
+                               SELECT 1 FROM item_tags t
+                               WHERE t.item_id = d.id AND t.tag = 'hidden'
+                           ) AS is_hidden
+                    FROM downloads d
+                    WHERE lower(d.source) IN ({placeholders})
+                    """,
+                    tuple(sorted(target_sources)),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT d.id, d.source, d.book_key, d.url, d.title, d.author, d.status,
+                           EXISTS (
+                               SELECT 1 FROM item_tags t
+                               WHERE t.item_id = d.id AND t.tag = 'hidden'
+                           ) AS is_hidden
+                    FROM downloads d
+                    """
+                ).fetchall()
+
+        if not rows:
+            return [""] * len(books)
+
+        _RANK = {"downloaded": 3, "pending": 2, "trashed": 1}
+        by_source_key: dict[tuple[str, str], tuple[str, bool]] = {}
+        by_url: dict[str, tuple[str, bool]] = {}
+        row_badges: dict[int, tuple[str, bool]] = {}
+        index = ArchiveMatchIndex()
+
+        def _pick_better(
+            existing: tuple[str, bool] | None,
+            candidate: tuple[str, bool],
+        ) -> tuple[str, bool]:
+            if existing is None:
+                return candidate
+            if _RANK.get(candidate[0], 0) > _RANK.get(existing[0], 0):
+                return candidate
+            return existing
+
+        for row in rows:
+            entry_id = int(row["id"])
+            row_source = str(row["source"] or "").strip().lower()
+            book_key = str(row["book_key"] or "").strip()
+            row_url = str(row["url"] or "").strip()
+            status = str(row["status"] or "downloaded").strip().lower()
+            is_hidden = bool(row["is_hidden"])
+            badge_pair = (status, is_hidden)
+            row_badges[entry_id] = badge_pair
+            if row_source and book_key:
+                key_pair = (row_source, book_key)
+                by_source_key[key_pair] = _pick_better(by_source_key.get(key_pair), badge_pair)
+            if row_url:
+                by_url[row_url] = _pick_better(by_url.get(row_url), badge_pair)
+            index.add(
+                entry_id,
+                book_key=book_key,
+                url=row_url,
+                title=str(row["title"] or ""),
+                author=str(row["author"] or ""),
+            )
+
+        def _format_badge(pair: tuple[str, bool] | None) -> str:
+            if pair is None:
+                return ""
+            status, is_hidden = pair
+            if status == "trashed":
+                return "Trashed"
+            if status == "downloaded":
+                return "Downloaded (Hidden)" if is_hidden else "Downloaded"
+            if is_hidden:
+                return "Hidden"
+            if status == "pending":
+                return "Pending"
+            return status.capitalize()
+
+        out: list[str] = []
+        for book in books:
+            item_source = (book.source or default_source).strip().lower() or default_source
+            book_key = make_catalog_book_key(item_source, book)
+            matched = by_source_key.get((item_source, book_key))
+            if matched is None and book.url:
+                matched = by_url.get(book.url.strip())
+            if matched is None:
+                matched_id = index.find(
+                    title=book.title,
+                    author=book.author,
+                    scrape_url=book.url,
+                )
+                if matched_id is not None:
+                    matched = row_badges.get(matched_id)
+            out.append(_format_badge(matched))
+        return out
+
     def set_status(self, entry_id: int, status: str) -> bool:
         """Update the lifecycle `status` (`pending`, `downloaded`, `trashed`) of `entry_id`."""
         if status not in VALID_LIBRARY_STATUSES:
