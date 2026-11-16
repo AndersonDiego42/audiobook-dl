@@ -1,5 +1,6 @@
 from audiobookdl import AudiobookFile, exceptions, logging
 from audiobookdl.utils.audiobook import AESEncryption
+from audiobookdl.utils.concurrency import run_cancellable_pool
 from audiobookdl.utils.http import (
     DEFAULT_HTTP_TIMEOUT,
     extract_session_cookies,
@@ -192,7 +193,25 @@ def get_stream_files(
     media_sequence = playlist.media_sequence or 0
     files = []
     init_cache: dict[tuple[str, str | None], bytes] = {}
+    key_cache: dict[str, bytes] = {}
     last_byterange_end: dict[str, int] = {}
+
+    unique_key_uris = list(
+        dict.fromkeys(
+            str(seg.key.absolute_uri)
+            for seg in playlist.segments
+            if seg.key is not None
+            and getattr(seg.key, "method", None) not in (None, "NONE")
+            and getattr(seg.key, "absolute_uri", None)
+        )
+    )
+    if len(unique_key_uris) > 1:
+        fetched_keys = run_cancellable_pool(
+            lambda uri: self._get_page(uri, headers=base_headers),
+            unique_key_uris,
+            max_workers=min(8, len(unique_key_uris)),
+        )
+        key_cache.update(zip(unique_key_uris, fetched_keys, strict=True))
 
     for idx, seg in enumerate(playlist.segments):
         seg_ext = extension if extension is not None else _segment_extension(seg.absolute_uri)
@@ -236,8 +255,11 @@ def get_stream_files(
                 iv_bytes = int(seg.key.iv, 0).to_bytes(16, byteorder="big")
             else:
                 iv_bytes = (media_sequence + idx).to_bytes(16, byteorder="big")
+            key_uri = str(seg.key.absolute_uri)
+            if key_uri not in key_cache:
+                key_cache[key_uri] = self._get_page(key_uri, headers=base_headers)
             current.encryption_method = AESEncryption(
-                key=self._get_page(seg.key.absolute_uri, headers=base_headers),
+                key=key_cache[key_uri],
                 iv=iv_bytes,
             )
         files.append(current)

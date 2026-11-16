@@ -189,7 +189,13 @@ class WebDashboardState:
                 )
                 if has_run:
                     for job in added:
-                        self.controller.register_queue_record(job, self.service_label_for_url(job.url))
+                        self.controller.register_queue_record(
+                            job,
+                            self.service_label_for_url(job.url),
+                            persist=False,
+                        )
+                    if added:
+                        self.controller.save_queue_state()
                     return len(added), new_total
 
             job_specs = [
@@ -202,7 +208,13 @@ class WebDashboardState:
             self.stage_text = "Preparing"
             self.progress_pct = 0.0
             for job in queued_jobs:
-                self.controller.register_queue_record(job, self.service_label_for_url(job.url))
+                self.controller.register_queue_record(
+                    job,
+                    self.service_label_for_url(job.url),
+                    persist=False,
+                )
+            if queued_jobs:
+                self.controller.save_queue_state()
             return len(queued_jobs), len(queued_jobs)
 
     def status_snapshot(self) -> dict[str, Any]:

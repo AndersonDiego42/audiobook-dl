@@ -9,6 +9,7 @@ from audiobookdl.exceptions import (
     RequestError,
     UserNotAuthorized,
 )
+from audiobookdl.utils.concurrency import run_cancellable_pool
 from audiobookdl.utils.fs import atomic_write_text
 
 import calendar
@@ -328,14 +329,23 @@ class NextorySource(Source):
         return []
 
     def get_files(self, audio_data) -> list[AudiobookFile]:
-        files = []
         session_headers: dict[str, str] = {
             str(k): v.decode("latin-1") if isinstance(v, bytes) else str(v)
             for k, v in self._session.headers.items()
         }
-        for file in audio_data["files"]:
-            files.extend(self._resolve_stream_uri(file["uri"], session_headers))
-        return files
+        raw_files = audio_data["files"]
+        if len(raw_files) <= 1:
+            files: list[AudiobookFile] = []
+            for file in raw_files:
+                files.extend(self._resolve_stream_uri(file["uri"], session_headers))
+            return files
+
+        grouped = run_cancellable_pool(
+            lambda entry: self._resolve_stream_uri(entry["uri"], session_headers),
+            raw_files,
+            max_workers=min(8, len(raw_files)),
+        )
+        return [item for part_files in grouped for item in part_files]
 
     def get_metadata(self, book_info) -> AudiobookMetadata:
         series_name, series_order = self._extract_series_metadata(book_info)

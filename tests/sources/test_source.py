@@ -278,7 +278,7 @@ def test_source_close_closes_child_sessions_and_save_cookie_file_is_atomic(tmp_p
 
 
 def test_get_source_classes_discovers_valid_plugin_entry_points(tmp_path, monkeypatch):
-    from audiobookdl.sources import Source, get_source_classes
+    from audiobookdl.sources import Source, _discover_plugin_sources, get_source_classes
 
     class _PluginSource(Source):
         names = ["CustomPlugin"]
@@ -298,6 +298,7 @@ def test_get_source_classes_discovers_valid_plugin_entry_points(tmp_path, monkey
                 raise self._error
             return self._obj
 
+    _discover_plugin_sources.cache_clear()
     monkeypatch.setattr(
         "audiobookdl.sources.importlib.metadata.entry_points",
         lambda group="": [
@@ -306,9 +307,12 @@ def test_get_source_classes_discovers_valid_plugin_entry_points(tmp_path, monkey
             _FakeEP("broken", error=ImportError("missing dep")),
         ] if group == "audiobookdl.sources" else [],
     )
-    classes = get_source_classes()
-    assert _PluginSource in classes
-    assert _InvalidPlugin not in classes
+    try:
+        classes = get_source_classes()
+        assert _PluginSource in classes
+        assert _InvalidPlugin not in classes
+    finally:
+        _discover_plugin_sources.cache_clear()
 
 
 def test_load_cookie_file_ignores_empty_and_expired_jars_but_accepts_session_cookies(tmp_path):

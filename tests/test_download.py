@@ -408,6 +408,7 @@ def test_download_audiobook_multipart_resume_preserves_parts_on_cancel_and_resum
         skip_downloaded=False,
         write_json_metadata=False,
         no_chapters=True,
+        max_workers=1,
     )
 
     # First run: part 0 completes, part 1 writes partial bytes and cancels mid-stream
@@ -1564,6 +1565,58 @@ def test_add_metadata_to_dir_passes_track_context_and_cover(tmp_path, monkeypatc
     assert calls[0][3].album == "Dir Book"
     assert calls[1][3].track_number == 2
     assert calls[1][3].total_tracks == 2
+
+
+def test_download_reuses_probe_cache_from_download_file_for_combine(tmp_path, monkeypatch):
+    import os
+    from types import SimpleNamespace
+    from audiobookdl.output import download as dl_mod
+    from audiobookdl.output import output as out_mod
+    from audiobookdl.utils import AudioProbeInfo
+
+    probed_paths: list[str] = []
+
+    def counting_probe(path: str) -> AudioProbeInfo:
+        probed_paths.append(path)
+        dur = 25.0 if ".tmp." in os.path.basename(path) else 12.5
+        return AudioProbeInfo(duration=dur, codec_name="mp3", bitrate=128000, sample_rate=44100, channels=2)
+
+    monkeypatch.setattr(out_mod, "_probe_audio_info", counting_probe)
+    monkeypatch.setattr(out_mod, "find_executable", lambda _name: "ffprobe")
+    monkeypatch.setattr(out_mod, "_require_executable", lambda name: name)
+    monkeypatch.setattr(out_mod, "_remux_to_mpegts", lambda _src, dst, **_kw: open(dst, "wb").write(b"ts") > 0)
+    monkeypatch.setattr(dl_mod, "add_metadata_to_file", lambda *a, **kw: None)
+
+    def fake_run(cmd, **_kwargs):
+        Path(cmd[-1]).write_bytes(b"combined")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(out_mod, "run_cancellable_subprocess", fake_run)
+
+    session = MagicMock()
+    session.get.side_effect = [
+        _mock_response(headers={"Content-Length": "4"}, chunks=[b"mp3a"]),
+        _mock_response(headers={"Content-Length": "4"}, chunks=[b"mp3b"]),
+    ]
+    ab = Audiobook(
+        session=session,
+        metadata=AudiobookMetadata(title="Cached Book"),
+        files=[
+            AudiobookFile(url="https://example.com/1.mp3", ext="mp3"),
+            AudiobookFile(url="https://example.com/2.mp3", ext="mp3"),
+        ],
+    )
+    opts = DownloadOptions(combine=True, output_format="mp3")
+    download_audiobook(ab, str(tmp_path / "Cached Book"), opts)
+
+    # Exactly 2 probes for the 2 downloaded parts (verified on .mp3.tmp), zero duplicate .mp3 probes.
+    part_probes = [
+        p for p in probed_paths
+        if p.endswith(".mp3") and os.path.basename(p).startswith("Part ")
+    ]
+    assert part_probes == []
+    tmp_part_probes = [p for p in probed_paths if p.endswith(".mp3.tmp")]
+    assert len(tmp_part_probes) == 2
 
 
 

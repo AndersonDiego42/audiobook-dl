@@ -447,3 +447,55 @@ def test_cli_parses_new_enrichment_flags():
 
     with pytest.raises(SystemExit):
         args.parse_arguments(["--enrich-providers", "invalid_provider"])
+
+
+def test_enrichment_skips_incapable_providers_for_missing_fields():
+    from audiobookdl import Chapter, Cover
+
+    requested_urls: list[str] = []
+
+    class _RecordingSession:
+        def get(self, url, **_kwargs):
+            requested_urls.append(url)
+            if "audnex.us/books/B08F7X1234" in url:
+                return _FakeResponse(
+                    json_data={
+                        "asin": "B08F7X1234",
+                        "title": "Complete Book",
+                        "authors": [{"name": "Author"}],
+                        "narrators": [{"name": "Narrator Name"}],
+                    }
+                )
+            return _FakeResponse(status_code=404)
+
+    book = Audiobook(
+        session=requests.Session(),
+        metadata=AudiobookMetadata(
+            title="Complete Book",
+            authors=["Author"],
+            genres=["Sci-Fi"],
+            language="en",
+            description="Already present",
+            isbn="9781234567890",
+            asin="B08F7X1234",
+            publisher="Pub",
+            release_date=date(2020, 1, 1),
+            series="Existing Series",
+            series_order=1,
+        ),
+        files=[],
+        cover=Cover(image=b"img", extension="jpg"),
+        chapters=[Chapter(start=0, title="Ch 1")],
+    )
+    # Only `narrators` is missing: itunes/google/openlibrary cannot supply narrators, so only audnexus runs.
+    res = enrich_audiobook_metadata(
+        book,
+        providers=("itunes", "google", "openlibrary", "audnexus"),
+        session=_RecordingSession(),  # type: ignore[arg-type]
+        use_cache=False,
+    )
+    assert res.updated is True
+    assert book.metadata.narrators == ["Narrator Name"]
+    assert all("itunes.apple.com" not in u for u in requested_urls)
+    assert all("googleapis.com" not in u for u in requested_urls)
+    assert all("openlibrary.org" not in u for u in requested_urls)

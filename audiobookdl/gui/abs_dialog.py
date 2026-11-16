@@ -7,6 +7,7 @@ from collections.abc import Callable
 
 from audiobookdl.config import AudiobookshelfConfig, save_audiobookshelf_config
 from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, apply_theme_to_window, scale_px
+from audiobookdl.gui.widgets import MainThreadCallbackQueue
 from audiobookdl.integrations.audiobookshelf import AudiobookshelfClient
 
 
@@ -78,6 +79,7 @@ class AudiobookshelfDialog(tk.Toplevel):
         ttk.Button(btns, text="Save", command=self._save).pack(side=tk.RIGHT, padx=(0, 6))
 
         apply_theme_to_window(self, self._palette)
+        self._cb_queue = MainThreadCallbackQueue(self)
 
     def _resolve_library_id_value(self) -> str:
         raw = self._library_var.get().strip()
@@ -95,17 +97,6 @@ class AudiobookshelfDialog(tk.Toplevel):
         self._test_btn.configure(state="disabled")
         self._status_var.set("Connecting to Audiobookshelf...")
 
-        def _worker() -> None:
-            client = AudiobookshelfClient(url, token)
-            try:
-                username = client.ping()
-                libs = client.list_libraries()
-                self.after(0, lambda: _done(username, libs, None))
-            except Exception as exc:
-                self.after(0, lambda err=str(exc): _done("", [], err))
-            finally:
-                client.close()
-
         def _done(username: str, libs: list[tuple[str, str]], error: str | None) -> None:
             if not self.winfo_exists():
                 return
@@ -119,6 +110,20 @@ class AudiobookshelfDialog(tk.Toplevel):
             if libs and not self._library_var.get().strip():
                 self._library_var.set(labels[0])
             self._status_var.set(f"Connected as {username} ({len(libs)} libraries found).")
+
+        self._cb_queue.begin_task()
+
+        def _worker() -> None:
+            client = AudiobookshelfClient(url, token)
+            try:
+                username = client.ping()
+                libs = client.list_libraries()
+                self._cb_queue.post(lambda u=username, l=libs: _done(u, l, None))
+            except Exception as exc:
+                self._cb_queue.post(lambda err=str(exc): _done("", [], err))
+            finally:
+                client.close()
+                self._cb_queue.finish_worker()
 
         threading.Thread(target=_worker, daemon=True).start()
 

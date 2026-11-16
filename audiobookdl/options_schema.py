@@ -559,6 +559,8 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         config_key="debug",
         config_kind="bool",
         toml_serializer=_serialize_bool,
+        merge_from_config=True,
+        merge_only_if_default=True,
         gui=GuiBinding(
             var_attr="debug_var",
             var_type="bool",
@@ -585,6 +587,8 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         config_key="cover",
         config_kind="bool",
         toml_serializer=_serialize_bool,
+        merge_from_config=True,
+        merge_only_if_default=True,
         gui=GuiBinding(
             var_attr="cover_only_var",
             var_type="bool",
@@ -1386,6 +1390,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         ),
         config_key="check_updates",
         config_kind="bool",
+        toml_serializer=_serialize_bool,
     ),
     # Config-only top-level keys (not part of DownloadOptions)
     OptionSpec(

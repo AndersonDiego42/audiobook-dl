@@ -1,7 +1,11 @@
 """Audiobookshelf REST client for library inspection, book upload, and library scans."""
 
-from typing import Any
+from collections.abc import Mapping, Sequence
+import io
+import mimetypes
 import os
+from typing import Any, IO
+import uuid
 import requests
 
 from audiobookdl.exceptions import AudiobookDLException
@@ -43,6 +47,122 @@ def _normalize_base_url(url: str) -> str:
     return url.strip().rstrip("/")
 
 
+_UPLOAD_CHUNK_SIZE = 64 * 1024
+
+
+def _escape_disposition_value(value: str) -> str:
+    return value.replace("\r", "").replace("\n", "").replace('"', '\\"')
+
+
+class _MultipartUploadStream(io.RawIOBase):
+    """Streaming `multipart/form-data` body with exact `Content-Length` and O(64 KiB) RAM usage."""
+
+    def __init__(
+        self,
+        fields: Mapping[str, Any],
+        file_entries: Sequence[tuple[str, str]],
+        *,
+        boundary: str | None = None,
+    ) -> None:
+        self.boundary = boundary or f"----audiobookdl-{uuid.uuid4().hex}"
+        self._segments: list[bytes | str] = []
+        total_len = 0
+        b_bytes = self.boundary.encode("ascii")
+
+        for name, raw_val in fields.items():
+            safe_name = _escape_disposition_value(str(name))
+            val_bytes = str(raw_val).encode("utf-8")
+            part = (
+                b"--" + b_bytes + b"\r\n"
+                + f'Content-Disposition: form-data; name="{safe_name}"\r\n\r\n'.encode()
+                + val_bytes
+                + b"\r\n"
+            )
+            self._segments.append(part)
+            total_len += len(part)
+
+        for field_name, fpath in file_entries:
+            safe_field = _escape_disposition_value(field_name)
+            safe_filename = _escape_disposition_value(os.path.basename(fpath))
+            mime_type = mimetypes.guess_type(safe_filename)[0] or "application/octet-stream"
+            header = (
+                b"--" + b_bytes + b"\r\n"
+                + (
+                    f'Content-Disposition: form-data; name="{safe_field}"; '
+                    f'filename="{safe_filename}"\r\n'
+                ).encode()
+                + f"Content-Type: {mime_type}\r\n\r\n".encode("ascii")
+            )
+            file_size = os.path.getsize(fpath)
+            self._segments.append(header)
+            self._segments.append(fpath)
+            self._segments.append(b"\r\n")
+            total_len += len(header) + file_size + 2
+
+        closing = b"--" + b_bytes + b"--\r\n"
+        self._segments.append(closing)
+        total_len += len(closing)
+
+        self._total_len = total_len
+        self._seg_index = 0
+        self._seg_offset = 0
+        self._open_file: IO[bytes] | None = None
+
+    def __len__(self) -> int:
+        return self._total_len
+
+    def readable(self) -> bool:
+        return True
+
+    def _close_active_file(self) -> None:
+        if self._open_file is not None:
+            try:
+                self._open_file.close()
+            finally:
+                self._open_file = None
+
+    def close(self) -> None:
+        self._close_active_file()
+        super().close()
+
+    def read(self, size: int = -1) -> bytes:
+        if self.closed:
+            return b""
+        if size == 0:
+            return b""
+        chunks: list[bytes] = []
+        remaining = size if size is not None and size > 0 else None
+
+        while self._seg_index < len(self._segments):
+            if remaining is not None and remaining <= 0:
+                break
+            seg = self._segments[self._seg_index]
+            if isinstance(seg, bytes):
+                take = len(seg) - self._seg_offset if remaining is None else min(remaining, len(seg) - self._seg_offset)
+                if take > 0:
+                    chunks.append(seg[self._seg_offset : self._seg_offset + take])
+                    self._seg_offset += take
+                    if remaining is not None:
+                        remaining -= take
+                if self._seg_offset >= len(seg):
+                    self._seg_index += 1
+                    self._seg_offset = 0
+            else:
+                if self._open_file is None:
+                    self._open_file = open(seg, "rb")
+                to_read = _UPLOAD_CHUNK_SIZE if remaining is None else min(_UPLOAD_CHUNK_SIZE, remaining)
+                data = self._open_file.read(to_read)
+                if data:
+                    chunks.append(data)
+                    if remaining is not None:
+                        remaining -= len(data)
+                else:
+                    self._close_active_file()
+                    self._seg_index += 1
+                    self._seg_offset = 0
+        return b"".join(chunks)
+
+
 class AudiobookshelfClient:
     """HTTP API client for an Audiobookshelf server."""
 
@@ -77,15 +197,19 @@ class AudiobookshelfClient:
         path: str,
         *,
         json_body: dict[str, Any] | None = None,
-        data: dict[str, Any] | None = None,
+        data: Any = None,
         files: list[tuple[str, tuple[str, Any]]] | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> requests.Response:
         url = f"{self.base_url}{path}"
+        req_headers = self._headers()
+        if headers:
+            req_headers.update(headers)
         try:
             resp = self.session.request(
                 method,
                 url,
-                headers=self._headers(),
+                headers=req_headers,
                 json=json_body,
                 data=data,
                 files=files,
@@ -203,17 +327,20 @@ class AudiobookshelfClient:
             if metadata.series:
                 form_data["series"] = metadata.series
 
-        handles = []
-        multipart_files: list[tuple[str, tuple[str, Any]]] = []
+        file_entries = [(str(idx), fpath) for idx, fpath in enumerate(filepaths)]
+        stream = _MultipartUploadStream(form_data, file_entries)
         try:
-            for idx, fpath in enumerate(filepaths):
-                fh = open(fpath, "rb")
-                handles.append(fh)
-                multipart_files.append((str(idx), (os.path.basename(fpath), fh)))
-            self._request("POST", "/api/upload", data=form_data, files=multipart_files)
+            self._request(
+                "POST",
+                "/api/upload",
+                data=stream,
+                headers={
+                    "Content-Type": f"multipart/form-data; boundary={stream.boundary}",
+                    "Content-Length": str(len(stream)),
+                },
+            )
         finally:
-            for fh in handles:
-                fh.close()
+            stream.close()
         return True
 
 

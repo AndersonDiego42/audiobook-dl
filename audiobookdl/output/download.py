@@ -206,6 +206,7 @@ def download_audiobook(
             download_output_dir = stage_dir
 
     try:
+        probe_cache: dict[str, Any] = {}
         # Downloading files
         filepaths = download_files_with_cli_output(
             audiobook,
@@ -221,6 +222,7 @@ def download_audiobook(
             max_workers=options.max_workers,
             timeout=options.timeout,
             limit_rate=getattr(options, "limit_rate", None),
+            probe_cache=probe_cache,
         )
         if cancel_event is not None and cancel_event.is_set():
             raise DownloadCancelled
@@ -229,7 +231,6 @@ def download_audiobook(
             None if ebook else options.output_format,
             filepaths,
         )
-        probe_cache: dict[str, Any] = {}
         chapters_embedded = False
         cover_embedded = False
         chapter_offset_ms = int(getattr(options, "chapter_offset_ms", 0) or 0)
@@ -249,7 +250,9 @@ def download_audiobook(
                 )
             if may_silence_chapters and len(filepaths) == 1:
                 detected = output.detect_silence_chapters(
-                    filepaths[0], cancel_event=cancel_event
+                    filepaths[0],
+                    cancel_event=cancel_event,
+                    probe_cache=probe_cache,
                 )
                 if detected:
                     if chapter_offset_ms != 0:
@@ -310,7 +313,9 @@ def download_audiobook(
                     )
                     if not audiobook.chapters and may_silence_chapters:
                         detected = output.detect_silence_chapters(
-                            master_path, cancel_event=cancel_event
+                            master_path,
+                            cancel_event=cancel_event,
+                            probe_cache=probe_cache,
                         )
                         if detected:
                             if chapter_offset_ms != 0:
@@ -382,8 +387,11 @@ def download_audiobook(
                         **audio_filter_kwargs,
                     )
                 )
+                staged_key = staged_combined_path
                 os.replace(staged_combined_path, output_path)
                 staged_combined_path = None
+                if staged_key in probe_cache:
+                    output.store_cached_probe(probe_cache, output_path, probe_cache.pop(staged_key))
                 if not use_staging_dir and os.path.isdir(work_output_dir):
                     shutil.rmtree(work_output_dir, ignore_errors=True)
                 cover_embedded = combine_cover is not None
@@ -391,7 +399,9 @@ def download_audiobook(
                 filepaths = [output_path]
                 if may_silence_chapters and not audiobook.chapters:
                     detected = output.detect_silence_chapters(
-                        output_path, cancel_event=cancel_event
+                        output_path,
+                        cancel_event=cancel_event,
+                        probe_cache=probe_cache,
                     )
                     if detected:
                         if chapter_offset_ms != 0:
@@ -595,16 +605,14 @@ def add_metadata_to_file(
     cover_written_with_other = False
     if id3.is_id3_file(filepath) and not ebook_file:
         logging.book_update("Adding metadata")
-        metadata.add_metadata(filepath, audiobook.metadata)
-        if needs_chapters or needs_cover:
-            logging.book_update("Adding chapters" if needs_chapters else "Embedding cover")
-            cover_written_with_other = bool(
-                id3.add_id3_chapters_and_cover(
-                    filepath,
-                    chapters=audiobook.chapters if needs_chapters else None,
-                    cover=audiobook.cover if needs_cover else None,
-                )
+        cover_written_with_other = bool(
+            metadata.add_metadata(
+                filepath,
+                audiobook.metadata,
+                cover=audiobook.cover if needs_cover else None,
+                chapters=audiobook.chapters if needs_chapters else None,
             )
+        )
     else:
         # Chapters must be muxed before container metadata/cover because ffmpeg's remux drops unmapped MP4 atoms
         if needs_chapters:
@@ -773,6 +781,7 @@ def download_files_with_cli_output(
     max_workers: int | None = None,
     timeout: float | None = None,
     limit_rate: str | None = None,
+    probe_cache: dict[str, Any] | None = None,
 ) -> list[str]:
     """
     Download `audiobook` with cli progress bar
@@ -829,6 +838,7 @@ def download_files_with_cli_output(
                 max_workers=max_workers,
                 timeout=timeout,
                 limit_rate=limit_rate,
+                probe_cache=probe_cache,
             )
             # Make sure progress bar is at 100%
             remaining_progress: float = progress.tasks[0].remaining or 0
@@ -969,6 +979,7 @@ def download_file(
     resume: bool = False,
     timeout: float | None = None,
     rate_limiter: TokenBucketRateLimiter | None = None,
+    probe_cache: dict[str, Any] | None = None,
 ) -> str:
     # Prepare download
     if len(args) == 6:
@@ -1271,6 +1282,7 @@ def download_file(
     # Decrypt file if necessary (when resume mode wrote raw ciphertext to tmp),
     # verify audio integrity before committing, and keep any existing target intact on failure.
     ext = file.ext.lstrip(".").lower()
+    verified_info: Any = None
     if file.encryption_method and not decrypted_inline:
         dec_tmp = f"{filepath}.dec.{uuid.uuid4().hex[:8]}.tmp"
         try:
@@ -1282,7 +1294,7 @@ def download_file(
             )
             if not is_ebook_extension(ext):
                 try:
-                    output.verify_audio_integrity(dec_tmp)
+                    verified_info = output.verify_audio_integrity(dec_tmp)
                 except FailedCombining as exc:
                     raise GenericAudiobookDLException(
                         f"Downloaded file '{os.path.basename(filepath)}' failed media integrity verification"
@@ -1302,7 +1314,7 @@ def download_file(
         try:
             if not is_ebook_extension(ext):
                 try:
-                    output.verify_audio_integrity(inline_dec_tmp)
+                    verified_info = output.verify_audio_integrity(inline_dec_tmp)
                 except FailedCombining as exc:
                     raise GenericAudiobookDLException(
                         f"Downloaded file '{os.path.basename(filepath)}' failed media integrity verification"
@@ -1322,7 +1334,7 @@ def download_file(
     else:
         if not is_ebook_extension(ext):
             try:
-                output.verify_audio_integrity(filepath_tmp)
+                verified_info = output.verify_audio_integrity(filepath_tmp)
             except FailedCombining as exc:
                 if os.path.exists(filepath_tmp):
                     try:
@@ -1334,6 +1346,8 @@ def download_file(
                 ) from exc
         # Atomically move into place (overwrites confirmed existing single-file outputs on Windows)
         os.replace(filepath_tmp, filepath)
+    if verified_info is not None:
+        output.store_cached_probe(probe_cache, filepath, verified_info)
     # Return filepath
     return filepath
 
@@ -1348,6 +1362,7 @@ def download_files(
     max_workers: int | None = None,
     timeout: float | None = None,
     limit_rate: str | None = None,
+    probe_cache: dict[str, Any] | None = None,
 ) -> list[str]:
     """Download files from audiobook and return paths of the downloaded files"""
     file_count = len(audiobook.files)
@@ -1368,6 +1383,8 @@ def download_files(
         worker_kwargs["resume"] = True
     if timeout is not None:
         worker_kwargs["timeout"] = timeout
+    if probe_cache is not None:
+        worker_kwargs["probe_cache"] = probe_cache
     rate_bps = parse_byte_rate(limit_rate)
     if rate_bps is not None:
         worker_kwargs["rate_limiter"] = TokenBucketRateLimiter(rate_bps)

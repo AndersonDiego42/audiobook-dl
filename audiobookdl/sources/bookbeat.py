@@ -21,12 +21,22 @@ class BookBeatSource(Source):
     _authentication_methods = ["login"]
     supports_library = True
     supports_search = True
-    saved_books: dict
     book_info: dict
 
     def __init__(self, options):
         super().__init__(options)
-        self.saved_books = {"_embedded": {"savedBooks": []}}
+        self._saved_books_cache: dict[str, Any] | None = None
+
+    @property
+    def saved_books(self) -> dict[str, Any]:
+        """Lazily load and cache the user's saved BookBeat library."""
+        if self._saved_books_cache is None:
+            self._saved_books_cache = self._fetch_saved_books()
+        return self._saved_books_cache
+
+    @saved_books.setter
+    def saved_books(self, value: dict[str, Any] | None) -> None:
+        self._saved_books_cache = value
 
     @staticmethod
     def create_device_id() -> str:
@@ -69,7 +79,6 @@ class BookBeatSource(Source):
         )
         token = tokens["token"]
         self._session.headers.update({"authorization": f"Bearer {token}"})
-        self.saved_books = self._fetch_saved_books()
 
     def _fetch_saved_books(self) -> dict[str, Any]:
         """Fetch all saved books from BookBeat across paginated responses."""
@@ -286,16 +295,17 @@ class BookBeatSource(Source):
         return Cover(cover_data, "jpg")
 
     def find_book_info(self, book_id: str) -> dict:
-        """Find book metadata by id, checking `saved_books` first and falling back to catalog API."""
-        saved_list = self.saved_books.get("_embedded", {}).get("savedBooks", [])
-        for book in saved_list:
-            if str(book.get("bookid")) == str(book_id):
-                book_copy = dict(book)
-                book_copy["metadata"] = self.get_json(
-                    book["_links"]["book"]["href"]
-                )
-                return book_copy
-        # Allow downloading arbitrary catalog URLs without requiring saved_books membership.
+        """Find book metadata by id, checking cached `saved_books` if loaded, else catalog API."""
+        if self._saved_books_cache is not None:
+            saved_list = self._saved_books_cache.get("_embedded", {}).get("savedBooks", [])
+            for book in saved_list:
+                if str(book.get("bookid")) == str(book_id):
+                    book_copy = dict(book)
+                    book_copy["metadata"] = self.get_json(
+                        book["_links"]["book"]["href"]
+                    )
+                    return book_copy
+        # Query catalog metadata directly without paginating the user's full saved library.
         catalog_meta = self.get_json(f"https://api.bookbeat.com/api/books/{book_id}")
         return {
             "bookid": int(book_id) if book_id.isdigit() else book_id,
@@ -332,8 +342,6 @@ class BookBeatSource(Source):
         )
 
     def list_library(self) -> list[CatalogBook]:
-        if not self.saved_books.get("_embedded", {}).get("savedBooks"):
-            self.saved_books = self._fetch_saved_books()
         books: list[CatalogBook] = []
         for entry in self.saved_books.get("_embedded", {}).get("savedBooks", []):
             item = self._entry_to_catalog_book(entry)

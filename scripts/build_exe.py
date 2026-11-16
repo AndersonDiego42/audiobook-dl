@@ -211,13 +211,28 @@ def build(
             cli_cmd.extend(["--icon", str(ICON_PATH)])
         if os.name == "nt":
             cli_cmd.extend(["--version-file", str(version_file)])
+        if bundle_ffmpeg:
+            for binary in binaries:
+                cli_cmd.extend(["--add-binary", f"{binary}{sep}."])
         cli_cmd.append(str(CLI_ENTRY_POINT))
         subprocess.run(cli_cmd, cwd=str(REPO_ROOT), check=True)
-        built_cli = DIST_DIR / cli_name / cli_exe_name
+        cli_dist_dir = DIST_DIR / cli_name
+        built_cli = cli_dist_dir / cli_exe_name
         if built_cli.is_file():
             exe_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(built_cli, exe_path.parent / cli_exe_name)
-        cli_dist_dir = DIST_DIR / cli_name
+        cli_internal_dir = cli_dist_dir / "_internal"
+        if cli_internal_dir.is_dir():
+            target_internal_dir = exe_path.parent / "_internal"
+            target_internal_dir.mkdir(parents=True, exist_ok=True)
+            for root_dir, _dirs, files in os.walk(cli_internal_dir):
+                rel = Path(root_dir).relative_to(cli_internal_dir)
+                dst_dir = target_internal_dir / rel
+                dst_dir.mkdir(parents=True, exist_ok=True)
+                for fname in files:
+                    dst_file = dst_dir / fname
+                    if not dst_file.exists():
+                        shutil.copy2(Path(root_dir) / fname, dst_file)
         if cli_dist_dir.is_dir():
             shutil.rmtree(cli_dist_dir, ignore_errors=True)
     if copy_ffmpeg and not bundle_ffmpeg:

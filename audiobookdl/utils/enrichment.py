@@ -924,30 +924,98 @@ def _download_cover(
     return Cover(image=raw_bytes, extension=ext)
 
 
+_PROVIDER_CAPABILITIES: dict[str, frozenset[str]] = {
+    "audnexus": frozenset({
+        "title",
+        "authors",
+        "narrators",
+        "series",
+        "series_order",
+        "genres",
+        "language",
+        "description",
+        "asin",
+        "publisher",
+        "release_date",
+        "cover",
+        "chapters",
+    }),
+    "itunes": frozenset({
+        "title",
+        "authors",
+        "genres",
+        "description",
+        "release_date",
+        "cover",
+    }),
+    "google": frozenset({
+        "title",
+        "authors",
+        "genres",
+        "language",
+        "description",
+        "isbn",
+        "publisher",
+        "release_date",
+        "cover",
+    }),
+    "openlibrary": frozenset({
+        "title",
+        "authors",
+        "genres",
+        "description",
+        "isbn",
+        "publisher",
+        "release_date",
+        "cover",
+    }),
+}
+
+
+def _missing_enrichment_fields(
+    audiobook: Audiobook,
+    *,
+    include_chapters: bool = True,
+) -> set[str]:
+    meta = audiobook.metadata
+    missing: set[str] = set()
+    if not meta.title:
+        missing.add("title")
+    if not meta.authors:
+        missing.add("authors")
+    if not meta.narrators:
+        missing.add("narrators")
+    if not meta.series:
+        missing.add("series")
+    if meta.series_order is None:
+        missing.add("series_order")
+    if not meta.genres:
+        missing.add("genres")
+    if meta.language is None:
+        missing.add("language")
+    if not meta.description:
+        missing.add("description")
+    if not meta.isbn:
+        missing.add("isbn")
+    if not meta.asin:
+        missing.add("asin")
+    if not meta.publisher:
+        missing.add("publisher")
+    if meta.release_date is None:
+        missing.add("release_date")
+    if audiobook.cover is None:
+        missing.add("cover")
+    if include_chapters and not audiobook.chapters:
+        missing.add("chapters")
+    return missing
+
+
 def _has_missing_enrichment_fields(
     audiobook: Audiobook,
     *,
     include_chapters: bool = True,
 ) -> bool:
-    meta = audiobook.metadata
-    if not all((
-        meta.authors,
-        meta.narrators,
-        meta.series,
-        meta.genres,
-        meta.language is not None,
-        meta.description,
-        meta.isbn,
-        meta.asin,
-        meta.publisher,
-        meta.release_date is not None,
-    )):
-        return True
-    if audiobook.cover is None:
-        return True
-    if include_chapters and not audiobook.chapters:
-        return True
-    return False
+    return bool(_missing_enrichment_fields(audiobook, include_chapters=include_chapters))
 
 
 def apply_candidate_to_audiobook(
@@ -1131,8 +1199,12 @@ def enrich_audiobook_metadata(
 
     with cache_cm as cache, session_cm as sess:
         for provider in provider_list:
-            if not _has_missing_enrichment_fields(audiobook, include_chapters=include_chapters):
+            missing = _missing_enrichment_fields(audiobook, include_chapters=include_chapters)
+            if not missing:
                 break
+            supported = _PROVIDER_CAPABILITIES.get(provider)
+            if supported is not None and missing.isdisjoint(supported):
+                continue
             candidates = _query_provider(
                 provider,
                 audiobook.metadata,

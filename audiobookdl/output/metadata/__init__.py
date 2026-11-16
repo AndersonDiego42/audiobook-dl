@@ -11,15 +11,21 @@ def add_metadata(
     filepath: str,
     metadata: AudiobookMetadata,
     cover: Cover | None = None,
+    chapters: Sequence[Chapter] | None = None,
     track_context: TrackTagContext | None = None,
 ) -> bool:
-    """Adds metadata (and optional cover art where supported inline) to `filepath`.
+    """Adds metadata (and optional cover art / ID3 chapters where supported inline) to `filepath`.
 
     Returns ``True`` if ``cover`` was embedded in the same save pass.
     """
     if id3.is_id3_file(filepath):
-        id3.add_id3_metadata(filepath, metadata, track_context=track_context)
-        return False
+        return id3.add_id3_metadata(
+            filepath,
+            metadata,
+            cover=cover,
+            chapters=chapters,
+            track_context=track_context,
+        )
     elif mp4.is_mp4_file(filepath):
         return mp4.add_mp4_metadata(filepath, metadata, cover=cover, track_context=track_context)
     elif vorbis.is_vorbis_file(filepath):

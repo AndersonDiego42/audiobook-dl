@@ -1,3 +1,4 @@
+import fnmatch
 import os
 from audiobookdl import logging, Chapter, AudiobookMetadata, Cover
 from audiobookdl.utils.audiobook import TrackTagContext
@@ -93,46 +94,80 @@ def is_id3_file(filepath: str) -> bool:
     return ext in ID3_FORMATS
 
 
+def _set_easy_id3_tag(id3_tags: ID3, key: str, value: str | Sequence[str]) -> None:
+    """Apply an `EasyID3`-mapped tag directly onto an `ID3` container."""
+    values = [value] if isinstance(value, str) else [str(v) for v in value]
+    lower_key = key.lower()
+    setter = EasyID3.Set.get(lower_key)
+    if setter is None:
+        for pattern, candidate in EasyID3.Set.items():
+            if "*" in pattern and fnmatch.fnmatchcase(lower_key, pattern):
+                setter = candidate
+                break
+    if setter is None:
+        setter = EasyID3.SetFallback
+    if setter is None:
+        raise EasyID3KeyError(f"{key!r} is not a valid EasyID3 key")
+    setter(id3_tags, key, values)
+
+
 def add_id3_metadata(
     filepath: str,
     metadata: AudiobookMetadata,
+    cover: Cover | None = None,
+    chapters: Sequence[Chapter] | None = None,
     track_context: TrackTagContext | None = None,
-) -> None:
-    """Add ID3 metadata tags to the given audio file"""
-    audio = MP3(filepath, ID3=EasyID3)
+) -> bool:
+    """Add ID3 metadata tags (plus optional chapters and cover art) in a single save pass.
+
+    Returns ``True`` when ``cover`` was embedded inline.
+    """
+    audio = MP3(filepath, ID3=ID3)
+    if audio.tags is None:
+        audio.add_tags()
+    id3_tags = audio.tags
+    assert id3_tags is not None
+
     # Adding tags
     for key, value in metadata.all_properties(allow_duplicate_keys=None):
         if key == "release_date":
             iso_date = value.strftime("%Y-%m-%d")
-            audio["originaldate"] = iso_date
-            audio["date"] = iso_date
-            audio["year"] = value.strftime("%Y")
+            _set_easy_id3_tag(id3_tags, "originaldate", iso_date)
+            _set_easy_id3_tag(id3_tags, "date", iso_date)
+            _set_easy_id3_tag(id3_tags, "year", value.strftime("%Y"))
         elif key == "language":
-            audio["language"] = value.alpha_3
+            _set_easy_id3_tag(id3_tags, "language", value.alpha_3)
         elif key == "narrators":
-            audio["composer"] = value
-            audio["performer"] = value
+            _set_easy_id3_tag(id3_tags, "composer", value)
+            _set_easy_id3_tag(id3_tags, "performer", value)
         elif key == "series":
-            audio["series_tag"] = value
+            _set_easy_id3_tag(id3_tags, "series_tag", value)
             if track_context is None:
-                audio["album"] = value
+                _set_easy_id3_tag(id3_tags, "album", value)
         elif key == "series_order":
-            audio["series_part"] = str(value)
+            _set_easy_id3_tag(id3_tags, "series_part", str(value))
             if track_context is None:
-                audio["tracknumber"] = str(value)
+                _set_easy_id3_tag(id3_tags, "tracknumber", str(value))
         elif key in ID3_CONVERT:
-            audio[ID3_CONVERT[key]] = value
+            _set_easy_id3_tag(id3_tags, ID3_CONVERT[key], value)
         elif key in EasyID3.valid_keys.keys():
-            audio[key] = value
+            _set_easy_id3_tag(id3_tags, key, value)
     if track_context is not None:
-        audio["title"] = track_context.title
+        _set_easy_id3_tag(id3_tags, "title", track_context.title)
         album_name = track_context.album or metadata.title
         if album_name:
-            audio["album"] = album_name
-        audio["tracknumber"] = f"{track_context.track_number}/{track_context.total_tracks}"
+            _set_easy_id3_tag(id3_tags, "album", album_name)
+        _set_easy_id3_tag(id3_tags, "tracknumber", f"{track_context.track_number}/{track_context.total_tracks}")
     elif not metadata.series and metadata.title:
-        audio["album"] = metadata.title
+        _set_easy_id3_tag(id3_tags, "album", metadata.title)
+
+    if chapters:
+        _apply_id3_chapters(id3_tags, filepath, chapters)
+    cover_embedded = False
+    if cover is not None:
+        cover_embedded = _apply_id3_cover(id3_tags, cover)
     audio.save(v2_version=4)
+    return cover_embedded
 
 
 def _apply_id3_cover(audio: ID3, cover: Cover) -> bool:

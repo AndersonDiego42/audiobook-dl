@@ -13,6 +13,7 @@ import weakref
 
 _PATH_LOCKS_GUARD = threading.Lock()
 _PATH_LOCKS: weakref.WeakValueDictionary[str, threading.RLock] = weakref.WeakValueDictionary()
+_THREAD_LOCK_STATE = threading.local()
 
 
 def _get_path_lock(abs_path: str) -> threading.RLock:
@@ -24,13 +25,22 @@ def _get_path_lock(abs_path: str) -> threading.RLock:
         return lock
 
 
+def _thread_lock_depths() -> dict[str, int]:
+    depths = getattr(_THREAD_LOCK_STATE, "depths", None)
+    if depths is None:
+        depths = {}
+        _THREAD_LOCK_STATE.depths = depths
+    return depths
+
+
 @contextmanager
 def file_lock(target_path: str, timeout: float = 5.0) -> Iterator[None]:
     """
     Serialize in-process threads and cross-process access around `target_path`.
 
     Acquires an in-process per-path `RLock` and an advisory OS lock on
-    `<target_path>.lock`.
+    `<target_path>.lock`. Reentrant calls on the same thread reuse the outer
+    OS file lock without deadlocking.
     """
     abs_path = os.path.abspath(target_path)
     parent = os.path.dirname(abs_path)
@@ -39,12 +49,27 @@ def file_lock(target_path: str, timeout: float = 5.0) -> Iterator[None]:
     lock_path = f"{abs_path}.lock"
     thread_lock = _get_path_lock(abs_path)
     with thread_lock:
-        fh = open(lock_path, "a+b")
-        try:
-            _acquire_os_lock(fh, timeout=timeout)
+        depths = _thread_lock_depths()
+        depth = depths.get(abs_path, 0)
+        if depth > 0:
+            depths[abs_path] = depth + 1
             try:
                 yield
             finally:
+                remaining = depths.get(abs_path, 1) - 1
+                if remaining <= 0:
+                    depths.pop(abs_path, None)
+                else:
+                    depths[abs_path] = remaining
+            return
+        fh = open(lock_path, "a+b")
+        try:
+            _acquire_os_lock(fh, timeout=timeout)
+            depths[abs_path] = 1
+            try:
+                yield
+            finally:
+                depths.pop(abs_path, None)
                 _release_os_lock(fh)
         finally:
             fh.close()

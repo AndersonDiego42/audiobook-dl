@@ -136,3 +136,43 @@ def test_build_exe_onedir_builds_console_cli_companion(tmp_path, monkeypatch):
     assert str(build_exe.CLI_ENTRY_POINT) == captured_cmds[1][-1]
     cli_suffix = ".exe" if os.name == "nt" else ""
     assert (exe_path.parent / f"audiobook-dl-cli{cli_suffix}").is_file()
+
+
+def test_build_exe_onedir_merges_cli_internal_and_bundles_ffmpeg_for_cli(tmp_path, monkeypatch):
+    build_exe = _load_build_exe()
+    dist_dir = tmp_path / "dist"
+    fake_bin_dir = tmp_path / "tools"
+    fake_bin_dir.mkdir()
+    exe_ext = ".exe" if os.name == "nt" else ""
+    (fake_bin_dir / f"ffmpeg{exe_ext}").write_text("ff")
+    (fake_bin_dir / f"ffprobe{exe_ext}").write_text("fp")
+
+    monkeypatch.setattr(build_exe, "DIST_DIR", dist_dir)
+    monkeypatch.setattr(build_exe, "BUILD_DIR", tmp_path / "build")
+    monkeypatch.setattr(
+        build_exe.shutil,
+        "which",
+        lambda name: str(fake_bin_dir / f"{name}{exe_ext}"),
+    )
+
+    captured_cmds = []
+
+    def fake_run(cmd, cwd, check):
+        captured_cmds.append(cmd)
+        name = cmd[cmd.index("--name") + 1]
+        out_dir = dist_dir / name
+        internal = out_dir / "_internal" / "nested"
+        internal.mkdir(parents=True, exist_ok=True)
+        suffix = ".exe" if os.name == "nt" else ""
+        (out_dir / f"{name}{suffix}").write_text("stub")
+        (out_dir / "_internal" / f"{name}_dep.dll").write_text("dll")
+        if name == "audiobook-dl-cli":
+            (internal / "cli_only.pyd").write_text("pyd")
+
+    with patch.object(build_exe.subprocess, "run", side_effect=fake_run):
+        exe_path = build_exe.build(bundle_ffmpeg=True, onedir=True)
+
+    assert "--add-binary" in captured_cmds[1]
+    assert (exe_path.parent / "_internal" / "audiobook-dl-cli_dep.dll").is_file()
+    assert (exe_path.parent / "_internal" / "nested" / "cli_only.pyd").is_file()
+    assert not (dist_dir / "audiobook-dl-cli").exists()

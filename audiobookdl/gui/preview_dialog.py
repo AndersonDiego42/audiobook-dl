@@ -16,7 +16,7 @@ from audiobookdl.gui.formatting import (
     render_cover_thumbnail,
 )
 from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, apply_theme_to_window, scale_px
-from audiobookdl.gui.widgets import ScrolledTreeview, TreeColumnSpec
+from audiobookdl.gui.widgets import MainThreadCallbackQueue, ScrolledTreeview, TreeColumnSpec
 from audiobookdl.sources.source import Source
 from audiobookdl.utils.audiobook import Audiobook, BookId, Cover, Result, Series
 from audiobookdl.utils.enrichment import (
@@ -224,6 +224,9 @@ class PreviewDialog(tk.Toplevel):
         self._palette = palette or LIGHT_PALETTE
         self._on_search_enrichment = on_search_enrichment
         self._on_apply_enrichment = on_apply_enrichment
+        self._source_transferred = False
+        self._source_closed = False
+        self._cb_queue = MainThreadCallbackQueue(self)
 
         self._cover_photo: Any | None = None
         self._pending_cover: Cover | None = result.cover if isinstance(result, Audiobook) else None
@@ -261,6 +264,26 @@ class PreviewDialog(tk.Toplevel):
             self._build_series_view(body, result)
 
         apply_theme_to_window(self, self._palette)
+        self.bind("<Destroy>", self._on_dialog_destroy, add="+")
+
+    def _close_untransferred_source(self) -> None:
+        if self._source_transferred or self._source_closed:
+            return
+        self._source_closed = True
+        close_fn = getattr(self._source, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                pass
+
+    def _on_dialog_destroy(self, event: tk.Event) -> None:
+        if getattr(event, "widget", None) is self:
+            self._close_untransferred_source()
+
+    def destroy(self) -> None:
+        self._close_untransferred_source()
+        super().destroy()
 
     def _refresh_cover_preview(self) -> None:
         if self._cover_label is None:
@@ -427,6 +450,7 @@ class PreviewDialog(tk.Toplevel):
         def _confirm_book() -> None:
             if not self._apply_audiobook_edits(audiobook):
                 return
+            self._source_transferred = True
             self.destroy()
             self._on_confirm(self._url, (self._source, audiobook), None)
 
@@ -495,18 +519,20 @@ class PreviewDialog(tk.Toplevel):
             )
         )
 
+        self._cb_queue.begin_task()
+
         def _worker() -> None:
+            candidates: list[EnrichmentCandidate] = []
+            exc: Exception | None = None
             try:
                 candidates = search_fn(audiobook)
-                exc: Exception | None = None
             except Exception as err:
-                candidates = []
                 exc = err
-            try:
-                if self.winfo_exists():
-                    self.after(0, lambda: self._on_enrichment_search_done(audiobook, candidates, exc))
-            except tk.TclError:
-                pass
+            finally:
+                self._cb_queue.post(
+                    lambda c=candidates, e=exc: self._on_enrichment_search_done(audiobook, c, e)
+                )
+                self._cb_queue.finish_worker()
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -548,27 +574,24 @@ class PreviewDialog(tk.Toplevel):
             )
         )
 
+        self._cb_queue.begin_task()
+
         def _apply_worker() -> None:
+            fields: list[str] = []
+            cover_updated = False
+            chapters_updated = False
+            err_exc: Exception | None = None
             try:
                 fields, cover_updated, chapters_updated = apply_fn(audiobook, chosen)
-                err_exc: Exception | None = None
             except Exception as err:
-                fields, cover_updated, chapters_updated = [], False, False
                 err_exc = err
-            try:
-                if self.winfo_exists():
-                    self.after(
-                        0,
-                        lambda: self._on_enrichment_applied(
-                            audiobook,
-                            fields,
-                            cover_updated,
-                            chapters_updated,
-                            err_exc,
-                        ),
+            finally:
+                self._cb_queue.post(
+                    lambda f=fields, cu=cover_updated, ch=chapters_updated, e=err_exc: self._on_enrichment_applied(
+                        audiobook, f, cu, ch, e
                     )
-            except tk.TclError:
-                pass
+                )
+                self._cb_queue.finish_worker()
 
         threading.Thread(target=_apply_worker, daemon=True).start()
 
@@ -689,6 +712,7 @@ class PreviewDialog(tk.Toplevel):
                     parent=self,
                 )
                 return
+            self._source_transferred = True
             self.destroy()
             self._on_confirm(self._url, (self._source, series), indices)
 

@@ -780,5 +780,76 @@ def test_pack_book_runs_silence_detection_when_chapters_from_silence_enabled(tmp
     assert meta_calls == [detected]
 
 
+def test_pack_dialog_preserves_explicit_fields_passes_output_dir_and_keeps_global_format(
+    tmp_path: Path,
+):
+    import gc
+    import time
+    import tkinter as tk
+    from audiobookdl.config import load_config, save_output_preferences
+    from audiobookdl.gui.app import AudiobookDLApp
+    from audiobookdl.gui.pack_dialog import PackDialog
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    save_output_preferences(config_location=str(cfg_path), output_format="mp3")
+
+    src_dir = tmp_path / "Author A - Book One"
+    src_dir.mkdir()
+    _create_empty_id3_mp3(src_dir / "01.mp3")
+    pack_out = tmp_path / "pack_output"
+    pack_out.mkdir()
+
+    app = AudiobookDLApp(root, config_location=str(cfg_path))
+    app.output_format_var.set("mp3")
+    submitted: list[tuple[list[PackJobRequest], str]] = []
+    base_opts = args.build_default_options(output_format="mp3")
+    dlg: PackDialog | None = None
+    try:
+        dlg = PackDialog(
+            root,
+            app.controller,
+            base_opts,
+            output_dir=str(pack_out),
+            on_submit=lambda reqs, fmt: submitted.append((reqs, fmt)),
+        )
+        dlg.format_var.set("m4b")
+        cloned = dlg._clone_options_for_pack()
+        assert cloned.output_format == "m4b"
+        assert cloned._explicit_fields == frozenset({"output_format"})
+
+        dlg._append_path(str(src_dir))
+        fake_probe = AudioProbeInfo(duration=10.0, bitrate=128_000, codec_name="mp3", format_name="mp3")
+        with patch("audiobookdl.pack.probe_audio_info", return_value=fake_probe):
+            dlg._start_scan()
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and dlg._is_scanning:
+                root.update()
+                time.sleep(0.01)
+        assert len(dlg._preview_specs) == 1
+        assert Path(dlg._preview_specs[0].output_path).parent == pack_out
+
+        dlg._submit()
+        assert len(submitted) == 1
+        assert submitted[0][0][0].output_dir == str(pack_out)
+
+        # Submitting a pack job with m4b must NOT overwrite global saved output_format="mp3"
+        with patch.object(app.controller, "start_or_enqueue_pack_jobs", return_value=(True, 1, [], 1)):
+            app._on_pack_submitted(submitted[0][0], "m4b")
+        reloaded = load_config(str(cfg_path))
+        assert reloaded.output_format == "mp3"
+    finally:
+        dlg = None
+        gc.collect()
+        app.controller.shutdown(is_running=False, is_previewing=False)
+        root.destroy()
+
+
+
 
 

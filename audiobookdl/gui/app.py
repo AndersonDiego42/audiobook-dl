@@ -1,6 +1,8 @@
 """Main Tkinter desktop window coordinator and launcher entry point for audiobook-dl."""
 
 import argparse
+from collections import deque
+import dataclasses
 import importlib.resources
 import os
 import subprocess
@@ -59,7 +61,7 @@ from audiobookdl.sources import ServiceInfo, get_available_services
 from audiobookdl.sources.source import Source
 from audiobookdl.utils import read_asset_file
 from audiobookdl.utils.archive import default_archive_path
-from audiobookdl.utils.audiobook import Audiobook, BookId, Result
+from audiobookdl.utils.audiobook import Audiobook, BookId, Result, Series
 from audiobookdl.utils.updater import UpdateInfo
 
 
@@ -144,6 +146,8 @@ class AudiobookDLApp:
         self._set_running_state(False)
 
         self._poll_after_id: str | None = None
+        self._modal_prompt_active = False
+        self._deferred_modal_events: deque[tuple] = deque()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<Destroy>", self._on_root_destroy, add="+")
         self._poll_after_id = self.root.after(50, self._poll_queue)
@@ -887,10 +891,17 @@ class AudiobookDLApp:
             f"--- Starting download ({len(job_specs)} URL{'s' if len(job_specs) != 1 else ''}) ---",
         )
         for job in queued_jobs:
-            self._queue_panel.register_queue_job(job)
+            self._queue_panel.register_queue_job(job, persist=False)
+        if queued_jobs:
+            self._controller.save_queue_state()
 
-    def _enqueue_additional_urls(self, urls: list[str]) -> bool:
-        """Append new URLs to the currently active download queue."""
+    def _enqueue_additional_urls(
+        self,
+        urls: list[str],
+        *,
+        allow_existing: bool = False,
+    ) -> bool:
+        """Append new URLs (or retried URLs when `allow_existing=True`) to the active queue."""
         if not self._auth_panel.validate_cookie_file():
             return True
         if self._try_build_options(urls_override=[]) is None:
@@ -898,6 +909,7 @@ class AudiobookDLApp:
         has_active_run, added_jobs, new_total = self._controller.enqueue_additional_urls(
             urls,
             lambda u: self.build_options(urls_override=[u]),
+            allow_existing=allow_existing,
         )
         if not has_active_run:
             return False
@@ -906,7 +918,8 @@ class AudiobookDLApp:
             self._queue_panel.append_log("All entered URL(s) are already in the active queue.")
             return True
         for job in added_jobs:
-            self._queue_panel.register_queue_job(job)
+            self._queue_panel.register_queue_job(job, persist=False)
+        self._controller.save_queue_state()
         self._queue_panel.ui_item_total = new_total
         self._queue_panel.refresh_batch_label()
         self.status_var.set(f"Queued +{len(added_jobs)} (total {new_total})")
@@ -922,7 +935,7 @@ class AudiobookDLApp:
             return
         if self._is_running:
             if not self._controller.cancel_event.is_set():
-                self._enqueue_additional_urls(failed_urls)
+                self._enqueue_additional_urls(failed_urls, allow_existing=True)
             return
         options = self._try_build_options()
         if options is None:
@@ -956,23 +969,26 @@ class AudiobookDLApp:
 
     def _on_pack_submitted(self, requests_list: list[PackJobRequest], output_format: str) -> None:
         """Queue one or more local repackaging requests onto `GuiController`."""
+        if not requests_list:
+            return
+        base_opts = self._try_build_options(urls_override=[])
+        if base_opts is None:
+            return
+        self._save_run_preferences(base_opts)
         pairs: list[tuple[PackJobRequest, args.DownloadOptions]] = []
         for req in requests_list:
-            opts = self._try_build_options(urls_override=[])
-            if opts is None:
-                return
-            opts.output_format = output_format
+            opts = dataclasses.replace(base_opts, output_format=output_format)
+            opts._explicit_fields = frozenset(base_opts._explicit_fields | {"output_format"})
             pairs.append((req, opts))
-        if not pairs:
-            return
-        self._save_run_preferences(pairs[0][1])
 
         was_appended, run_id, queued_jobs, new_total = self._controller.start_or_enqueue_pack_jobs(
             pairs
         )
         if was_appended:
             for job in queued_jobs:
-                self._queue_panel.register_queue_job(job)
+                self._queue_panel.register_queue_job(job, persist=False)
+            if queued_jobs:
+                self._controller.save_queue_state()
             self._queue_panel.ui_item_total = new_total
             self._queue_panel.refresh_batch_label()
             self.status_var.set(f"Queued +{len(queued_jobs)} pack job(s) (total {new_total})")
@@ -988,7 +1004,9 @@ class AudiobookDLApp:
             f"--- Starting local pack ({len(queued_jobs)} book{'s' if len(queued_jobs) != 1 else ''}) ---",
         )
         for job in queued_jobs:
-            self._queue_panel.register_queue_job(job)
+            self._queue_panel.register_queue_job(job, persist=False)
+        if queued_jobs:
+            self._controller.save_queue_state()
 
     def start_download(self) -> None:
         if self._is_previewing:
@@ -1094,8 +1112,26 @@ class AudiobookDLApp:
             return
 
         source, result = prepared
+        try:
+            root_exists = self.root.winfo_exists()
+        except tk.TclError:
+            root_exists = False
+        if not root_exists:
+            self._close_prefetched_source(prepared)
+            return
         self.status_var.set(f"Preview ready: {result.title[:60]}")
         self._show_preview_dialog(url, source, result)
+
+    @staticmethod
+    def _close_prefetched_source(prefetched: tuple[Source, Result] | None) -> None:
+        if prefetched is None:
+            return
+        close_fn = getattr(prefetched[0], "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                pass
 
     def _show_preview_dialog(self, url: str, source: Source, result: Result) -> PreviewDialog:
         """Display resolved `Audiobook` metadata/cover or a selectable `Series` checklist."""
@@ -1110,6 +1146,7 @@ class AudiobookDLApp:
             opts = self.build_options(urls_override=[url])
             return self._controller.apply_enrichment_candidate(book, candidate, opts)
 
+        cached_series_opts = self.build_options() if isinstance(result, Series) else None
         dialog = PreviewDialog(
             self.root,
             url,
@@ -1117,7 +1154,7 @@ class AudiobookDLApp:
             result,
             is_running=self._is_running,
             skip_downloaded=self.skip_downloaded_var.get(),
-            series_book_exists=self._series_book_exists,
+            series_book_exists=lambda book: self._series_book_exists(book, options=cached_series_opts),
             on_confirm=self._enqueue_from_preview,
             palette=self._palette,
             on_search_enrichment=_search_enrichment,
@@ -1126,12 +1163,17 @@ class AudiobookDLApp:
         self._preview_dialog = dialog
         return dialog
 
-    def _series_book_exists(self, book: BookId[Any] | Audiobook) -> bool:
+    def _series_book_exists(
+        self,
+        book: BookId[Any] | Audiobook,
+        *,
+        options: args.DownloadOptions | None = None,
+    ) -> bool:
         """Return True when `book` already appears on disk at the configured output path."""
         if not isinstance(book, Audiobook):
             return False
         try:
-            opts = self.build_options()
+            opts = options if options is not None else self.build_options()
             template = opts.output_template or "{title}"
             target = output.gen_output_location(template, book.metadata, opts.remove_chars)
             if os.path.exists(target):
@@ -1158,8 +1200,10 @@ class AudiobookDLApp:
         """Start or queue a download from an inspected preview result."""
         options = self._try_build_options(urls_override=[url])
         if options is None:
+            self._close_prefetched_source(prefetched)
             return
         if not self._ffmpeg_assistant.ensure_available(options):
+            self._close_prefetched_source(prefetched)
             return
         if self._is_running:
             enqueued = self._controller.enqueue_from_preview(
@@ -1199,18 +1243,28 @@ class AudiobookDLApp:
                 return
         except tk.TclError:
             return
+        # Schedule the next poll before draining so nested modal dialogs
+        # (`askstring`, `askyesno`, `wait_window`) do not freeze log/progress updates.
+        try:
+            self._poll_after_id = self.root.after(50, self._poll_queue)
+        except tk.TclError:
+            self._poll_after_id = None
+            return
         processed = self._controller.drain_events(
             self._handle_event,
             max_batch=self._controller.MAX_QUEUE_BATCH,
         )
+        while not self._modal_prompt_active and self._deferred_modal_events:
+            self._handle_event(self._deferred_modal_events.popleft())
         if self._is_running:
             self._queue_panel.update_metrics_display(is_running=True)
-        delay_ms = 10 if processed >= self._controller.MAX_QUEUE_BATCH else 50
-        try:
-            if self.root.winfo_exists():
-                self._poll_after_id = self.root.after(delay_ms, self._poll_queue)
-        except tk.TclError:
-            self._poll_after_id = None
+        if processed >= self._controller.MAX_QUEUE_BATCH and self._poll_after_id is not None:
+            self._cancel_poll_timer()
+            try:
+                if self.root.winfo_exists():
+                    self._poll_after_id = self.root.after(10, self._poll_queue)
+            except tk.TclError:
+                self._poll_after_id = None
 
     def _cancel_poll_timer(self) -> None:
         after_id = getattr(self, "_poll_after_id", None)
@@ -1229,31 +1283,39 @@ class AudiobookDLApp:
         if self._queue_panel.handle_activity_event(item):
             return
         kind = item[0]
-        if kind == "prompt_input":
-            _, prompt, hidden, holder, done = item
-            holder["value"] = simpledialog.askstring(
-                "Authentication Required",
-                f"{prompt}:",
-                show="*" if hidden else None,
-                parent=self.root,
-            )
-            done.set()
-        elif kind == "prompt_confirm":
-            _, message, holder, done = item
-            holder["value"] = messagebox.askyesno("Confirm", message, parent=self.root)
-            done.set()
-        elif kind == "prompt_choice":
-            _, choice_title, choices, default_idx, holder, done = item
-            dlg = ChoiceDialog(
-                self.root,
-                choice_title,
-                choices,
-                default=default_idx,
-                palette=self._palette,
-            )
-            self.root.wait_window(dlg)
-            holder["value"] = dlg.selected_index
-            done.set()
+        if kind in ("prompt_input", "prompt_confirm", "prompt_choice"):
+            if self._modal_prompt_active:
+                self._deferred_modal_events.append(item)
+                return
+            self._modal_prompt_active = True
+            try:
+                if kind == "prompt_input":
+                    _, prompt, hidden, holder, done = item
+                    holder["value"] = simpledialog.askstring(
+                        "Authentication Required",
+                        f"{prompt}:",
+                        show="*" if hidden else None,
+                        parent=self.root,
+                    )
+                    done.set()
+                elif kind == "prompt_confirm":
+                    _, message, holder, done = item
+                    holder["value"] = messagebox.askyesno("Confirm", message, parent=self.root)
+                    done.set()
+                elif kind == "prompt_choice":
+                    _, choice_title, choices, default_idx, holder, done = item
+                    dlg = ChoiceDialog(
+                        self.root,
+                        choice_title,
+                        choices,
+                        default=default_idx,
+                        palette=self._palette,
+                    )
+                    self.root.wait_window(dlg)
+                    holder["value"] = dlg.selected_index
+                    done.set()
+            finally:
+                self._modal_prompt_active = False
         elif kind == "preview_done":
             _, preview_url, prepared, preview_exc = item
             self._handle_preview_done(preview_url, prepared, preview_exc)

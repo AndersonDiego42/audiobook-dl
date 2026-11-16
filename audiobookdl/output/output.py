@@ -95,16 +95,35 @@ def _probe_audio_info(path: str) -> AudioProbeInfo:
     return probe_audio_info(path)
 
 
+_PROBE_CACHE_LOCK = threading.Lock()
+
+
+def store_cached_probe(
+    probe_cache: dict[str, AudioProbeInfo] | None,
+    path: str,
+    info: AudioProbeInfo,
+) -> None:
+    """Thread-safely record `info` under `path` when `probe_cache` is provided."""
+    if probe_cache is None:
+        return
+    with _PROBE_CACHE_LOCK:
+        probe_cache[path] = info
+
+
 def _get_cached_probe(
     path: str,
     probe_cache: dict[str, AudioProbeInfo] | None = None,
 ) -> AudioProbeInfo:
     """Return cached `AudioProbeInfo` for `path`, probing once and storing on miss."""
-    if probe_cache is not None and path in probe_cache:
-        return probe_cache[path]
+    if probe_cache is not None:
+        with _PROBE_CACHE_LOCK:
+            cached = probe_cache.get(path)
+        if cached is not None:
+            return cached
     info = _probe_audio_info(path)
     if probe_cache is not None:
-        probe_cache[path] = info
+        with _PROBE_CACHE_LOCK:
+            probe_cache[path] = info
     return info
 
 
@@ -267,7 +286,8 @@ def _probe_uncached_audio_info(
     cancel_event: threading.Event | None = None,
 ) -> list[AudioProbeInfo]:
     """Populate `cache` for any uncached `paths` in parallel and return infos in order."""
-    uncached = [p for p in dict.fromkeys(paths) if p not in cache]
+    with _PROBE_CACHE_LOCK:
+        uncached = [p for p in dict.fromkeys(paths) if p not in cache]
     if uncached:
         probed = run_cancellable_pool(
             _probe_audio_info,
@@ -275,9 +295,11 @@ def _probe_uncached_audio_info(
             max_workers=COMBINE_REMUX_THREADS,
             cancel_event=cancel_event,
         )
-        for path, info in zip(uncached, probed, strict=True):
-            cache[path] = info
-    return [cache[p] for p in paths]
+        with _PROBE_CACHE_LOCK:
+            for path, info in zip(uncached, probed, strict=True):
+                cache[path] = info
+    with _PROBE_CACHE_LOCK:
+        return [cache[p] for p in paths]
 
 
 _MPEGTS_PACKET_SIZE = 188
@@ -501,6 +523,7 @@ def detect_silence_chapters(
     noise_db: float = -35.0,
     min_silence_sec: float = 1.8,
     cancel_event: threading.Event | None = None,
+    probe_cache: dict[str, AudioProbeInfo] | None = None,
 ) -> list[Chapter]:
     """Run FFmpeg `silencedetect` on `filepath` and synthesize chapter markers at pauses."""
     ffmpeg = _require_executable("ffmpeg")
@@ -519,7 +542,7 @@ def detect_silence_chapters(
     if result.returncode != 0:
         return []
     stderr_text = (result.stderr or b"").decode("utf-8", errors="replace")
-    info = _probe_audio_info(filepath)
+    info = _get_cached_probe(filepath, probe_cache)
     duration_ms = round(info.duration * 1000) if info.duration > 0 else None
 
     starts = [0]
@@ -693,7 +716,7 @@ def combine_audiofiles(
                         nonlocal completed_parts
                         index, source = item
                         ts_path = os.path.join(ts_dir, f"{str(index).zfill(padding)}.ts")
-                        with part_lock:
+                        with _PROBE_CACHE_LOCK:
                             src_info = input_infos[index] if input_infos is not None else cache.get(source)
                         needs_encode = parallel_aac_encoded and (
                             src_info is None
@@ -714,11 +737,9 @@ def combine_audiofiles(
                             ok = _remux_to_mpegts(source, ts_path, cancel_event=cancel_event)
                         if ok:
                             if src_info is None and len(filepaths) > 1:
-                                src_info = _probe_audio_info(source)
-                                with part_lock:
-                                    cache[source] = src_info
+                                src_info = _get_cached_probe(source, cache)
                             if src_info is not None and src_info.duration > 0:
-                                with part_lock:
+                                with _PROBE_CACHE_LOCK:
                                     if ts_path not in cache:
                                         cache[ts_path] = AudioProbeInfo(
                                             duration=src_info.duration,
@@ -816,13 +837,17 @@ def combine_audiofiles(
                     )
                     if ok:
                         src_info = input_infos[idx]
-                        cache[dst] = AudioProbeInfo(
-                            duration=src_info.duration,
-                            bitrate=src_info.bitrate,
-                            codec_name=inter_codec,
-                            format_name=inter_ext,
-                            sample_rate=target_sr or src_info.sample_rate,
-                            channels=target_ch or src_info.channels,
+                        store_cached_probe(
+                            cache,
+                            dst,
+                            AudioProbeInfo(
+                                duration=src_info.duration,
+                                bitrate=src_info.bitrate,
+                                codec_name=inter_codec,
+                                format_name=inter_ext,
+                                sample_rate=target_sr or src_info.sample_rate,
+                                channels=target_ch or src_info.channels,
+                            ),
                         )
                     return dst, ok
 

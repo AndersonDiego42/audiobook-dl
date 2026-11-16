@@ -1,7 +1,9 @@
 """Reusable Tkinter composite widgets and input helpers for the desktop GUI."""
 
 from dataclasses import dataclass
+import queue
 import sys
+import threading
 import tkinter as tk
 from tkinter import ttk
 from typing import Any
@@ -351,3 +353,92 @@ def attach_url_context_menu(
     if sys.platform == "darwin":
         text_widget.bind("<Button-2>", _show_menu)
     return menu
+
+
+class MainThreadCallbackQueue:
+    """Thread-safe queue delivering background worker callbacks onto the Tk main thread."""
+
+    def __init__(self, widget: tk.Misc, interval_ms: int = 25) -> None:
+        self._widget = widget
+        self._interval_ms = interval_ms
+        self._queue: queue.Queue[Callable[[], None]] = queue.Queue()
+        self._after_id: str | None = None
+        self._destroyed = False
+        self._active_workers = 0
+        self._lock = threading.Lock()
+        widget.bind("<Destroy>", self._on_destroy, add="+")
+
+    def begin_task(self) -> None:
+        """Register an active background task and start main-thread polling."""
+        with self._lock:
+            if self._destroyed:
+                return
+            self._active_workers += 1
+        self._ensure_polling()
+
+    def post(self, callback: Callable[[], None]) -> None:
+        """Enqueue `callback` from any thread without touching Tcl/Tk."""
+        self._queue.put(callback)
+
+    def finish_worker(self) -> None:
+        """Mark one background worker complete from any thread."""
+        with self._lock:
+            self._active_workers = max(0, self._active_workers - 1)
+
+    def _ensure_polling(self) -> None:
+        if self._destroyed or self._after_id is not None:
+            return
+        try:
+            if self._widget.winfo_exists():
+                self._after_id = self._widget.after(self._interval_ms, self._poll)
+        except tk.TclError:
+            self._after_id = None
+
+    def _poll(self) -> None:
+        self._after_id = None
+        if self._destroyed:
+            return
+        try:
+            if not self._widget.winfo_exists():
+                self._destroyed = True
+                return
+        except tk.TclError:
+            self._destroyed = True
+            return
+
+        while not self._destroyed:
+            try:
+                cb = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if not self._widget.winfo_exists():
+                    self._destroyed = True
+                    break
+            except tk.TclError:
+                self._destroyed = True
+                break
+            cb()
+
+        if self._destroyed:
+            return
+        with self._lock:
+            keep_polling = self._active_workers > 0 or not self._queue.empty()
+        if keep_polling:
+            self._ensure_polling()
+
+    def _on_destroy(self, event: tk.Event) -> None:
+        if getattr(event, "widget", None) is not self._widget:
+            return
+        self._destroyed = True
+        if self._after_id is not None:
+            try:
+                self._widget.after_cancel(self._after_id)
+            except tk.TclError:
+                pass
+            self._after_id = None
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break

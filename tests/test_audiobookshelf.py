@@ -42,9 +42,26 @@ class _MockResponse:
 class _FakeAbsSession:
     def __init__(self):
         self.calls = []
+        self.streamed_bodies = []
 
     def request(self, method, url, headers=None, json=None, data=None, files=None, timeout=None):
+        import re as _re
+
         uploaded_names = [pair[1][0] for pair in (files or [])]
+        body_bytes = b""
+        if data is not None and hasattr(data, "read"):
+            chunks = []
+            while True:
+                chunk = data.read(16384)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            body_bytes = b"".join(chunks)
+            self.streamed_bodies.append((headers or {}, len(data), body_bytes))
+            uploaded_names.extend(
+                m.decode("utf-8")
+                for m in _re.findall(rb'filename="([^"]+)"', body_bytes)
+            )
         self.calls.append((method, url, headers, data, uploaded_names))
         if url.endswith("/api/authorize"):
             return _MockResponse(200, {"user": {"username": "absadmin"}})
@@ -293,3 +310,37 @@ def test_abs_sidecar_sets_final_chapter_duration_and_avoids_clobbering(tmp_path)
     sec_abs = json.loads((flat_dir / "Second Book.metadata.json").read_text(encoding="utf-8"))
     assert sec_abs["title"] == "Second Book"
     assert sec_abs["chapters"][-1]["end"] == 35.0
+
+
+def test_multipart_upload_stream_computes_exact_length_and_streams_chunks(tmp_path):
+    from audiobookdl.integrations.audiobookshelf import _MultipartUploadStream
+
+    f1 = tmp_path / "book.m4b"
+    f2 = tmp_path / "metadata.json"
+    payload1 = b"A" * 200_000
+    payload2 = b'{"title": "Streamed"}'
+    f1.write_bytes(payload1)
+    f2.write_bytes(payload2)
+
+    stream = _MultipartUploadStream(
+        {"library": "lib-1", "title": "Streamed"},
+        [("0", str(f1)), ("1", str(f2))],
+        boundary="test-boundary-123",
+    )
+    expected_len = len(stream)
+    chunks = []
+    try:
+        while True:
+            chunk = stream.read(16_384)
+            if not chunk:
+                break
+            assert len(chunk) <= 16_384
+            chunks.append(chunk)
+    finally:
+        stream.close()
+
+    assembled = b"".join(chunks)
+    assert len(assembled) == expected_len
+    assert payload1 in assembled
+    assert payload2 in assembled
+    assert b"--test-boundary-123--\r\n" in assembled

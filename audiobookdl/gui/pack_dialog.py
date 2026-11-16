@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import threading
 import tkinter as tk
@@ -13,7 +14,7 @@ from audiobookdl.exceptions import AudiobookDLException
 from audiobookdl.gui.controller import GuiController, PackJobRequest
 from audiobookdl.gui.formatting import format_duration
 from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, apply_theme_to_window, scale_px
-from audiobookdl.gui.widgets import ScrolledTreeview, TreeColumnSpec
+from audiobookdl.gui.widgets import MainThreadCallbackQueue, ScrolledTreeview, TreeColumnSpec
 from audiobookdl.pack import PackBookSpec, PackOverrides, scope_overrides_for_batch
 
 
@@ -49,6 +50,7 @@ class PackDialog(tk.Toplevel):
         self._preview_specs: list[PackBookSpec] = []
         self._scan_token = 0
         self._is_scanning = False
+        self._cb_queue = MainThreadCallbackQueue(self)
 
         self.title("Pack Local Audiobooks")
         self.transient(parent)  # type: ignore[arg-type]
@@ -267,12 +269,9 @@ class PackDialog(tk.Toplevel):
 
     def _clone_options_for_pack(self) -> args.DownloadOptions:
         fmt = self.format_var.get().strip().lower() or "m4b"
-        data = {
-            name: getattr(self._base_options, name)
-            for name in self._base_options.__dataclass_fields__
-            if name not in ("_explicit_fields", "urls", "output_format")
-        }
-        return args.build_default_options(output_format=fmt, **data)
+        cloned = dataclasses.replace(self._base_options, urls=[], output_format=fmt)
+        cloned._explicit_fields = frozenset(self._base_options._explicit_fields | {"output_format"})
+        return cloned
 
     def _start_scan(self) -> None:
         if not self._paths:
@@ -292,6 +291,40 @@ class PackDialog(tk.Toplevel):
         paths_snapshot = list(self._paths)
         recursive = bool(self.recursive_var.get())
         opts = self._clone_options_for_pack()
+        output_dir = self._output_dir
+        def _apply(s: list[PackBookSpec] | None, e: str | None) -> None:
+            if not self.winfo_exists() or token != self._scan_token:
+                return
+            self._is_scanning = False
+            self._scan_btn.configure(state="normal")
+            for iid in self._tree.get_children():
+                self._tree.delete(iid)
+            if e is not None:
+                self._preview_specs.clear()
+                self.status_var.set(f"Scan error: {e}")
+                return
+            self._preview_specs = s or []
+            for spec in self._preview_specs:
+                dur = format_duration(spec.total_duration_seconds) if spec.total_duration_seconds > 0 else "-"
+                self._tree.insert(
+                    "",
+                    tk.END,
+                    values=(
+                        spec.audiobook.title,
+                        spec.audiobook.metadata.author or "(Unknown)",
+                        len(spec.track_paths),
+                        len(spec.audiobook.chapters),
+                        dur,
+                        spec.output_path,
+                    ),
+                )
+            count = len(self._preview_specs)
+            if count == 0:
+                self.status_var.set("No audiobooks found in selected paths.")
+            else:
+                self.status_var.set(f"Ready: {count} audiobook{'s' if count != 1 else ''} detected.")
+
+        self._cb_queue.begin_task()
 
         def _worker() -> None:
             specs: list[PackBookSpec] | None = None
@@ -301,47 +334,16 @@ class PackDialog(tk.Toplevel):
                     paths_snapshot,
                     opts,
                     recursive=recursive,
-                    output_dir=None,
+                    output_dir=output_dir,
                     overrides=overrides,
                 )
             except AudiobookDLException as exc:
                 err = exc.error_description
             except Exception as exc:
                 err = str(exc)
-
-            def _apply() -> None:
-                if not self.winfo_exists() or token != self._scan_token:
-                    return
-                self._is_scanning = False
-                self._scan_btn.configure(state="normal")
-                for iid in self._tree.get_children():
-                    self._tree.delete(iid)
-                if err is not None:
-                    self._preview_specs.clear()
-                    self.status_var.set(f"Scan error: {err}")
-                    return
-                self._preview_specs = specs or []
-                for spec in self._preview_specs:
-                    dur = format_duration(spec.total_duration_seconds) if spec.total_duration_seconds > 0 else "-"
-                    self._tree.insert(
-                        "",
-                        tk.END,
-                        values=(
-                            spec.audiobook.title,
-                            spec.audiobook.metadata.author or "(Unknown)",
-                            len(spec.track_paths),
-                            len(spec.audiobook.chapters),
-                            dur,
-                            spec.output_path,
-                        ),
-                    )
-                count = len(self._preview_specs)
-                if count == 0:
-                    self.status_var.set("No audiobooks found in selected paths.")
-                else:
-                    self.status_var.set(f"Ready: {count} audiobook{'s' if count != 1 else ''} detected.")
-
-            self.after(0, _apply)
+            finally:
+                self._cb_queue.post(lambda s=specs, e=err: _apply(s, e))
+                self._cb_queue.finish_worker()
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -373,6 +375,7 @@ class PackDialog(tk.Toplevel):
                     paths=[spec.source_root] if os.path.isdir(spec.source_root) else list(spec.track_paths),
                     recursive=False,
                     delete_source=delete_source,
+                    output_dir=self._output_dir,
                     overrides=batch_overrides,
                     label=spec.audiobook.title,
                 )
@@ -389,6 +392,7 @@ class PackDialog(tk.Toplevel):
                     paths=list(self._paths),
                     recursive=recursive,
                     delete_source=delete_source,
+                    output_dir=self._output_dir,
                     overrides=overrides,
                     label=label,
                 )

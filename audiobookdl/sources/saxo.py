@@ -2,7 +2,6 @@ from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, logging
 from audiobookdl.exceptions import BookNotFound, NoSourceFound
 from audiobookdl.utils.audiobook import AESEncryption, parse_language, parse_release_date
-from audiobookdl.utils.concurrency import run_cancellable_pool
 
 import os
 import re
@@ -95,24 +94,27 @@ class SaxoSource(Source):
         book_id = book_info["bookId"]
         chapters = book_info["techInfo"]["chapters"]
 
-        def _fetch_file(file: dict) -> AudiobookFile:
-            filename = file["fileName"]
-            link = self.get_json(
-                f"https://api-read.saxo.com/api/v1/book/{book_id}/content/encryptedstream/{filename}",
-                headers=self._app_headers(),
-            )["link"]
-            return AudiobookFile(
-                url=link,
+        def _make_resolver(filename: str):
+            def _resolve() -> str:
+                return self.get_json(
+                    f"https://api-read.saxo.com/api/v1/book/{book_id}/content/encryptedstream/{filename}",
+                    headers=self._app_headers(),
+                )["link"]
+
+            return _resolve
+
+        return [
+            AudiobookFile(
+                url="",
                 ext="mp3",
                 encryption_method=AESEncryption(
                     b"CD3E9D141D8EFC0886912E7A8F3652C4",
                     b"78CB354D377772F1",
                 ),
+                url_resolver=_make_resolver(chapter["fileName"]),
             )
-
-        if len(chapters) <= 1:
-            return [_fetch_file(f) for f in chapters]
-        return run_cancellable_pool(_fetch_file, chapters, max_workers=8)
+            for chapter in chapters
+        ]
 
     @staticmethod
     def get_chapters(book_info: dict[str, Any]) -> list[Chapter]:

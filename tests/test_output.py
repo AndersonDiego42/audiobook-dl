@@ -234,23 +234,35 @@ def test_combine_audiofiles_sizes_remux_pool_dynamically(tmp_path, monkeypatch):
     combine_audiofiles([str(src)], str(tmp_path / "tmp1"), str(tmp_path / "out1.mp3"))
     assert pool_sizes == []
 
-    # 3 files: pool size 3
+    # 3 files without pre-warmed probe cache: probe pool (3) + remux pool (3)
     files_3 = []
     for i in range(3):
         p = tmp_path / f"f{i}.mp3"
         p.write_bytes(b"a")
         files_3.append(str(p))
     combine_audiofiles(files_3, str(tmp_path / "tmp3"), str(tmp_path / "out3.mp3"))
+    assert pool_sizes == [3, 3]
+
+    # Pre-warmed probe_cache skips the probe ThreadPoolExecutor completely
+    pool_sizes.clear()
+    warm_cache = {p: AudioProbeInfo(duration=10.0, codec_name="mp3") for p in files_3}
+    combine_audiofiles(
+        files_3,
+        str(tmp_path / "tmp3_cached"),
+        str(tmp_path / "out3.mp3"),
+        probe_cache=warm_cache,
+    )
     assert pool_sizes == [3]
 
-    # 20 files: capped at COMBINE_REMUX_THREADS (16)
+    # 20 files without pre-warmed cache: both pools capped at COMBINE_REMUX_THREADS (16)
+    pool_sizes.clear()
     files_20 = []
     for i in range(20):
         p = tmp_path / f"g{i}.mp3"
         p.write_bytes(b"a")
         files_20.append(str(p))
     combine_audiofiles(files_20, str(tmp_path / "tmp20"), str(tmp_path / "out20.mp3"))
-    assert pool_sizes == [3, output.COMBINE_REMUX_THREADS]
+    assert pool_sizes == [output.COMBINE_REMUX_THREADS, output.COMBINE_REMUX_THREADS]
 
 
 def test_run_cancellable_subprocess_terminates_child_promptly():
@@ -594,7 +606,14 @@ def test_convert_output_parallel_preserves_sources_on_failure(tmp_path):
     out0 = tmp_path / "part0.m4b"
     out1 = tmp_path / "part1.m4b"
 
-    def fake_convert_single(old_path, target_format, cancel_event=None, audio_bitrate=None, remove_source=True):
+    def fake_convert_single(
+        old_path,
+        target_format,
+        cancel_event=None,
+        audio_bitrate=None,
+        remove_source=True,
+        **_kwargs,
+    ):
         if old_path == str(f0):
             out0.write_bytes(b"m4b0")
             return str(out0), False
@@ -1305,6 +1324,50 @@ def test_split_audio_by_chapters_normalizes_chapters_and_applies_filters(tmp_pat
         assert "loudnorm" in af_val
         assert "-ac" in cmd and cmd[cmd.index("-ac") + 1] == "1"
         assert "-c:a" in cmd and cmd[cmd.index("-c:a") + 1] != "copy"
+
+
+def test_detect_silence_chapters_reuses_probe_cache(tmp_path, monkeypatch):
+    audio_path = tmp_path / "silence.mp3"
+    audio_path.write_bytes(b"mp3")
+    monkeypatch.setattr(output, "_require_executable", lambda _n: "ffmpeg")
+    monkeypatch.setattr(
+        output,
+        "run_cancellable_subprocess",
+        lambda *_a, **_kw: SimpleNamespace(
+            returncode=0,
+            stderr=b"[silencedetect] silence_end: 10.0 | silence_duration: 2.0\n",
+        ),
+    )
+    monkeypatch.setattr(
+        output,
+        "_probe_audio_info",
+        lambda _p: (_ for _ in ()).throw(AssertionError("should not spawn ffprobe on cache hit")),
+    )
+    cache = {str(audio_path): AudioProbeInfo(duration=30.0, codec_name="mp3")}
+    chapters = output.detect_silence_chapters(str(audio_path), probe_cache=cache)
+    assert [(c.start, c.title) for c in chapters] == [(0, "Chapter 1"), (10000, "Chapter 2")]
+
+
+def test_run_cancellable_pool_bounds_in_flight_futures():
+    from audiobookdl.utils.concurrency import run_cancellable_pool
+
+    active = 0
+    peak_active = 0
+    lock = threading.Lock()
+
+    def work(x: int) -> int:
+        nonlocal active, peak_active
+        with lock:
+            active += 1
+            peak_active = max(peak_active, active)
+        time.sleep(0.01)
+        with lock:
+            active -= 1
+        return x * 2
+
+    results = run_cancellable_pool(work, list(range(20)), max_workers=3)
+    assert results == [i * 2 for i in range(20)]
+    assert 1 <= peak_active <= 3
 
 
 

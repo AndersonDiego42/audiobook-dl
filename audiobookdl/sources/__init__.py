@@ -19,6 +19,7 @@ from .yourcloudlibrary import YourCloudLibrarySource
 
 from ..exceptions import NoSourceFound
 from dataclasses import dataclass
+import functools
 import importlib.metadata
 import re
 import threading
@@ -131,6 +132,7 @@ _BUILTIN_SOURCES: tuple[type[Source], ...] = (
 )
 
 
+@functools.lru_cache(maxsize=1)
 def _discover_plugin_sources() -> list[type[Source]]:
     """Discover third-party `Source` subclasses via the `audiobookdl.sources` entry point group."""
     from audiobookdl import logging

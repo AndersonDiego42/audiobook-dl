@@ -11,5 +11,6 @@ __pycache__/
 *.db
 *.sqlite
 *.toml
+!pyproject.toml
 *.log
 tests/

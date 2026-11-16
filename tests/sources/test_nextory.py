@@ -363,3 +363,47 @@ def test_nextory_catalog_download_succeeds_without_want_to_read_list(tmp_path):
         src.download_from_id(999)
     assert exc_info.value.error_description == "nextory_want_to_read"
 
+
+def test_nextory_parallel_playlists_and_hls_key_deduplication(tmp_path):
+    src = _make_source(tmp_path)
+    key_calls: list[str] = []
+    playlist = (
+        b"#EXTM3U\n"
+        b'#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n'
+        b"#EXTINF:5.0,\nseg0.ts\n"
+        b"#EXTINF:5.0,\nseg1.ts\n"
+        b"#EXTINF:5.0,\nseg2.ts\n"
+        b"#EXT-X-ENDLIST\n"
+    )
+
+    def fake_get(url, **_kwargs):
+        if url.endswith(".key") or url.endswith(".bin"):
+            key_calls.append(url)
+            return MagicMock(status_code=200, content=b"0123456789abcdef")
+        if url.endswith(".m3u8"):
+            return MagicMock(status_code=200, content=playlist)
+        raise AssertionError(f"Unexpected GET {url}")
+
+    src._session.get = MagicMock(side_effect=fake_get)
+    files = src.get_files(
+        {
+            "files": [
+                {"uri": "https://cdn.nextory.com/p1/media.m3u8"},
+                {"uri": "https://cdn.nextory.com/p2/media.m3u8"},
+            ]
+        }
+    )
+    assert [f.url for f in files] == [
+        "https://cdn.nextory.com/p1/seg0.ts",
+        "https://cdn.nextory.com/p1/seg1.ts",
+        "https://cdn.nextory.com/p1/seg2.ts",
+        "https://cdn.nextory.com/p2/seg0.ts",
+        "https://cdn.nextory.com/p2/seg1.ts",
+        "https://cdn.nextory.com/p2/seg2.ts",
+    ]
+    # Each playlist's 3 segments share 1 distinct key URI -> 2 key fetches total instead of 6
+    assert sorted(key_calls) == [
+        "https://cdn.nextory.com/p1/key.bin",
+        "https://cdn.nextory.com/p2/key.bin",
+    ]
+

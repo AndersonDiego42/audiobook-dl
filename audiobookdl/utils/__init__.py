@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import functools
 import importlib.resources
 import json
 import math
@@ -6,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from typing import Any
 from collections.abc import Callable, Sequence
 import shutil
@@ -46,6 +48,7 @@ def normalize_audio_bitrate(bitrate: str | None) -> str | None:
     return f"{kbps}k"
 
 
+@functools.lru_cache(maxsize=64)
 def read_asset_file(path: str) -> str:
     """
     Read audiobook-dl asset file.
@@ -88,13 +91,39 @@ def resolve_ffmpeg_dir(directory: str) -> str | None:
     return None
 
 
+_VALIDATE_EXEC_LOCK = threading.Lock()
+_VALIDATE_EXEC_CACHE: dict[tuple[str, int, int, tuple[str, ...]], str | None] = {}
+
+
+def clear_executable_validation_cache() -> None:
+    """Clear cached `validate_executable` results."""
+    with _VALIDATE_EXEC_LOCK:
+        _VALIDATE_EXEC_CACHE.clear()
+
+
 def validate_executable(path: str, *, probe_args: Sequence[str] = ("-version",)) -> str | None:
     """
     Verify that `path` can be executed on this host.
 
+    Results are cached by `(abspath, mtime_ns, size, probe_args)` to avoid
+    spawning redundant subprocesses during UI refreshes and preflight checks.
+
     Returns `None` when runnable, or a concise diagnostic message if launching fails
     (for example due to a CPU architecture mismatch, missing DLLs, or permissions).
     """
+    cache_key: tuple[str, int, int, tuple[str, ...]] | None = None
+    try:
+        st = os.stat(path)
+        cache_key = (os.path.abspath(path), st.st_mtime_ns, st.st_size, tuple(probe_args))
+    except OSError:
+        cache_key = None
+
+    if cache_key is not None:
+        with _VALIDATE_EXEC_LOCK:
+            if cache_key in _VALIDATE_EXEC_CACHE:
+                return _VALIDATE_EXEC_CACHE[cache_key]
+
+    err: str | None
     try:
         result = subprocess.run(
             [path, *probe_args],
@@ -104,22 +133,29 @@ def validate_executable(path: str, *, probe_args: Sequence[str] = ("-version",))
             **subprocess_kwargs(capture_output=True),
         )
     except OSError as exc:
-        return f"{os.path.basename(path)} failed to execute: {exc}"
+        err = f"{os.path.basename(path)} failed to execute: {exc}"
     except subprocess.SubprocessError as exc:
-        return f"{os.path.basename(path)} failed health check: {exc}"
-    if result.returncode != 0:
-        code = result.returncode
-        code_text = f"{code} (0x{code & 0xFFFFFFFF:08X})" if (code < -1 or code >= 0x80000000) else str(code)
-        detail = ""
-        for stream in (result.stderr, result.stdout):
-            if stream:
-                first_line = next((ln.strip() for ln in stream.splitlines() if ln.strip()), "")
-                if first_line:
-                    detail = first_line[:200]
-                    break
-        msg = f"{os.path.basename(path)} exited with code {code_text}"
-        return f"{msg}: {detail}" if detail else msg
-    return None
+        err = f"{os.path.basename(path)} failed health check: {exc}"
+    else:
+        if result.returncode != 0:
+            code = result.returncode
+            code_text = f"{code} (0x{code & 0xFFFFFFFF:08X})" if (code < -1 or code >= 0x80000000) else str(code)
+            detail = ""
+            for stream in (result.stderr, result.stdout):
+                if stream:
+                    first_line = next((ln.strip() for ln in stream.splitlines() if ln.strip()), "")
+                    if first_line:
+                        detail = first_line[:200]
+                        break
+            msg = f"{os.path.basename(path)} exited with code {code_text}"
+            err = f"{msg}: {detail}" if detail else msg
+        else:
+            err = None
+
+    if cache_key is not None:
+        with _VALIDATE_EXEC_LOCK:
+            _VALIDATE_EXEC_CACHE[cache_key] = err
+    return err
 
 
 def validate_ffmpeg_dir(directory: str) -> tuple[str | None, str | None]:

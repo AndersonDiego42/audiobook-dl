@@ -222,7 +222,12 @@ class GuiController:
         self.queue_records: dict[str, dict[str, Any]] = {}
         self.catalog_request_id = 0
         self.preview_request_id = 0
-        self._http_session: Any | None = None
+        self.active_job_id: str | None = None
+        self.active_job_running = False
+        self.cancelled_job_ids: set[str] = set()
+        self._thread_local = threading.local()
+        self._sessions_lock = threading.Lock()
+        self._thread_sessions: list[Any] = []
 
     @staticmethod
     def make_job_id() -> str:
@@ -317,11 +322,29 @@ class GuiController:
         )
 
     def get_http_session(self) -> Any:
-        if self._http_session is None:
+        """Return a per-thread pooled `requests.Session` closed on controller shutdown."""
+        session = getattr(self._thread_local, "http_session", None)
+        if session is None:
             import requests
 
-            self._http_session = requests.Session()
-        return self._http_session
+            session = requests.Session()
+            self._thread_local.http_session = session
+            with self._sessions_lock:
+                self._thread_sessions.append(session)
+        return session
+
+    @staticmethod
+    def _close_job_prefetched(job: QueuedJob | None) -> None:
+        if job is None or job.prefetched is None:
+            return
+        source = job.prefetched[0]
+        job.prefetched = None
+        close_fn = getattr(source, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                pass
 
     def queue_state_path(self) -> str:
         """Return path to `gui_queue.json` beside `config_location` (or default config dir)."""
@@ -427,7 +450,13 @@ class GuiController:
         self.pause_queue()
         return True
 
-    def register_queue_record(self, job: QueuedJob, service_label: str) -> dict[str, Any]:
+    def register_queue_record(
+        self,
+        job: QueuedJob,
+        service_label: str,
+        *,
+        persist: bool = True,
+    ) -> dict[str, Any]:
         rec = {
             "job_id": job.job_id,
             "run_id": job.run_id,
@@ -439,7 +468,8 @@ class GuiController:
         }
         with self.queue_lock:
             self.queue_records[job.job_id] = rec
-        self.save_queue_state()
+        if persist:
+            self.save_queue_state()
         return rec
 
     def update_queue_record(self, job_id: str, status: str, detail: str = "") -> dict[str, Any] | None:
@@ -494,14 +524,20 @@ class GuiController:
         self,
         urls: Sequence[str],
         build_job_options: Callable[[str], args.DownloadOptions],
+        *,
+        allow_existing: bool = False,
     ) -> tuple[bool, list[QueuedJob], int]:
-        """Append unseen URLs to the active queue; returns `(has_active_run, added_jobs, batch_total)`."""
+        """Append unseen URLs (or retried URLs when `allow_existing=True`) to the active queue."""
         unique_urls = list(dict.fromkeys(urls))
         added_jobs: list[QueuedJob] = []
         with self.queue_cond:
             if not self.worker_has_active_run:
                 return False, [], self.batch_total
-            new_urls = [u for u in unique_urls if u not in self.run_seen_urls]
+            new_urls = (
+                list(unique_urls)
+                if allow_existing
+                else [u for u in unique_urls if u not in self.run_seen_urls]
+            )
             if not new_urls:
                 return True, [], self.batch_total
             if self.interaction is None:
@@ -628,26 +664,37 @@ class GuiController:
 
     def remove_pending_job(self, job_id: str) -> tuple[bool, int | None, bool]:
         """Remove a job from pending queue/records; returns `(removed, new_batch_total, is_active_running)`."""
-        rec = self.queue_records.get(job_id)
-        if rec is None:
-            return False, None, False
+        removed_job: QueuedJob | None = None
         with self.queue_cond:
+            rec = self.queue_records.get(job_id)
+            if rec is None:
+                return False, None, False
             pending_idx: int | None = None
             for idx, job in enumerate(self.pending_jobs):
                 if job is not None and job.job_id == job_id:
                     pending_idx = idx
                     break
             if pending_idx is not None:
+                removed_job = self.pending_jobs[pending_idx]
                 del self.pending_jobs[pending_idx]
                 self.batch_total = max(0, self.batch_total - 1)
-                self.run_seen_urls.discard(rec["url"])
+                if not any(j is not None and j.url == rec["url"] for j in self.pending_jobs):
+                    self.run_seen_urls.discard(rec["url"])
                 new_total: int | None = self.batch_total
+            elif self.active_job_id == job_id:
+                if self.active_job_running or rec["status"] == "Running":
+                    return False, None, True
+                self.cancelled_job_ids.add(job_id)
+                self.batch_total = max(0, self.batch_total - 1)
+                if not any(j is not None and j.url == rec["url"] for j in self.pending_jobs):
+                    self.run_seen_urls.discard(rec["url"])
+                new_total = self.batch_total
             elif rec["status"] == "Running":
                 return False, None, True
             else:
                 new_total = None
-        with self.queue_lock:
             self.queue_records.pop(job_id, None)
+        self._close_job_prefetched(removed_job)
         self.save_queue_state()
         return True, new_total, False
 
@@ -713,18 +760,41 @@ class GuiController:
     def _drain_pending_jobs(self, cancel_status: str = "Cancelled") -> bool:
         """Remove queued jobs after cancellation/error; return True if close sentinel seen."""
         saw_sentinel = False
-        cancelled_ids: list[str] = []
+        cancelled_jobs: list[QueuedJob] = []
         with self.queue_cond:
             while self.pending_jobs:
                 pending = self.pending_jobs.popleft()
                 if pending is None:
                     saw_sentinel = True
                     break
-                cancelled_ids.append(pending.job_id)
+                cancelled_jobs.append(pending)
             self.worker_has_active_run = False
-        for job_id in cancelled_ids:
-            self.event_queue.put(("job_status", job_id, cancel_status, ""))
+        for job in cancelled_jobs:
+            self._close_job_prefetched(job)
+            self.event_queue.put(("job_status", job.job_id, cancel_status, ""))
         return saw_sentinel
+
+    def _pop_next_job_locked(self) -> tuple[QueuedJob | None, bool]:
+        """Pop the next job from `pending_jobs` while holding `self.queue_cond`."""
+        if not self.pending_jobs:
+            self.worker_has_active_run = False
+            self.active_job_id = None
+            self.active_job_running = False
+            return None, False
+        next_job = self.pending_jobs.popleft()
+        if next_job is None:
+            self.worker_has_active_run = False
+            self.active_job_id = None
+            self.active_job_running = False
+            return None, True
+        self.active_job_id = next_job.job_id
+        self.active_job_running = False
+        return next_job, False
+
+    def _discard_seen_url_if_unpending(self, url: str) -> None:
+        with self.queue_cond:
+            if not any(j is not None and j.url == url for j in self.pending_jobs):
+                self.run_seen_urls.discard(url)
 
     def _worker_loop(self) -> None:
         while True:
@@ -732,6 +802,9 @@ class GuiController:
                 while not self.pending_jobs:
                     self.queue_cond.wait()
                 first_job = self.pending_jobs.popleft()
+                if first_job is not None:
+                    self.active_job_id = first_job.job_id
+                    self.active_job_running = False
             if first_job is None:
                 break
 
@@ -748,19 +821,43 @@ class GuiController:
                     while not self.pause_event.wait(0.2):
                         if self.cancel_event.is_set():
                             break
-                item_index += 1
+                        with self.queue_cond:
+                            if current_job.job_id in self.cancelled_job_ids:
+                                break
                 if self.cancel_event.is_set():
                     batch_summary.cancelled = True
+                    self._close_job_prefetched(current_job)
+                    with self.queue_cond:
+                        self.cancelled_job_ids.discard(current_job.job_id)
+                        self.active_job_id = None
+                        self.active_job_running = False
                     self.event_queue.put(("job_status", current_job.job_id, "Cancelled", ""))
                     saw_sentinel = self._drain_pending_jobs("Cancelled")
                     break
 
-                with self.queue_lock:
-                    item_total = self.batch_total
+                with self.queue_cond:
+                    if current_job.job_id in self.cancelled_job_ids:
+                        self.cancelled_job_ids.discard(current_job.job_id)
+                        self.active_job_id = None
+                        self.active_job_running = False
+                        skipped_job = current_job
+                        current_job, saw_sentinel = self._pop_next_job_locked()
+                        skip_removed = True
+                    else:
+                        self.active_job_running = True
+                        item_total = self.batch_total
+                        skip_removed = False
+                        skipped_job = None
 
+                if skip_removed:
+                    self._close_job_prefetched(skipped_job)
+                    continue
+
+                item_index += 1
                 self.event_queue.put(("batch_item", run_id, item_index, item_total, current_job.url))
                 self.event_queue.put(("job_status", current_job.job_id, "Running", ""))
 
+                should_break = False
                 try:
                     config = self.config_snapshot()
                     if current_job.pack_request is not None:
@@ -810,11 +907,13 @@ class GuiController:
                     batch_summary.book_errors.extend(summary.book_errors)
                     if summary.cancelled:
                         batch_summary.cancelled = True
+                        self._discard_seen_url_if_unpending(current_job.url)
                         self.event_queue.put(("job_status", current_job.job_id, "Cancelled", ""))
                         saw_sentinel = self._drain_pending_jobs("Cancelled")
-                        break
-                    if summary.failed > 0 or summary.books_failed > 0:
+                        should_break = True
+                    elif summary.failed > 0 or summary.books_failed > 0:
                         detail = format_failed_job_detail(summary.book_errors)
+                        self._discard_seen_url_if_unpending(current_job.url)
                         self.event_queue.put(("job_status", current_job.job_id, "Failed", detail))
                     else:
                         detail = (
@@ -823,24 +922,39 @@ class GuiController:
                             else ("Skipped" if summary.books_skipped else "Done")
                         )
                         self.event_queue.put(("job_status", current_job.job_id, "Completed", detail))
-                except Exception as exc:
-                    fatal_exc = exc
-                    self.event_queue.put(("job_status", current_job.job_id, "Failed", str(exc)[:120]))
+                except DownloadCancelled:
+                    batch_summary.cancelled = True
+                    self._discard_seen_url_if_unpending(current_job.url)
+                    self.event_queue.put(("job_status", current_job.job_id, "Cancelled", ""))
                     saw_sentinel = self._drain_pending_jobs("Cancelled")
+                    should_break = True
+                except Exception as exc:
+                    if self.cancel_event.is_set():
+                        batch_summary.cancelled = True
+                        self._discard_seen_url_if_unpending(current_job.url)
+                        self.event_queue.put(("job_status", current_job.job_id, "Cancelled", ""))
+                        saw_sentinel = self._drain_pending_jobs("Cancelled")
+                        should_break = True
+                    else:
+                        err_text = str(exc).strip() or type(exc).__name__
+                        batch_summary.failed += 1
+                        batch_summary.books_failed += 1
+                        batch_summary.book_errors.append((current_job.url, err_text))
+                        self._discard_seen_url_if_unpending(current_job.url)
+                        self.event_queue.put(("log", "ERROR", f"{current_job.url}: {err_text}"))
+                        self.event_queue.put(("job_status", current_job.job_id, "Failed", err_text[:120]))
+                finally:
+                    self._close_job_prefetched(current_job)
+                    with self.queue_cond:
+                        self.cancelled_job_ids.discard(current_job.job_id)
+                        self.active_job_id = None
+                        self.active_job_running = False
+
+                if should_break:
                     break
 
                 with self.queue_cond:
-                    if not self.pending_jobs:
-                        self.worker_has_active_run = False
-                        current_job = None
-                    else:
-                        next_job = self.pending_jobs.popleft()
-                        if next_job is None:
-                            self.worker_has_active_run = False
-                            saw_sentinel = True
-                            current_job = None
-                        else:
-                            current_job = next_job
+                    current_job, saw_sentinel = self._pop_next_job_locked()
 
             self.event_queue.put(("done", run_id, batch_summary, fatal_exc))
             if saw_sentinel:
@@ -954,9 +1068,9 @@ class GuiController:
 
     def start_update_check(self, *, interactive: bool, respect_opt_out: bool) -> None:
         proxy = self.config.proxy
-        session = self.get_http_session()
 
         def _worker() -> None:
+            session = self.get_http_session()
             info = check_for_updates(proxy=proxy, session=session, respect_opt_out=respect_opt_out)
             if interactive or (info is not None and info.has_update):
                 self.event_queue.put(("update_checked", info, interactive))
@@ -1064,11 +1178,32 @@ class GuiController:
             self.preview_cancel_event.set()
             if self.preview_interaction is not None:
                 self.preview_interaction.release_all()
+        drained_jobs: list[QueuedJob] = []
         with self.queue_cond:
+            for item in self.pending_jobs:
+                if item is not None:
+                    drained_jobs.append(item)
             self.pending_jobs.append(None)
             self.queue_cond.notify_all()
-        if self._http_session is not None:
+        for job in drained_jobs:
+            self._close_job_prefetched(job)
+        while True:
             try:
-                self._http_session.close()
+                ev = self.event_queue.get_nowait()
+            except queue.Empty:
+                break
+            if ev and ev[0] == "preview_done" and len(ev) >= 3 and ev[2] is not None:
+                close_fn = getattr(ev[2][0], "close", None)
+                if callable(close_fn):
+                    try:
+                        close_fn()
+                    except Exception:
+                        pass
+        with self._sessions_lock:
+            sessions = list(self._thread_sessions)
+            self._thread_sessions.clear()
+        for session in sessions:
+            try:
+                session.close()
             except Exception:
                 pass

@@ -90,7 +90,8 @@ def test_blinkist_source_parses_api_fixtures(tmp_path):
     assert book.metadata.title == "Blink Book"
     assert book.metadata.authors == ["Jane Doe"]
     assert book.metadata.language is not None and book.metadata.language.alpha_3 == "eng"
-    assert [f.url for f in book.files] == [
+    assert [f.url for f in book.files] == ["", ""]
+    assert [f.url_resolver() for f in book.files if f.url_resolver is not None] == [
         "https://cdn.blinkist.com/c1.m4a",
         "https://cdn.blinkist.com/c2.m4a",
     ]
@@ -98,16 +99,6 @@ def test_blinkist_source_parses_api_fixtures(tmp_path):
 
 
 def test_bookbeat_source_login_and_download(tmp_path):
-    saved_books = {
-        "_embedded": {
-            "savedBooks": [
-                {
-                    "bookid": 42,
-                    "_links": {"book": {"href": "https://api.bookbeat.com/api/books/42"}},
-                }
-            ]
-        }
-    }
     book_meta = {
         "title": "BookBeat Novel",
         "language": "sv",
@@ -140,7 +131,6 @@ def test_bookbeat_source_login_and_download(tmp_path):
     src._session.post = MagicMock(return_value=_json_resp({"token": "bb-jwt"}))
     src._session.get = MagicMock(
         side_effect=[
-            _json_resp(saved_books),
             _json_resp(book_meta),
             _json_resp(dl_info),
             _json_resp(lic),
@@ -149,6 +139,7 @@ def test_bookbeat_source_login_and_download(tmp_path):
     )
     src.login("https://www.bookbeat.com/book/42", username="u", password="p")
     book = src.download("https://www.bookbeat.com/book/42")
+    assert src._saved_books_cache is None
     assert isinstance(book, Audiobook)
     assert book.metadata.title == "BookBeat Novel"
     assert book.metadata.authors == ["Ada Lovelace"]
@@ -296,7 +287,9 @@ def test_chirp_source_decrypts_track_urls_and_parses_credits(tmp_path):
     assert book.metadata.title == "Chirp Book"
     assert book.metadata.authors == ["Alice"]
     assert book.metadata.narrators == ["Bob"]
-    assert book.files[0].url == short_url
+    assert book.files[0].url == ""
+    assert book.files[0].url_resolver is not None
+    assert book.files[0].url_resolver() == short_url
     assert book.chapters[0].title == "Ch 1"
 
 
@@ -349,8 +342,8 @@ def test_saxo_source_login_search_and_download(tmp_path):
     src._session.get = MagicMock(
         side_effect=[
             _json_resp({"items": [{"bookId": "saxo-1"}]}),
-            _json_resp({"link": "https://stream.saxo.com/ch01.mp3"}),
             MagicMock(status_code=200, content=b"saxo-cover"),
+            _json_resp({"link": "https://stream.saxo.com/ch01.mp3"}),
         ]
     )
     src.login("https://www.saxo.com/dk/book_9781234567890", username="u", password="p")
@@ -359,7 +352,9 @@ def test_saxo_source_login_search_and_download(tmp_path):
     assert book.metadata.series == "S Series"
     assert book.metadata.language is not None and book.metadata.language.alpha_3 == "dan"
     assert book.metadata.release_date == date(2023, 9, 10)
-    assert book.files[0].url == "https://stream.saxo.com/ch01.mp3"
+    assert book.files[0].url == ""
+    assert book.files[0].url_resolver is not None
+    assert book.files[0].url_resolver() == "https://stream.saxo.com/ch01.mp3"
     assert book.files[0].encryption_method is not None
 
 
@@ -1278,7 +1273,6 @@ def test_source_metadata_language_and_release_date_serialize_to_all_output_forma
 
 
 def test_section23_adapter_scraping_routing_and_auth_fixes(tmp_path):
-    from audiobookdl.exceptions import UserNotAuthorized
     from audiobookdl.sources import find_compatible_source
 
     # 1. OverDrive: semicolons inside bData, nested TOC chapters, and verify_auth false-positive fix
@@ -1359,7 +1353,9 @@ def test_section23_adapter_scraping_routing_and_auth_fixes(tmp_path):
     ch_book = ch.download("https://www.chirpbooks.com/player/77")
     assert ch_book.metadata.authors == ["Alice Smith"]
     assert ch_book.metadata.narrators == ["Bob Jones"]
-    assert ch_book.files[0].url == track_url
+    assert ch_book.files[0].url == ""
+    assert ch_book.files[0].url_resolver is not None
+    assert ch_book.files[0].url_resolver() == track_url
 
     # 3. Audiobooks.com: trailing slash, multi-part /book/stream/<id>/<n>, dotted domain & opaque ci_session
     ab = AudiobooksdotcomSource(_opts(tmp_path))

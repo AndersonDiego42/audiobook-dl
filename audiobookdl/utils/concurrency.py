@@ -4,7 +4,7 @@ import contextvars
 import subprocess
 import tempfile
 import threading
-from typing import TypeVar, cast
+from typing import Any, TypeVar, cast
 from collections.abc import Callable, Iterator, Sequence
 
 from audiobookdl.exceptions import DownloadCancelled
@@ -158,14 +158,23 @@ def run_cancellable_pool(
             raise DownloadCancelled
         return fn(item)
 
-    futures = [
-        executor.submit(contextvars.copy_context().run, _run_item, item)
-        for item in items
-    ]
-    future_to_idx = {fut: idx for idx, fut in enumerate(futures)}
     ordered: list[T_out | None] = [None] * count
-    pending = set(futures)
+    future_to_idx: dict[Any, int] = {}
+    pending: set[Any] = set()
+    next_idx = 0
+
+    def _submit_up_to_window() -> None:
+        nonlocal next_idx
+        while next_idx < count and len(pending) < workers:
+            if cancel_event is not None and cancel_event.is_set():
+                raise DownloadCancelled
+            fut = executor.submit(contextvars.copy_context().run, _run_item, items[next_idx])
+            future_to_idx[fut] = next_idx
+            pending.add(fut)
+            next_idx += 1
+
     try:
+        _submit_up_to_window()
         while pending:
             if cancel_event is not None and cancel_event.is_set():
                 raise DownloadCancelled
@@ -175,11 +184,13 @@ def run_cancellable_pool(
                 return_when=FIRST_COMPLETED,
             )
             for fut in done:
-                ordered[future_to_idx[fut]] = fut.result()
+                idx = future_to_idx.pop(fut)
+                ordered[idx] = fut.result()
+            _submit_up_to_window()
         executor.shutdown(wait=True)
         return cast(list[T_out], ordered)
     except BaseException:
-        for fut in futures:
+        for fut in pending:
             fut.cancel()
         if cancel_event is not None and cancel_event.is_set() and pending:
             wait(pending, timeout=2.0)

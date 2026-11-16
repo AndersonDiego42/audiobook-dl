@@ -476,4 +476,46 @@ def test_atomic_write_text_private_succeeds(tmp_path):
     assert target.read_text(encoding="utf-8") == "secret-token\n"
 
 
+def test_file_lock_allows_reentrant_nesting_in_same_thread(tmp_path):
+    from audiobookdl.utils.fs import file_lock
+
+    target = tmp_path / "reentrant.toml"
+    with file_lock(str(target), timeout=0.5):
+        with file_lock(str(target), timeout=0.5):
+            target.write_text("ok", encoding="utf-8")
+    assert target.read_text(encoding="utf-8") == "ok"
+
+
+def test_env_config_overrides_portable_mode_in_config_dir(tmp_path, monkeypatch):
+    import sys
+
+    exe_dir = tmp_path / "portable"
+    exe_dir.mkdir()
+    (exe_dir / ".portable").write_text("", encoding="utf-8")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(exe_dir / "audiobook-dl.exe"))
+    assert is_portable_mode() is True
+
+    env_cfg = tmp_path / "override" / "custom.toml"
+    monkeypatch.setenv("AUDIOBOOK_DL_CONFIG", str(env_cfg))
+    assert config_dir() == str(env_cfg.parent)
+    assert get_config_location(None) == str(env_cfg)
+
+
+def test_debug_and_cover_keys_merge_from_config(tmp_path):
+    from audiobookdl import args
+    from audiobookdl.config import structure_config
+    from audiobookdl.pipeline import apply_runtime_options
+
+    cfg = structure_config(
+        str(tmp_path / "audiobook-dl.toml"),
+        {"debug": True, "cover": True},
+        credential_store=None,
+    )
+    opts = args.parse_arguments([])
+    apply_runtime_options(opts, cfg)
+    assert opts.debug is True
+    assert opts.cover is True
+
+
 

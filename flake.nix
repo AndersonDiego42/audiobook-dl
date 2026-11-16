@@ -35,7 +35,6 @@
 
           build-system = with python.pkgs; [
             setuptools
-            setuptools-scm
           ];
 
           dependencies = with python.pkgs; [
@@ -52,9 +51,14 @@
             pycryptodome
             requests
             rich
+            tkinter
             tomli
             urllib3
             python-dateutil
+          ];
+
+          makeWrapperArgs = [
+            "--prefix" "PATH" ":" "${lib.makeBinPath [ pkgs.ffmpeg ]}"
           ];
 
           meta = {

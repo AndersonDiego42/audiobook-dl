@@ -8,6 +8,7 @@ from collections.abc import Callable
 
 from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, apply_theme_to_window, scale_px
 from audiobookdl.gui.widgets import (
+    MainThreadCallbackQueue,
     ScrolledTreeview,
     TreeColumnSpec,
     populate_grouped_tree,
@@ -47,6 +48,7 @@ class ArchiveLedgerDialog(tk.Toplevel):
         self._on_queue_urls = on_queue_urls
         self._entries_by_id: dict[int, ArchiveEntry] = {}
         self._palette = palette or LIGHT_PALETTE
+        self._cb_queue = MainThreadCallbackQueue(self)
 
         self.title("Library & Download Ledger")
         self.transient(parent)  # type: ignore[arg-type]
@@ -268,8 +270,9 @@ class ArchiveLedgerDialog(tk.Toplevel):
         if raw is None:
             return
         parsed = parse_tags_input(raw)
-        for entry_id in selected_ids:
-            ledger.set_tags(entry_id, parsed)
+        with ledger.batch_connection():
+            for entry_id in selected_ids:
+                ledger.set_tags(entry_id, parsed)
         self._refresh()
 
     def _toggle_hide_selected(self) -> None:
@@ -279,12 +282,13 @@ class ArchiveLedgerDialog(tk.Toplevel):
         ledger = self._get_ledger()
         if ledger is None:
             return
-        for entry_id in selected_ids:
-            entry = self._entries_by_id.get(entry_id)
-            if entry is not None and entry.is_hidden:
-                ledger.remove_tags(entry_id, ["hidden"])
-            else:
-                ledger.add_tags(entry_id, ["hidden"])
+        with ledger.batch_connection():
+            for entry_id in selected_ids:
+                entry = self._entries_by_id.get(entry_id)
+                if entry is not None and entry.is_hidden:
+                    ledger.remove_tags(entry_id, ["hidden"])
+                else:
+                    ledger.add_tags(entry_id, ["hidden"])
         self._refresh()
 
     def _toggle_trash_selected(self) -> None:
@@ -294,15 +298,16 @@ class ArchiveLedgerDialog(tk.Toplevel):
         ledger = self._get_ledger()
         if ledger is None:
             return
-        for entry_id in selected_ids:
-            entry = self._entries_by_id.get(entry_id)
-            if entry is None:
-                continue
-            if entry.status == "trashed":
-                restored_status = "downloaded" if entry.output_path else "pending"
-                ledger.set_status(entry_id, restored_status)
-            else:
-                ledger.set_status(entry_id, "trashed")
+        with ledger.batch_connection():
+            for entry_id in selected_ids:
+                entry = self._entries_by_id.get(entry_id)
+                if entry is None:
+                    continue
+                if entry.status == "trashed":
+                    restored_status = "downloaded" if entry.output_path else "pending"
+                    ledger.set_status(entry_id, restored_status)
+                else:
+                    ledger.set_status(entry_id, "trashed")
         self._refresh()
 
     def _remove_selected(self) -> None:
@@ -312,10 +317,11 @@ class ArchiveLedgerDialog(tk.Toplevel):
         ledger = self._get_ledger()
         if ledger is None:
             return
-        for entry_id in selected_ids:
-            ledger.delete_entry(entry_id)
-            if self._tree.exists(str(entry_id)):
-                self._tree.delete(str(entry_id))
+        with ledger.batch_connection():
+            for entry_id in selected_ids:
+                ledger.delete_entry(entry_id)
+                if self._tree.exists(str(entry_id)):
+                    self._tree.delete(str(entry_id))
         self._refresh()
 
     def _clear_all(self) -> None:
@@ -368,16 +374,19 @@ class ArchiveLedgerDialog(tk.Toplevel):
             _finish(res, None)
             return res
 
+        self._cb_queue.begin_task()
+
         def _worker() -> None:
             # Open a dedicated sqlite connection in the worker thread.
             worker_ledger = DownloadArchive(self._archive_path, persistent=True)
             try:
                 res = scan_local_library([folder], worker_ledger, verify_missing=True)
-                self.after(0, lambda: _finish(res, None))
+                self._cb_queue.post(lambda r=res: _finish(r, None))
             except Exception as exc:
-                self.after(0, lambda err=str(exc): _finish(None, err))
+                self._cb_queue.post(lambda err=str(exc): _finish(None, err))
             finally:
                 worker_ledger.close()
+                self._cb_queue.finish_worker()
 
         threading.Thread(target=_worker, daemon=True).start()
         return None

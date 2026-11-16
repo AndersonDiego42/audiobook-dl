@@ -2,7 +2,6 @@ from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover
 from audiobookdl.exceptions import RequestError, UserNotAuthorized
 from audiobookdl.utils.audiobook import parse_language
-from audiobookdl.utils.concurrency import run_cancellable_pool
 
 from html import unescape
 import re
@@ -128,21 +127,26 @@ class BlinkistSource(Source):
         book_id = book_info["book"]["id"]
         chapters = book_info["chapters"]
 
-        def _fetch_chapter(chapter: dict) -> AudiobookFile:
-            chapter_id = chapter["id"]
-            audio_url = self.get_json(
-                f"https://www.blinkist.com/api/books/{book_id}/chapters/{chapter_id}"
-            )["signed_audio_url"]
-            ch_title = chapter.get("title") or chapter.get("headline")
-            return AudiobookFile(
-                url=audio_url,
-                ext="m4a",
-                title=str(ch_title).strip() if ch_title else None,
-            )
+        def _make_resolver(chapter_id: str):
+            def _resolve() -> str:
+                return self.get_json(
+                    f"https://www.blinkist.com/api/books/{book_id}/chapters/{chapter_id}"
+                )["signed_audio_url"]
 
-        if len(chapters) <= 1:
-            return [_fetch_chapter(c) for c in chapters]
-        return run_cancellable_pool(_fetch_chapter, chapters, max_workers=8)
+            return _resolve
+
+        files: list[AudiobookFile] = []
+        for chapter in chapters:
+            ch_title = chapter.get("title") or chapter.get("headline")
+            files.append(
+                AudiobookFile(
+                    url="",
+                    ext="m4a",
+                    title=str(ch_title).strip() if ch_title else None,
+                    url_resolver=_make_resolver(chapter["id"]),
+                )
+            )
+        return files
 
     def download_book_info(self, book_id: str) -> dict:
         return self.get_json(

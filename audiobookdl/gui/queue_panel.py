@@ -296,12 +296,12 @@ class ActivityQueuePanel(ttk.LabelFrame):
                 values=(rec["service"], rec["url"], rec["status"], rec.get("detail", "")),
             )
 
-    def register_queue_job(self, job: QueuedJob) -> None:
+    def register_queue_job(self, job: QueuedJob, *, persist: bool = True) -> None:
         """Insert a queued job row into the Queue & History table and internal index."""
         service_label = (
             "Local Pack" if job.pack_request is not None else self._service_label_for_url(job.url)
         )
-        self._controller.register_queue_record(job, service_label)
+        self._controller.register_queue_record(job, service_label, persist=persist)
         self.queue_tree.insert(
             "",
             tk.END,

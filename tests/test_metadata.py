@@ -426,9 +426,9 @@ def test_add_id3_metadata_sets_4_digit_tyer_and_full_iso_tdrc_tdor(
         orig_save = audio.save
 
         def capture_save(*args, **save_kwargs):
-            recorded_easy_keys["year"] = list(audio["year"])
-            recorded_easy_keys["date"] = list(audio["date"])
-            recorded_easy_keys["originaldate"] = list(audio["originaldate"])
+            recorded_easy_keys["year"] = [str(x) for x in audio["TYER"].text]
+            recorded_easy_keys["date"] = [str(x) for x in audio["TDRC"].text]
+            recorded_easy_keys["originaldate"] = [str(x) for x in audio["TDOR"].text]
             return orig_save(*args, **save_kwargs)
 
         audio.save = capture_save
@@ -849,4 +849,45 @@ def test_add_metadata_with_track_context_writes_track_and_preserves_series(tmp_p
         assert info.track_number == 2
         assert info.metadata.series == "Saga Name"
         assert info.metadata.series_order == 2
+
+
+def test_add_id3_metadata_writes_tags_chapters_and_cover_in_single_save(tmp_path, monkeypatch):
+    from audiobookdl import Cover
+
+    mp3_path = tmp_path / "single_save.mp3"
+    _create_silent_audio(mp3_path, ["-c:a", "libmp3lame"])
+
+    save_calls = []
+    real_mp3 = id3.MP3
+
+    def spy_mp3(path, **kwargs):
+        audio = real_mp3(path, **kwargs)
+        orig_save = audio.save
+
+        def count_save(*args, **save_kwargs):
+            save_calls.append((args, save_kwargs))
+            return orig_save(*args, **save_kwargs)
+
+        audio.save = count_save
+        return audio
+
+    monkeypatch.setattr(id3, "MP3", spy_mp3)
+
+    meta = AudiobookMetadata(title="Single Save", authors=["Author"])
+    chapters = [Chapter(start=0, title="Intro")]
+    cover = Cover(image=_make_image_bytes("PNG", mode="RGB"), extension="png")
+
+    embedded = output_metadata.add_metadata(
+        str(mp3_path),
+        meta,
+        cover=cover,
+        chapters=chapters,
+    )
+    assert embedded is True
+    assert len(save_calls) == 1
+    tags = ID3(str(mp3_path))
+    assert str(tags["TIT2"]) == "Single Save"
+    assert tags.getall("APIC")
+    assert tags.getall("CHAP")
+    assert tags.getall("CTOC")
 

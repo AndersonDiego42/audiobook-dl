@@ -1,7 +1,6 @@
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover
 from audiobookdl.exceptions import BookNotFound, DataNotPresent
-from audiobookdl.utils.concurrency import run_cancellable_pool
 
 import base64
 from Crypto.Cipher import AES
@@ -113,16 +112,18 @@ class ChirpSource(Source):
         return unpad(cipher.decrypt(ciphertext), AES.block_size).decode("utf-8")
 
     def get_files(self, book_id: int, key: bytes, iv: bytes, tracks) -> list[AudiobookFile]:
-        def _fetch_track(track) -> AudiobookFile:
-            return AudiobookFile(
-                url=self.get_audio_url(book_id, key, iv, track),
+        def _make_resolver(trk: dict):
+            return lambda: self.get_audio_url(book_id, key, iv, trk)
+
+        return [
+            AudiobookFile(
+                url="",
                 ext="mp3",
                 title=track["displayName"],
+                url_resolver=_make_resolver(track),
             )
-
-        if len(tracks) <= 1:
-            return [_fetch_track(track) for track in tracks]
-        return run_cancellable_pool(_fetch_track, tracks, max_workers=8)
+            for track in tracks
+        ]
 
     def get_chapters(self, tracks) -> list[Chapter]:
         chapters = []

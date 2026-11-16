@@ -175,6 +175,8 @@ def test_schema_driven_merge_and_preset_precedence(tmp_path):
             "download_archive": str(tmp_path / "arch.sqlite"),
             "database_directory": str(tmp_path / "db"),
             "remove_chars": ":?",
+            "debug": True,
+            "cover": True,
             "no_chapters": True,
             "split_chapters": True,
             "write_json_metadata": True,

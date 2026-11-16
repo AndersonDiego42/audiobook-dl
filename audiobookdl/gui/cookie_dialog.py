@@ -11,7 +11,7 @@ from tkinter import filedialog, messagebox, ttk
 from collections.abc import Callable, Sequence
 
 from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, apply_theme_to_window, scale_px
-from audiobookdl.gui.widgets import ScrolledTreeview, TreeColumnSpec
+from audiobookdl.gui.widgets import MainThreadCallbackQueue, ScrolledTreeview, TreeColumnSpec
 from audiobookdl.sources import ServiceInfo
 from audiobookdl.utils.browser_cookies import (
     BROWSER_LABELS,
@@ -80,6 +80,7 @@ class CookieImportDialog(tk.Toplevel):
         self._matched_cookies: list[http.cookiejar.Cookie] = []
         self._is_scanning = False
         self._custom_output_path = bool(initial_cookie_path.strip())
+        self._cb_queue = MainThreadCallbackQueue(self)
 
         self._browser_key_by_display: dict[str, str] = {}
         self._browser_displays: list[str] = []
@@ -259,6 +260,8 @@ class CookieImportDialog(tk.Toplevel):
         self._browser_combo.configure(state="disabled")
         self._set_status(f"Scanning {self._browser_var.get()} cookies...", "Muted.TLabel")
 
+        self._cb_queue.begin_task()
+
         def _worker() -> None:
             result: CookieImportResult | None = None
             err: Exception | None = None
@@ -266,8 +269,9 @@ class CookieImportDialog(tk.Toplevel):
                 result = self._extractor(browser_key, domains)
             except Exception as exc:
                 err = exc
-            if self.winfo_exists():
-                self.after(0, lambda r=result, e=err: self._on_scan_finished(r, e))
+            finally:
+                self._cb_queue.post(lambda r=result, e=err: self._on_scan_finished(r, e))
+                self._cb_queue.finish_worker()
 
         threading.Thread(target=_worker, daemon=True, name="abdl-cookie-scan").start()
 

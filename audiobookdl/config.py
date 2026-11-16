@@ -297,13 +297,13 @@ def config_dir() -> str:
 
     :returns: Path of configuration directory
     """
+    env_cfg = _env_config_path()
+    if env_cfg is not None:
+        return os.path.dirname(env_cfg)
     if is_portable_mode():
         exe_dir = _frozen_executable_dir()
         if exe_dir is not None:
             return exe_dir
-    env_cfg = _env_config_path()
-    if env_cfg is not None:
-        return os.path.dirname(env_cfg)
     return platformdirs.user_config_dir("audiobook-dl", "jo1gi")
 
 
