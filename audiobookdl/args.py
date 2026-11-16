@@ -140,7 +140,7 @@ def parse_arguments(argv: Sequence[str] | None = None) -> DownloadOptions:
             "  audiobook-dl pack <paths...>      Repackage local folders/tracks offline into .m4b\n"
             "  audiobook-dl library <action>     Manage unified library ledger, tags, and trash\n"
             "  audiobook-dl scan <paths...>      Scan local folders into downloads.db\n"
-            "  audiobook-dl export <out>         Export library catalog (csv, json, xlsx, md)\n"
+            "  audiobook-dl export <out>         Export library catalog (csv, json, xlsx)\n"
             "  audiobook-dl sync                 Poll configured libraries and download new books\n"
             "  audiobook-dl serve                Launch headless Web UI dashboard and JSON API"
         ),
