@@ -5,11 +5,11 @@ from audiobookdl.utils.concurrency import run_cancellable_pool
 
 from html import unescape
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any
 from urllib.parse import quote_plus, urlsplit
 
 
-def _clean_html_text(raw: Optional[str]) -> Optional[str]:
+def _clean_html_text(raw: str | None) -> str | None:
     if not raw or not isinstance(raw, str):
         return None
     text = re.sub(r"</?(?:p|div|br|li|ul|ol|h[1-6])\b[^>]*>", " ", raw, flags=re.IGNORECASE)
@@ -18,7 +18,7 @@ def _clean_html_text(raw: Optional[str]) -> Optional[str]:
     return cleaned or None
 
 
-def _duration_seconds(chapter: Dict[str, Any]) -> float:
+def _duration_seconds(chapter: dict[str, Any]) -> float:
     for key in ("duration", "duration_in_seconds", "audio_duration", "length"):
         val = chapter.get(key)
         if isinstance(val, (int, float)) and val > 0:
@@ -63,13 +63,13 @@ class BlinkistSource(Source):
     @staticmethod
     def format_metadata(book_info: dict) -> AudiobookMetadata:
         book = book_info.get("book", book_info)
-        authors: List[str] = []
+        authors: list[str] = []
         if isinstance(book.get("authors"), list):
             authors = [str(a).strip() for a in book["authors"] if str(a).strip()]
         elif isinstance(book.get("author"), str) and book["author"].strip():
             authors = [book["author"].strip()]
 
-        narrators: List[str] = []
+        narrators: list[str] = []
         raw_narrators = book.get("narrators") or book.get("narrator") or book.get("reader")
         if isinstance(raw_narrators, list):
             narrators = [
@@ -89,7 +89,7 @@ class BlinkistSource(Source):
             or _clean_html_text(book.get("summary"))
         )
 
-        genres: List[str] = []
+        genres: list[str] = []
         if isinstance(book.get("categories"), list):
             for cat in book["categories"]:
                 label = cat.get("label") if isinstance(cat, dict) else cat
@@ -109,9 +109,9 @@ class BlinkistSource(Source):
         )
 
     @staticmethod
-    def get_chapters(book_info: dict) -> List[Chapter]:
+    def get_chapters(book_info: dict) -> list[Chapter]:
         raw_chapters = book_info.get("chapters") or []
-        chapters: List[Chapter] = []
+        chapters: list[Chapter] = []
         offset_ms = 0
         for idx, chapter in enumerate(raw_chapters, start=1):
             title = (
@@ -123,7 +123,7 @@ class BlinkistSource(Source):
             offset_ms += round(_duration_seconds(chapter) * 1000)
         return chapters
 
-    def download_files(self, book_info: dict) -> List[AudiobookFile]:
+    def download_files(self, book_info: dict) -> list[AudiobookFile]:
         book_id = book_info["book"]["id"]
         chapters = book_info["chapters"]
 
@@ -156,7 +156,7 @@ class BlinkistSource(Source):
         return path.split("/")[-1]
 
     @staticmethod
-    def _catalog_items_from_payload(payload: Any) -> List[CatalogBook]:
+    def _catalog_items_from_payload(payload: Any) -> list[CatalogBook]:
         if isinstance(payload, dict):
             raw_items = (
                 payload.get("books")
@@ -170,7 +170,7 @@ class BlinkistSource(Source):
         else:
             raw_items = []
 
-        results: List[CatalogBook] = []
+        results: list[CatalogBook] = []
         for entry in raw_items:
             if not isinstance(entry, dict):
                 continue
@@ -194,7 +194,7 @@ class BlinkistSource(Source):
             )
         return results
 
-    def search(self, query: str) -> List[CatalogBook]:
+    def search(self, query: str) -> list[CatalogBook]:
         cleaned = query.strip()
         if not cleaned:
             return []
@@ -202,7 +202,7 @@ class BlinkistSource(Source):
         payload = self.get_json(f"https://www.blinkist.com/api/books/search?q={quote_plus(cleaned)}")
         return self._catalog_items_from_payload(payload)
 
-    def list_library(self) -> List[CatalogBook]:
+    def list_library(self) -> list[CatalogBook]:
         self._prepare_headers()
         payload = self.get_json("https://www.blinkist.com/api/library")
         return self._catalog_items_from_payload(payload)

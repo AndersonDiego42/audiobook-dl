@@ -7,7 +7,8 @@ import io
 import os
 from pathlib import Path
 import re
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any
+from collections.abc import Sequence
 
 if TYPE_CHECKING:
     import tkinter as tk
@@ -31,15 +32,15 @@ from audiobookdl.utils.enrichment import EnrichmentCandidate
 OUTPUT_FORMATS = GUI_OUTPUT_FORMATS
 MEDIA_TYPE_OPTIONS = GUI_MEDIA_TYPE_OPTIONS
 OVERWRITE_OPTIONS = GUI_OVERWRITE_OPTIONS
-TEMPLATE_PRESET_LABELS: Tuple[Tuple[str, str], ...] = (
+TEMPLATE_PRESET_LABELS: tuple[tuple[str, str], ...] = (
     ("Custom", ""),
     ("Default", output.OUTPUT_TEMPLATE_PRESETS["default"]),
     ("Audiobookshelf", output.OUTPUT_TEMPLATE_PRESETS["audiobookshelf"]),
     ("Plex", output.OUTPUT_TEMPLATE_PRESETS["plex"]),
     ("Kavita", output.OUTPUT_TEMPLATE_PRESETS["kavita"]),
 )
-PRESET_LABEL_TO_TEMPLATE: Dict[str, str] = {label: tpl for label, tpl in TEMPLATE_PRESET_LABELS if tpl}
-TEMPLATE_TO_PRESET_LABEL: Dict[str, str] = {tpl: label for label, tpl in TEMPLATE_PRESET_LABELS if tpl}
+PRESET_LABEL_TO_TEMPLATE: dict[str, str] = {label: tpl for label, tpl in TEMPLATE_PRESET_LABELS if tpl}
+TEMPLATE_TO_PRESET_LABEL: dict[str, str] = {tpl: label for label, tpl in TEMPLATE_PRESET_LABELS if tpl}
 SAMPLE_PREVIEW_METADATA = AudiobookMetadata(
     title="Dune",
     authors=["Frank Herbert"],
@@ -72,7 +73,7 @@ def format_speed(bytes_per_sec: float) -> str:
     return f"{bytes_per_sec / (1024 * 1024):.1f} MB/s"
 
 
-def format_duration(seconds: Optional[float]) -> str:
+def format_duration(seconds: float | None) -> str:
     """Format a duration in seconds as `MM:SS` or `H:MM:SS`."""
     if seconds is None or seconds < 0:
         return "--"
@@ -85,7 +86,7 @@ def format_duration(seconds: Optional[float]) -> str:
 
 
 def format_failed_job_detail(
-    book_errors: Sequence[Tuple[str, str]],
+    book_errors: Sequence[tuple[str, str]],
     max_length: int = 120,
 ) -> str:
     """Format the first `(label, message)` error tuple into a single-line status string."""
@@ -101,7 +102,7 @@ def format_failed_job_detail(
     return detail[:max_length]
 
 
-def describe_series_book(index: int, book: Union[BookId[Any], Audiobook]) -> str:
+def describe_series_book(index: int, book: BookId[Any] | Audiobook) -> str:
     """Return a readable display label for an entry inside a `Series`."""
     if isinstance(book, Audiobook):
         author = book.metadata.author
@@ -117,10 +118,10 @@ def describe_series_book(index: int, book: Union[BookId[Any], Audiobook]) -> str
     return f"Book {index + 1} (ID: {book_id})"
 
 
-def format_audiobook_preview(audiobook: Audiobook) -> List[Tuple[str, str]]:
+def format_audiobook_preview(audiobook: Audiobook) -> list[tuple[str, str]]:
     """Build ordered `(label, value)` metadata rows for previewing an `Audiobook`."""
     meta = audiobook.metadata
-    rows: List[Tuple[str, str]] = [("Title", audiobook.title)]
+    rows: list[tuple[str, str]] = [("Title", audiobook.title)]
     if meta.author:
         rows.append(("Author(s)", meta.author))
     if meta.narrator:
@@ -160,7 +161,7 @@ def format_multi_metadata_values(values: Sequence[str]) -> str:
     return "; ".join(v.strip() for v in values if v and v.strip())
 
 
-def parse_multi_metadata_values(raw: str) -> List[str]:
+def parse_multi_metadata_values(raw: str) -> list[str]:
     """Parse semicolon-separated metadata text into trimmed non-empty values."""
     return [part.strip() for part in raw.split(";") if part.strip()]
 
@@ -173,7 +174,7 @@ def apply_audiobook_metadata_edits(
     narrators_text: str,
     series_text: str,
     series_order_text: str,
-    cover: Optional[Cover] = None,
+    cover: Cover | None = None,
     update_cover: bool = False,
 ) -> None:
     """Validate and apply inline metadata/cover edits onto `audiobook`."""
@@ -182,7 +183,7 @@ def apply_audiobook_metadata_edits(
         raise ValueError("Title cannot be empty.")
 
     order_raw = series_order_text.strip()
-    parsed_order: Optional[int]
+    parsed_order: int | None
     if not order_raw:
         parsed_order = None
     else:
@@ -219,10 +220,10 @@ def load_cover_from_file(path: str) -> Cover:
 
 
 def render_cover_thumbnail(
-    cover: Optional[Cover],
+    cover: Cover | None,
     master: tk.Misc,
     max_size: int = 180,
-) -> Optional[Any]:
+) -> Any | None:
     """Decode `cover` bytes into a resized `ImageTk.PhotoImage`, or `None` on failure."""
     if cover is None or not cover.image:
         return None
@@ -248,7 +249,7 @@ def format_enrichment_candidate(candidate: EnrichmentCandidate) -> str:
     """Format an `EnrichmentCandidate` summary for GUI and interactive pickers."""
     pct = round(candidate.score * 100)
     authors = ", ".join(candidate.authors) or "Unknown author"
-    extras: List[str] = []
+    extras: list[str] = []
     if candidate.narrators:
         extras.append(f"Narr: {', '.join(candidate.narrators)}")
     if candidate.release_date:
@@ -263,6 +264,6 @@ def format_enrichment_candidate(candidate: EnrichmentCandidate) -> str:
     return f"[{candidate.provider} {pct}%] {candidate.title} — {authors}{suffix}"
 
 
-def parse_url_text(raw: str) -> List[str]:
+def parse_url_text(raw: str) -> list[str]:
     """Extract non-empty URLs from whitespace/newline-separated input text."""
     return [token.strip() for token in raw.split() if token.strip()]

@@ -16,7 +16,8 @@ from audiobookdl.options_schema import (
 from audiobookdl.utils.fs import atomic_write_text, file_lock
 from attrs import Factory, define
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any
+from collections.abc import Sequence
 
 import os
 import re
@@ -33,29 +34,29 @@ import platformdirs
 @define
 class SourceConfig:
     """Stores configuration for source"""
-    username: Optional[str]
-    password: Optional[str]
-    library: Optional[str]
-    cookie_file: Optional[str]
+    username: str | None
+    password: str | None
+    library: str | None
+    cookie_file: str | None
 
 
 @define
 class GuiConfig:
     """Stores desktop GUI layout and output preferences"""
-    window_geometry: Optional[str] = None
-    output_dir: Optional[str] = None
-    output_template: Optional[str] = None
-    use_download_archive: Optional[bool] = None
-    theme: Optional[str] = None
-    notify_on_complete: Optional[bool] = None
+    window_geometry: str | None = None
+    output_dir: str | None = None
+    output_template: str | None = None
+    use_download_archive: bool | None = None
+    theme: str | None = None
+    notify_on_complete: bool | None = None
 
 
 @define
 class AudiobookshelfConfig:
     """Audiobookshelf server connection and sync configuration"""
-    url: Optional[str] = None
-    api_key: Optional[str] = None
-    library_id: Optional[str] = None
+    url: str | None = None
+    api_key: str | None = None
+    library_id: str | None = None
     auto_upload: bool = False
     auto_scan: bool = True
 
@@ -63,43 +64,43 @@ class AudiobookshelfConfig:
 @define
 class Config:
     """audiobook-dl config"""
-    sources: Dict[str, SourceConfig]
-    output_template: Optional[str]
-    database_directory: Optional[str]
-    skip_downloaded: Optional[bool]
-    output_format: Optional[str] = None
-    media_type: Optional[str] = None
-    combine: Optional[bool] = None
-    ffmpeg_dir: Optional[str] = None
-    resume: Optional[bool] = None
-    audio_bitrate: Optional[str] = None
-    overwrite: Optional[bool] = None
-    max_workers: Optional[int] = None
-    book_delay: Optional[float] = None
-    limit_rate: Optional[str] = None
-    proxy: Optional[str] = None
-    timeout: Optional[float] = None
-    impersonate: Optional[str] = None
-    post_exec: Optional[str] = None
-    loudnorm: Optional[bool] = None
-    mono: Optional[bool] = None
-    square_cover: Optional[bool] = None
-    max_cover_size: Optional[int] = None
-    download_archive: Optional[str] = None
-    check_updates: Optional[bool] = None
-    remove_chars: Optional[str] = None
-    debug: Optional[bool] = None
-    cover: Optional[bool] = None
-    no_chapters: Optional[bool] = None
-    split_chapters: Optional[bool] = None
-    write_json_metadata: Optional[bool] = None
-    write_cover: Optional[bool] = None
-    write_opf: Optional[bool] = None
-    write_abs_metadata: Optional[bool] = None
-    write_cue: Optional[bool] = None
-    enrich_metadata: Optional[bool] = None
-    enrich_providers: Optional[str] = None
-    enrich_interactive: Optional[bool] = None
+    sources: dict[str, SourceConfig]
+    output_template: str | None
+    database_directory: str | None
+    skip_downloaded: bool | None
+    output_format: str | None = None
+    media_type: str | None = None
+    combine: bool | None = None
+    ffmpeg_dir: str | None = None
+    resume: bool | None = None
+    audio_bitrate: str | None = None
+    overwrite: bool | None = None
+    max_workers: int | None = None
+    book_delay: float | None = None
+    limit_rate: str | None = None
+    proxy: str | None = None
+    timeout: float | None = None
+    impersonate: str | None = None
+    post_exec: str | None = None
+    loudnorm: bool | None = None
+    mono: bool | None = None
+    square_cover: bool | None = None
+    max_cover_size: int | None = None
+    download_archive: str | None = None
+    check_updates: bool | None = None
+    remove_chars: str | None = None
+    debug: bool | None = None
+    cover: bool | None = None
+    no_chapters: bool | None = None
+    split_chapters: bool | None = None
+    write_json_metadata: bool | None = None
+    write_cover: bool | None = None
+    write_opf: bool | None = None
+    write_abs_metadata: bool | None = None
+    write_cue: bool | None = None
+    enrich_metadata: bool | None = None
+    enrich_providers: str | None = None
+    enrich_interactive: bool | None = None
     gui: GuiConfig = Factory(GuiConfig)
     audiobookshelf: AudiobookshelfConfig = Factory(AudiobookshelfConfig)
 
@@ -129,7 +130,7 @@ class Config:
             auto_upload=self.audiobookshelf.auto_upload,
             auto_scan=self.audiobookshelf.auto_scan,
         )
-        kwargs: Dict[str, Any] = {
+        kwargs: dict[str, Any] = {
             "sources": sources_copy,
             "gui": gui_copy,
             "audiobookshelf": abs_copy,
@@ -174,7 +175,7 @@ def normalize_source_key(raw_key: str) -> str:
 DEFAULT_PROFILE = "default"
 
 
-def normalize_profile_name(profile: Optional[str]) -> str:
+def normalize_profile_name(profile: str | None) -> str:
     """Normalize a source profile identifier, defaulting empty/None to `'default'`."""
     if profile is None:
         return DEFAULT_PROFILE
@@ -182,7 +183,7 @@ def normalize_profile_name(profile: Optional[str]) -> str:
     return cleaned or DEFAULT_PROFILE
 
 
-def make_source_profile_key(service_key: str, profile: Optional[str] = None) -> str:
+def make_source_profile_key(service_key: str, profile: str | None = None) -> str:
     """Build canonical `Config.sources` / `CredentialStore` key for `(service_key, profile)`."""
     canonical = normalize_source_key(service_key)
     norm_profile = normalize_profile_name(profile)
@@ -191,7 +192,7 @@ def make_source_profile_key(service_key: str, profile: Optional[str] = None) -> 
     return f"{canonical}:{norm_profile}"
 
 
-def split_source_profile_key(raw_key: str) -> Tuple[str, str]:
+def split_source_profile_key(raw_key: str) -> tuple[str, str]:
     """Split a `Config.sources` or vault key into `(canonical_service, profile)`."""
     if ":" in raw_key:
         service_part, profile_part = raw_key.split(":", 1)
@@ -202,9 +203,9 @@ def split_source_profile_key(raw_key: str) -> Tuple[str, str]:
 def get_source_config(
     config: Config,
     service_key: str,
-    profile: Optional[str] = None,
+    profile: str | None = None,
     aliases: Sequence[str] = (),
-) -> Optional[SourceConfig]:
+) -> SourceConfig | None:
     """Look up `SourceConfig` for `(service_key, profile)` checking canonical and alias names."""
     norm_profile = normalize_profile_name(profile)
     candidates = [service_key, *(a for a in aliases if a)]
@@ -216,10 +217,10 @@ def get_source_config(
     return None
 
 
-def list_source_profiles(config: Config, service_key: str) -> List[str]:
+def list_source_profiles(config: Config, service_key: str) -> list[str]:
     """Return configured profile names for `service_key`, with `'default'` first if present."""
     canonical = normalize_source_key(service_key)
-    profiles: List[str] = []
+    profiles: list[str] = []
     for raw_key in config.sources:
         svc, prof = split_source_profile_key(raw_key)
         if svc == canonical and prof not in profiles:
@@ -228,9 +229,9 @@ def list_source_profiles(config: Config, service_key: str) -> List[str]:
     return profiles
 
 
-def list_configured_source_profiles(config: Config) -> List[Tuple[str, str, SourceConfig]]:
+def list_configured_source_profiles(config: Config) -> list[tuple[str, str, SourceConfig]]:
     """Return all configured `(service_key, profile, SourceConfig)` entries sorted deterministically."""
-    out: List[Tuple[str, str, SourceConfig]] = []
+    out: list[tuple[str, str, SourceConfig]] = []
     for raw_key, src_cfg in config.sources.items():
         svc, prof = split_source_profile_key(raw_key)
         out.append((svc, prof, src_cfg))
@@ -239,8 +240,8 @@ def list_configured_source_profiles(config: Config) -> List[Tuple[str, str, Sour
 
 
 def load_config(
-    overwrite: Optional[str],
-    credential_store: Optional[CredentialStore] = None,
+    overwrite: str | None,
+    credential_store: CredentialStore | None = None,
 ) -> Config:
     """
     Load config file from disk
@@ -257,7 +258,7 @@ def load_config(
     return structure_config(config_location, config_dict, credential_store=store)
 
 
-def _frozen_executable_dir() -> Optional[str]:
+def _frozen_executable_dir() -> str | None:
     """Return the directory containing the frozen executable, or `None`."""
     if not getattr(sys, "frozen", False):
         return None
@@ -281,7 +282,7 @@ def is_portable_mode() -> bool:
     )
 
 
-def _env_config_path() -> Optional[str]:
+def _env_config_path() -> str | None:
     """Return configured path override from `AUDIOBOOK_DL_CONFIG` (or `AUDIOBOOKDL_CONFIG`), if set."""
     raw = os.environ.get("AUDIOBOOK_DL_CONFIG") or os.environ.get("AUDIOBOOKDL_CONFIG")
     if not raw:
@@ -306,7 +307,7 @@ def config_dir() -> str:
     return platformdirs.user_config_dir("audiobook-dl", "jo1gi")
 
 
-def get_config_location(overwrite: Optional[str]) -> str:
+def get_config_location(overwrite: str | None) -> str:
     """
     Get path of configuration file
 
@@ -341,7 +342,7 @@ def read_config(config_file: str) -> dict:
 
 def _migrate_profile_password(
     profile_key: str,
-    values: Dict[str, Any],
+    values: dict[str, Any],
     store: CredentialStore,
 ) -> bool:
     """Move plaintext `password` out of `values` into `store`; return True if modified."""
@@ -366,7 +367,7 @@ def _migrate_profile_password(
 
 def _migrate_legacy_passwords(
     config_location: str,
-    config_dict: Dict[str, Any],
+    config_dict: dict[str, Any],
     store: CredentialStore,
 ) -> None:
     """Move any plaintext passwords in `config_dict` into `store` and scrub TOML."""
@@ -421,9 +422,9 @@ def _build_source_config_from_dict(
     section_label: str,
     raw_source_name: str,
     profile_key: str,
-    values: Dict[str, Any],
+    values: dict[str, Any],
     config_dir_path: str,
-    credential_store: Optional[CredentialStore],
+    credential_store: CredentialStore | None,
     allowed_keys: Sequence[str],
 ) -> SourceConfig:
     """Validate and construct a `SourceConfig` from a parsed TOML source/profile table."""
@@ -455,7 +456,7 @@ def _build_source_config_from_dict(
 def structure_config(
     config_location: str,
     config_dict: dict,
-    credential_store: Optional[CredentialStore] = None,
+    credential_store: CredentialStore | None = None,
 ) -> Config:
     """
     Structure configuration file content as `Config`
@@ -470,7 +471,7 @@ def structure_config(
             logging.log(f"Warning: unknown config key '{key}' ignored")
 
     # Add sources with normalized canonical keys and validation warnings
-    sources: Dict[str, SourceConfig] = {}
+    sources: dict[str, SourceConfig] = {}
     config_dir_path = os.path.dirname(os.path.abspath(config_location))
     raw_sources = config_dict.get("sources")
     if raw_sources is not None and not isinstance(raw_sources, dict):
@@ -572,7 +573,7 @@ def structure_config(
         else:
             use_archive_val = use_archive_raw
         theme_raw = gui_section.get("theme")
-        theme_val: Optional[str] = None
+        theme_val: str | None = None
         if theme_raw is not None:
             if isinstance(theme_raw, str) and theme_raw.strip().lower() in ("system", "light", "dark"):
                 theme_val = theme_raw.strip().lower()
@@ -613,7 +614,7 @@ def structure_config(
         abs_auto_upload = abs_dict.get("auto_upload") if isinstance(abs_dict.get("auto_upload"), bool) else False
         abs_auto_scan = abs_dict.get("auto_scan") if isinstance(abs_dict.get("auto_scan"), bool) else True
         abs_key_raw = abs_dict.get("api_key")
-        abs_key: Optional[str] = abs_key_raw.strip() if isinstance(abs_key_raw, str) and abs_key_raw.strip() else None
+        abs_key: str | None = abs_key_raw.strip() if isinstance(abs_key_raw, str) and abs_key_raw.strip() else None
         abs_account = abs_url or "api"
         if credential_store is not None:
             if abs_key is not None and credential_store.is_secure:
@@ -633,7 +634,7 @@ def structure_config(
             auto_scan=abs_auto_scan,
         )
 
-    parsed_options: Dict[str, Any] = {}
+    parsed_options: dict[str, Any] = {}
     for spec in CONFIG_OPTION_SPECS:
         key = spec.config_key
         if key is None or spec.config_kind is None:
@@ -687,12 +688,12 @@ def _format_toml_value(value: Any) -> str:
     return f'"{"".join(escaped)}"'
 
 
-def _split_toml_section_header(header: str) -> Optional[Tuple[str, ...]]:
+def _split_toml_section_header(header: str) -> tuple[str, ...] | None:
     """Parse a dotted TOML `[section.sub]` header into key segments."""
     text = header.strip()
     if not text:
         return None
-    parts: List[str] = []
+    parts: list[str] = []
     idx = 0
     while idx < len(text):
         while idx < len(text) and text[idx].isspace():
@@ -731,7 +732,7 @@ def _split_toml_section_header(header: str) -> Optional[Tuple[str, ...]]:
     return tuple(parts) if parts else None
 
 
-def _strip_toml_assignment_key(line: str) -> Optional[Tuple[str, str]]:
+def _strip_toml_assignment_key(line: str) -> tuple[str, str] | None:
     """Return `(key_name, trailing_comment)` if `line` is a single-line TOML assignment."""
     stripped = line.lstrip()
     if not stripped or stripped.startswith("#") or stripped.startswith("["):
@@ -747,7 +748,7 @@ def _strip_toml_assignment_key(line: str) -> Optional[Tuple[str, str]]:
     else:
         return None
     rhs = stripped[eq_idx + 1 :]
-    in_quote: Optional[str] = None
+    in_quote: str | None = None
     escaped = False
     trailing = ""
     for pos, ch in enumerate(rhs):
@@ -770,16 +771,16 @@ def _strip_toml_assignment_key(line: str) -> Optional[Tuple[str, str]]:
     return key_name, trailing
 
 
-def _iter_toml_sections(data: Dict[str, Any], prefix: Tuple[str, ...] = ()) -> List[Tuple[Tuple[str, ...], List[Tuple[str, Any]]]]:
+def _iter_toml_sections(data: dict[str, Any], prefix: tuple[str, ...] = ()) -> list[tuple[tuple[str, ...], list[tuple[str, Any]]]]:
     """Collect `(section_path, scalar_items)` pairs in deterministic order for all nested dicts."""
-    scalars: List[Tuple[str, Any]] = []
-    sub_sections: List[Tuple[Tuple[str, ...], List[Tuple[str, Any]]]] = []
+    scalars: list[tuple[str, Any]] = []
+    sub_sections: list[tuple[tuple[str, ...], list[tuple[str, Any]]]] = []
     for k, v in data.items():
         if isinstance(v, dict):
             sub_sections.extend(_iter_toml_sections(v, prefix + (str(k),)))
         elif v is not None and v != "":
             scalars.append((str(k), v))
-    sections: List[Tuple[Tuple[str, ...], List[Tuple[str, Any]]]] = []
+    sections: list[tuple[tuple[str, ...], list[tuple[str, Any]]]] = []
     if prefix:
         if scalars:
             sections.append((prefix, scalars))
@@ -789,17 +790,17 @@ def _iter_toml_sections(data: Dict[str, Any], prefix: Tuple[str, ...] = ()) -> L
     return sections
 
 
-def _merge_toml_preserving_comments(existing_text: str, data: Dict[str, Any]) -> str:
+def _merge_toml_preserving_comments(existing_text: str, data: dict[str, Any]) -> str:
     """
     Update TOML `existing_text` with `data` while preserving `#` comments, blank lines,
     key order, inline comments, and unknown user sections.
     """
     target_sections = dict(_iter_toml_sections(data))
-    emitted_keys: Dict[Tuple[str, ...], set[str]] = {sec: set() for sec in target_sections}
-    out_lines: List[str] = []
-    current_section: Tuple[str, ...] = ()
+    emitted_keys: dict[tuple[str, ...], set[str]] = {sec: set() for sec in target_sections}
+    out_lines: list[str] = []
+    current_section: tuple[str, ...] = ()
 
-    def _flush_missing_for_section(sec: Tuple[str, ...]) -> None:
+    def _flush_missing_for_section(sec: tuple[str, ...]) -> None:
         if sec not in target_sections:
             return
         seen = emitted_keys.setdefault(sec, set())
@@ -807,7 +808,7 @@ def _merge_toml_preserving_comments(existing_text: str, data: Dict[str, Any]) ->
         if not missing:
             return
         # Insert new keys before any trailing blank lines at the end of the section.
-        trailing_blanks: List[str] = []
+        trailing_blanks: list[str] = []
         while out_lines and out_lines[-1].strip() == "":
             trailing_blanks.append(out_lines.pop())
         for k, v in missing:
@@ -859,9 +860,9 @@ def _merge_toml_preserving_comments(existing_text: str, data: Dict[str, Any]) ->
     return "\n".join(out_lines) + ("\n" if out_lines else "")
 
 
-def _dump_toml(data: Dict[str, Any]) -> str:
+def _dump_toml(data: dict[str, Any]) -> str:
     """Serialize config dictionary (top-level scalars + all nested tables) to TOML."""
-    lines: List[str] = []
+    lines: list[str] = []
     for sec, entries in _iter_toml_sections(data):
         if not entries:
             continue
@@ -874,7 +875,7 @@ def _dump_toml(data: Dict[str, Any]) -> str:
     return "\n".join(lines) + ("\n" if lines else "")
 
 
-def _has_plaintext_password(config_dict: Dict[str, Any]) -> bool:
+def _has_plaintext_password(config_dict: dict[str, Any]) -> bool:
     sources = config_dict.get("sources")
     if not isinstance(sources, dict):
         return False
@@ -892,10 +893,10 @@ def _has_plaintext_password(config_dict: Dict[str, Any]) -> bool:
     return False
 
 
-def _write_config_dict(config_location: str, config_dict: Dict[str, Any]) -> str:
+def _write_config_dict(config_location: str, config_dict: dict[str, Any]) -> str:
     if os.path.isfile(config_location):
         try:
-            with open(config_location, "r", encoding="utf-8") as fh:
+            with open(config_location, encoding="utf-8") as fh:
                 existing_text = fh.read()
             rendered = _merge_toml_preserving_comments(existing_text, config_dict)
         except OSError:
@@ -911,14 +912,14 @@ def _write_config_dict(config_location: str, config_dict: Dict[str, Any]) -> str
 
 def save_source_credentials(
     service_key: str,
-    username: Optional[str] = None,
-    password: Optional[str] = None,
-    library: Optional[str] = None,
-    cookie_file: Optional[str] = None,
-    overwrite: Optional[str] = None,
-    credential_store: Optional[CredentialStore] = None,
+    username: str | None = None,
+    password: str | None = None,
+    library: str | None = None,
+    cookie_file: str | None = None,
+    overwrite: str | None = None,
+    credential_store: CredentialStore | None = None,
     *,
-    profile: Optional[str] = None,
+    profile: str | None = None,
 ) -> str:
     """
     Save or clear credentials for `(service_key, profile)` in the configuration file.
@@ -945,7 +946,7 @@ def save_source_credentials(
             prev_entry = profiles_dict.get(norm_profile) if isinstance(profiles_dict.get(norm_profile), dict) else {}
         prev_username = prev_entry.get("username") if isinstance(prev_entry, dict) else None
 
-        entry: Dict[str, Any] = {
+        entry: dict[str, Any] = {
             k: v
             for k, v in (
                 ("username", username),
@@ -1007,7 +1008,7 @@ _UNSET: Any = object()
 def save_output_preferences(
     output_format: Any = _UNSET,
     combine: Any = _UNSET,
-    config_location: Optional[str] = None,
+    config_location: str | None = None,
     *,
     audio_bitrate: Any = _UNSET,
     resume: Any = _UNSET,
@@ -1081,14 +1082,14 @@ def save_output_preferences(
 
 
 def save_gui_preferences(
-    window_geometry: Optional[str] = None,
-    output_dir: Optional[str] = None,
-    output_template: Optional[str] = None,
-    overwrite: Optional[str] = None,
+    window_geometry: str | None = None,
+    output_dir: str | None = None,
+    output_template: str | None = None,
+    overwrite: str | None = None,
     *,
-    use_download_archive: Optional[bool] = None,
-    theme: Optional[str] = None,
-    notify_on_complete: Optional[bool] = None,
+    use_download_archive: bool | None = None,
+    theme: str | None = None,
+    notify_on_complete: bool | None = None,
 ) -> str:
     """Persist GUI window geometry, output prefs, archive toggle, theme, and notifications in `audiobook-dl.toml`."""
     config_location = overwrite or get_config_location(None)
@@ -1121,8 +1122,8 @@ def save_gui_preferences(
 
 
 def save_ffmpeg_dir(
-    ffmpeg_dir: Optional[str],
-    overwrite: Optional[str] = None,
+    ffmpeg_dir: str | None,
+    overwrite: str | None = None,
 ) -> str:
     """Persist or clear custom `ffmpeg_dir` in `audiobook-dl.toml`."""
     config_location = overwrite or get_config_location(None)
@@ -1138,13 +1139,13 @@ def save_ffmpeg_dir(
 
 def save_audiobookshelf_config(
     *,
-    url: Optional[str] = None,
-    library_id: Optional[str] = None,
-    api_key: Optional[str] = None,
-    auto_upload: Optional[bool] = None,
-    auto_scan: Optional[bool] = None,
-    overwrite: Optional[str] = None,
-    credential_store: Optional[CredentialStore] = None,
+    url: str | None = None,
+    library_id: str | None = None,
+    api_key: str | None = None,
+    auto_upload: bool | None = None,
+    auto_scan: bool | None = None,
+    overwrite: str | None = None,
+    credential_store: CredentialStore | None = None,
 ) -> str:
     """Persist Audiobookshelf settings in `audiobook-dl.toml` and store the API key in the OS vault."""
     config_location = overwrite or get_config_location(None)

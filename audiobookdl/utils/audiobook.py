@@ -1,7 +1,8 @@
 from datetime import date, datetime
 import re
 import requests
-from typing import Callable, Dict, Generic, List, Optional, Union, Sequence, Tuple, TypeVar, Any, MutableMapping
+from typing import Generic, Optional, TypeVar, Any
+from collections.abc import Callable, Sequence, MutableMapping
 import json
 from attrs import define, Factory
 import pycountry
@@ -37,35 +38,35 @@ class AudiobookFile:
     # Output file extension
     ext: str
     # Title of file
-    title: Optional[str] = None
+    title: str | None = None
     # Headers for request
-    headers: MutableMapping[str, Union[str, bytes]] = Factory(dict)
+    headers: MutableMapping[str, str | bytes] = Factory(dict)
     # Encryption method
-    encryption_method: Optional[AudiobookFileEncryption] = None
+    encryption_method: AudiobookFileEncryption | None = None
     # Expected content-type of the download request
-    expected_content_type: Optional[str] = None
+    expected_content_type: str | None = None
     # Expected status code of the download request
     expected_status_code: int = 200
     # Optional lazy URL resolver invoked when downloading starts
-    url_resolver: Optional[Callable[[], str]] = None
+    url_resolver: Callable[[], str] | None = None
 
 
 @define
 class AudiobookMetadata:
     title: str
-    scrape_url: Optional[str] = None
-    series: Optional[str] = None
-    series_order: Optional[int] = None
-    authors: List[str] = Factory(list)
-    narrators: List[str] = Factory(list)
-    genres: List[str] = Factory(list)
+    scrape_url: str | None = None
+    series: str | None = None
+    series_order: int | None = None
+    authors: list[str] = Factory(list)
+    narrators: list[str] = Factory(list)
+    genres: list[str] = Factory(list)
     language: Optional["pycountry.db.Language"] = None # type: ignore
-    description: Optional[str] = None
-    isbn: Optional[str] = None
-    asin: Optional[str] = None
-    publisher: Optional[str] = None
-    release_date: Optional[date] = None
-    source: Optional[str] = None
+    description: str | None = None
+    isbn: str | None = None
+    asin: str | None = None
+    publisher: str | None = None
+    release_date: date | None = None
+    source: str | None = None
 
     def add_author(self, author: str):
         """Add author to metadata"""
@@ -88,8 +89,8 @@ class AudiobookMetadata:
     def add_genres(self, genres: Sequence[str]):
         self.genres.extend(genres)
 
-    def all_properties(self, allow_duplicate_keys: Optional[bool] = False) -> List[Tuple[str, Any]]:
-        result: List[Tuple[str, Any]] = []
+    def all_properties(self, allow_duplicate_keys: bool | None = False) -> list[tuple[str, Any]]:
+        result: list[tuple[str, Any]] = []
         add = add_if_value_exists(self, result)
         add("title")
         add("scrape_url")
@@ -119,8 +120,8 @@ class AudiobookMetadata:
             result.append(("genre", self.genre))
         return result
 
-    def all_properties_dict(self) -> Dict[str, Any]:
-        result: Dict[str, Any] = {}
+    def all_properties_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {}
         for (key, value) in self.all_properties(allow_duplicate_keys=False):
             result[key] = value
         return result
@@ -141,7 +142,7 @@ class AudiobookMetadata:
         return "; ".join(self.genres)
 
 
-    def as_dict(self, chapters: Optional[Sequence[Chapter]] = None) -> dict:
+    def as_dict(self, chapters: Sequence[Chapter] | None = None) -> dict:
         """
         Export metadata as dictionary (compatible with Audiobookshelf/Plex readers).
 
@@ -192,7 +193,7 @@ class AudiobookMetadata:
         return result
 
 
-    def as_json(self, chapters: Optional[Sequence[Chapter]] = None) -> str:
+    def as_json(self, chapters: Sequence[Chapter] | None = None) -> str:
         """
         Export metadata as json
 
@@ -209,7 +210,7 @@ class AudiobookMetadata:
         return json.dumps(self.as_dict(chapters=chapters), cls=AudiobookMetadataJSONEncoder, ensure_ascii=False)
 
 
-def add_if_value_exists(metadata: AudiobookMetadata, l: List[Tuple[str, Any]]):
+def add_if_value_exists(metadata: AudiobookMetadata, l: list[tuple[str, Any]]):
     def add(key: str):
         value = getattr(metadata, key, None)
         if value:
@@ -221,9 +222,9 @@ def add_if_value_exists(metadata: AudiobookMetadata, l: List[Tuple[str, Any]]):
 class Audiobook:
     session: requests.Session
     metadata: AudiobookMetadata
-    files: List[AudiobookFile]
-    chapters: List[Chapter] = Factory(list)
-    cover: Optional[Cover] = None
+    files: list[AudiobookFile]
+    chapters: list[Chapter] = Factory(list)
+    cover: Cover | None = None
     source_data: Any = None
 
     @property
@@ -235,31 +236,28 @@ T = TypeVar("T")
 @define
 class BookId(Generic[T]):
     id: T
-    title: Optional[str] = None
+    title: str | None = None
 
 @define
 class Series(Generic[T]):
     # Title of series
     title: str
     # Internal ids of book in series
-    books: Sequence[Union[BookId[T], Audiobook]]
+    books: Sequence[BookId[T] | Audiobook]
 
-Result = Union[
-    Audiobook,
-    Series
-]
+Result = Audiobook | Series
 
 EBOOK_EXTENSIONS = frozenset({"epub", "pdf", "mobi", "azw3", "cbz", "cbr"})
 
 
-def is_ebook_extension(ext: Optional[str]) -> bool:
+def is_ebook_extension(ext: str | None) -> bool:
     """Return True when `ext` represents an ebook file rather than audio."""
     if not ext:
         return False
     return ext.lstrip(".").lower() in EBOOK_EXTENSIONS
 
 
-def parse_release_date(raw: Any) -> Optional[date]:
+def parse_release_date(raw: Any) -> date | None:
     """Parse a release date (`YYYY-MM-DD`, `YYYY-MM`, `YYYY`, `int`, or `date`) cleanly."""
     if isinstance(raw, date) and not isinstance(raw, datetime):
         return raw

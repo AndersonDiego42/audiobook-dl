@@ -8,7 +8,8 @@ from rich.markup import render
 from rich.console import Console
 from rich.progress import Progress, ProgressColumn
 from rich.prompt import Confirm, Prompt
-from typing import Any, Deque, Iterator, List, Optional, Protocol, Sequence, Tuple, Union
+from typing import Any, Protocol
+from collections.abc import Iterator, Sequence
 from audiobookdl.utils import read_asset_file
 import io
 import sys
@@ -39,8 +40,8 @@ class InteractionHandler(Protocol):
         self,
         title: str,
         choices: Sequence[str],
-        default: Optional[int] = None,
-    ) -> Optional[int]: ...
+        default: int | None = None,
+    ) -> int | None: ...
 
 
 class CliInteractionHandler:
@@ -56,8 +57,8 @@ class CliInteractionHandler:
         self,
         title: str,
         choices: Sequence[str],
-        default: Optional[int] = None,
-    ) -> Optional[int]:
+        default: int | None = None,
+    ) -> int | None:
         if not choices:
             return None
         console.print(f"\n[bold]{title}[/]")
@@ -83,31 +84,31 @@ class JobContext:
     debug: bool = False
     quiet: bool = False
     ffmpeg_output: bool = False
-    ffmpeg_dir: Optional[str] = None
-    sink: Optional[LogSink] = None
-    interaction: Optional[InteractionHandler] = None
-    cancel_event: Optional[threading.Event] = None
+    ffmpeg_dir: str | None = None
+    sink: LogSink | None = None
+    interaction: InteractionHandler | None = None
+    cancel_event: threading.Event | None = None
 
 
-_job_context: contextvars.ContextVar[Optional[JobContext]] = contextvars.ContextVar(
+_job_context: contextvars.ContextVar[JobContext | None] = contextvars.ContextVar(
     "audiobookdl_job_context",
     default=None,
 )
 
 
-def get_job_context() -> Optional[JobContext]:
+def get_job_context() -> JobContext | None:
     """Return the active `JobContext` for the current task/thread, if any."""
     return _job_context.get()
 
 
 def set_job_context(
-    ctx: Optional[JobContext],
-) -> contextvars.Token[Optional[JobContext]]:
+    ctx: JobContext | None,
+) -> contextvars.Token[JobContext | None]:
     """Bind `ctx` to the current task/thread and return the reset token."""
     return _job_context.set(ctx)
 
 
-def reset_job_context(token: contextvars.Token[Optional[JobContext]]) -> None:
+def reset_job_context(token: contextvars.Token[JobContext | None]) -> None:
     """Restore the previous `JobContext` using `token`."""
     _job_context.reset(token)
 
@@ -140,7 +141,7 @@ def is_ffmpeg_output() -> bool:
     return bool(ctx.ffmpeg_output) if ctx is not None else False
 
 
-def get_ui_sink() -> Optional[LogSink]:
+def get_ui_sink() -> LogSink | None:
     """Return the active `LogSink` for the current `JobContext`, if any."""
     ctx = _job_context.get()
     return ctx.sink if ctx is not None else None
@@ -181,7 +182,7 @@ class _SinkTask:
         self.last_emitted_time = now
         self.start_time = now
         self.bytes_downloaded = 0
-        self.byte_samples: Deque[Tuple[float, int]] = deque()
+        self.byte_samples: deque[tuple[float, int]] = deque()
         self.last_metrics_time = 0.0
 
     @property
@@ -195,7 +196,7 @@ class _SinkProgressAdapter:
     def __init__(self, sink: LogSink) -> None:
         self._sink = sink
         self._lock = threading.Lock()
-        self.tasks: List[_SinkTask] = []
+        self.tasks: list[_SinkTask] = []
 
     def __enter__(self) -> "_SinkProgressAdapter":
         return self
@@ -215,7 +216,7 @@ class _SinkProgressAdapter:
         self,
         task: _SinkTask,
         now: float,
-    ) -> Tuple[float, float, int, float, float, Optional[float]]:
+    ) -> tuple[float, float, int, float, float, float | None]:
         cutoff = now - _SPEED_WINDOW_SECONDS
         while task.byte_samples and task.byte_samples[0][0] < cutoff:
             task.byte_samples.popleft()
@@ -227,7 +228,7 @@ class _SinkProgressAdapter:
             speed_bps = window_bytes / effective_span
         else:
             speed_bps = 0.0
-        eta_seconds: Optional[float] = None
+        eta_seconds: float | None = None
         if task.total > 0 and task.completed > 0:
             if task.completed >= task.total:
                 eta_seconds = 0.0
@@ -244,7 +245,7 @@ class _SinkProgressAdapter:
 
     def _emit_metrics(
         self,
-        metrics: Optional[Tuple[float, float, int, float, float, Optional[float]]],
+        metrics: tuple[float, float, int, float, float, float | None] | None,
     ) -> None:
         if metrics is None:
             return
@@ -273,7 +274,7 @@ class _SinkProgressAdapter:
         self._emit_metrics(metrics)
 
     def advance(self, task_id: int, advance: float = 1.0) -> None:
-        emit_values: Optional[Tuple[float, float]] = None
+        emit_values: tuple[float, float] | None = None
         metrics = None
         with self._lock:
             task = self.tasks[task_id]
@@ -311,7 +312,7 @@ def _emit_to_sink(level: str, msg: str) -> bool:
     return True
 
 
-def mask_secret(value: Optional[str]) -> str:
+def mask_secret(value: str | None) -> str:
     """Return a redacted representation of a secret/token for debug logging."""
     if not value:
         return "<empty>"
@@ -413,10 +414,10 @@ class _CliByteMetricsColumn(ProgressColumn):
 class _CliProgressAdapter:
     """Wrap Rich `Progress` so CLI downloads also track byte counts, speed, and ETA."""
 
-    def __init__(self, progress_format: Sequence[Union[str, ProgressColumn]]) -> None:
+    def __init__(self, progress_format: Sequence[str | ProgressColumn]) -> None:
         self._lock = threading.Lock()
         self._bytes_total: dict[Any, int] = {}
-        self._samples: dict[Any, Deque[Tuple[float, int]]] = {}
+        self._samples: dict[Any, deque[tuple[float, int]]] = {}
         columns = list(progress_format)
         if columns:
             columns.append(_CliByteMetricsColumn(self))
@@ -433,7 +434,7 @@ class _CliProgressAdapter:
     def __exit__(self, *args: Any) -> Any:
         return self._progress.__exit__(*args)
 
-    def add_task(self, description: str, total: Optional[float] = 100.0, **kwargs: Any) -> Any:
+    def add_task(self, description: str, total: float | None = 100.0, **kwargs: Any) -> Any:
         task_id = self._progress.add_task(description, total=total, **kwargs)
         with self._lock:
             self._bytes_total[task_id] = 0
@@ -455,7 +456,7 @@ class _CliProgressAdapter:
             while bucket and bucket[0][0] < cutoff:
                 bucket.popleft()
 
-    def get_byte_metrics(self, task_id: Any) -> Optional[Tuple[int, float]]:
+    def get_byte_metrics(self, task_id: Any) -> tuple[int, float] | None:
         now = time.monotonic()
         cutoff = now - _SPEED_WINDOW_SECONDS
         with self._lock:
@@ -473,7 +474,7 @@ class _CliProgressAdapter:
             return total, speed_bps
 
 
-def progress(progress_format: List[Union[str, ProgressColumn]]) -> Any:
+def progress(progress_format: list[str | ProgressColumn]) -> Any:
     sink = get_ui_sink()
     if sink is not None:
         return _SinkProgressAdapter(sink)

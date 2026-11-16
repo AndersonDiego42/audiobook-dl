@@ -5,7 +5,7 @@ from __future__ import annotations
 from io import BytesIO
 from pathlib import Path
 import subprocess
-from typing import Dict, Optional, Sequence, Tuple
+from collections.abc import Sequence
 
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
@@ -15,11 +15,11 @@ from PIL import Image
 class MediaFixtureFactory:
     """Generates and caches real audio/image test fixtures using FFmpeg and Pillow."""
 
-    def __init__(self, cache_dir: Path, ffmpeg_path: Optional[str]) -> None:
+    def __init__(self, cache_dir: Path, ffmpeg_path: str | None) -> None:
         self._cache_dir = cache_dir
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._ffmpeg = ffmpeg_path
-        self._bytes_cache: Dict[Tuple[object, ...], bytes] = {}
+        self._bytes_cache: dict[tuple[object, ...], bytes] = {}
 
     def require_ffmpeg(self) -> str:
         if not self._ffmpeg:
@@ -101,8 +101,8 @@ class MediaFixtureFactory:
     def make_jpeg(
         self,
         *,
-        size: Tuple[int, int] = (32, 32),
-        color: Tuple[int, int, int] = (35, 115, 195),
+        size: tuple[int, int] = (32, 32),
+        color: tuple[int, int, int] = (35, 115, 195),
     ) -> bytes:
         """Generate a deterministic valid JPEG cover image."""
         key = ("jpg", size, color)
@@ -124,7 +124,7 @@ def build_librivox_html(
     *,
     title: str,
     cover_url: str,
-    parts: Sequence[Tuple[str, str]],
+    parts: Sequence[tuple[str, str]],
 ) -> bytes:
     """Build deterministic HTML matching `LibrivoxSource` CSS selectors."""
     part_links = "\n".join(

@@ -16,14 +16,14 @@ from rich.markup import escape
 import json
 import lxml.html
 import re
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
 from urllib.parse import unquote, urljoin
 from urllib3.util import parse_url
 
 BASEURL = "https://www.audiobooks.com/book/stream/"
 
 
-def _parse_timestamp_ms(raw: Any) -> Optional[int]:
+def _parse_timestamp_ms(raw: Any) -> int | None:
     """Parse numeric seconds or `HH:MM:SS` / `MM:SS` strings into milliseconds."""
     if raw is None or raw == "":
         return None
@@ -44,7 +44,7 @@ def _parse_timestamp_ms(raw: Any) -> Optional[int]:
     return None
 
 
-def _split_series_order(raw_series: str) -> Tuple[str, Optional[int]]:
+def _split_series_order(raw_series: str) -> tuple[str, int | None]:
     cleaned = " ".join(raw_series.split())
     match = re.match(r"^(.*?)\s*(?:#|,\s*Book\s+|Book\s+)(\d+(?:\.\d+)?)\s*$", cleaned, re.IGNORECASE)
     if match and match.group(1).strip():
@@ -56,7 +56,7 @@ def _split_series_order(raw_series: str) -> Tuple[str, Optional[int]]:
 
 class AudiobooksdotcomSource(Source):
     match = [
-        r"{}\d+(/\d)?".format(BASEURL),
+        rf"{BASEURL}\d+(/\d)?",
         r"https?://(www\.)?audiobooks\.com/audiobook/.+",
         r"https?://(www\.)?audiobooks\.com/browse/library.*",
     ]
@@ -96,12 +96,12 @@ class AudiobooksdotcomSource(Source):
             chapters=self.extract_chapters(scrape_url),
         )
 
-    def _scrape_library_entries(self, url: str) -> List[Tuple[str, str, Optional[str], str]]:
+    def _scrape_library_entries(self, url: str) -> list[tuple[str, str, str | None, str]]:
         """Scrape library pages in display order returning `(book_id, title, author, book_url)`."""
         logging.debug(f"Downloading library from {url}")
-        entries: List[Tuple[str, str, Optional[str], str]] = []
+        entries: list[tuple[str, str, str | None, str]] = []
         seen_ids = set()
-        page_url: Optional[str] = url
+        page_url: str | None = url
         parsed_initial_url = parse_url(url)
         origin = f"{parsed_initial_url.scheme}://{parsed_initial_url.host}"
 
@@ -158,8 +158,8 @@ class AudiobooksdotcomSource(Source):
         )
 
     @staticmethod
-    def _extract_jsonld_blocks(tree: lxml.html.HtmlElement) -> List[Dict[str, Any]]:
-        blocks: List[Dict[str, Any]] = []
+    def _extract_jsonld_blocks(tree: lxml.html.HtmlElement) -> list[dict[str, Any]]:
+        blocks: list[dict[str, Any]] = []
         for script in tree.cssselect('script[type="application/ld+json"]'):
             raw = (script.text or "").strip()
             if not raw:
@@ -181,13 +181,13 @@ class AudiobooksdotcomSource(Source):
         title_elems = tree.cssselect("h2#bookTitle") or tree.cssselect("h1")
         title = " ".join(title_elems[0].text_content().split()) if title_elems else ""
 
-        authors: List[str] = []
-        narrators: List[str] = []
-        description: Optional[str] = None
-        series_name: Optional[str] = None
-        series_order: Optional[int] = None
-        isbn: Optional[str] = None
-        publisher: Optional[str] = None
+        authors: list[str] = []
+        narrators: list[str] = []
+        description: str | None = None
+        series_name: str | None = None
+        series_order: int | None = None
+        isbn: str | None = None
+        publisher: str | None = None
 
         for block in self._extract_jsonld_blocks(tree):
             if not title and isinstance(block.get("name"), str):
@@ -272,10 +272,10 @@ class AudiobooksdotcomSource(Source):
         )
         return metadata
 
-    def extract_chapters(self, scrape_url: str) -> List[Chapter]:
+    def extract_chapters(self, scrape_url: str) -> list[Chapter]:
         """Extract chapter timestamps from inline script payloads or chapter list elements."""
         page_html = self._get_page(scrape_url).decode("utf-8", errors="replace")
-        chapters: List[Chapter] = []
+        chapters: list[Chapter] = []
 
         # Try inline JS chapters array (e.g., chapters: [{"title": "...", "start": 0}])
         js_match = re.search(r"chapters\s*:\s*(\[[^\]]*\])", page_html, re.DOTALL)
@@ -328,7 +328,7 @@ class AudiobooksdotcomSource(Source):
 
         :returns: User-Agent string
         """
-        raw: Union[str, None] = self._session.cookies.get("ci_session", domain="www.audiobooks.com")
+        raw: str | None = self._session.cookies.get("ci_session", domain="www.audiobooks.com")
         if not raw:
             raise GenericAudiobookDLException("ci_session missing from cookie")
         decoded_cookie = unquote(raw)
@@ -337,10 +337,10 @@ class AudiobooksdotcomSource(Source):
             return match.group(1)
         try:
             return decoded_cookie.split('"')[11]
-        except IndexError:
-            raise GenericAudiobookDLException("Could not extract user_agent from ci_session cookie")
+        except IndexError as error:
+            raise GenericAudiobookDLException("Could not extract user_agent from ci_session cookie") from error
 
-    def extract_file(self, scrape_url: str) -> List[AudiobookFile]:
+    def extract_file(self, scrape_url: str) -> list[AudiobookFile]:
         """
         Extract audio url from html page using the cached page response.
 
@@ -358,7 +358,7 @@ class AudiobooksdotcomSource(Source):
         audio_url = audio_match.group()
         return [AudiobookFile(url=audio_url, ext="mp3")]
 
-    def list_library(self) -> List[CatalogBook]:
+    def list_library(self) -> list[CatalogBook]:
         if self._session.cookies.get("ci_session", domain="www.audiobooks.com"):
             self._apply_cookie_user_agent()
         entries = self._scrape_library_entries("https://www.audiobooks.com/browse/library")

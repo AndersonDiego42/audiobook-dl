@@ -5,7 +5,8 @@ import sys
 import threading
 import time
 import weakref
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any
+from collections.abc import Callable, Sequence
 
 import requests
 
@@ -53,10 +54,10 @@ class DownloadSummary:
     books_completed: int = field(default=0, compare=False)
     books_skipped: int = field(default=0, compare=False)
     books_failed: int = field(default=0, compare=False)
-    book_errors: List[Tuple[str, str]] = field(default_factory=list, compare=False)
-    outputs: List[Dict[str, Any]] = field(default_factory=list, compare=False)
+    book_errors: list[tuple[str, str]] = field(default_factory=list, compare=False)
+    outputs: list[dict[str, Any]] = field(default_factory=list, compare=False)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Serialize summary fields into a JSON-compatible dictionary."""
         return {
             "completed": self.completed,
@@ -71,12 +72,12 @@ class DownloadSummary:
 
 
 def run_post_exec_hook(
-    command: Optional[str],
+    command: str | None,
     *,
     output_path: str,
     metadata: Any,
-    audio_format: Optional[str],
-) -> Optional[int]:
+    audio_format: str | None,
+) -> int | None:
     """
     Execute user-configured `--post-exec` command with `AUDIOBOOK_DL_*` environment variables.
 
@@ -110,7 +111,7 @@ class DownloadEvent:
     """Structured log or progress event emitted by `Downloader`."""
 
     kind: str
-    data: Dict[str, Any]
+    data: dict[str, Any]
 
 
 EventCallback = Callable[[DownloadEvent], None]
@@ -141,7 +142,7 @@ class _EventLogSink:
         bytes_downloaded: int,
         speed_bps: float,
         elapsed_seconds: float,
-        eta_seconds: Optional[float],
+        eta_seconds: float | None,
     ) -> None:
         self._emit(
             "progress_metrics",
@@ -202,7 +203,7 @@ def apply_runtime_options(
     )
 
 
-def _pause_between_books(delay: float, cancel_event: Optional[threading.Event]) -> None:
+def _pause_between_books(delay: float, cancel_event: threading.Event | None) -> None:
     if delay <= 0:
         return
     if cancel_event is not None:
@@ -222,13 +223,13 @@ class Downloader:
 
     def __init__(
         self,
-        config: Optional[Config] = None,
-        options: Optional[DownloadOptions] = None,
+        config: Config | None = None,
+        options: DownloadOptions | None = None,
         *,
-        on_event: Optional[EventCallback] = None,
-        sink: Optional[logging.LogSink] = None,
-        interaction: Optional[logging.InteractionHandler] = None,
-        cancel_event: Optional[threading.Event] = None,
+        on_event: EventCallback | None = None,
+        sink: logging.LogSink | None = None,
+        interaction: logging.InteractionHandler | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         if sink is not None and on_event is not None:
             raise ValueError("Specify either 'sink' or 'on_event', not both")
@@ -241,9 +242,9 @@ class Downloader:
         self.interaction: logging.InteractionHandler = (
             interaction if interaction is not None else logging.CliInteractionHandler()
         )
-        self.cancel_event: Optional[threading.Event] = cancel_event
+        self.cancel_event: threading.Event | None = cancel_event
         if sink is not None:
-            self.sink: Optional[logging.LogSink] = sink
+            self.sink: logging.LogSink | None = sink
         elif on_event is not None:
             self.sink = _EventLogSink(on_event)
         else:
@@ -268,7 +269,7 @@ class Downloader:
         ctx.sink = self.sink if self.sink is not None else logging.get_ui_sink()
         return ctx
 
-    def prepare(self, url: str) -> Tuple[Source, Result]:
+    def prepare(self, url: str) -> tuple[Source, Result]:
         """Resolve source for `url`, authenticate if needed, and fetch `Result`."""
         with logging.job_context(self._build_context()):
             return prepare_source_result(
@@ -293,7 +294,7 @@ class Downloader:
         source: Source,
         result: Result,
         *,
-        selected_indices: Optional[Sequence[int]] = None,
+        selected_indices: Sequence[int] | None = None,
     ) -> None:
         """Download an already-resolved `Audiobook` or `Series` `Result`."""
         with logging.job_context(self._build_context()):
@@ -309,10 +310,10 @@ class Downloader:
 
     def download(
         self,
-        urls: Union[str, Sequence[str]],
+        urls: str | Sequence[str],
         *,
-        selected_indices: Optional[Sequence[int]] = None,
-        prefetched: Optional[Tuple[Source, Result]] = None,
+        selected_indices: Sequence[int] | None = None,
+        prefetched: tuple[Source, Result] | None = None,
     ) -> DownloadSummary:
         """Download one URL or a sequence of URLs and return a `DownloadSummary`."""
         url_list: Sequence[str] = [urls] if isinstance(urls, str) else urls
@@ -333,7 +334,7 @@ class Downloader:
                         logging.log("Download cancelled")
                         break
                 try:
-                    extra_kwargs: Dict[str, Any] = {}
+                    extra_kwargs: dict[str, Any] = {}
                     if index == 0:
                         if selected_indices is not None:
                             extra_kwargs["selected_indices"] = selected_indices
@@ -378,11 +379,11 @@ def run_downloads(
     urls: Sequence[str],
     options: DownloadOptions,
     config: Config,
-    interaction: Optional[logging.InteractionHandler] = None,
-    cancel_event: Optional[threading.Event] = None,
-    sink: Optional[logging.LogSink] = None,
-    selected_indices: Optional[Sequence[int]] = None,
-    prefetched: Optional[Tuple[Source, Result]] = None,
+    interaction: logging.InteractionHandler | None = None,
+    cancel_event: threading.Event | None = None,
+    sink: logging.LogSink | None = None,
+    selected_indices: Sequence[int] | None = None,
+    prefetched: tuple[Source, Result] | None = None,
 ) -> DownloadSummary:
     """Run audiobook downloads for `urls` with isolated per-job context."""
     return Downloader(
@@ -402,10 +403,10 @@ def prepare_source_result(
     url: str,
     options: DownloadOptions,
     config: Config,
-    interaction: Optional[logging.InteractionHandler] = None,
-    cancel_event: Optional[threading.Event] = None,
-    session: Optional[requests.Session] = None,
-) -> Tuple[Source, Result]:
+    interaction: logging.InteractionHandler | None = None,
+    cancel_event: threading.Event | None = None,
+    session: requests.Session | None = None,
+) -> tuple[Source, Result]:
     """
     Resolve source for `url`, authenticate if required, and fetch `Result`
     without downloading audio files.
@@ -446,8 +447,8 @@ def fetch_metadata(
     url: str,
     options: DownloadOptions,
     config: Config,
-    interaction: Optional[logging.InteractionHandler] = None,
-    cancel_event: Optional[threading.Event] = None,
+    interaction: logging.InteractionHandler | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> Result:
     """Fetch `Audiobook` or `Series` metadata for `url` without downloading audio files."""
     source, result = prepare_source_result(
@@ -461,7 +462,7 @@ def fetch_metadata(
     return result
 
 
-def _audiobook_output_entry(audiobook: Audiobook, options: DownloadOptions) -> Dict[str, Any]:
+def _audiobook_output_entry(audiobook: Audiobook, options: DownloadOptions) -> dict[str, Any]:
     location = output.gen_output_location(
         options.output_template,
         audiobook.metadata,
@@ -487,8 +488,8 @@ def _result_to_info_dict(
     result: Result,
     options: DownloadOptions,
     *,
-    selected_indices: Optional[Sequence[int]] = None,
-) -> Dict[str, Any]:
+    selected_indices: Sequence[int] | None = None,
+) -> dict[str, Any]:
     if isinstance(result, Audiobook):
         if not result.metadata.source:
             result.metadata.source = source.name
@@ -522,7 +523,7 @@ def print_result_info(
     result: Result,
     options: DownloadOptions,
     *,
-    selected_indices: Optional[Sequence[int]] = None,
+    selected_indices: Sequence[int] | None = None,
 ) -> None:
     """Display parsed metadata and resolved output path(s) without downloading media."""
     logging.log(f"[magenta]{source.name}[/] info:")
@@ -569,11 +570,11 @@ def download_result(
     source: Source,
     result: Result,
     options: DownloadOptions,
-    interaction: Optional[logging.InteractionHandler] = None,
-    cancel_event: Optional[threading.Event] = None,
-    selected_indices: Optional[Sequence[int]] = None,
-    summary: Optional[DownloadSummary] = None,
-    config: Optional[Config] = None,
+    interaction: logging.InteractionHandler | None = None,
+    cancel_event: threading.Event | None = None,
+    selected_indices: Sequence[int] | None = None,
+    summary: DownloadSummary | None = None,
+    config: Config | None = None,
 ) -> None:
     """Download (or inspect when `options.info_only`) a resolved `Audiobook` or `Series` `Result`."""
     handler = interaction or logging.CliInteractionHandler()
@@ -622,7 +623,7 @@ def download_result(
                 summary.outputs.append(_audiobook_output_entry(result, options))
     elif isinstance(result, Series):
         if selected_indices is None:
-            books_to_process: List[Union[BookId[Any], Audiobook]] = list(result.books)
+            books_to_process: list[BookId[Any] | Audiobook] = list(result.books)
         else:
             seen_idx = set()
             books_to_process = []
@@ -641,7 +642,7 @@ def download_result(
         done_count = 0
         skip_count = 0
         fail_count = 0
-        errors: List[Tuple[str, str]] = []
+        errors: list[tuple[str, str]] = []
         for index, book in enumerate(books_to_process, start=1):
             if cancel_event is not None and cancel_event.is_set():
                 raise DownloadCancelled
@@ -706,12 +707,12 @@ def process_url(
     url: str,
     options: DownloadOptions,
     config: Config,
-    interaction: Optional[logging.InteractionHandler] = None,
-    cancel_event: Optional[threading.Event] = None,
-    selected_indices: Optional[Sequence[int]] = None,
-    prefetched: Optional[Tuple[Source, Result]] = None,
-    summary: Optional[DownloadSummary] = None,
-    session: Optional[requests.Session] = None,
+    interaction: logging.InteractionHandler | None = None,
+    cancel_event: threading.Event | None = None,
+    selected_indices: Sequence[int] | None = None,
+    prefetched: tuple[Source, Result] | None = None,
+    summary: DownloadSummary | None = None,
+    session: requests.Session | None = None,
 ) -> None:
     """
     Process `url` based on `options` and `config`.
@@ -745,7 +746,7 @@ def process_url(
             _close_source(source)
 
 
-def get_cookie_path(options: DownloadOptions, config: Optional[SourceConfig]) -> Optional[str]:
+def get_cookie_path(options: DownloadOptions, config: SourceConfig | None) -> str | None:
     """
     Find path to cookie file. The cookie files are looked for in CLI arguments
     and in the current directory.
@@ -763,15 +764,15 @@ def get_or_ask(
     attr: str,
     hidden: bool,
     options: DownloadOptions,
-    config: Optional[SourceConfig],
-    interaction: Optional[logging.InteractionHandler] = None,
+    config: SourceConfig | None,
+    interaction: logging.InteractionHandler | None = None,
 ) -> str:
     """
     Check for `attr` in CLI options and config options.
     Ask the user for the value if it is not found.
     """
     config_value = getattr(config, attr, None)
-    value: Optional[str] = getattr(options, attr, None) or config_value
+    value: str | None = getattr(options, attr, None) or config_value
     if value is None:
         handler = interaction or logging.CliInteractionHandler()
         return handler.ask_input(attr.capitalize(), hidden=hidden)
@@ -782,8 +783,8 @@ def login(
     url: str,
     source: Source,
     options: DownloadOptions,
-    config: Optional[SourceConfig],
-    interaction: Optional[logging.InteractionHandler] = None,
+    config: SourceConfig | None,
+    interaction: logging.InteractionHandler | None = None,
 ) -> None:
     """Login to `source`."""
     login_data = {}
@@ -798,7 +799,7 @@ def authenticate(
     source: Source,
     options: DownloadOptions,
     config: Config,
-    interaction: Optional[logging.InteractionHandler] = None,
+    interaction: logging.InteractionHandler | None = None,
 ) -> None:
     """Authenticate `source` using cookie file and/or login credentials."""
     req_profile = normalize_profile_name(getattr(options, "profile", None))
@@ -848,7 +849,7 @@ def _init_service_source(
     options: DownloadOptions,
     config: Config,
     *,
-    interaction: Optional[logging.InteractionHandler] = None,
+    interaction: logging.InteractionHandler | None = None,
     url: str = "",
 ) -> Source:
     """Instantiate `service_name` and authenticate when required."""
@@ -871,7 +872,7 @@ def verify_service_auth(
     options: DownloadOptions,
     config: Config,
     *,
-    interaction: Optional[logging.InteractionHandler] = None,
+    interaction: logging.InteractionHandler | None = None,
     persist_cookies: bool = True,
 ) -> bool:
     """Authenticate against `service_name` and optionally cache session cookies."""
@@ -892,8 +893,8 @@ def search_service(
     options: DownloadOptions,
     config: Config,
     *,
-    interaction: Optional[logging.InteractionHandler] = None,
-) -> List[CatalogBook]:
+    interaction: logging.InteractionHandler | None = None,
+) -> list[CatalogBook]:
     """Search `service_name` catalog for `query`."""
     with logging.job_context(apply_runtime_options(options, config)):
         source = _init_service_source(service_name, options, config, interaction=interaction)
@@ -908,8 +909,8 @@ def list_service_library(
     options: DownloadOptions,
     config: Config,
     *,
-    interaction: Optional[logging.InteractionHandler] = None,
-) -> List[CatalogBook]:
+    interaction: logging.InteractionHandler | None = None,
+) -> list[CatalogBook]:
     """List books from `service_name`'s user library/bookshelf."""
     with logging.job_context(apply_runtime_options(options, config)):
         source = _init_service_source(service_name, options, config, interaction=interaction)
@@ -919,11 +920,11 @@ def list_service_library(
             _close_source(source)
 
 
-def _flatten_resolved_books(source: Source, resolved: Result) -> List[Audiobook]:
+def _flatten_resolved_books(source: Source, resolved: Result) -> list[Audiobook]:
     """Expand a `Result` (`Audiobook` or `Series`) into concrete `Audiobook` items."""
     if isinstance(resolved, Audiobook):
         return [resolved]
-    items: List[Audiobook] = []
+    items: list[Audiobook] = []
     for entry in resolved.books:
         if isinstance(entry, Audiobook):
             items.append(entry)
@@ -935,7 +936,7 @@ def _flatten_resolved_books(source: Source, resolved: Result) -> List[Audiobook]
 
 def audiobook_from_series(
     source: Source,
-    book: Union[BookId[Any], Audiobook],
+    book: BookId[Any] | Audiobook,
 ) -> Audiobook:
     """Make an `Audiobook` object from a book entry in a `Series`."""
     if isinstance(book, Audiobook):
@@ -975,9 +976,9 @@ def enrich_audiobook_with_options(
     audiobook: Audiobook,
     options: DownloadOptions,
     *,
-    source: Optional[Source] = None,
-    interaction: Optional[logging.InteractionHandler] = None,
-) -> Optional[EnrichmentResult]:
+    source: Source | None = None,
+    interaction: logging.InteractionHandler | None = None,
+) -> EnrichmentResult | None:
     """Run multi-provider metadata enrichment for `audiobook` according to `options`."""
     raw_providers = getattr(options, "enrich_providers", None)
     try:
@@ -991,7 +992,7 @@ def enrich_audiobook_with_options(
         handler = interaction or logging.CliInteractionHandler()
         choose_fn = getattr(handler, "choose_index", None)
         if choose_fn is not None:
-            def _select(provider_name: str, candidates: Sequence[EnrichmentCandidate]) -> Optional[int]:
+            def _select(provider_name: str, candidates: Sequence[EnrichmentCandidate]) -> int | None:
                 labels = [_format_candidate_choice(c) for c in candidates]
                 return choose_fn(
                     f"Select {provider_name} match for '{audiobook.title}'",
@@ -1028,9 +1029,9 @@ def process_audiobook(
     source: Source,
     audiobook: Audiobook,
     options: DownloadOptions,
-    interaction: Optional[logging.InteractionHandler] = None,
-    cancel_event: Optional[threading.Event] = None,
-    config: Optional[Config] = None,
+    interaction: logging.InteractionHandler | None = None,
+    cancel_event: threading.Event | None = None,
+    config: Config | None = None,
 ) -> bool:
     """Operate on `audiobook` based on `options`. Return False if skipped via archive."""
     if not audiobook.metadata.source and source is not None:
@@ -1058,7 +1059,7 @@ def process_audiobook(
             else None
         )
     )
-    archive: Optional[DownloadArchive] = None
+    archive: DownloadArchive | None = None
     check_archive = bool(use_archive and (explicit_archive or (options.skip_downloaded and ledger_path)))
     if check_archive and ledger_path:
         archive = DownloadArchive(ledger_path)

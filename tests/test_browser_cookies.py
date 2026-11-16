@@ -17,7 +17,6 @@ from audiobookdl.utils.browser_cookies import (
     extract_browser_cookies,
     parse_domain_filter,
     read_chromium_cookies,
-    read_firefox_cookies,
 )
 
 

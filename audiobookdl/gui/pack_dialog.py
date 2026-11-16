@@ -6,7 +6,7 @@ import os
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from typing import Callable, List, Optional, Sequence
+from collections.abc import Callable
 
 from audiobookdl import args
 from audiobookdl.exceptions import AudiobookDLException
@@ -36,8 +36,8 @@ class PackDialog(tk.Toplevel):
         options: args.DownloadOptions,
         *,
         output_dir: str,
-        on_submit: Callable[[List[PackJobRequest], str], None],
-        palette: Optional[ThemePalette] = None,
+        on_submit: Callable[[list[PackJobRequest], str], None],
+        palette: ThemePalette | None = None,
     ) -> None:
         super().__init__(parent)
         self._controller = controller
@@ -45,8 +45,8 @@ class PackDialog(tk.Toplevel):
         self._output_dir = output_dir
         self._on_submit = on_submit
         self._palette = palette or LIGHT_PALETTE
-        self._paths: List[str] = []
-        self._preview_specs: List[PackBookSpec] = []
+        self._paths: list[str] = []
+        self._preview_specs: list[PackBookSpec] = []
         self._scan_token = 0
         self._is_scanning = False
 
@@ -231,16 +231,16 @@ class PackDialog(tk.Toplevel):
             self.cover_path_var.set(chosen)
 
     @staticmethod
-    def _split_multi_value(raw: str) -> List[str]:
+    def _split_multi_value(raw: str) -> list[str]:
         return [part.strip() for part in raw.split(";") if part.strip()]
 
-    def _build_overrides(self) -> Optional[PackOverrides]:
+    def _build_overrides(self) -> PackOverrides | None:
         title = self.title_var.get().strip() or None
         authors = self._split_multi_value(self.author_var.get())
         narrators = self._split_multi_value(self.narrator_var.get())
         series = self.series_var.get().strip() or None
         raw_order = self.series_order_var.get().strip()
-        series_order: Optional[int] = None
+        series_order: int | None = None
         if raw_order:
             try:
                 num = float(raw_order)
@@ -294,8 +294,8 @@ class PackDialog(tk.Toplevel):
         opts = self._clone_options_for_pack()
 
         def _worker() -> None:
-            specs: Optional[List[PackBookSpec]] = None
-            err: Optional[str] = None
+            specs: list[PackBookSpec] | None = None
+            err: str | None = None
             try:
                 specs = self._controller.inspect_local_pack_preview(
                     paths_snapshot,

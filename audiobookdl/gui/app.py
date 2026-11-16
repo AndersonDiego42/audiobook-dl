@@ -8,7 +8,8 @@ import sys
 import tempfile
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any
+from collections.abc import Sequence
 
 from audiobookdl import __version__, args, output
 from audiobookdl.config import (
@@ -96,7 +97,7 @@ class AudiobookDLApp:
     enrich_providers_var: tk.StringVar
     enrich_interactive_var: tk.BooleanVar
 
-    def __init__(self, root: tk.Tk, config_location: Optional[str] = None) -> None:
+    def __init__(self, root: tk.Tk, config_location: str | None = None) -> None:
         self.root = root
         self._controller = GuiController(config_location)
         self.root.title(f"audiobook-dl {__version__}")
@@ -120,11 +121,11 @@ class AudiobookDLApp:
         self._theme_var = tk.StringVar(value=self._theme_mode)
         self._palette: ThemePalette = apply_theme(self.root, self._style, self._theme_mode)
 
-        self._services: List[ServiceInfo] = get_available_services()
+        self._services: list[ServiceInfo] = get_available_services()
         self._is_running = False
         self._is_previewing = False
-        self._preview_dialog: Optional[PreviewDialog] = None
-        self._output_widgets: List[Union[ttk.Entry, ttk.Button, ttk.Combobox]] = []
+        self._preview_dialog: PreviewDialog | None = None
+        self._output_widgets: list[ttk.Entry | ttk.Button | ttk.Combobox] = []
 
         self._init_variables()
         self._ffmpeg_assistant = FFmpegAssistant(
@@ -142,7 +143,7 @@ class AudiobookDLApp:
         self._queue_panel.restore_saved_queue_history()
         self._set_running_state(False)
 
-        self._poll_after_id: Optional[str] = None
+        self._poll_after_id: str | None = None
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<Destroy>", self._on_root_destroy, add="+")
         self._poll_after_id = self.root.after(50, self._poll_queue)
@@ -511,7 +512,7 @@ class AudiobookDLApp:
         if urls:
             self._append_urls_to_input(urls)
 
-    def _append_urls_to_input(self, urls: Sequence[str]) -> List[str]:
+    def _append_urls_to_input(self, urls: Sequence[str]) -> list[str]:
         existing = parse_url_text(self.urls_text.get("1.0", tk.END))
         existing_set = set(existing)
         added = [u for u in urls if u not in existing_set]
@@ -522,7 +523,7 @@ class AudiobookDLApp:
             self._on_urls_changed()
         return added
 
-    def _on_urls_changed(self, _event: Optional[tk.Event] = None) -> None:
+    def _on_urls_changed(self, _event: tk.Event | None = None) -> None:
         self._auth_panel.on_urls_changed(parse_url_text(self.urls_text.get("1.0", tk.END)))
 
     def _reload_config(self) -> None:
@@ -569,7 +570,7 @@ class AudiobookDLApp:
         return default_archive_path(db_dir)
 
     def _show_archive_ledger_dialog(self) -> ArchiveLedgerDialog:
-        def _on_queue_urls(urls_to_add: List[str]) -> None:
+        def _on_queue_urls(urls_to_add: list[str]) -> None:
             added = self._append_urls_to_input(urls_to_add)
             self.status_var.set(
                 f"Queued {len(added)} URL{'s' if len(added) != 1 else ''} from library"
@@ -611,16 +612,16 @@ class AudiobookDLApp:
             options.profile = None if chosen_profile == DEFAULT_PROFILE else chosen_profile
             self._controller.start_catalog_fetch(mode, svc.key, query_text, options, dialog)
 
-        def _on_add_urls(urls_to_add: List[str]) -> None:
+        def _on_add_urls(urls_to_add: list[str]) -> None:
             added = self._append_urls_to_input(urls_to_add)
             self.status_var.set(
                 f"Added {len(added)} URL{'s' if len(added) != 1 else ''} from catalog"
             )
 
-        def _profile_resolver(service_key: str) -> List[str]:
+        def _profile_resolver(service_key: str) -> list[str]:
             return list_source_profiles(self._controller.config_snapshot(), service_key)
 
-        def _on_save_to_library(svc_key: str, prof: str, books: Sequence[Any]) -> Tuple[int, int]:
+        def _on_save_to_library(svc_key: str, prof: str, books: Sequence[Any]) -> tuple[int, int]:
             from audiobookdl.utils.archive import DownloadArchive
 
             archive = DownloadArchive(self._archive_ledger_path())
@@ -671,13 +672,13 @@ class AudiobookDLApp:
         elif self.output_format_var.get() == "m4b":
             self.output_format_var.set("Original")
 
-    def _on_format_selected(self, _event: Optional[tk.Event] = None) -> None:
+    def _on_format_selected(self, _event: tk.Event | None = None) -> None:
         is_m4b = self.output_format_var.get() == "m4b"
         self.m4b_var.set(is_m4b)
         if is_m4b:
             self.combine_var.set(True)
 
-    def _on_preset_selected(self, _event: Optional[tk.Event] = None) -> None:
+    def _on_preset_selected(self, _event: tk.Event | None = None) -> None:
         chosen = self.template_preset_var.get()
         tpl = PRESET_LABEL_TO_TEMPLATE.get(chosen)
         if tpl:
@@ -717,7 +718,7 @@ class AudiobookDLApp:
         if not path:
             return
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 content = f.read().strip()
         except OSError as exc:
             messagebox.showerror("Error", f"Could not read file:\n{exc}", parent=self.root)
@@ -733,7 +734,7 @@ class AudiobookDLApp:
         self.urls_text.delete("1.0", tk.END)
         self._on_urls_changed()
 
-    def _paste_urls_from_clipboard(self) -> List[str]:
+    def _paste_urls_from_clipboard(self) -> list[str]:
         """Insert URLs from the system clipboard into the URL box."""
         try:
             raw = self.root.clipboard_get()
@@ -799,9 +800,9 @@ class AudiobookDLApp:
 
     def _try_build_options(
         self,
-        urls_override: Optional[Sequence[str]] = None,
-        parent: Optional[tk.Misc] = None,
-    ) -> Optional[args.DownloadOptions]:
+        urls_override: Sequence[str] | None = None,
+        parent: tk.Misc | None = None,
+    ) -> args.DownloadOptions | None:
         """Build `DownloadOptions`, displaying a validation dialog on invalid numeric/text input."""
         try:
             return self.build_options(urls_override=urls_override)
@@ -814,7 +815,7 @@ class AudiobookDLApp:
             )
             return None
 
-    def build_options(self, urls_override: Optional[Sequence[str]] = None) -> args.DownloadOptions:
+    def build_options(self, urls_override: Sequence[str] | None = None) -> args.DownloadOptions:
         """Build `DownloadOptions` from current UI field values."""
         output_dir = self.output_dir_var.get().strip() or default_output_dir()
         template = self.template_var.get().strip() or "{title}"
@@ -847,9 +848,9 @@ class AudiobookDLApp:
             **option_values,
         )
 
-    def _read_persisted_gui_preferences(self) -> Dict[str, Any]:
+    def _read_persisted_gui_preferences(self) -> dict[str, Any]:
         """Read valid persisted GUI toggle/option values without failing on transient invalid input."""
-        prefs: Dict[str, Any] = {}
+        prefs: dict[str, Any] = {}
         for spec in PERSISTED_GUI_OPTION_SPECS:
             binding = spec.gui
             if binding is None:
@@ -874,7 +875,7 @@ class AudiobookDLApp:
     def _start_new_run(
         self,
         job_specs: Sequence[
-            Tuple[str, args.DownloadOptions, Optional[List[int]], Optional[Tuple[Source, Result]]]
+            tuple[str, args.DownloadOptions, list[int] | None, tuple[Source, Result] | None]
         ],
     ) -> None:
         """Initialize UI and queue state for a fresh download run."""
@@ -888,7 +889,7 @@ class AudiobookDLApp:
         for job in queued_jobs:
             self._queue_panel.register_queue_job(job)
 
-    def _enqueue_additional_urls(self, urls: List[str]) -> bool:
+    def _enqueue_additional_urls(self, urls: list[str]) -> bool:
         """Append new URLs to the currently active download queue."""
         if not self._auth_panel.validate_cookie_file():
             return True
@@ -953,9 +954,9 @@ class AudiobookDLApp:
             palette=self._palette,
         )
 
-    def _on_pack_submitted(self, requests_list: List[PackJobRequest], output_format: str) -> None:
+    def _on_pack_submitted(self, requests_list: list[PackJobRequest], output_format: str) -> None:
         """Queue one or more local repackaging requests onto `GuiController`."""
-        pairs: List[Tuple[PackJobRequest, args.DownloadOptions]] = []
+        pairs: list[tuple[PackJobRequest, args.DownloadOptions]] = []
         for req in requests_list:
             opts = self._try_build_options(urls_override=[])
             if opts is None:
@@ -1071,8 +1072,8 @@ class AudiobookDLApp:
     def _handle_preview_done(
         self,
         url: str,
-        prepared: Optional[Tuple[Source, Result]],
-        exc: Optional[Exception],
+        prepared: tuple[Source, Result] | None,
+        exc: Exception | None,
     ) -> None:
         self._set_previewing_state(False)
         self._controller.preview_interaction = None
@@ -1125,7 +1126,7 @@ class AudiobookDLApp:
         self._preview_dialog = dialog
         return dialog
 
-    def _series_book_exists(self, book: Union[BookId[Any], Audiobook]) -> bool:
+    def _series_book_exists(self, book: BookId[Any] | Audiobook) -> bool:
         """Return True when `book` already appears on disk at the configured output path."""
         if not isinstance(book, Audiobook):
             return False
@@ -1151,8 +1152,8 @@ class AudiobookDLApp:
     def _enqueue_from_preview(
         self,
         url: str,
-        prefetched: Tuple[Source, Result],
-        selected_indices: Optional[List[int]],
+        prefetched: tuple[Source, Result],
+        selected_indices: list[int] | None,
     ) -> None:
         """Start or queue a download from an inspected preview result."""
         options = self._try_build_options(urls_override=[url])
@@ -1285,7 +1286,7 @@ class AudiobookDLApp:
             if run_id == self._queue_panel.current_ui_run_id:
                 self._finish_run(summary, exc)
 
-    def _handle_update_checked(self, info: Optional[UpdateInfo], interactive: bool) -> None:
+    def _handle_update_checked(self, info: UpdateInfo | None, interactive: bool) -> None:
         if info is None:
             if interactive:
                 self.status_var.set("Update check failed")
@@ -1315,7 +1316,7 @@ class AudiobookDLApp:
                 parent=self.root,
             )
 
-    def _finish_run(self, summary: Optional[DownloadSummary], exc: Optional[Exception]) -> None:
+    def _finish_run(self, summary: DownloadSummary | None, exc: Exception | None) -> None:
         self._set_running_state(False)
         self._controller.clear_seen_urls()
         self._queue_panel.finish_run(
@@ -1396,12 +1397,12 @@ def _attach_parent_console_windows() -> None:
         if sys.stderr is None:
             sys.stderr = open("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)
         if sys.stdin is None:
-            sys.stdin = open("CONIN$", "r", encoding="utf-8", errors="replace")
+            sys.stdin = open("CONIN$", encoding="utf-8", errors="replace")
     except Exception:
         pass
 
 
-def parse_gui_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+def parse_gui_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments supported by the desktop GUI launcher."""
     parser = argparse.ArgumentParser(prog="audiobook-dl-gui")
     parser.add_argument(
@@ -1462,7 +1463,7 @@ def run_self_test(check_gui: bool = True) -> None:
                 root.destroy()
 
 
-def main(argv: Optional[Sequence[str]] = None) -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     """Launch the audiobook-dl desktop GUI, or dispatch CLI invocations."""
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     if not _is_gui_invocation(raw_argv):

@@ -4,12 +4,12 @@ from audiobookdl.utils import program_in_path
 
 import os
 import threading
-from typing import Optional, Sequence
+from collections.abc import Sequence
 
 def add_metadata(
     filepath: str,
     metadata: AudiobookMetadata,
-    cover: Optional[Cover] = None,
+    cover: Cover | None = None,
 ) -> bool:
     """Adds metadata (and optional cover art where supported inline) to `filepath`.
 
@@ -42,9 +42,9 @@ def embed_cover(filepath: str, cover: Cover):
 def add_chapters(
     filepath: str,
     chapters: Sequence[Chapter],
-    cancel_event: Optional[threading.Event] = None,
-    audio_bitrate: Optional[str] = None,
-    cover: Optional[Cover] = None,
+    cancel_event: threading.Event | None = None,
+    audio_bitrate: str | None = None,
+    cover: Cover | None = None,
 ) -> bool:
     """Adds chapters (and optional ID3 cover art in one save) to `filepath`.
 

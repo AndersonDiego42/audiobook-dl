@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 from urllib.parse import quote
 
 from .source import CatalogBook, Source
@@ -12,7 +12,7 @@ from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Co
 from audiobookdl.exceptions import BookNotFound, RequestError
 
 # Higher value = preferred container/encoding when Archive.org stores derived variants for one stem.
-_FORMAT_PRIORITY: Dict[str, int] = {
+_FORMAT_PRIORITY: dict[str, int] = {
     "m4b": 100,
     "mpeg4 audio": 95,
     "m4a": 90,
@@ -25,7 +25,7 @@ _FORMAT_PRIORITY: Dict[str, int] = {
 }
 
 
-def _parse_ia_length_ms(raw: Any) -> Optional[int]:
+def _parse_ia_length_ms(raw: Any) -> int | None:
     if raw is None or raw == "":
         return None
     if isinstance(raw, (int, float)):
@@ -42,12 +42,12 @@ def _parse_ia_length_ms(raw: Any) -> Optional[int]:
     return None
 
 
-def _natural_sort_key(text: str) -> Tuple[Any, ...]:
+def _natural_sort_key(text: str) -> tuple[Any, ...]:
     parts = re.split(r"(\d+)", text.lower())
     return tuple(int(p) if p.isdigit() else p for p in parts)
 
 
-def _strip_html(raw: Optional[str]) -> Optional[str]:
+def _strip_html(raw: str | None) -> str | None:
     if not raw:
         return None
     cleaned = " ".join(re.sub(r"<[^>]+>", " ", str(raw)).split())
@@ -57,7 +57,7 @@ def _strip_html(raw: Optional[str]) -> Optional[str]:
 class ArchiveOrgSource(Source):
     """Internet Archive (`archive.org`) Metadata API & search adapter."""
 
-    _authentication_methods: List[str] = []
+    _authentication_methods: list[str] = []
     names = ["Archive.org", "Internet Archive"]
     supports_search = True
     supports_library = False
@@ -75,9 +75,9 @@ class ArchiveOrgSource(Source):
             raise BookNotFound
         return ident
 
-    def _select_audio_files(self, raw_files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _select_audio_files(self, raw_files: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Deduplicate derived transcodes per stem, picking highest-priority audio per track."""
-        by_stem: Dict[str, Tuple[int, Dict[str, Any]]] = {}
+        by_stem: dict[str, tuple[int, dict[str, Any]]] = {}
         for entry in raw_files:
             if not isinstance(entry, dict):
                 continue
@@ -99,7 +99,7 @@ class ArchiveOrgSource(Source):
 
         selected = [pair[1] for pair in by_stem.values()]
 
-        def _track_key(item: Dict[str, Any]) -> Tuple[int, int, Tuple[Any, ...]]:
+        def _track_key(item: dict[str, Any]) -> tuple[int, int, tuple[Any, ...]]:
             raw_track = str(item.get("track") or "").split("/", 1)[0].strip()
             if raw_track.isdigit():
                 return (0, int(raw_track), _natural_sort_key(str(item.get("name") or "")))
@@ -108,9 +108,9 @@ class ArchiveOrgSource(Source):
         selected.sort(key=_track_key)
         return selected
 
-    def _fetch_cover(self, identifier: str, raw_files: List[Dict[str, Any]]) -> Optional[Cover]:
+    def _fetch_cover(self, identifier: str, raw_files: list[dict[str, Any]]) -> Cover | None:
         image_exts = ("jpg", "jpeg", "png", "webp")
-        candidates: List[Tuple[int, str]] = []
+        candidates: list[tuple[int, str]] = []
         for entry in raw_files:
             if not isinstance(entry, dict):
                 continue
@@ -136,7 +136,7 @@ class ArchiveOrgSource(Source):
                 continue
         return None
 
-    def search(self, query: str) -> List[CatalogBook]:
+    def search(self, query: str) -> list[CatalogBook]:
         cleaned = query.strip()
         if not cleaned:
             return []
@@ -153,7 +153,7 @@ class ArchiveOrgSource(Source):
         except RequestError:
             return []
         docs = (payload.get("response") or {}).get("docs") or []
-        results: List[CatalogBook] = []
+        results: list[CatalogBook] = []
         for doc in docs:
             if not isinstance(doc, dict):
                 continue
@@ -235,13 +235,13 @@ class ArchiveOrgSource(Source):
             isbn_val = md["isbn"][0] if isinstance(md["isbn"], list) else md["isbn"]
             meta.isbn = str(isbn_val).strip()
 
-        files: List[AudiobookFile] = []
-        chapters: List[Chapter] = []
+        files: list[AudiobookFile] = []
+        chapters: list[Chapter] = []
         running_ms = 0
-        lengths: List[Optional[int]] = [_parse_ia_length_ms(entry.get("length")) for entry in selected]
+        lengths: list[int | None] = [_parse_ia_length_ms(entry.get("length")) for entry in selected]
         all_have_lengths = all(dur is not None and dur > 0 for dur in lengths)
 
-        for entry, dur_ms in zip(selected, lengths):
+        for entry, dur_ms in zip(selected, lengths, strict=True):
             fname = str(entry["name"])
             ext = os.path.splitext(fname)[1].lstrip(".").lower() or "mp3"
             track_title = str(entry.get("title") or os.path.splitext(os.path.basename(fname))[0]).strip()

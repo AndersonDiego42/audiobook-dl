@@ -1,6 +1,7 @@
 import argparse
 from dataclasses import dataclass, field
-from typing import Any, FrozenSet, List, Optional, Sequence
+from typing import Any
+from collections.abc import Sequence
 
 from audiobookdl import __version__
 from audiobookdl.options_schema import (
@@ -9,7 +10,7 @@ from audiobookdl.options_schema import (
 )
 
 
-def parse_series_selection(spec: str, total: int) -> List[int]:
+def parse_series_selection(spec: str, total: int) -> list[int]:
     """
     Parse a 1-based comma/range selection string (e.g. `'1,3-5'`) into unique
     ordered 0-based indices bounded by `[0, total)`.
@@ -19,7 +20,7 @@ def parse_series_selection(spec: str, total: int) -> List[int]:
     cleaned = spec.strip()
     if not cleaned:
         raise ValueError("Series item selection cannot be empty")
-    selected: List[int] = []
+    selected: list[int] = []
     seen = set()
     for token in cleaned.split(","):
         part = token.strip()
@@ -55,11 +56,11 @@ def parse_series_selection(spec: str, total: int) -> List[int]:
 class DownloadOptions:
     """Typed runtime options shared across CLI, GUI, pipeline, and sources."""
 
-    urls: List[str] = field(default_factory=list)
-    cookie_file: Optional[str] = None
+    urls: list[str] = field(default_factory=list)
+    cookie_file: str | None = None
     combine: bool = False
     output_template: str = "{title}"
-    output_preset: Optional[str] = None
+    output_preset: str | None = None
     remove_chars: str = ""
     debug: bool = False
     quiet: bool = False
@@ -67,16 +68,16 @@ class DownloadOptions:
     cover: bool = False
     no_chapters: bool = False
     split_chapters: bool = False
-    output_format: Optional[str] = None
+    output_format: str | None = None
     media_type: str = "auto"
     ffmpeg_output: bool = False
-    input_file: Optional[str] = None
-    username: Optional[str] = None
-    password: Optional[str] = None
-    library: Optional[str] = None
-    profile: Optional[str] = None
+    input_file: str | None = None
+    username: str | None = None
+    password: str | None = None
+    library: str | None = None
+    profile: str | None = None
     skip_downloaded: bool = False
-    download_archive: Optional[str] = None
+    download_archive: str | None = None
     no_download_archive: bool = False
     database_directory: str = field(default_factory=default_database_directory)
     write_json_metadata: bool = False
@@ -85,37 +86,37 @@ class DownloadOptions:
     write_abs_metadata: bool = False
     upload_to_abs: bool = False
     write_cue: bool = False
-    config_location: Optional[str] = None
+    config_location: str | None = None
     resume: bool = False
-    audio_bitrate: Optional[str] = None
-    overwrite: Optional[bool] = None
+    audio_bitrate: str | None = None
+    overwrite: bool | None = None
     list_sources: bool = False
     info_only: bool = False
-    series_items: Optional[str] = None
-    max_workers: Optional[int] = None
+    series_items: str | None = None
+    max_workers: int | None = None
     book_delay: float = 0.0
-    limit_rate: Optional[str] = None
-    proxy: Optional[str] = None
-    timeout: Optional[float] = None
-    impersonate: Optional[str] = None
+    limit_rate: str | None = None
+    proxy: str | None = None
+    timeout: float | None = None
+    impersonate: str | None = None
     json_output: bool = False
-    post_exec: Optional[str] = None
+    post_exec: str | None = None
     loudnorm: bool = False
     mono: bool = False
     chapters_from_silence: bool = False
     chapter_offset_ms: int = 0
     square_cover: bool = False
-    max_cover_size: Optional[int] = None
-    service: Optional[str] = None
-    search_query: Optional[str] = None
+    max_cover_size: int | None = None
+    service: str | None = None
+    search_query: str | None = None
     library_list: bool = False
     verify_auth: bool = False
     enrich_metadata: bool = False
-    enrich_providers: Optional[str] = None
+    enrich_providers: str | None = None
     enrich_interactive: bool = False
     no_enrich_cache: bool = False
     check_updates: bool = False
-    _explicit_fields: FrozenSet[str] = field(
+    _explicit_fields: frozenset[str] = field(
         default_factory=frozenset,
         init=False,
         repr=False,
@@ -130,7 +131,7 @@ def build_default_options(**overrides: Any) -> DownloadOptions:
     return opts
 
 
-def parse_arguments(argv: Optional[Sequence[str]] = None) -> DownloadOptions:
+def parse_arguments(argv: Sequence[str] | None = None) -> DownloadOptions:
     parser = argparse.ArgumentParser(
         prog="audiobook-dl",
         description="Download audiobooks from websites",
@@ -160,7 +161,7 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> DownloadOptions:
     return build_default_options(**provided)
 
 
-_PACK_SHARED_OPTION_NAMES: FrozenSet[str] = frozenset(
+_PACK_SHARED_OPTION_NAMES: frozenset[str] = frozenset(
     {
         "output_template",
         "output_preset",
@@ -210,20 +211,20 @@ def _parse_series_order_arg(value: str) -> int:
 class PackOptions:
     """Pack-subcommand arguments for offline local audiobook repackaging."""
 
-    paths: List[str] = field(default_factory=list)
+    paths: list[str] = field(default_factory=list)
     recursive: bool = False
     delete_source: bool = False
     dry_run: bool = False
     json_output: bool = False
-    output_dir: Optional[str] = None
-    title: Optional[str] = None
-    authors: List[str] = field(default_factory=list)
-    narrators: List[str] = field(default_factory=list)
-    series: Optional[str] = None
-    series_order: Optional[int] = None
-    isbn: Optional[str] = None
-    asin: Optional[str] = None
-    cover_path: Optional[str] = None
+    output_dir: str | None = None
+    title: str | None = None
+    authors: list[str] = field(default_factory=list)
+    narrators: list[str] = field(default_factory=list)
+    series: str | None = None
+    series_order: int | None = None
+    isbn: str | None = None
+    asin: str | None = None
+    cover_path: str | None = None
 
 
 def build_pack_parser() -> argparse.ArgumentParser:
@@ -301,7 +302,7 @@ def build_pack_parser() -> argparse.ArgumentParser:
 
 
 def parse_pack_arguments(
-    argv: Optional[Sequence[str]] = None,
+    argv: Sequence[str] | None = None,
 ) -> tuple[DownloadOptions, PackOptions]:
     """Parse arguments for `audiobook-dl pack` into `(DownloadOptions, PackOptions)`."""
     parser = build_pack_parser()
@@ -330,18 +331,18 @@ class LibraryOptions:
     """Arguments for `audiobook-dl library` subcommand."""
 
     action: str
-    entry_ids: List[int] = field(default_factory=list)
+    entry_ids: list[int] = field(default_factory=list)
     query: str = ""
     limit: int = 100
     include_trashed: bool = False
     include_hidden: bool = True
-    tags: List[str] = field(default_factory=list)
-    archive_path: Optional[str] = None
-    config_location: Optional[str] = None
+    tags: list[str] = field(default_factory=list)
+    archive_path: str | None = None
+    config_location: str | None = None
     json_output: bool = False
 
 
-def parse_library_arguments(argv: Optional[Sequence[str]] = None) -> LibraryOptions:
+def parse_library_arguments(argv: Sequence[str] | None = None) -> LibraryOptions:
     """Parse arguments for `audiobook-dl library`."""
     parser = argparse.ArgumentParser(
         prog="audiobook-dl library",
@@ -383,7 +384,7 @@ def parse_library_arguments(argv: Optional[Sequence[str]] = None) -> LibraryOpti
         act_p.add_argument("entry_ids", nargs="+", type=int, help="Entry ID(s)")
 
     ns = parser.parse_args(argv)
-    tags: List[str] = []
+    tags: list[str] = []
     if ns.action == "tag":
         tags = [*ns.add, *(f"-{t}" for t in ns.remove)]
     return LibraryOptions(
@@ -404,16 +405,16 @@ def parse_library_arguments(argv: Optional[Sequence[str]] = None) -> LibraryOpti
 class ScanOptions:
     """CLI options parsed by `audiobook-dl scan`."""
 
-    paths: List[str] = field(default_factory=list)
+    paths: list[str] = field(default_factory=list)
     verify_missing: bool = False
     dry_run: bool = False
     json_output: bool = False
     profile: str = "default"
-    archive_path: Optional[str] = None
-    config_location: Optional[str] = None
+    archive_path: str | None = None
+    config_location: str | None = None
 
 
-def parse_scan_arguments(argv: Optional[Sequence[str]] = None) -> ScanOptions:
+def parse_scan_arguments(argv: Sequence[str] | None = None) -> ScanOptions:
     """Parse arguments for `audiobook-dl scan`."""
     parser = argparse.ArgumentParser(
         prog="audiobook-dl scan",
@@ -447,16 +448,16 @@ class ExportOptions:
     """CLI options parsed by `audiobook-dl export`."""
 
     output_path: str
-    fmt: Optional[str] = None
+    fmt: str | None = None
     query: str = ""
     limit: int = 100000
     include_trashed: bool = False
     include_hidden: bool = True
-    archive_path: Optional[str] = None
-    config_location: Optional[str] = None
+    archive_path: str | None = None
+    config_location: str | None = None
 
 
-def parse_export_arguments(argv: Optional[Sequence[str]] = None) -> ExportOptions:
+def parse_export_arguments(argv: Sequence[str] | None = None) -> ExportOptions:
     """Parse arguments for `audiobook-dl export`."""
     parser = argparse.ArgumentParser(
         prog="audiobook-dl export",
@@ -494,20 +495,20 @@ def parse_export_arguments(argv: Optional[Sequence[str]] = None) -> ExportOption
 class SyncOptions:
     """CLI options parsed by `audiobook-dl sync`."""
 
-    services: List[str] = field(default_factory=list)
-    profile: Optional[str] = None
+    services: list[str] = field(default_factory=list)
+    profile: str | None = None
     scan_only: bool = False
     dry_run: bool = False
     watch: bool = False
     interval_seconds: int = 3600
     json_output: bool = False
-    output_template: Optional[str] = None
-    output_format: Optional[str] = None
-    archive_path: Optional[str] = None
-    config_location: Optional[str] = None
+    output_template: str | None = None
+    output_format: str | None = None
+    archive_path: str | None = None
+    config_location: str | None = None
 
 
-def parse_sync_arguments(argv: Optional[Sequence[str]] = None) -> SyncOptions:
+def parse_sync_arguments(argv: Sequence[str] | None = None) -> SyncOptions:
     """Parse arguments for `audiobook-dl sync`."""
     parser = argparse.ArgumentParser(
         prog="audiobook-dl sync",
@@ -559,14 +560,14 @@ class ServeOptions:
 
     host: str = "127.0.0.1"
     port: int = 8080
-    output_dir: Optional[str] = None
-    output_template: Optional[str] = None
-    output_format: Optional[str] = None
-    token: Optional[str] = None
-    config_location: Optional[str] = None
+    output_dir: str | None = None
+    output_template: str | None = None
+    output_format: str | None = None
+    token: str | None = None
+    config_location: str | None = None
 
 
-def parse_serve_arguments(argv: Optional[Sequence[str]] = None) -> ServeOptions:
+def parse_serve_arguments(argv: Sequence[str] | None = None) -> ServeOptions:
     """Parse arguments for `audiobook-dl serve`."""
     import os
 
@@ -599,7 +600,7 @@ def parse_serve_arguments(argv: Optional[Sequence[str]] = None) -> ServeOptions:
     )
 
 
-def get_urls(options: DownloadOptions) -> List[str]:
+def get_urls(options: DownloadOptions) -> list[str]:
     """
     Creates a list of all urls in cli options.
     Urls a found in `options.urls` and read from `options.input_file` if the
@@ -614,11 +615,11 @@ def get_urls(options: DownloadOptions) -> List[str]:
     # File
     if options.input_file:
         try:
-            with open(options.input_file, "r", encoding="utf-8-sig") as f:
+            with open(options.input_file, encoding="utf-8-sig") as f:
                 urls.extend(f.read().split())
         except OSError as error:
             raise SystemExit(
                 f"Error: cannot read input file '{options.input_file}': "
                 f"{error.strerror or error}"
-            )
+            ) from error
     return urls

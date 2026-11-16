@@ -1,6 +1,6 @@
 """Audiobookshelf REST client for library inspection, book upload, and library scans."""
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any
 import os
 import requests
 
@@ -51,7 +51,7 @@ class AudiobookshelfClient:
         base_url: str,
         api_token: str,
         *,
-        session: Optional[requests.Session] = None,
+        session: requests.Session | None = None,
         timeout: Any = DEFAULT_HTTP_TIMEOUT,
     ) -> None:
         self.base_url = _normalize_base_url(base_url)
@@ -68,7 +68,7 @@ class AudiobookshelfClient:
         if self._owns_session:
             self.session.close()
 
-    def _headers(self) -> Dict[str, str]:
+    def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.api_token}"}
 
     def _request(
@@ -76,9 +76,9 @@ class AudiobookshelfClient:
         method: str,
         path: str,
         *,
-        json_body: Optional[Dict[str, Any]] = None,
-        data: Optional[Dict[str, Any]] = None,
-        files: Optional[List[Tuple[str, Tuple[str, Any]]]] = None,
+        json_body: dict[str, Any] | None = None,
+        data: dict[str, Any] | None = None,
+        files: list[tuple[str, tuple[str, Any]]] | None = None,
     ) -> requests.Response:
         url = f"{self.base_url}{path}"
         try:
@@ -113,12 +113,12 @@ class AudiobookshelfClient:
                 return str(user["username"])
         return "authenticated"
 
-    def list_libraries(self) -> List[Tuple[str, str]]:
+    def list_libraries(self) -> list[tuple[str, str]]:
         """Return `(library_id, name)` tuples configured on the server."""
         resp = self._request("GET", "/api/libraries")
         payload = resp.json()
         libraries = payload.get("libraries") if isinstance(payload, dict) else []
-        out: List[Tuple[str, str]] = []
+        out: list[tuple[str, str]] = []
         if isinstance(libraries, list):
             for lib in libraries:
                 if isinstance(lib, dict) and lib.get("id"):
@@ -146,7 +146,7 @@ class AudiobookshelfClient:
         self._request("POST", f"/api/libraries/{library_id}/scan{suffix}")
         return True
 
-    def _collect_upload_files(self, local_path: str) -> List[str]:
+    def _collect_upload_files(self, local_path: str) -> list[str]:
         abs_path = os.path.abspath(local_path)
         if not os.path.exists(abs_path):
             raise AudiobookshelfError(f"Upload path does not exist: {local_path}")
@@ -169,7 +169,7 @@ class AudiobookshelfClient:
                     files.append(candidate)
             return files
 
-        collected: List[str] = []
+        collected: list[str] = []
         for walk_root, _dirs, names in os.walk(abs_path):
             for name in sorted(names):
                 ext = os.path.splitext(name)[1].lower()
@@ -184,15 +184,15 @@ class AudiobookshelfClient:
         local_path: str,
         *,
         library_id: str,
-        metadata: Optional[AudiobookMetadata] = None,
-        folder_id: Optional[str] = None,
+        metadata: AudiobookMetadata | None = None,
+        folder_id: str | None = None,
     ) -> bool:
         """Upload local audiobook files and sidecars via `POST /api/upload`."""
         if not library_id.strip():
             raise AudiobookshelfError("Audiobookshelf library ID is required to upload")
         resolved_folder = folder_id or self.get_library_folder_id(library_id)
         filepaths = self._collect_upload_files(local_path)
-        form_data: Dict[str, Any] = {
+        form_data: dict[str, Any] = {
             "library": library_id,
             "folder": resolved_folder,
             "title": (metadata.title if metadata and metadata.title else os.path.basename(local_path)),
@@ -204,7 +204,7 @@ class AudiobookshelfClient:
                 form_data["series"] = metadata.series
 
         handles = []
-        multipart_files: List[Tuple[str, Tuple[str, Any]]] = []
+        multipart_files: list[tuple[str, tuple[str, Any]]] = []
         try:
             for idx, fpath in enumerate(filepaths):
                 fh = open(fpath, "rb")
@@ -219,11 +219,11 @@ class AudiobookshelfClient:
 
 def sync_book_to_audiobookshelf(
     local_path: str,
-    metadata: Optional[AudiobookMetadata],
+    metadata: AudiobookMetadata | None,
     abs_config: Any,
     *,
     force_upload: bool = False,
-    session: Optional[requests.Session] = None,
+    session: requests.Session | None = None,
 ) -> bool:
     """Upload and/or trigger a library scan on Audiobookshelf when configured.
 

@@ -5,7 +5,8 @@ import os
 import sqlite3
 import threading
 import time
-from typing import Any, Iterator, Mapping, Optional
+from typing import Any
+from collections.abc import Iterator, Mapping
 
 
 DEFAULT_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
@@ -16,7 +17,7 @@ def default_enrichment_cache_path(database_directory: str) -> str:
     return os.path.join(database_directory, "enrichment_cache.db")
 
 
-def make_cache_key(provider: str, endpoint: str, params: Optional[Mapping[str, Any]] = None) -> str:
+def make_cache_key(provider: str, endpoint: str, params: Mapping[str, Any] | None = None) -> str:
     """Build a deterministic SHA-256 cache key for a provider HTTP query."""
     normalized_params = sorted(
         (str(k), "" if v is None else str(v))
@@ -49,7 +50,7 @@ class EnrichmentCache:
         self.ttl_seconds = float(ttl_seconds)
         self._persistent = persistent
         self._lock = threading.RLock()
-        self._conn: Optional[sqlite3.Connection] = None
+        self._conn: sqlite3.Connection | None = None
         parent = os.path.dirname(self.db_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -110,9 +111,9 @@ class EnrichmentCache:
         self,
         cache_key: str,
         *,
-        ttl_seconds: Optional[float] = None,
-        now: Optional[float] = None,
-    ) -> Optional[Any]:
+        ttl_seconds: float | None = None,
+        now: float | None = None,
+    ) -> Any | None:
         """Return cached JSON payload for `cache_key` if present and within TTL, else `None`."""
         effective_ttl = self.ttl_seconds if ttl_seconds is None else float(ttl_seconds)
         current_ts = time.time() if now is None else float(now)
@@ -137,7 +138,7 @@ class EnrichmentCache:
         provider: str,
         payload: Any,
         *,
-        now: Optional[float] = None,
+        now: float | None = None,
     ) -> None:
         """Persist `payload` as JSON for `cache_key` under `provider`."""
         serialized = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
@@ -158,8 +159,8 @@ class EnrichmentCache:
     def prune_expired(
         self,
         *,
-        ttl_seconds: Optional[float] = None,
-        now: Optional[float] = None,
+        ttl_seconds: float | None = None,
+        now: float | None = None,
     ) -> int:
         """Delete expired cache entries and return the number of rows removed."""
         effective_ttl = self.ttl_seconds if ttl_seconds is None else float(ttl_seconds)
@@ -172,7 +173,7 @@ class EnrichmentCache:
             )
             return int(cursor.rowcount)
 
-    def clear(self, provider: Optional[str] = None) -> int:
+    def clear(self, provider: str | None = None) -> int:
         """Delete cached entries (optionally scoped to `provider`) and return row count."""
         with self._connection() as conn:
             if provider:

@@ -2,12 +2,13 @@
 
 import tkinter as tk
 from tkinter import ttk
-from typing import Any, Callable, List, Optional, Union
+from typing import Any
+from collections.abc import Callable
 
 from audiobookdl.gui.formatting import MEDIA_TYPE_OPTIONS, OUTPUT_FORMATS, OVERWRITE_OPTIONS
 from audiobookdl.utils import AUDIO_BITRATE_PRESETS
 
-OptionWidget = Union[ttk.Entry, ttk.Checkbutton, ttk.Combobox, ttk.Spinbox]
+OptionWidget = ttk.Entry | ttk.Checkbutton | ttk.Combobox | ttk.Spinbox
 
 
 class OptionsPanel(ttk.LabelFrame):
@@ -19,13 +20,13 @@ class OptionsPanel(ttk.LabelFrame):
         vars_owner: Any,
         *,
         on_m4b_toggled: Callable[[], None],
-        on_format_selected: Callable[[Optional[tk.Event]], None],
+        on_format_selected: Callable[[tk.Event | None], None],
     ) -> None:
         super().__init__(master, text="Options", padding=(8, 4))
         self._vars = vars_owner
         self._on_m4b_toggled = on_m4b_toggled
         self._on_format_selected = on_format_selected
-        self._widgets: List[OptionWidget] = []
+        self._widgets: list[OptionWidget] = []
         self._build_widgets()
 
     def _build_widgets(self) -> None:

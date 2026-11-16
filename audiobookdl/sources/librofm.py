@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 from urllib.parse import quote, urlparse
 
 from .source import CatalogBook, Source
@@ -45,8 +45,8 @@ class LibrofmSource(Source):
 
     def __init__(self, options) -> None:
         super().__init__(options)
-        self._access_token: Optional[str] = None
-        self._library_cache: Optional[List[Dict[str, Any]]] = None
+        self._access_token: str | None = None
+        self._library_cache: list[dict[str, Any]] | None = None
 
     def _login(self, url: str, username: str, password: str) -> None:
         resp = self.request(
@@ -69,10 +69,10 @@ class LibrofmSource(Source):
         self._access_token = token
         self._session.headers.update({"Authorization": f"Bearer {token}"})
 
-    def _fetch_raw_library(self) -> List[Dict[str, Any]]:
+    def _fetch_raw_library(self) -> list[dict[str, Any]]:
         if self._library_cache is not None:
             return self._library_cache
-        books: List[Dict[str, Any]] = []
+        books: list[dict[str, Any]] = []
         page = 1
         while page <= 50:
             payload = self.get_json(f"https://libro.fm/api/v7/library?page={page}")
@@ -89,7 +89,7 @@ class LibrofmSource(Source):
         self._library_cache = books
         return books
 
-    def _book_to_catalog_entry(self, item: Dict[str, Any]) -> Optional[CatalogBook]:
+    def _book_to_catalog_entry(self, item: dict[str, Any]) -> CatalogBook | None:
         isbn = str(item.get("isbn") or item.get("id") or "").strip()
         title = str(item.get("title") or isbn).strip()
         if not isbn or not title:
@@ -99,8 +99,8 @@ class LibrofmSource(Source):
             book_url = f"https://libro.fm{book_url}"
         author = _join_people(item.get("authors") or item.get("author"))
         series_raw = item.get("series")
-        series_name: Optional[str] = None
-        series_order: Optional[int] = None
+        series_name: str | None = None
+        series_order: int | None = None
         if isinstance(series_raw, dict):
             series_name = str(series_raw.get("name") or "").strip() or None
             raw_ord = series_raw.get("book_number") or series_raw.get("order")
@@ -117,15 +117,15 @@ class LibrofmSource(Source):
             source="libro.fm",
         )
 
-    def list_library(self) -> List[CatalogBook]:
-        results: List[CatalogBook] = []
+    def list_library(self) -> list[CatalogBook]:
+        results: list[CatalogBook] = []
         for item in self._fetch_raw_library():
             entry = self._book_to_catalog_entry(item)
             if entry is not None:
                 results.append(entry)
         return results
 
-    def search(self, query: str) -> List[CatalogBook]:
+    def search(self, query: str) -> list[CatalogBook]:
         cleaned = query.strip().lower()
         if not cleaned:
             return []
@@ -139,7 +139,7 @@ class LibrofmSource(Source):
             if cleaned in entry.title.lower() or cleaned in entry.author.lower()
         ]
 
-    def _resolve_book_entry(self, url: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+    def _resolve_book_entry(self, url: str) -> tuple[str, dict[str, Any] | None]:
         m = re.search(r"/audiobooks/([^/?#]+)", url)
         if not m:
             raise BookNotFound
@@ -147,7 +147,7 @@ class LibrofmSource(Source):
         isbn_match = re.match(r"^(97[89]\d{10}|\d{9}[\dXx])(?:-|$)", slug)
         candidate_isbn = isbn_match.group(1) if isbn_match else None
 
-        matched_entry: Optional[Dict[str, Any]] = None
+        matched_entry: dict[str, Any] | None = None
         if self._access_token or self.authenticated:
             try:
                 for item in self._fetch_raw_library():
@@ -200,8 +200,8 @@ class LibrofmSource(Source):
             pub = info["publisher"]
             meta.publisher = str(pub.get("name") if isinstance(pub, dict) else pub).strip()
 
-        files: List[AudiobookFile] = []
-        chapters: List[Chapter] = []
+        files: list[AudiobookFile] = []
+        chapters: list[Chapter] = []
 
         m4b_url = manifest.get("m4b_url") or manifest.get("audiobook_m4b")
         if isinstance(m4b_url, str) and m4b_url.strip():
@@ -226,7 +226,7 @@ class LibrofmSource(Source):
         if not files:
             raise BookNotFound
 
-        cover: Optional[Cover] = None
+        cover: Cover | None = None
         cover_url = info.get("cover_url") or manifest.get("cover_url")
         if isinstance(cover_url, str) and cover_url.strip():
             try:

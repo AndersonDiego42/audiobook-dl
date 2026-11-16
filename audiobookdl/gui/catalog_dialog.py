@@ -2,7 +2,7 @@
 
 import tkinter as tk
 from tkinter import ttk
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from collections.abc import Callable, Sequence
 
 from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, apply_theme_to_window, scale_px
 from audiobookdl.gui.widgets import (
@@ -29,23 +29,23 @@ class CatalogBrowserDialog(tk.Toplevel):
         self,
         parent: tk.Misc,
         services: Sequence[ServiceInfo],
-        selected_service: Optional[ServiceInfo],
+        selected_service: ServiceInfo | None,
         *,
         on_fetch: Callable[[str, ServiceInfo, str, "CatalogBrowserDialog"], None],
-        on_add_urls: Callable[[List[str]], None],
-        on_save_to_library: Optional[Callable[[str, str, Sequence[CatalogBook]], Tuple[int, int]]] = None,
-        profile_resolver: Optional[Callable[[str], Sequence[str]]] = None,
+        on_add_urls: Callable[[list[str]], None],
+        on_save_to_library: Callable[[str, str, Sequence[CatalogBook]], tuple[int, int]] | None = None,
+        profile_resolver: Callable[[str], Sequence[str]] | None = None,
         selected_profile: str = "default",
-        palette: Optional[ThemePalette] = None,
+        palette: ThemePalette | None = None,
     ) -> None:
         super().__init__(parent)
         browseable = [svc for svc in services if svc.supports_search or svc.supports_library]
-        self._services_by_label: Dict[str, ServiceInfo] = {svc.label: svc for svc in browseable}
+        self._services_by_label: dict[str, ServiceInfo] = {svc.label: svc for svc in browseable}
         self._on_fetch = on_fetch
         self._on_add_urls = on_add_urls
         self._on_save_to_library = on_save_to_library
         self._profile_resolver = profile_resolver
-        self._loaded_books: List[CatalogBook] = []
+        self._loaded_books: list[CatalogBook] = []
         self._loaded_service_key: str = ""
         self._loaded_profile: str = "default"
         self._palette = palette or LIGHT_PALETTE
@@ -125,7 +125,7 @@ class CatalogBrowserDialog(tk.Toplevel):
         ttk.Button(btn_bar, text="Add Selected to URLs", command=self.add_selected).pack(
             side=tk.RIGHT, padx=(0, 6)
         )
-        self._save_lib_btn: Optional[ttk.Button] = None
+        self._save_lib_btn: ttk.Button | None = None
         if self._on_save_to_library is not None:
             self._save_lib_btn = ttk.Button(
                 btn_bar,
@@ -229,7 +229,7 @@ class CatalogBrowserDialog(tk.Toplevel):
         selected_iids = resolve_selected_leaf_iids(self._tree)
         if not selected_iids:
             selected_iids = [f"book-{idx}" for idx in range(len(self._loaded_books))]
-        urls_to_add: List[str] = []
+        urls_to_add: list[str] = []
         for iid in selected_iids:
             values = self._tree.item(iid, "values")
             if values and len(values) >= 4 and str(values[3]).strip():

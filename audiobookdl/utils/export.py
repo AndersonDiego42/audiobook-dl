@@ -3,7 +3,8 @@
 import csv
 import json
 import os
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any
+from collections.abc import Sequence
 
 from audiobookdl.exceptions import GenericAudiobookDLException
 from audiobookdl.utils.archive import ArchiveEntry
@@ -33,7 +34,7 @@ EXPORT_COLUMNS = (
 )
 
 
-def resolve_export_format(output_path: str, explicit_format: Optional[str] = None) -> str:
+def resolve_export_format(output_path: str, explicit_format: str | None = None) -> str:
     """Resolve and validate the export format (`csv`, `json`, or `xlsx`)."""
     raw = (explicit_format or os.path.splitext(output_path)[1].lstrip(".") or "csv").strip().lower()
     if raw not in SUPPORTED_EXPORT_FORMATS:
@@ -43,7 +44,7 @@ def resolve_export_format(output_path: str, explicit_format: Optional[str] = Non
     return raw
 
 
-def _entry_to_dict(entry: ArchiveEntry) -> Dict[str, Any]:
+def _entry_to_dict(entry: ArchiveEntry) -> dict[str, Any]:
     return {
         "id": entry.id,
         "status": entry.status,
@@ -67,7 +68,7 @@ def _entry_to_dict(entry: ArchiveEntry) -> Dict[str, Any]:
     }
 
 
-def _entry_to_row(entry: ArchiveEntry) -> List[Any]:
+def _entry_to_row(entry: ArchiveEntry) -> list[Any]:
     return [
         entry.id,
         entry.status,
@@ -95,7 +96,7 @@ def export_library_entries(
     entries: Sequence[ArchiveEntry],
     output_path: str,
     *,
-    fmt: Optional[str] = None,
+    fmt: str | None = None,
 ) -> int:
     """Export `entries` to `output_path` in CSV, JSON, or XLSX format and return count exported."""
     resolved_fmt = resolve_export_format(output_path, fmt)

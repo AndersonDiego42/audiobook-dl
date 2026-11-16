@@ -3,7 +3,7 @@
 import os
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from typing import Callable, Dict, List, Optional, Sequence
+from collections.abc import Callable, Sequence
 
 from audiobookdl import args
 from audiobookdl.config import (
@@ -41,7 +41,7 @@ class ServiceAuthPanel(ttk.LabelFrame):
         show_password_var: tk.BooleanVar,
         remember_login_var: tk.BooleanVar,
         palette_provider: Callable[[], ThemePalette],
-        build_verify_options: Callable[[], Optional[args.DownloadOptions]],
+        build_verify_options: Callable[[], args.DownloadOptions | None],
         is_running_provider: Callable[[], bool],
         on_log: Callable[[str], None],
     ) -> None:
@@ -51,9 +51,9 @@ class ServiceAuthPanel(ttk.LabelFrame):
         self._services = list(services)
         self._services_by_label = {s.label: s for s in self._services}
         self._services_by_key = {s.key: s for s in self._services}
-        self._last_detected_service: Optional[str] = None
+        self._last_detected_service: str | None = None
         self._is_verifying_auth = False
-        self._cookie_dialog: Optional[CookieImportDialog] = None
+        self._cookie_dialog: CookieImportDialog | None = None
 
         self._status_var = status_var
         self.service_label_var = service_label_var
@@ -75,11 +75,11 @@ class ServiceAuthPanel(ttk.LabelFrame):
         self._build_widgets()
 
     @property
-    def cookie_dialog(self) -> Optional[CookieImportDialog]:
+    def cookie_dialog(self) -> CookieImportDialog | None:
         return self._cookie_dialog
 
     @cookie_dialog.setter
-    def cookie_dialog(self, dlg: Optional[CookieImportDialog]) -> None:
+    def cookie_dialog(self, dlg: CookieImportDialog | None) -> None:
         self._cookie_dialog = dlg
 
     @property
@@ -183,7 +183,7 @@ class ServiceAuthPanel(ttk.LabelFrame):
         )
         self.test_auth_btn.pack(side=tk.RIGHT, padx=(0, 4))
 
-    def selected_service(self) -> Optional[ServiceInfo]:
+    def selected_service(self) -> ServiceInfo | None:
         return self._services_by_label.get(self.service_label_var.get())
 
     def service_label_for_url(self, url: str) -> str:
@@ -192,12 +192,12 @@ class ServiceAuthPanel(ttk.LabelFrame):
             return self._services_by_key[detected].label
         return detected or "Unknown"
 
-    def on_service_selected(self, _event: Optional[tk.Event] = None) -> None:
+    def on_service_selected(self, _event: tk.Event | None = None) -> None:
         self.profile_var.set(DEFAULT_PROFILE)
         self.load_service_into_form()
         self.update_field_states()
 
-    def on_profile_changed(self, _event: Optional[tk.Event] = None) -> None:
+    def on_profile_changed(self, _event: tk.Event | None = None) -> None:
         normalized = normalize_profile_name(self.profile_var.get())
         if self.profile_var.get() != normalized:
             self.profile_var.set(normalized)
@@ -231,7 +231,7 @@ class ServiceAuthPanel(ttk.LabelFrame):
         if self.profile_var.get() != active_profile:
             self.profile_var.set(active_profile)
 
-        saved: Optional[SourceConfig] = get_source_config(cfg, service.key, active_profile)
+        saved: SourceConfig | None = get_source_config(cfg, service.key, active_profile)
         self.username_var.set((saved.username or "") if saved else "")
         self.password_var.set((saved.password or "") if saved else "")
         self.library_var.set((saved.library or "") if saved else "")
@@ -431,7 +431,7 @@ class ServiceAuthPanel(ttk.LabelFrame):
         self,
         service_label: str,
         ok: bool,
-        auth_exc: Optional[Exception],
+        auth_exc: Exception | None,
     ) -> None:
         """Finish background login verification and notify the user."""
         self._is_verifying_auth = False
@@ -466,7 +466,7 @@ class ServiceAuthPanel(ttk.LabelFrame):
         """Warn before starting if batch URLs target an unconfigured auth service alongside another."""
         selected = self.selected_service()
         selected_key = selected.key if selected else None
-        detected_keys: List[str] = []
+        detected_keys: list[str] = []
         for url in urls:
             key = detect_service_key(url)
             if key and key not in detected_keys:
@@ -474,7 +474,7 @@ class ServiceAuthPanel(ttk.LabelFrame):
         if len(detected_keys) <= 1 and (not detected_keys or detected_keys[0] == selected_key):
             return True
         cfg = self._controller.config_snapshot()
-        missing: List[str] = []
+        missing: list[str] = []
         for key in detected_keys:
             if key == selected_key:
                 continue
@@ -505,7 +505,7 @@ class ServiceAuthPanel(ttk.LabelFrame):
             parent=self._window,
         )
 
-    def extract_options_auth(self, urls: Sequence[str]) -> Dict[str, Optional[str]]:
+    def extract_options_auth(self, urls: Sequence[str]) -> dict[str, str | None]:
         """Extract credential overrides when `urls` match or do not conflict with selected service."""
         detected_keys = {k for k in (detect_service_key(u) for u in urls) if k}
         service = self.selected_service()
@@ -514,7 +514,7 @@ class ServiceAuthPanel(ttk.LabelFrame):
             and (len(detected_keys) <= 1)
             and (not detected_keys or service.key in detected_keys)
         )
-        result: Dict[str, Optional[str]] = {
+        result: dict[str, str | None] = {
             "username": None,
             "password": None,
             "library": None,

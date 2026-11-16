@@ -10,7 +10,8 @@ import hmac
 import json
 import os
 import threading
-from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Any
+from collections.abc import Sequence
 from urllib.parse import parse_qs, urlparse
 
 from audiobookdl import __version__, args
@@ -31,7 +32,7 @@ class WebDashboardState:
     def __init__(self, serve_options: args.ServeOptions) -> None:
         self.options = serve_options
         self.controller = GuiController(serve_options.config_location)
-        self.token: Optional[str] = serve_options.token
+        self.token: str | None = serve_options.token
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
 
@@ -40,8 +41,8 @@ class WebDashboardState:
         self.stage_text = ""
         self.progress_pct = 0.0
         self.speed_bps = 0.0
-        self.eta_seconds: Optional[float] = None
-        self.logs: Deque[str] = deque(maxlen=MAX_WEB_LOG_LINES)
+        self.eta_seconds: float | None = None
+        self.logs: deque[str] = deque(maxlen=MAX_WEB_LOG_LINES)
         self._services = get_available_services()
         self._services_by_key = {s.key: s for s in self._services}
 
@@ -132,7 +133,7 @@ class WebDashboardState:
     def build_download_options(
         self,
         urls: Sequence[str],
-        overrides: Optional[Dict[str, Any]] = None,
+        overrides: dict[str, Any] | None = None,
     ) -> args.DownloadOptions:
         cfg = self.controller.config_snapshot()
         raw_ov = overrides or {}
@@ -172,7 +173,7 @@ class WebDashboardState:
             return self._services_by_key[key].label
         return key or "Unknown"
 
-    def queue_urls(self, urls: Sequence[str], payload: Dict[str, Any]) -> Tuple[int, int]:
+    def queue_urls(self, urls: Sequence[str], payload: dict[str, Any]) -> tuple[int, int]:
         unique_urls = [u.strip() for u in urls if isinstance(u, str) and u.strip()]
         unique_urls = list(dict.fromkeys(unique_urls))
         if not unique_urls:
@@ -204,7 +205,7 @@ class WebDashboardState:
                 self.controller.register_queue_record(job, self.service_label_for_url(job.url))
             return len(queued_jobs), len(queued_jobs)
 
-    def status_snapshot(self) -> Dict[str, Any]:
+    def status_snapshot(self) -> dict[str, Any]:
         with self._lock:
             with self.controller.queue_lock:
                 records = [dict(rec) for rec in self.controller.queue_records.values()]
@@ -444,7 +445,7 @@ class _WebRequestHandler(BaseHTTPRequestHandler):
         alt = (self.headers.get("X-API-Token") or "").strip()
         return bool(alt and hmac.compare_digest(alt, expected))
 
-    def _read_json_body(self) -> Dict[str, Any]:
+    def _read_json_body(self) -> dict[str, Any]:
         raw_len = self.headers.get("Content-Length") or "0"
         if not raw_len.strip().isdigit():
             raise ValueError("Invalid Content-Length header")

@@ -5,7 +5,6 @@ import re
 import shutil
 import subprocess
 import sys
-from typing import Optional, Tuple
 
 import requests
 
@@ -28,7 +27,7 @@ class UpdateInfo:
     release_url: str = _RELEASES_PAGE_URL
 
 
-def parse_version_tuple(version_str: str) -> Tuple[int, ...]:
+def parse_version_tuple(version_str: str) -> tuple[int, ...]:
     """Parse a semantic version string (e.g. `'v1.2.3'`) into numeric parts."""
     cleaned = version_str.strip().lstrip("vV")
     parts = [int(m) for m in re.findall(r"\d+", cleaned)]
@@ -53,10 +52,10 @@ def check_for_updates(
     current_version: str = __version__,
     *,
     timeout: float = 5.0,
-    session: Optional[requests.Session] = None,
-    proxy: Optional[str] = None,
+    session: requests.Session | None = None,
+    proxy: str | None = None,
     respect_opt_out: bool = True,
-) -> Optional[UpdateInfo]:
+) -> UpdateInfo | None:
     """
     Query upstream GitHub Releases (falling back to PyPI) for a newer release.
 
@@ -110,7 +109,7 @@ def winget_available() -> bool:
     return sys.platform.startswith("win") and shutil.which("winget") is not None
 
 
-def install_ffmpeg_via_winget() -> Tuple[bool, str]:
+def install_ffmpeg_via_winget() -> tuple[bool, str]:
     """Run `winget install -e --id Gyan.FFmpeg` and return `(success, message)`."""
     winget = shutil.which("winget")
     if not sys.platform.startswith("win") or not winget:

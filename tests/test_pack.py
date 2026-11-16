@@ -5,11 +5,10 @@ from pathlib import Path
 import shutil
 import subprocess
 import time
-from typing import List, Sequence
+from collections.abc import Sequence
 from unittest.mock import patch
 
 from PIL import Image
-from mutagen.flac import FLAC
 from mutagen.id3 import APIC, ID3, TALB, TIT2, TPE1, TPOS, TRCK
 from mutagen.mp4 import MP4
 import pytest
@@ -17,12 +16,11 @@ import pytest
 from audiobookdl import AudiobookMetadata, Chapter, Cover, args
 from audiobookdl.__main__ import main as cli_main
 from audiobookdl.config import Config
-from audiobookdl.exceptions import DownloadCancelled, GenericAudiobookDLException
+from audiobookdl.exceptions import GenericAudiobookDLException
 from audiobookdl.gui.controller import GuiController, PackJobRequest
 from audiobookdl.output.metadata import id3, mp4, sidecars, vorbis
 from audiobookdl.output.metadata.reader import (
     infer_metadata_from_path,
-    parse_cue_chapters,
     read_sidecar_metadata,
     read_track_tags,
 )
@@ -574,7 +572,7 @@ def test_gui_controller_executes_pack_job(tmp_path: Path):
         Path(out_path).write_bytes(b"fake-gui-m4b")
         return True
 
-    events: List[tuple] = []
+    events: list[tuple] = []
     with (
         patch("audiobookdl.pack.probe_audio_info", return_value=fake_probe),
         patch("audiobookdl.pack.output.combine_audiofiles", side_effect=_fake_combine),
@@ -616,7 +614,7 @@ def test_pack_dialog_renders_and_submits(tmp_path: Path):
     src_dir.mkdir()
     _create_empty_id3_mp3(src_dir / "01.mp3")
 
-    dlg: Optional[PackDialog] = None  # type: ignore[name-defined]
+    dlg: PackDialog | None = None
     submitted: list = []
     controller = GuiController()
     opts = args.build_default_options(output_format="m4b")

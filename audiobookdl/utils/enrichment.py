@@ -5,7 +5,8 @@ from difflib import SequenceMatcher
 import html
 from io import BytesIO
 import re
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any
+from collections.abc import Callable, Mapping, Sequence
 
 from PIL import Image
 import pycountry
@@ -28,8 +29,8 @@ from audiobookdl.utils.enrichment_cache import (
 from audiobookdl.utils.http import DEFAULT_USER_AGENT
 
 
-DEFAULT_PROVIDERS: Tuple[str, ...] = ("audnexus", "itunes", "google", "openlibrary")
-PROVIDER_ALIASES: Dict[str, str] = {
+DEFAULT_PROVIDERS: tuple[str, ...] = ("audnexus", "itunes", "google", "openlibrary")
+PROVIDER_ALIASES: dict[str, str] = {
     "audnexus": "audnexus",
     "audible": "audnexus",
     "itunes": "itunes",
@@ -65,20 +66,20 @@ class EnrichmentCandidate:
     provider: str
     score: float
     title: str
-    authors: List[str] = field(default_factory=list)
-    narrators: List[str] = field(default_factory=list)
-    series: Optional[str] = None
-    series_order: Optional[int] = None
-    genres: List[str] = field(default_factory=list)
-    language: Optional[Any] = None
-    description: Optional[str] = None
-    isbn: Optional[str] = None
-    asin: Optional[str] = None
-    publisher: Optional[str] = None
-    release_date: Optional[date] = None
-    cover_url: Optional[str] = None
-    chapters: List[Chapter] = field(default_factory=list)
-    raw_id: Optional[str] = None
+    authors: list[str] = field(default_factory=list)
+    narrators: list[str] = field(default_factory=list)
+    series: str | None = None
+    series_order: int | None = None
+    genres: list[str] = field(default_factory=list)
+    language: Any | None = None
+    description: str | None = None
+    isbn: str | None = None
+    asin: str | None = None
+    publisher: str | None = None
+    release_date: date | None = None
+    cover_url: str | None = None
+    chapters: list[Chapter] = field(default_factory=list)
+    raw_id: str | None = None
 
 
 @dataclass
@@ -86,21 +87,21 @@ class EnrichmentResult:
     """Summary of metadata, cover, and chapter updates applied by enrichment."""
 
     updated: bool = False
-    providers_used: List[str] = field(default_factory=list)
-    matched_candidates: List[EnrichmentCandidate] = field(default_factory=list)
-    fields_updated: List[str] = field(default_factory=list)
+    providers_used: list[str] = field(default_factory=list)
+    matched_candidates: list[EnrichmentCandidate] = field(default_factory=list)
+    fields_updated: list[str] = field(default_factory=list)
     cover_updated: bool = False
     chapters_updated: bool = False
 
 
-CandidateSelector = Callable[[str, Sequence[EnrichmentCandidate]], Optional[int]]
+CandidateSelector = Callable[[str, Sequence[EnrichmentCandidate]], int | None]
 
 
-def parse_provider_list(raw: Optional[str]) -> Tuple[str, ...]:
+def parse_provider_list(raw: str | None) -> tuple[str, ...]:
     """Parse a comma-separated provider list into canonical deduplicated provider names."""
     if raw is None or not raw.strip():
         return DEFAULT_PROVIDERS
-    resolved: List[str] = []
+    resolved: list[str] = []
     seen = set()
     for token in raw.split(","):
         cleaned = token.strip().lower()
@@ -121,8 +122,8 @@ def parse_provider_list(raw: Optional[str]) -> Tuple[str, ...]:
 def resolve_redirect_url(
     url: str,
     *,
-    session: Optional[requests.Session] = None,
-    proxy: Optional[str] = None,
+    session: requests.Session | None = None,
+    proxy: str | None = None,
     timeout: float = 10.0,
 ) -> str:
     """Follow HTTP redirects on short/share links to obtain the canonical target URL."""
@@ -160,7 +161,7 @@ def resolve_redirect_url(
         return url
 
 
-def _clean_isbn(raw: Any) -> Optional[str]:
+def _clean_isbn(raw: Any) -> str | None:
     if raw is None:
         return None
     candidate = _ISBN_CLEAN_RE.sub("", str(raw)).upper()
@@ -169,7 +170,7 @@ def _clean_isbn(raw: Any) -> Optional[str]:
     return None
 
 
-def _clean_asin(raw: Any) -> Optional[str]:
+def _clean_asin(raw: Any) -> str | None:
     if raw is None:
         return None
     candidate = str(raw).strip().upper()
@@ -178,7 +179,7 @@ def _clean_asin(raw: Any) -> Optional[str]:
     return None
 
 
-def _strip_html(raw: Any) -> Optional[str]:
+def _strip_html(raw: Any) -> str | None:
     if not isinstance(raw, str):
         return None
     text = _HTML_BREAK_RE.sub("\n", raw)
@@ -189,7 +190,7 @@ def _strip_html(raw: Any) -> Optional[str]:
     return cleaned.strip() or None
 
 
-def _parse_language(raw: Any) -> Optional[Any]:
+def _parse_language(raw: Any) -> Any | None:
     if raw is None:
         return None
     if hasattr(raw, "alpha_3"):
@@ -214,7 +215,7 @@ def _parse_language(raw: Any) -> Optional[Any]:
     return None
 
 
-def _parse_series_order(raw: Any) -> Optional[int]:
+def _parse_series_order(raw: Any) -> int | None:
     if raw is None or isinstance(raw, bool):
         return None
     if isinstance(raw, int):
@@ -225,10 +226,10 @@ def _parse_series_order(raw: Any) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
-def _extract_names(items: Any) -> List[str]:
+def _extract_names(items: Any) -> list[str]:
     if not isinstance(items, list):
         return []
-    names: List[str] = []
+    names: list[str] = []
     seen = set()
     for item in items:
         if isinstance(item, dict):
@@ -318,14 +319,14 @@ def _cached_get_json(
     provider: str,
     url: str,
     *,
-    params: Optional[Mapping[str, Any]] = None,
-    headers: Optional[Mapping[str, str]] = None,
-    proxy: Optional[str] = None,
+    params: Mapping[str, Any] | None = None,
+    headers: Mapping[str, str] | None = None,
+    proxy: str | None = None,
     timeout: float = 10.0,
-    cache: Optional[EnrichmentCache] = None,
+    cache: EnrichmentCache | None = None,
     use_cache: bool = True,
     cache_ttl_seconds: float = DEFAULT_CACHE_TTL_SECONDS,
-) -> Optional[Any]:
+) -> Any | None:
     cache_key = make_cache_key(provider, url, params)
     if cache is not None and use_cache:
         cached = cache.get(cache_key, ttl_seconds=cache_ttl_seconds)
@@ -355,7 +356,7 @@ def _cached_get_json(
     return payload
 
 
-def _parse_audnexus_book(payload: Mapping[str, Any]) -> Optional[EnrichmentCandidate]:
+def _parse_audnexus_book(payload: Mapping[str, Any]) -> EnrichmentCandidate | None:
     title = str(payload.get("title") or "").strip()
     if not title:
         return None
@@ -363,7 +364,7 @@ def _parse_audnexus_book(payload: Mapping[str, Any]) -> Optional[EnrichmentCandi
     authors = _extract_names(payload.get("authors"))
     narrators = _extract_names(payload.get("narrators"))
 
-    genres: List[str] = []
+    genres: list[str] = []
     raw_genres = payload.get("genres")
     if isinstance(raw_genres, list):
         for g in raw_genres:
@@ -374,8 +375,8 @@ def _parse_audnexus_book(payload: Mapping[str, Any]) -> Optional[EnrichmentCandi
             if g_name and g_name not in genres:
                 genres.append(g_name)
 
-    series_name: Optional[str] = None
-    series_order: Optional[int] = None
+    series_name: str | None = None
+    series_order: int | None = None
     series_primary = payload.get("seriesPrimary")
     if isinstance(series_primary, dict):
         raw_series = str(series_primary.get("name") or "").strip()
@@ -409,7 +410,7 @@ def _parse_audnexus_book(payload: Mapping[str, Any]) -> Optional[EnrichmentCandi
     )
 
 
-def _parse_audible_product(product: Mapping[str, Any]) -> Optional[EnrichmentCandidate]:
+def _parse_audible_product(product: Mapping[str, Any]) -> EnrichmentCandidate | None:
     title = str(product.get("title") or "").strip()
     if not title:
         return None
@@ -417,14 +418,14 @@ def _parse_audible_product(product: Mapping[str, Any]) -> Optional[EnrichmentCan
     authors = _extract_names(product.get("authors"))
     narrators = _extract_names(product.get("narrators"))
 
-    series_name: Optional[str] = None
-    series_order: Optional[int] = None
+    series_name: str | None = None
+    series_order: int | None = None
     series_list = product.get("series")
     if isinstance(series_list, list) and series_list and isinstance(series_list[0], dict):
         series_name = str(series_list[0].get("title") or "").strip() or None
         series_order = _parse_series_order(series_list[0].get("sequence"))
 
-    cover_url: Optional[str] = None
+    cover_url: str | None = None
     images = product.get("product_images")
     if isinstance(images, dict) and images:
         for size_key in ("1024", "900", "500"):
@@ -463,12 +464,12 @@ def _fetch_audnexus_chapters(
     session: requests.Session,
     asin: str,
     *,
-    proxy: Optional[str] = None,
+    proxy: str | None = None,
     timeout: float = 10.0,
-    cache: Optional[EnrichmentCache] = None,
+    cache: EnrichmentCache | None = None,
     use_cache: bool = True,
     cache_ttl_seconds: float = DEFAULT_CACHE_TTL_SECONDS,
-) -> List[Chapter]:
+) -> list[Chapter]:
     payload = _cached_get_json(
         session,
         "audnexus",
@@ -484,7 +485,7 @@ def _fetch_audnexus_chapters(
     raw_chapters = payload.get("chapters")
     if not isinstance(raw_chapters, list):
         return []
-    chapters: List[Chapter] = []
+    chapters: list[Chapter] = []
     for item in raw_chapters:
         if not isinstance(item, dict):
             continue
@@ -507,13 +508,13 @@ def _query_audnexus(
     metadata: AudiobookMetadata,
     *,
     session: requests.Session,
-    proxy: Optional[str] = None,
+    proxy: str | None = None,
     timeout: float = 10.0,
-    cache: Optional[EnrichmentCache] = None,
+    cache: EnrichmentCache | None = None,
     use_cache: bool = True,
     cache_ttl_seconds: float = DEFAULT_CACHE_TTL_SECONDS,
     min_confidence: float = DEFAULT_CONFIDENCE_THRESHOLD,
-) -> List[EnrichmentCandidate]:
+) -> list[EnrichmentCandidate]:
     direct_asin = _clean_asin(metadata.asin)
     if direct_asin:
         book_payload = _cached_get_json(
@@ -536,7 +537,7 @@ def _query_audnexus(
     if not metadata.title:
         return []
 
-    search_params: Dict[str, Any] = {
+    search_params: dict[str, Any] = {
         "title": metadata.title,
         "num_results": 5,
         "products_sort_by": "Relevance",
@@ -562,7 +563,7 @@ def _query_audnexus(
     if not isinstance(products, list):
         return []
 
-    preliminary: List[EnrichmentCandidate] = []
+    preliminary: list[EnrichmentCandidate] = []
     for product in products:
         if not isinstance(product, dict):
             continue
@@ -572,7 +573,7 @@ def _query_audnexus(
             preliminary.append(cand)
 
     preliminary.sort(key=lambda c: c.score, reverse=True)
-    enriched: List[EnrichmentCandidate] = []
+    enriched: list[EnrichmentCandidate] = []
     for idx, cand in enumerate(preliminary):
         if cand.asin and (idx < 3 and cand.score >= min_confidence * 0.7):
             book_payload = _cached_get_json(
@@ -596,7 +597,7 @@ def _query_audnexus(
     return enriched
 
 
-def _upgrade_itunes_artwork(url: Optional[str]) -> Optional[str]:
+def _upgrade_itunes_artwork(url: str | None) -> str | None:
     if not url:
         return None
     cleaned = url.strip()
@@ -611,12 +612,12 @@ def _query_itunes(
     metadata: AudiobookMetadata,
     *,
     session: requests.Session,
-    proxy: Optional[str] = None,
+    proxy: str | None = None,
     timeout: float = 10.0,
-    cache: Optional[EnrichmentCache] = None,
+    cache: EnrichmentCache | None = None,
     use_cache: bool = True,
     cache_ttl_seconds: float = DEFAULT_CACHE_TTL_SECONDS,
-) -> List[EnrichmentCandidate]:
+) -> list[EnrichmentCandidate]:
     if not metadata.title:
         return []
     term = f"{metadata.title} {metadata.authors[0]}" if metadata.authors else metadata.title
@@ -637,7 +638,7 @@ def _query_itunes(
     if not isinstance(results, list):
         return []
 
-    candidates: List[EnrichmentCandidate] = []
+    candidates: list[EnrichmentCandidate] = []
     for item in results:
         if not isinstance(item, dict):
             continue
@@ -670,7 +671,7 @@ def _query_itunes(
     return candidates
 
 
-def _upgrade_google_cover(image_links: Any) -> Optional[str]:
+def _upgrade_google_cover(image_links: Any) -> str | None:
     if not isinstance(image_links, dict):
         return None
     for key in ("extraLarge", "large", "medium", "small", "thumbnail", "smallThumbnail"):
@@ -684,10 +685,10 @@ def _upgrade_google_cover(image_links: Any) -> Optional[str]:
     return None
 
 
-def _extract_google_isbn(identifiers: Any) -> Optional[str]:
+def _extract_google_isbn(identifiers: Any) -> str | None:
     if not isinstance(identifiers, list):
         return None
-    isbn10: Optional[str] = None
+    isbn10: str | None = None
     for entry in identifiers:
         if not isinstance(entry, dict):
             continue
@@ -706,12 +707,12 @@ def _query_google(
     metadata: AudiobookMetadata,
     *,
     session: requests.Session,
-    proxy: Optional[str] = None,
+    proxy: str | None = None,
     timeout: float = 10.0,
-    cache: Optional[EnrichmentCache] = None,
+    cache: EnrichmentCache | None = None,
     use_cache: bool = True,
     cache_ttl_seconds: float = DEFAULT_CACHE_TTL_SECONDS,
-) -> List[EnrichmentCandidate]:
+) -> list[EnrichmentCandidate]:
     isbn = _clean_isbn(metadata.isbn)
     if isbn:
         query = f"isbn:{isbn}"
@@ -739,7 +740,7 @@ def _query_google(
     if not isinstance(items, list):
         return []
 
-    candidates: List[EnrichmentCandidate] = []
+    candidates: list[EnrichmentCandidate] = []
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -771,7 +772,7 @@ def _query_google(
     return candidates
 
 
-def _extract_first_isbn(doc: Mapping[str, Any]) -> Optional[str]:
+def _extract_first_isbn(doc: Mapping[str, Any]) -> str | None:
     isbns = doc.get("isbn") or []
     for raw in isbns:
         candidate = _clean_isbn(raw)
@@ -784,13 +785,13 @@ def _query_openlibrary(
     metadata: AudiobookMetadata,
     *,
     session: requests.Session,
-    proxy: Optional[str] = None,
+    proxy: str | None = None,
     timeout: float = 10.0,
-    cache: Optional[EnrichmentCache] = None,
+    cache: EnrichmentCache | None = None,
     use_cache: bool = True,
     cache_ttl_seconds: float = DEFAULT_CACHE_TTL_SECONDS,
-) -> List[EnrichmentCandidate]:
-    params: Dict[str, Any] = {"limit": 5}
+) -> list[EnrichmentCandidate]:
+    params: dict[str, Any] = {"limit": 5}
     if metadata.isbn:
         params["isbn"] = metadata.isbn
     elif metadata.title:
@@ -817,7 +818,7 @@ def _query_openlibrary(
     if not isinstance(docs, list):
         return []
 
-    candidates: List[EnrichmentCandidate] = []
+    candidates: list[EnrichmentCandidate] = []
     for doc in docs:
         if not isinstance(doc, dict):
             continue
@@ -828,7 +829,7 @@ def _query_openlibrary(
         publishers = doc.get("publisher") or []
         publisher = str(publishers[0]).strip() if publishers else None
         genres = [str(s).strip() for s in (doc.get("subject") or [])[:5] if str(s).strip()]
-        description: Optional[str] = None
+        description: str | None = None
         first_sentence = doc.get("first_sentence")
         if isinstance(first_sentence, (list, str)):
             text = first_sentence[0] if isinstance(first_sentence, list) and first_sentence else first_sentence
@@ -864,13 +865,13 @@ def _query_provider(
     metadata: AudiobookMetadata,
     *,
     session: requests.Session,
-    proxy: Optional[str] = None,
+    proxy: str | None = None,
     timeout: float = 10.0,
-    cache: Optional[EnrichmentCache] = None,
+    cache: EnrichmentCache | None = None,
     use_cache: bool = True,
     cache_ttl_seconds: float = DEFAULT_CACHE_TTL_SECONDS,
     min_confidence: float = DEFAULT_CONFIDENCE_THRESHOLD,
-) -> List[EnrichmentCandidate]:
+) -> list[EnrichmentCandidate]:
     if provider == "audnexus":
         return _query_audnexus(
             metadata,
@@ -919,9 +920,9 @@ def _download_cover(
     session: requests.Session,
     cover_url: str,
     *,
-    proxy: Optional[str] = None,
+    proxy: str | None = None,
     timeout: float = 10.0,
-) -> Optional[Cover]:
+) -> Cover | None:
     proxies = {"http": proxy, "https": proxy} if proxy else None
     try:
         resp = session.get(
@@ -978,20 +979,20 @@ def apply_candidate_to_audiobook(
     audiobook: Audiobook,
     candidate: EnrichmentCandidate,
     *,
-    session: Optional[requests.Session] = None,
-    proxy: Optional[str] = None,
+    session: requests.Session | None = None,
+    proxy: str | None = None,
     timeout: float = 10.0,
-    cache: Optional[EnrichmentCache] = None,
+    cache: EnrichmentCache | None = None,
     use_cache: bool = True,
     cache_ttl_seconds: float = DEFAULT_CACHE_TTL_SECONDS,
     include_chapters: bool = True,
-) -> Tuple[List[str], bool, bool]:
+) -> tuple[list[str], bool, bool]:
     """
     Apply missing metadata fields, cover, and chapters from `candidate` onto
     `audiobook` without overwriting existing non-empty fields.
     """
     meta = audiobook.metadata
-    updated_fields: List[str] = []
+    updated_fields: list[str] = []
 
     if not meta.title and candidate.title:
         meta.title = candidate.title
@@ -1077,15 +1078,15 @@ def apply_candidate_to_audiobook(
 def search_enrichment_candidates(
     metadata: AudiobookMetadata,
     *,
-    providers: Optional[Sequence[str]] = None,
-    session: Optional[requests.Session] = None,
-    proxy: Optional[str] = None,
+    providers: Sequence[str] | None = None,
+    session: requests.Session | None = None,
+    proxy: str | None = None,
     timeout: float = 10.0,
-    database_directory: Optional[str] = None,
+    database_directory: str | None = None,
     use_cache: bool = True,
     cache_ttl_seconds: float = DEFAULT_CACHE_TTL_SECONDS,
     min_confidence: float = DEFAULT_CONFIDENCE_THRESHOLD,
-) -> List[EnrichmentCandidate]:
+) -> list[EnrichmentCandidate]:
     """Query configured providers and return scored `EnrichmentCandidate` entries."""
     provider_list = tuple(providers) if providers is not None else DEFAULT_PROVIDERS
     cache_cm: Any = (
@@ -1098,7 +1099,7 @@ def search_enrichment_candidates(
         else nullcontext(None)
     )
     session_cm = nullcontext(session) if session is not None else requests.Session()
-    collected: List[EnrichmentCandidate] = []
+    collected: list[EnrichmentCandidate] = []
     with cache_cm as cache, session_cm as sess:
         for provider in provider_list:
             collected.extend(
@@ -1121,16 +1122,16 @@ def search_enrichment_candidates(
 def enrich_audiobook_metadata(
     audiobook: Audiobook,
     *,
-    providers: Optional[Sequence[str]] = None,
-    session: Optional[requests.Session] = None,
-    proxy: Optional[str] = None,
+    providers: Sequence[str] | None = None,
+    session: requests.Session | None = None,
+    proxy: str | None = None,
     timeout: float = 10.0,
-    database_directory: Optional[str] = None,
+    database_directory: str | None = None,
     use_cache: bool = True,
     cache_ttl_seconds: float = DEFAULT_CACHE_TTL_SECONDS,
     min_confidence: float = DEFAULT_CONFIDENCE_THRESHOLD,
     interactive: bool = False,
-    selector: Optional[CandidateSelector] = None,
+    selector: CandidateSelector | None = None,
     include_chapters: bool = True,
 ) -> EnrichmentResult:
     """
@@ -1171,7 +1172,7 @@ def enrich_audiobook_metadata(
             if not candidates:
                 continue
 
-            chosen: Optional[EnrichmentCandidate] = None
+            chosen: EnrichmentCandidate | None = None
             if interactive and selector is not None:
                 chosen_idx = selector(provider, candidates)
                 if chosen_idx is not None and 0 <= chosen_idx < len(candidates):
@@ -1209,10 +1210,10 @@ def enrich_audiobook_metadata(
 def enrich_metadata_from_openlibrary(
     metadata: AudiobookMetadata,
     *,
-    session: Optional[requests.Session] = None,
-    proxy: Optional[str] = None,
+    session: requests.Session | None = None,
+    proxy: str | None = None,
     timeout: float = 10.0,
-    database_directory: Optional[str] = None,
+    database_directory: str | None = None,
     use_cache: bool = True,
 ) -> bool:
     """

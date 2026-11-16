@@ -4,7 +4,7 @@ import ctypes
 from ctypes import wintypes
 import json
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 from audiobookdl import logging
 from audiobookdl.utils.fs import atomic_write_text, file_lock
@@ -24,20 +24,20 @@ class CredentialStore(ABC):
     is_secure: bool = True
 
     @abstractmethod
-    def get_password(self, service_key: str, username: Optional[str]) -> Optional[str]:
+    def get_password(self, service_key: str, username: str | None) -> str | None:
         """Retrieve stored password for `(service_key, username)`, or `None`."""
 
     @abstractmethod
     def set_password(
-        self, service_key: str, username: Optional[str], password: str
+        self, service_key: str, username: str | None, password: str
     ) -> None:
         """Persist `password` for `(service_key, username)`."""
 
     @abstractmethod
-    def delete_password(self, service_key: str, username: Optional[str]) -> None:
+    def delete_password(self, service_key: str, username: str | None) -> None:
         """Remove any stored password for `(service_key, username)`."""
 
-    def stored_services(self) -> Dict[str, Optional[str]]:
+    def stored_services(self) -> dict[str, str | None]:
         """Return `{service_key: username}` for entries known to this store."""
         return {}
 
@@ -49,15 +49,15 @@ class _DataBlob(ctypes.Structure):
     ]
 
 
-def _make_blob(data: bytes) -> Tuple[_DataBlob, Optional[ctypes.Array]]:
+def _make_blob(data: bytes) -> tuple[_DataBlob, ctypes.Array | None]:
     if not data:
         return _DataBlob(0, None), None
     buf = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
     return _DataBlob(len(data), buf), buf
 
 
-def _dpapi_entropy(service_key: str, username: Optional[str]) -> bytes:
-    return f"audiobook-dl\0{service_key}\0{username or ''}".encode("utf-8")
+def _dpapi_entropy(service_key: str, username: str | None) -> bytes:
+    return f"audiobook-dl\0{service_key}\0{username or ''}".encode()
 
 
 def _dpapi_protect(plaintext: bytes, entropy: bytes) -> bytes:
@@ -150,11 +150,11 @@ class DpapiCredentialStore(CredentialStore):
     def __init__(self, vault_path: str) -> None:
         self.vault_path = vault_path
 
-    def _read_entries(self) -> Dict[str, Dict[str, Any]]:
+    def _read_entries(self) -> dict[str, dict[str, Any]]:
         if not os.path.exists(self.vault_path):
             return {}
         try:
-            with open(self.vault_path, "r", encoding="utf-8") as f:
+            with open(self.vault_path, encoding="utf-8") as f:
                 data = json.load(f)
             entries = data.get("entries")
             if isinstance(entries, dict):
@@ -163,7 +163,7 @@ class DpapiCredentialStore(CredentialStore):
             logging.debug(f"Failed to read DPAPI credential vault '{self.vault_path}': {exc}")
         return {}
 
-    def _write_entries(self, entries: Dict[str, Dict[str, Any]]) -> None:
+    def _write_entries(self, entries: dict[str, dict[str, Any]]) -> None:
         if not entries:
             if os.path.exists(self.vault_path):
                 os.remove(self.vault_path)
@@ -175,7 +175,7 @@ class DpapiCredentialStore(CredentialStore):
             private=True,
         )
 
-    def get_password(self, service_key: str, username: Optional[str]) -> Optional[str]:
+    def get_password(self, service_key: str, username: str | None) -> str | None:
         with file_lock(self.vault_path):
             entries = self._read_entries()
         entry = entries.get(service_key)
@@ -196,7 +196,7 @@ class DpapiCredentialStore(CredentialStore):
             return None
 
     def set_password(
-        self, service_key: str, username: Optional[str], password: str
+        self, service_key: str, username: str | None, password: str
     ) -> None:
         encrypted = _dpapi_protect(
             password.encode("utf-8"),
@@ -210,7 +210,7 @@ class DpapiCredentialStore(CredentialStore):
             }
             self._write_entries(entries)
 
-    def delete_password(self, service_key: str, username: Optional[str]) -> None:
+    def delete_password(self, service_key: str, username: str | None) -> None:
         with file_lock(self.vault_path):
             entries = self._read_entries()
             entry = entries.get(service_key)
@@ -220,7 +220,7 @@ class DpapiCredentialStore(CredentialStore):
                 entries.pop(service_key, None)
                 self._write_entries(entries)
 
-    def stored_services(self) -> Dict[str, Optional[str]]:
+    def stored_services(self) -> dict[str, str | None]:
         with file_lock(self.vault_path):
             entries = self._read_entries()
         return {
@@ -236,19 +236,19 @@ class KeyringCredentialStore(CredentialStore):
     is_secure = True
     _SERVICE_NAME = "audiobook-dl"
 
-    def __init__(self, keyring_module: Any, index_path: Optional[str] = None) -> None:
+    def __init__(self, keyring_module: Any, index_path: str | None = None) -> None:
         self._keyring = keyring_module
         self.index_path = index_path
 
     @staticmethod
-    def _account_key(service_key: str, username: Optional[str]) -> str:
+    def _account_key(service_key: str, username: str | None) -> str:
         return f"{service_key}:{username or ''}"
 
-    def _read_index(self) -> Dict[str, Optional[str]]:
+    def _read_index(self) -> dict[str, str | None]:
         if not self.index_path or not os.path.exists(self.index_path):
             return {}
         try:
-            with open(self.index_path, "r", encoding="utf-8") as f:
+            with open(self.index_path, encoding="utf-8") as f:
                 data = json.load(f)
             entries = data.get("entries")
             if isinstance(entries, dict):
@@ -260,7 +260,7 @@ class KeyringCredentialStore(CredentialStore):
             logging.debug(f"Failed to read keyring index '{self.index_path}': {exc}")
         return {}
 
-    def _write_index(self, entries: Dict[str, Optional[str]]) -> None:
+    def _write_index(self, entries: dict[str, str | None]) -> None:
         if not self.index_path:
             return
         if not entries:
@@ -273,7 +273,7 @@ class KeyringCredentialStore(CredentialStore):
             private=True,
         )
 
-    def get_password(self, service_key: str, username: Optional[str]) -> Optional[str]:
+    def get_password(self, service_key: str, username: str | None) -> str | None:
         try:
             return self._keyring.get_password(
                 self._SERVICE_NAME,
@@ -284,7 +284,7 @@ class KeyringCredentialStore(CredentialStore):
             return None
 
     def set_password(
-        self, service_key: str, username: Optional[str], password: str
+        self, service_key: str, username: str | None, password: str
     ) -> None:
         self._keyring.set_password(
             self._SERVICE_NAME,
@@ -297,7 +297,7 @@ class KeyringCredentialStore(CredentialStore):
                 entries[service_key] = username
                 self._write_index(entries)
 
-    def delete_password(self, service_key: str, username: Optional[str]) -> None:
+    def delete_password(self, service_key: str, username: str | None) -> None:
         try:
             self._keyring.delete_password(
                 self._SERVICE_NAME,
@@ -314,12 +314,12 @@ class KeyringCredentialStore(CredentialStore):
                     entries.pop(service_key, None)
                     self._write_index(entries)
 
-    def stored_services(self) -> Dict[str, Optional[str]]:
+    def stored_services(self) -> dict[str, str | None]:
         if not self.index_path:
             return {}
         with file_lock(self.index_path):
             entries = self._read_index()
-        active: Dict[str, Optional[str]] = {}
+        active: dict[str, str | None] = {}
         for service_key, username in entries.items():
             if self.get_password(service_key, username) is not None:
                 active[service_key] = username
@@ -334,11 +334,11 @@ class PlaintextFallbackCredentialStore(CredentialStore):
     def __init__(self, allow_plaintext: bool = False) -> None:
         self.allow_plaintext = allow_plaintext
 
-    def get_password(self, service_key: str, username: Optional[str]) -> Optional[str]:
+    def get_password(self, service_key: str, username: str | None) -> str | None:
         return None
 
     def set_password(
-        self, service_key: str, username: Optional[str], password: str
+        self, service_key: str, username: str | None, password: str
     ) -> None:
         if self.allow_plaintext:
             logging.log(
@@ -351,7 +351,7 @@ class PlaintextFallbackCredentialStore(CredentialStore):
                 f"was not persisted. Set {PLAINTEXT_OPT_IN_ENV}=1 to allow plaintext storage."
             )
 
-    def delete_password(self, service_key: str, username: Optional[str]) -> None:
+    def delete_password(self, service_key: str, username: str | None) -> None:
         return None
 
 
@@ -380,7 +380,7 @@ def get_keyring_index_path(config_location: str) -> str:
 
 def get_credential_store(
     config_location: str,
-    allow_plaintext: Optional[bool] = None,
+    allow_plaintext: bool | None = None,
 ) -> CredentialStore:
     """Select the primary OS-backed `CredentialStore` for the current platform."""
     if os.name == "nt":

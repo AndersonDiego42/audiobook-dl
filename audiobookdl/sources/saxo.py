@@ -8,7 +8,7 @@ from datetime import datetime
 import os
 import pycountry
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any
 from urllib.parse import quote
 
 
@@ -23,7 +23,7 @@ class SaxoSource(Source):
     DEFAULT_APP_OS = "android"
     DEFAULT_APP_VERSION = "6.2.4"
 
-    def _app_headers(self) -> Dict[str, str]:
+    def _app_headers(self) -> dict[str, str]:
         app_os = os.environ.get("AUDIOBOOK_DL_SAXO_APP_OS") or self.DEFAULT_APP_OS
         app_version = os.environ.get("AUDIOBOOK_DL_SAXO_APP_VERSION") or self.DEFAULT_APP_VERSION
         return {
@@ -93,7 +93,7 @@ class SaxoSource(Source):
             raise BookNotFound
         return items[0]
 
-    def get_files(self, book_info) -> List[AudiobookFile]:
+    def get_files(self, book_info) -> list[AudiobookFile]:
         book_id = book_info["bookId"]
         chapters = book_info["techInfo"]["chapters"]
 
@@ -117,10 +117,10 @@ class SaxoSource(Source):
         return run_cancellable_pool(_fetch_file, chapters, max_workers=8)
 
     @staticmethod
-    def get_chapters(book_info: Dict[str, Any]) -> List[Chapter]:
+    def get_chapters(book_info: dict[str, Any]) -> list[Chapter]:
         """Build chapters from `techInfo.chapters` when titles or timings are supplied."""
         tech_chapters = (book_info.get("techInfo") or {}).get("chapters") or []
-        chapters: List[Chapter] = []
+        chapters: list[Chapter] = []
         offset_ms = 0
         for idx, ch in enumerate(tech_chapters, start=1):
             if not isinstance(ch, dict):
@@ -137,10 +137,10 @@ class SaxoSource(Source):
 
     def get_metadata(
         self,
-        book_info: Dict[str, Any],
+        book_info: dict[str, Any],
         *,
-        isbn: Optional[str] = None,
-        url: Optional[str] = None,
+        isbn: str | None = None,
+        url: str | None = None,
     ) -> AudiobookMetadata:
         metadata: dict = book_info["bookMetadata"]
         title = metadata["title"]
@@ -189,8 +189,8 @@ class SaxoSource(Source):
         return Cover(data, "jpg")
 
     @staticmethod
-    def _items_to_catalog(items: Any) -> List[CatalogBook]:
-        results: List[CatalogBook] = []
+    def _items_to_catalog(items: Any) -> list[CatalogBook]:
+        results: list[CatalogBook] = []
         for item in items or ():
             if not isinstance(item, dict):
                 continue
@@ -224,7 +224,7 @@ class SaxoSource(Source):
             )
         return results
 
-    def search(self, query: str) -> List[CatalogBook]:
+    def search(self, query: str) -> list[CatalogBook]:
         cleaned = query.strip()
         if not cleaned:
             return []
@@ -234,7 +234,7 @@ class SaxoSource(Source):
         )
         return self._items_to_catalog(resp.get("items") or [])
 
-    def list_library(self) -> List[CatalogBook]:
+    def list_library(self) -> list[CatalogBook]:
         resp = self.get_json(
             f"https://api-read.saxo.com/api/v2/user/{self.user_id}/books?booktypefilter=Audiobook",
             headers=self._app_headers(),

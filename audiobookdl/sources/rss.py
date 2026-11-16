@@ -5,7 +5,6 @@ from __future__ import annotations
 from email.utils import parsedate_to_datetime
 import os
 import re
-from typing import Any, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 from lxml import etree
@@ -33,7 +32,7 @@ _AUDIO_MIME_TO_EXT = {
 _AUDIO_EXTENSIONS = frozenset({"mp3", "m4a", "m4b", "ogg", "opus", "flac", "aac", "wav"})
 
 
-def _parse_duration_ms(raw: Optional[str]) -> Optional[int]:
+def _parse_duration_ms(raw: str | None) -> int | None:
     """Parse `<itunes:duration>` (`HH:MM:SS`, `MM:SS`, or seconds) into milliseconds."""
     if not raw:
         return None
@@ -51,7 +50,7 @@ def _parse_duration_ms(raw: Optional[str]) -> Optional[int]:
     return None
 
 
-def _strip_html(raw: Optional[str]) -> Optional[str]:
+def _strip_html(raw: str | None) -> str | None:
     if not raw:
         return None
     cleaned = " ".join(re.sub(r"<[^>]+>", " ", raw).split())
@@ -65,7 +64,7 @@ def _local_tag(elem: etree._Element) -> str:
     return tag.lower()
 
 
-def _find_child_text(parent: etree._Element, names: Tuple[str, ...]) -> Optional[str]:
+def _find_child_text(parent: etree._Element, names: tuple[str, ...]) -> str | None:
     lowered = set(names)
     for child in parent:
         if _local_tag(child) in lowered:
@@ -75,7 +74,7 @@ def _find_child_text(parent: etree._Element, names: Tuple[str, ...]) -> Optional
     return None
 
 
-def _guess_extension(audio_url: str, mime_type: Optional[str]) -> str:
+def _guess_extension(audio_url: str, mime_type: str | None) -> str:
     ext = os.path.splitext(urlparse(audio_url).path)[1].lstrip(".").lower()
     if ext in _AUDIO_EXTENSIONS:
         return ext
@@ -89,7 +88,7 @@ def _guess_extension(audio_url: str, mime_type: Optional[str]) -> str:
 class RssSource(Source):
     """Generic RSS 2.0 / Atom podcast & audiobook XML feed adapter."""
 
-    _authentication_methods: List[str] = []
+    _authentication_methods: list[str] = []
     names = ["RSS"]
     supports_search = False
     supports_library = False
@@ -107,7 +106,7 @@ class RssSource(Source):
             raise BookNotFound
         return root
 
-    def _extract_cover(self, container: etree._Element, base_url: str) -> Optional[Cover]:
+    def _extract_cover(self, container: etree._Element, base_url: str) -> Cover | None:
         for child in container:
             tag = _local_tag(child)
             if tag in ("image", "thumbnail"):
@@ -128,13 +127,13 @@ class RssSource(Source):
         self,
         channel: etree._Element,
         base_url: str,
-    ) -> List[Tuple[str, str, str, Optional[int], Optional[int], Optional[float]]]:
+    ) -> list[tuple[str, str, str, int | None, int | None, float | None]]:
         """Return list of `(url, ext, title, duration_ms, episode_num, pub_ts)`."""
-        episodes: List[Tuple[str, str, str, Optional[int], Optional[int], Optional[float]]] = []
+        episodes: list[tuple[str, str, str, int | None, int | None, float | None]] = []
         raw_items = [c for c in channel if _local_tag(c) in ("item", "entry")]
         for idx, item in enumerate(raw_items, start=1):
-            enclosure_url: Optional[str] = None
-            enclosure_type: Optional[str] = None
+            enclosure_url: str | None = None
+            enclosure_type: str | None = None
             for child in item:
                 ctag = _local_tag(child)
                 if ctag == "enclosure":
@@ -165,7 +164,7 @@ class RssSource(Source):
             raw_ep = _find_child_text(item, ("episode",))
             ep_num = int(raw_ep) if (raw_ep and raw_ep.isdigit()) else None
             pub_raw = _find_child_text(item, ("pubdate", "published", "updated"))
-            pub_ts: Optional[float] = None
+            pub_ts: float | None = None
             if pub_raw:
                 try:
                     pub_ts = parsedate_to_datetime(pub_raw).timestamp()
@@ -176,8 +175,8 @@ class RssSource(Source):
 
     def _order_episodes(
         self,
-        episodes: List[Tuple[str, str, str, Optional[int], Optional[int], Optional[float]]],
-    ) -> List[Tuple[str, str, str, Optional[int], Optional[int], Optional[float]]]:
+        episodes: list[tuple[str, str, str, int | None, int | None, float | None]],
+    ) -> list[tuple[str, str, str, int | None, int | None, float | None]]:
         if len(episodes) <= 1:
             return episodes
         if all(ep[4] is not None for ep in episodes):
@@ -222,8 +221,8 @@ class RssSource(Source):
                 pass
         cover = self._extract_cover(container, url)
 
-        files: List[AudiobookFile] = []
-        chapters: List[Chapter] = []
+        files: list[AudiobookFile] = []
+        chapters: list[Chapter] = []
         running_ms = 0
         all_have_duration = all(ep[3] is not None and ep[3] > 0 for ep in episodes)
         for ep_url, ext, ep_title, duration_ms, _ep_num, _pub_ts in episodes:

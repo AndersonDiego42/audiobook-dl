@@ -5,7 +5,7 @@ import os
 import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from typing import Callable, Optional, Tuple
+from collections.abc import Callable
 
 from audiobookdl import args, logging
 from audiobookdl.gui.controller import GuiController
@@ -30,8 +30,8 @@ class FFmpegAssistant:
         self._status_var = status_var
         self.status_var = ffmpeg_status_var
         self._on_log = on_log
-        self._status_label: Optional[ttk.Label] = None
-        self.locate_btn: Optional[ttk.Button] = None
+        self._status_label: ttk.Label | None = None
+        self.locate_btn: ttk.Button | None = None
 
     def build_controls(self, parent: ttk.Frame) -> ttk.Frame:
         """Build the header status label and Locate FFmpeg button inside `parent`."""
@@ -54,7 +54,7 @@ class FFmpegAssistant:
         self.locate_btn.pack(side=tk.LEFT)
         return box
 
-    def check_tool(self, program: str) -> Tuple[Optional[str], Optional[str]]:
+    def check_tool(self, program: str) -> tuple[str | None, str | None]:
         """Return `(resolved_path, validation_error)` for `ffmpeg` or `ffprobe`."""
         configured_dir = self._controller.config.ffmpeg_dir
         current_ctx = logging.get_job_context()

@@ -8,7 +8,8 @@ from datetime import date
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any
+from collections.abc import Sequence
 from xml.etree import ElementTree
 
 from mutagen import File as MutagenFile
@@ -51,15 +52,15 @@ _YEAR_SUFFIX_RE = re.compile(r"^(.*?)\s*\((\d{4})\)\s*$")
 class TrackTagInfo:
     """Normalized metadata and track numbers read from a single local audio file."""
 
-    disc_number: Optional[int] = None
-    track_number: Optional[int] = None
-    title: Optional[str] = None
-    album: Optional[str] = None
+    disc_number: int | None = None
+    track_number: int | None = None
+    title: str | None = None
+    album: str | None = None
     metadata: AudiobookMetadata = field(default_factory=lambda: AudiobookMetadata(""))
-    cover: Optional[Cover] = None
+    cover: Cover | None = None
 
 
-def _parse_int_prefix(raw: Any) -> Optional[int]:
+def _parse_int_prefix(raw: Any) -> int | None:
     if raw is None or isinstance(raw, bool):
         return None
     if isinstance(raw, int):
@@ -76,7 +77,7 @@ def _parse_int_prefix(raw: Any) -> Optional[int]:
         return None
 
 
-def _parse_series_order(raw: Any) -> Optional[int]:
+def _parse_series_order(raw: Any) -> int | None:
     if raw is None or isinstance(raw, bool):
         return None
     if isinstance(raw, int):
@@ -101,7 +102,7 @@ def _parse_language(raw: Any) -> Any:
         return None
 
 
-def _clean_text_list(values: Any) -> List[str]:
+def _clean_text_list(values: Any) -> list[str]:
     if values is None:
         return []
     if isinstance(values, (str, bytes)):
@@ -113,7 +114,7 @@ def _clean_text_list(values: Any) -> List[str]:
         ]
     else:
         raw_items = [str(values)]
-    out: List[str] = []
+    out: list[str] = []
     for item in raw_items:
         for part in re.split(r"\s*;\s*", item.strip()):
             cleaned = part.strip()
@@ -122,12 +123,12 @@ def _clean_text_list(values: Any) -> List[str]:
     return out
 
 
-def _first_text(values: Any) -> Optional[str]:
+def _first_text(values: Any) -> str | None:
     items = _clean_text_list(values)
     return items[0] if items else None
 
 
-def _cover_from_bytes_and_mime(data: bytes, mime: Optional[str] = None) -> Optional[Cover]:
+def _cover_from_bytes_and_mime(data: bytes, mime: str | None = None) -> Cover | None:
     if not data:
         return None
     ext = _EXT_TO_MIME_REVERSE.get((mime or "").lower().strip(), "")
@@ -148,15 +149,15 @@ def _read_id3_tags(filepath: str) -> TrackTagInfo:
     except Exception:
         return info
 
-    def _frame_texts(frame_id: str) -> List[str]:
-        out: List[str] = []
+    def _frame_texts(frame_id: str) -> list[str]:
+        out: list[str] = []
         for frame in tags.getall(frame_id):
             text_attr = getattr(frame, "text", None)
             if text_attr:
                 out.extend(str(t) for t in text_attr if str(t).strip())
         return out
 
-    txxx_map: Dict[str, List[str]] = {}
+    txxx_map: dict[str, list[str]] = {}
     for frame in tags.getall("TXXX"):
         desc = str(getattr(frame, "desc", "") or "").strip().lower()
         if desc:
@@ -217,7 +218,7 @@ def _read_id3_tags(filepath: str) -> TrackTagInfo:
     return info
 
 
-def _decode_mp4_freeform(values: Any) -> Optional[str]:
+def _decode_mp4_freeform(values: Any) -> str | None:
     if not values:
         return None
     first = values[0]
@@ -256,7 +257,7 @@ def _read_mp4_tags(filepath: str) -> TrackTagInfo:
     meta.publisher = _first_text(tags.get("\xa9pub") or tags.get("cprt"))
     meta.description = _first_text(tags.get("ldes") or tags.get("desc") or tags.get("\xa9cmt"))
 
-    freeform_ci: Dict[str, Any] = {}
+    freeform_ci: dict[str, Any] = {}
     for k, v in tags.items():
         if isinstance(k, str) and k.lower().startswith("----:com.apple.itunes:"):
             freeform_ci[k.split(":", 2)[2].lower()] = v
@@ -299,7 +300,7 @@ def _read_vorbis_tags(filepath: str) -> TrackTagInfo:
     if audio is None:
         return info
     tags = getattr(audio, "tags", None)
-    tag_ci: Dict[str, List[str]] = {}
+    tag_ci: dict[str, list[str]] = {}
     if tags:
         for k, v in tags.items():
             key_lower = str(k).lower()
@@ -358,7 +359,7 @@ def read_track_tags(filepath: str) -> TrackTagInfo:
     return _read_vorbis_tags(filepath)
 
 
-def read_cover_file(filepath: str) -> Optional[Cover]:
+def read_cover_file(filepath: str) -> Cover | None:
     """Load an external cover image file from disk into a `Cover` object."""
     if not os.path.isfile(filepath):
         return None
@@ -377,7 +378,7 @@ def read_cover_file(filepath: str) -> Optional[Cover]:
     return Cover(image=data, extension=ext)
 
 
-def find_sidecar_cover(directory: str) -> Optional[Cover]:
+def find_sidecar_cover(directory: str) -> Cover | None:
     """Find a folder-level cover image in `directory`, if present."""
     if not os.path.isdir(directory):
         return None
@@ -394,9 +395,9 @@ def find_sidecar_cover(directory: str) -> Optional[Cover]:
     return None
 
 
-def _parse_metadata_json(path: str) -> Tuple[Optional[AudiobookMetadata], List[Chapter]]:
+def _parse_metadata_json(path: str) -> tuple[AudiobookMetadata | None, list[Chapter]]:
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             payload = json.load(f)
     except (OSError, ValueError):
         return None, []
@@ -415,7 +416,7 @@ def _parse_metadata_json(path: str) -> Tuple[Optional[AudiobookMetadata], List[C
     meta.source = str(payload.get("source") or "").strip() or None
 
     raw_series = payload.get("series")
-    series_text: Optional[str] = None
+    series_text: str | None = None
     if isinstance(raw_series, list) and raw_series:
         first_series = raw_series[0]
         if isinstance(first_series, dict):
@@ -446,7 +447,7 @@ def _parse_metadata_json(path: str) -> Tuple[Optional[AudiobookMetadata], List[C
     if payload.get("language"):
         meta.language = _parse_language(payload["language"])
 
-    chapters: List[Chapter] = []
+    chapters: list[Chapter] = []
     raw_chapters = payload.get("chapters")
     if isinstance(raw_chapters, list):
         for item in raw_chapters:
@@ -475,16 +476,16 @@ def _local_tag_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1].lower()
 
 
-def _parse_opf_file(path: str, base_dir: str) -> Tuple[Optional[AudiobookMetadata], Optional[Cover]]:
+def _parse_opf_file(path: str, base_dir: str) -> tuple[AudiobookMetadata | None, Cover | None]:
     try:
         tree = ElementTree.parse(path)
     except (OSError, ElementTree.ParseError):
         return None, None
     root = tree.getroot()
     meta = AudiobookMetadata("")
-    cover_href: Optional[str] = None
-    cover_id: Optional[str] = None
-    manifest_items: Dict[str, str] = {}
+    cover_href: str | None = None
+    cover_id: str | None = None
+    manifest_items: dict[str, str] = {}
 
     for elem in root.iter():
         lname = _local_tag_name(elem.tag)
@@ -547,24 +548,24 @@ def _parse_opf_file(path: str, base_dir: str) -> Tuple[Optional[AudiobookMetadat
                     cover_href = href
 
     resolved_cover_href = manifest_items.get(cover_id or "") or cover_href
-    cover: Optional[Cover] = None
+    cover: Cover | None = None
     if resolved_cover_href:
         cover_path = os.path.join(base_dir, resolved_cover_href)
         cover = read_cover_file(cover_path)
     return meta, cover
 
 
-def parse_cue_chapters(path: str) -> List[Chapter]:
+def parse_cue_chapters(path: str) -> list[Chapter]:
     """Parse chapters (`TRACK nn AUDIO` / `TITLE` / `INDEX 01 MM:SS:FF`) from a `.cue` sheet."""
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
     except OSError:
         return []
 
-    chapters: List[Chapter] = []
+    chapters: list[Chapter] = []
     in_track = False
-    pending_title: Optional[str] = None
+    pending_title: str | None = None
     for line in lines:
         if _CUE_TRACK_RE.match(line):
             in_track = True
@@ -623,8 +624,8 @@ def merge_metadata(primary: AudiobookMetadata, fallback: AudiobookMetadata) -> A
 
 def read_sidecar_metadata(
     directory: str,
-    audio_stem: Optional[str] = None,
-) -> Tuple[Optional[AudiobookMetadata], Optional[Cover], List[Chapter]]:
+    audio_stem: str | None = None,
+) -> tuple[AudiobookMetadata | None, Cover | None, list[Chapter]]:
     """Inspect `directory` for `metadata.json`, `.opf`, cover art, and `.cue` chapters."""
     if not os.path.isdir(directory):
         return None, None, []
@@ -635,11 +636,11 @@ def read_sidecar_metadata(
 
     cover = find_sidecar_cover(directory)
     meta = AudiobookMetadata("")
-    chapters: List[Chapter] = []
+    chapters: list[Chapter] = []
 
-    json_candidates: List[str] = []
-    opf_candidates: List[str] = []
-    cue_candidates: List[str] = []
+    json_candidates: list[str] = []
+    opf_candidates: list[str] = []
+    cue_candidates: list[str] = []
     for name in filenames:
         low = name.lower()
         full = os.path.join(directory, name)

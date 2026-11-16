@@ -4,7 +4,7 @@ from ._chapters import build_bounded_chapters
 from mutagen import File as MutagenFile
 import os
 import threading
-from typing import List, Optional, Sequence
+from collections.abc import Sequence
 
 
 LOSSLESS_CONTAINERS = ("flac", "wav", "aiff", "alac", "wv")
@@ -22,11 +22,11 @@ def _escape_ffmetadata(text: str) -> str:
     )
 
 
-def create_metadata_text(metadata: Optional[AudiobookMetadata]) -> str:
+def create_metadata_text(metadata: AudiobookMetadata | None) -> str:
     """Render global FFMETADATA1 tag lines (`key=value\\n`) for `metadata`."""
     if metadata is None:
         return ""
-    lines: List[str] = []
+    lines: list[str] = []
     if metadata.title:
         lines.append(f"title={_escape_ffmetadata(metadata.title)}")
     if metadata.authors:
@@ -68,8 +68,8 @@ def create_tmp_chapter_file(filepath: str, chapters: Sequence[Chapter]) -> str:
 
 def _build_fallback_codec_args(
     filepath: str,
-    audio_bitrate: Optional[str] = None,
-) -> List[str]:
+    audio_bitrate: str | None = None,
+) -> list[str]:
     """Return FFmpeg audio encoding flags matching `filepath`'s container and `audio_bitrate`."""
     ext = os.path.splitext(filepath)[1].lstrip(".").lower()
     if not ext or ext in utils.MP4_CONTAINERS:
@@ -84,8 +84,8 @@ def _build_fallback_codec_args(
 def add_chapters_ffmpeg(
     filepath: str,
     chapters: Sequence[Chapter],
-    cancel_event: Optional[threading.Event] = None,
-    audio_bitrate: Optional[str] = None,
+    cancel_event: threading.Event | None = None,
+    audio_bitrate: str | None = None,
 ):
     if not chapters:
         return

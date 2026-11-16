@@ -9,7 +9,6 @@ from audiobookdl.args import build_default_options
 from audiobookdl.exceptions import DataNotPresent, NoSourceFound, RequestError
 from audiobookdl.sources import find_compatible_source
 from audiobookdl.sources.podimo import PodimoSource
-from audiobookdl.utils.http import DEFAULT_HTTP_TIMEOUT
 
 
 def _make_source(tmp_path) -> PodimoSource:

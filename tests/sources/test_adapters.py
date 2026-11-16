@@ -214,7 +214,7 @@ def test_overdrive_source_parses_bdata_fixture(tmp_path):
             ]
         },
     }
-    html = f"<script>window.bData = {json.dumps(bdata)};</script>".encode("utf-8")
+    html = f"<script>window.bData = {json.dumps(bdata)};</script>".encode()
     src = OverdriveSource(_opts(tmp_path))
     src._session.get = MagicMock(
         side_effect=[
@@ -252,7 +252,7 @@ def test_chirp_source_decrypts_track_urls_and_parses_credits(tmp_path):
         f'<img class="cover-image" src="https://cdn.chirp.test/cover.jpg"/>'
         f'<script>{{"id":{user_id}}}</script>'
         f"</body></html>"
-    ).encode("utf-8")
+    ).encode()
 
     tracks_resp = {
         "data": {
@@ -451,9 +451,7 @@ def test_everand_source_parses_external_audiobook_and_cleans_title(tmp_path):
             "session_key": "sess1",
         },
     }
-    html = f"<script>ReactDOM.render(Scribd.Audiobooks.Show, {json.dumps(show_payload)});</script>".encode(
-        "utf-8"
-    )
+    html = f"<script>ReactDOM.render(Scribd.Audiobooks.Show, {json.dumps(show_payload)});</script>".encode()
     src = EverandSource(_opts(tmp_path))
     src._session.get = MagicMock(
         side_effect=[
@@ -580,7 +578,7 @@ def test_overdrive_handles_short_toc_and_cumulative_offsets(tmp_path):
             ]
         },
     }
-    html = f"<script>window.bData = {json.dumps(bdata)};</script>".encode("utf-8")
+    html = f"<script>window.bData = {json.dumps(bdata)};</script>".encode()
     src = OverdriveSource(_opts(tmp_path))
     src._session.get = MagicMock(
         side_effect=[
@@ -741,7 +739,7 @@ def test_everand_wires_chapters_selects_highest_bandwidth_and_escapes_url_regex(
             {"chapter_number": 1, "duration": 10000},
         ],
     }
-    html = f"<script>ReactDOM.render(Scribd.Audiobooks.Show, {json.dumps(show_payload)});</script>".encode("utf-8")
+    html = f"<script>ReactDOM.render(Scribd.Audiobooks.Show, {json.dumps(show_payload)});</script>".encode()
     master_m3u8 = (
         b"#EXTM3U\n"
         b"#EXT-X-STREAM-INF:BANDWIDTH=64000\n"

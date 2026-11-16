@@ -229,7 +229,7 @@ def build(
 
 
 def verify_executable(exe_path: Path, timeout: int = 60) -> None:
-    """Launch the built executable with `--self-test` in an isolated temp directory."""
+    """Launch the built GUI executable with `--self-test` and companion CLI if present."""
     with tempfile.TemporaryDirectory() as tmpdir:
         subprocess.run(
             [str(exe_path), "--self-test"],
@@ -237,6 +237,17 @@ def verify_executable(exe_path: Path, timeout: int = 60) -> None:
             check=True,
             timeout=timeout,
         )
+        cli_name = "audiobook-dl-cli.exe" if os.name == "nt" else "audiobook-dl-cli"
+        cli_path = exe_path.parent / cli_name
+        if cli_path.is_file():
+            subprocess.run(
+                [str(cli_path), "serve", "--help"],
+                cwd=tmpdir,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout,
+            )
 
 
 def main() -> None:

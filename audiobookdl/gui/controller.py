@@ -6,7 +6,8 @@ import json
 import os
 import queue
 import threading
-from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any
+from collections.abc import Callable, Mapping, Sequence
 import uuid
 
 from audiobookdl import args, logging
@@ -55,11 +56,11 @@ from audiobookdl.utils.updater import check_for_updates, install_ffmpeg_via_wing
 class PackJobRequest:
     """Payload describing a local audiobook repackaging job."""
 
-    paths: List[str]
+    paths: list[str]
     recursive: bool = False
     delete_source: bool = False
-    output_dir: Optional[str] = None
-    overrides: Optional[PackOverrides] = None
+    output_dir: str | None = None
+    overrides: PackOverrides | None = None
     label: str = ""
 
 
@@ -72,9 +73,9 @@ class QueuedJob:
     url: str
     options: args.DownloadOptions
     interaction: "GuiInteractionHandler"
-    selected_indices: Optional[List[int]] = None
-    prefetched: Optional[Tuple[Source, Result]] = None
-    pack_request: Optional[PackJobRequest] = None
+    selected_indices: list[int] | None = None
+    prefetched: tuple[Source, Result] | None = None
+    pack_request: PackJobRequest | None = None
 
 
 class GuiLogSink:
@@ -103,7 +104,7 @@ class GuiLogSink:
         bytes_downloaded: int,
         speed_bps: float,
         elapsed_seconds: float,
-        eta_seconds: Optional[float],
+        eta_seconds: float | None,
     ) -> None:
         self._queue.put((
             "progress_metrics",
@@ -132,7 +133,7 @@ class GuiInteractionHandler:
     ) -> None:
         self._queue = event_queue
         self._cancel_event = cancel_event
-        self._pending_events: List[threading.Event] = []
+        self._pending_events: list[threading.Event] = []
         self._lock = threading.Lock()
 
     def ask_input(self, prompt: str, hidden: bool = False) -> str:
@@ -169,8 +170,8 @@ class GuiInteractionHandler:
         self,
         title: str,
         choices: Sequence[str],
-        default: Optional[int] = None,
-    ) -> Optional[int]:
+        default: int | None = None,
+    ) -> int | None:
         if self._cancel_event.is_set() or not choices:
             return None
         done = threading.Event()
@@ -197,31 +198,31 @@ class GuiController:
 
     MAX_QUEUE_BATCH = 200
 
-    def __init__(self, config_location: Optional[str] = None) -> None:
+    def __init__(self, config_location: str | None = None) -> None:
         self.config_location = config_location
         self.config = self.load_saved_config()
 
-        self.event_queue: "queue.Queue[tuple]" = queue.Queue()
+        self.event_queue: queue.Queue[tuple] = queue.Queue()
         self.sink = GuiLogSink(self.event_queue)
         self.cancel_event = threading.Event()
         self.pause_event = threading.Event()
         self.pause_event.set()
         self.preview_cancel_event = threading.Event()
-        self.interaction: Optional[GuiInteractionHandler] = None
-        self.preview_interaction: Optional[GuiInteractionHandler] = None
+        self.interaction: GuiInteractionHandler | None = None
+        self.preview_interaction: GuiInteractionHandler | None = None
 
-        self.pending_jobs: Deque[Optional[QueuedJob]] = deque()
+        self.pending_jobs: deque[QueuedJob | None] = deque()
         self.queue_lock = threading.Lock()
         self.queue_cond = threading.Condition(self.queue_lock)
-        self.worker: Optional[threading.Thread] = None
+        self.worker: threading.Thread | None = None
         self.worker_has_active_run = False
         self.worker_run_id = 0
         self.batch_total = 0
-        self.run_seen_urls: Set[str] = set()
-        self.queue_records: Dict[str, Dict[str, Any]] = {}
+        self.run_seen_urls: set[str] = set()
+        self.queue_records: dict[str, dict[str, Any]] = {}
         self.catalog_request_id = 0
         self.preview_request_id = 0
-        self._http_session: Optional[Any] = None
+        self._http_session: Any | None = None
 
     @staticmethod
     def make_job_id() -> str:
@@ -249,7 +250,7 @@ class GuiController:
         with self.queue_lock:
             return self.config.clone()
 
-    def save_ffmpeg_dir(self, resolved_dir: Optional[str]) -> Config:
+    def save_ffmpeg_dir(self, resolved_dir: str | None) -> Config:
         save_ffmpeg_dir(resolved_dir, overwrite=self.config_location)
         return self.reload_config()
 
@@ -257,11 +258,11 @@ class GuiController:
         self,
         service_key: str,
         *,
-        username: Optional[str] = None,
-        password: Optional[str] = None,
-        library: Optional[str] = None,
-        cookie_file: Optional[str] = None,
-        profile: Optional[str] = None,
+        username: str | None = None,
+        password: str | None = None,
+        library: str | None = None,
+        cookie_file: str | None = None,
+        profile: str | None = None,
     ) -> Config:
         save_source_credentials(
             service_key,
@@ -280,7 +281,7 @@ class GuiController:
         *,
         output_dir: str,
         output_template: str,
-        use_download_archive: Optional[bool] = None,
+        use_download_archive: bool | None = None,
     ) -> Config:
         prefs = {spec.name: getattr(options, spec.name) for spec in PERSISTED_GUI_OPTION_SPECS}
         save_output_preferences(config_location=self.config_location, **prefs)
@@ -295,13 +296,13 @@ class GuiController:
     def save_window_preferences(
         self,
         *,
-        window_geometry: Optional[str],
-        output_dir: Optional[str],
-        output_template: Optional[str],
-        use_download_archive: Optional[bool] = None,
-        theme: Optional[str] = None,
-        notify_on_complete: Optional[bool] = None,
-        output_prefs: Optional[Mapping[str, Any]] = None,
+        window_geometry: str | None,
+        output_dir: str | None,
+        output_template: str | None,
+        use_download_archive: bool | None = None,
+        theme: str | None = None,
+        notify_on_complete: bool | None = None,
+        output_prefs: Mapping[str, Any] | None = None,
     ) -> None:
         if output_prefs:
             save_output_preferences(config_location=self.config_location, **output_prefs)
@@ -333,7 +334,7 @@ class GuiController:
 
     def save_queue_state(self) -> None:
         """Persist non-completed download queue entries to `gui_queue.json` atomically."""
-        persistable: List[Dict[str, str]] = []
+        persistable: list[dict[str, str]] = []
         with self.queue_lock:
             records = list(self.queue_records.values())
         for rec in records:
@@ -370,19 +371,19 @@ class GuiController:
         except OSError:
             pass
 
-    def load_saved_queue_records(self) -> List[Dict[str, Any]]:
+    def load_saved_queue_records(self) -> list[dict[str, Any]]:
         """Load persisted unresolved queue items from `gui_queue.json`."""
         target = self.queue_state_path()
         if not os.path.isfile(target):
             return []
         try:
-            with open(target, "r", encoding="utf-8") as fh:
+            with open(target, encoding="utf-8") as fh:
                 raw = json.load(fh)
         except (OSError, ValueError):
             return []
         if not isinstance(raw, list):
             return []
-        restored: List[Dict[str, Any]] = []
+        restored: list[dict[str, Any]] = []
         with self.queue_lock:
             for item in raw:
                 if not isinstance(item, dict):
@@ -426,7 +427,7 @@ class GuiController:
         self.pause_queue()
         return True
 
-    def register_queue_record(self, job: QueuedJob, service_label: str) -> Dict[str, Any]:
+    def register_queue_record(self, job: QueuedJob, service_label: str) -> dict[str, Any]:
         rec = {
             "job_id": job.job_id,
             "run_id": job.run_id,
@@ -441,7 +442,7 @@ class GuiController:
         self.save_queue_state()
         return rec
 
-    def update_queue_record(self, job_id: str, status: str, detail: str = "") -> Optional[Dict[str, Any]]:
+    def update_queue_record(self, job_id: str, status: str, detail: str = "") -> dict[str, Any] | None:
         with self.queue_lock:
             rec = self.queue_records.get(job_id)
             if rec is None:
@@ -457,14 +458,14 @@ class GuiController:
 
     def start_new_run(
         self,
-        job_specs: Sequence[Tuple[str, args.DownloadOptions, Optional[List[int]], Optional[Tuple[Source, Result]]]],
-    ) -> Tuple[int, List[QueuedJob]]:
+        job_specs: Sequence[tuple[str, args.DownloadOptions, list[int] | None, tuple[Source, Result] | None]],
+    ) -> tuple[int, list[QueuedJob]]:
         """Initialize queue state for a fresh download run and ensure the worker is running."""
         self.cancel_event.clear()
         self.pause_event.set()
         self.interaction = GuiInteractionHandler(self.event_queue, self.cancel_event)
 
-        queued_jobs: List[QueuedJob] = []
+        queued_jobs: list[QueuedJob] = []
         with self.queue_cond:
             self.worker_run_id += 1
             run_id = self.worker_run_id
@@ -493,10 +494,10 @@ class GuiController:
         self,
         urls: Sequence[str],
         build_job_options: Callable[[str], args.DownloadOptions],
-    ) -> Tuple[bool, List[QueuedJob], int]:
+    ) -> tuple[bool, list[QueuedJob], int]:
         """Append unseen URLs to the active queue; returns `(has_active_run, added_jobs, batch_total)`."""
         unique_urls = list(dict.fromkeys(urls))
-        added_jobs: List[QueuedJob] = []
+        added_jobs: list[QueuedJob] = []
         with self.queue_cond:
             if not self.worker_has_active_run:
                 return False, [], self.batch_total
@@ -527,9 +528,9 @@ class GuiController:
         self,
         url: str,
         options: args.DownloadOptions,
-        prefetched: Tuple[Source, Result],
-        selected_indices: Optional[List[int]],
-    ) -> Optional[Tuple[QueuedJob, int]]:
+        prefetched: tuple[Source, Result],
+        selected_indices: list[int] | None,
+    ) -> tuple[QueuedJob, int] | None:
         """Append a previewed item to the active run if one exists; otherwise return `None`."""
         with self.queue_cond:
             if not self.worker_has_active_run:
@@ -554,13 +555,13 @@ class GuiController:
 
     def start_or_enqueue_pack_jobs(
         self,
-        requests_with_options: Sequence[Tuple[PackJobRequest, args.DownloadOptions]],
-    ) -> Tuple[bool, int, List[QueuedJob], int]:
+        requests_with_options: Sequence[tuple[PackJobRequest, args.DownloadOptions]],
+    ) -> tuple[bool, int, list[QueuedJob], int]:
         """Queue local pack jobs on the active run or start a new run when idle.
 
         Returns `(was_appended, run_id, queued_jobs, batch_total)`.
         """
-        queued_jobs: List[QueuedJob] = []
+        queued_jobs: list[QueuedJob] = []
         with self.queue_cond:
             was_appended = self.worker_has_active_run
             if not was_appended:
@@ -601,14 +602,14 @@ class GuiController:
         options: args.DownloadOptions,
         *,
         recursive: bool = False,
-        output_dir: Optional[str] = None,
-        overrides: Optional[PackOverrides] = None,
-    ) -> List[PackBookSpec]:
+        output_dir: str | None = None,
+        overrides: PackOverrides | None = None,
+    ) -> list[PackBookSpec]:
         """Discover and inspect local audiobook specs cleanly without modifying files."""
         groups = discover_pack_groups(paths, recursive=recursive)
         total = len(groups)
-        specs: List[PackBookSpec] = []
-        probe_cache: Dict[str, Any] = {}
+        specs: list[PackBookSpec] = []
+        probe_cache: dict[str, Any] = {}
         session = self.get_http_session()
         book_overrides = scope_overrides_for_batch(overrides, total)
         for source_root, raw_tracks in groups:
@@ -625,13 +626,13 @@ class GuiController:
             )
         return specs
 
-    def remove_pending_job(self, job_id: str) -> Tuple[bool, Optional[int], bool]:
+    def remove_pending_job(self, job_id: str) -> tuple[bool, int | None, bool]:
         """Remove a job from pending queue/records; returns `(removed, new_batch_total, is_active_running)`."""
         rec = self.queue_records.get(job_id)
         if rec is None:
             return False, None, False
         with self.queue_cond:
-            pending_idx: Optional[int] = None
+            pending_idx: int | None = None
             for idx, job in enumerate(self.pending_jobs):
                 if job is not None and job.job_id == job_id:
                     pending_idx = idx
@@ -640,7 +641,7 @@ class GuiController:
                 del self.pending_jobs[pending_idx]
                 self.batch_total = max(0, self.batch_total - 1)
                 self.run_seen_urls.discard(rec["url"])
-                new_total: Optional[int] = self.batch_total
+                new_total: int | None = self.batch_total
             elif rec["status"] == "Running":
                 return False, None, True
             else:
@@ -650,7 +651,7 @@ class GuiController:
         self.save_queue_state()
         return True, new_total, False
 
-    def move_pending_job(self, job_id: str, direction: int) -> Optional[str]:
+    def move_pending_job(self, job_id: str, direction: int) -> str | None:
         """Swap `job_id` with its neighbor in `pending_jobs`; returns swapped neighbor `job_id`."""
         if direction not in (-1, 1):
             return None
@@ -672,7 +673,7 @@ class GuiController:
             self.pending_jobs = deque(pending_list)
             return neighbor_id
 
-    def retryable_urls(self, ordered_ids: Sequence[str]) -> List[str]:
+    def retryable_urls(self, ordered_ids: Sequence[str]) -> list[str]:
         return [
             rec["url"]
             for iid in ordered_ids
@@ -682,7 +683,7 @@ class GuiController:
             and rec["status"] in ("Failed", "Cancelled", "Interrupted")
         ]
 
-    def clear_completed_records(self, ordered_ids: Sequence[str]) -> List[str]:
+    def clear_completed_records(self, ordered_ids: Sequence[str]) -> list[str]:
         with self.queue_lock:
             removable = [
                 iid
@@ -712,7 +713,7 @@ class GuiController:
     def _drain_pending_jobs(self, cancel_status: str = "Cancelled") -> bool:
         """Remove queued jobs after cancellation/error; return True if close sentinel seen."""
         saw_sentinel = False
-        cancelled_ids: List[str] = []
+        cancelled_ids: list[str] = []
         with self.queue_cond:
             while self.pending_jobs:
                 pending = self.pending_jobs.popleft()
@@ -736,10 +737,10 @@ class GuiController:
 
             run_id = first_job.run_id
             batch_summary = DownloadSummary()
-            fatal_exc: Optional[Exception] = None
+            fatal_exc: Exception | None = None
             item_index = 0
             saw_sentinel = False
-            current_job: Optional[QueuedJob] = first_job
+            current_job: QueuedJob | None = first_job
 
             while current_job is not None:
                 if self.is_paused() and not self.cancel_event.is_set():
@@ -786,7 +787,7 @@ class GuiController:
                             book_errors=list(pack_summary.book_errors),
                         )
                     else:
-                        run_kwargs: Dict[str, Any] = {
+                        run_kwargs: dict[str, Any] = {
                             "interaction": current_job.interaction,
                             "cancel_event": self.cancel_event,
                             "sink": self.sink,
@@ -973,7 +974,7 @@ class GuiController:
         self,
         audiobook: Audiobook,
         options: args.DownloadOptions,
-    ) -> List[EnrichmentCandidate]:
+    ) -> list[EnrichmentCandidate]:
         """Query configured metadata enrichment providers for `audiobook`."""
         raw_providers = getattr(options, "enrich_providers", None)
         providers = parse_provider_list(raw_providers) if raw_providers else None
@@ -992,7 +993,7 @@ class GuiController:
         audiobook: Audiobook,
         candidate: EnrichmentCandidate,
         options: args.DownloadOptions,
-    ) -> Tuple[List[str], bool, bool]:
+    ) -> tuple[list[str], bool, bool]:
         """Apply `candidate` onto `audiobook` using controller session and cache."""
         db_dir = getattr(options, "database_directory", None)
         use_cache = not bool(getattr(options, "no_enrich_cache", False))
@@ -1025,8 +1026,8 @@ class GuiController:
         max_batch: int = MAX_QUEUE_BATCH,
     ) -> int:
         """Drain up to `max_batch` events, coalescing consecutive progress updates."""
-        pending_progress: Optional[tuple] = None
-        pending_metrics: Optional[tuple] = None
+        pending_progress: tuple | None = None
+        pending_metrics: tuple | None = None
         processed = 0
         while processed < max_batch:
             try:

@@ -381,7 +381,6 @@ def test_series_summary_tracks_partial_failures_and_info_only_skips_downloads(mo
     from audiobookdl.exceptions import BookNotReleased, GenericAudiobookDLException
 
     b1 = Audiobook(session=requests.Session(), metadata=AudiobookMetadata(title="Book One"), files=[])
-    b2 = Audiobook(session=requests.Session(), metadata=AudiobookMetadata(title="Book Two"), files=[])
     series = Series(title="Saga", books=[BookId("1"), BookId("2"), BookId("3")])
 
     class _MixedSeriesSource:

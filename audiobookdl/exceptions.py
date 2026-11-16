@@ -1,11 +1,10 @@
 import audiobookdl.sources as sources
-from .logging import print_error_file, error
-from typing import Optional
+from .logging import print_error_file
 
 class AudiobookDLException(Exception):
     error_description = "unknown"
 
-    def __init__(self, error_description = None, message: Optional[str] = None, **kwargs) -> None:
+    def __init__(self, error_description = None, message: str | None = None, **kwargs) -> None:
         if message:
             super().__init__(message)
         if error_description:
@@ -64,7 +63,7 @@ class ConfigNotFound(AudiobookDLException):
 class GenericAudiobookDLException(AudiobookDLException):
     error_description: str = "generic"
 
-    def __init__(self, heading: str, body: Optional[str] = None) -> None:
+    def __init__(self, heading: str, body: str | None = None) -> None:
         super().__init__(message=f"{heading}: {body}" if body else heading)
         self.data = {'heading': heading, 'body': body if body else ""}
 

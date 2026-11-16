@@ -6,7 +6,6 @@ import requests
 
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, args
 from audiobookdl.__main__ import main as cli_main
-from audiobookdl.config import Config
 from audiobookdl.gui.app import AudiobookDLApp
 from audiobookdl.pipeline import process_audiobook
 from audiobookdl.sources.source import CatalogBook

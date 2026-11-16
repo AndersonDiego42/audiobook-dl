@@ -6,7 +6,6 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import sys
-from typing import List, Optional
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -42,18 +41,18 @@ class E2EConfig:
     """Runtime settings governing E2E execution across local and CI environments."""
 
     target_mode: str
-    cli_executable: Optional[Path]
-    gui_executable: Optional[Path]
+    cli_executable: Path | None
+    gui_executable: Path | None
     timeout_seconds: float
     server_host: str
-    ffmpeg_dir: Optional[Path]
-    artifacts_dir: Optional[Path]
+    ffmpeg_dir: Path | None
+    artifacts_dir: Path | None
     require_ffmpeg: bool
     require_gui: bool
     headless: bool
 
     @classmethod
-    def from_env(cls) -> "E2EConfig":
+    def from_env(cls) -> E2EConfig:
         """Load `E2EConfig` from `AUDIOBOOK_DL_E2E_*` environment variables."""
         target_mode = os.environ.get("AUDIOBOOK_DL_E2E_TARGET", "module").strip().lower()
         if target_mode not in ("module", "executable"):
@@ -79,7 +78,7 @@ class E2EConfig:
             headless=_detect_headless(),
         )
 
-    def cli_command(self) -> List[str]:
+    def cli_command(self) -> list[str]:
         """Return base argv used to launch the CLI entry point."""
         if self.target_mode == "executable":
             if self.cli_executable is not None:
@@ -87,7 +86,7 @@ class E2EConfig:
             return ["audiobook-dl"]
         return [sys.executable, "-m", "audiobookdl"]
 
-    def gui_self_test_command(self) -> List[str]:
+    def gui_self_test_command(self) -> list[str]:
         """Return argv used to invoke the GUI `--self-test` readiness check."""
         if self.target_mode == "executable" and self.gui_executable is not None:
             return [str(self.gui_executable), "--self-test"]

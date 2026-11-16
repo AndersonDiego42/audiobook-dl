@@ -4,7 +4,8 @@ from dataclasses import dataclass
 import sys
 import tkinter as tk
 from tkinter import ttk
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple
+from typing import Any
+from collections.abc import Callable, Sequence
 
 from audiobookdl.gui.theme import scale_px
 
@@ -25,10 +26,10 @@ import typing
 _TreeItemT = typing.TypeVar("_TreeItemT")
 
 
-def resolve_selected_leaf_iids(tree: ttk.Treeview) -> typing.List[str]:
+def resolve_selected_leaf_iids(tree: ttk.Treeview) -> list[str]:
     """Return selected leaf item IDs, expanding any selected group parent rows."""
     seen: set[str] = set()
-    leaves: typing.List[str] = []
+    leaves: list[str] = []
 
     def _collect(iid: str) -> None:
         children = tree.get_children(iid)
@@ -50,13 +51,13 @@ def populate_grouped_tree(
     *,
     grouped: bool,
     get_iid: typing.Callable[[_TreeItemT, int], str],
-    get_values: typing.Callable[[_TreeItemT], typing.Tuple[str, ...]],
+    get_values: typing.Callable[[_TreeItemT], tuple[str, ...]],
     get_group_key: typing.Callable[[_TreeItemT], str],
-    format_group_values: typing.Callable[[str, int], typing.Tuple[str, ...]],
-    should_group: typing.Optional[typing.Callable[[_TreeItemT, int], bool]] = None,
+    format_group_values: typing.Callable[[str, int], tuple[str, ...]],
+    should_group: typing.Callable[[_TreeItemT, int], bool] | None = None,
     group_prefix: str = "group:",
     open_groups: bool = True,
-    get_tags: typing.Optional[typing.Callable[[_TreeItemT], typing.Tuple[str, ...]]] = None,
+    get_tags: typing.Callable[[_TreeItemT], tuple[str, ...]] | None = None,
 ) -> int:
     """Populate `tree` flat or grouped under collapsible parent rows.
 
@@ -72,13 +73,13 @@ def populate_grouped_tree(
             tree.insert("", "end", iid=get_iid(item, idx), values=get_values(item), tags=tags)
         return 0
 
-    group_counts: Dict[str, int] = {}
+    group_counts: dict[str, int] = {}
     for item in items:
         key = get_group_key(item).strip()
         if key:
             group_counts[key] = group_counts.get(key, 0) + 1
 
-    group_iids: Dict[str, str] = {}
+    group_iids: dict[str, str] = {}
     group_counter = 0
     for idx, item in enumerate(items):
         key = get_group_key(item).strip()
@@ -121,7 +122,7 @@ class ScrolledTreeview(ttk.Frame):
         columns: Sequence[TreeColumnSpec],
         *,
         selectmode: str = "browse",
-        height: Optional[int] = None,
+        height: int | None = None,
         show_tree: bool = False,
         tree_heading: str = "",
         tree_width: int = 28,
@@ -130,7 +131,7 @@ class ScrolledTreeview(ttk.Frame):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
-        tree_kwargs: Dict[str, Any] = {
+        tree_kwargs: dict[str, Any] = {
             "columns": tuple(spec.key for spec in columns),
             "show": "tree headings" if show_tree else "headings",
             "selectmode": selectmode,
@@ -169,9 +170,9 @@ class ScrollableFrame(ttk.Frame):
         self,
         parent: tk.Misc,
         *,
-        style: Optional[ttk.Style] = None,
-        content_padding: Tuple[int, int] = (12, 8),
-        inner_scrollables: Optional[Callable[[], Sequence[tk.Widget]]] = None,
+        style: ttk.Style | None = None,
+        content_padding: tuple[int, int] = (12, 8),
+        inner_scrollables: Callable[[], Sequence[tk.Widget]] | None = None,
     ) -> None:
         super().__init__(parent)
         self.columnconfigure(0, weight=1)
@@ -179,11 +180,11 @@ class ScrollableFrame(ttk.Frame):
 
         self._inner_scrollables = inner_scrollables
         self.vscroll_visible = False
-        self._last_canvas_size: Optional[Tuple[int, int]] = None
-        self._last_content_req_size: Optional[Tuple[int, int]] = None
+        self._last_canvas_size: tuple[int, int] | None = None
+        self._last_content_req_size: tuple[int, int] | None = None
 
         canvas_bg = style.lookup("TFrame", "background") if style is not None else ""
-        canvas_kwargs: Dict[str, Any] = {"highlightthickness": 0, "borderwidth": 0}
+        canvas_kwargs: dict[str, Any] = {"highlightthickness": 0, "borderwidth": 0}
         if canvas_bg:
             canvas_kwargs["background"] = canvas_bg
         self.canvas = tk.Canvas(self, **canvas_kwargs)
@@ -208,7 +209,7 @@ class ScrollableFrame(ttk.Frame):
         if background:
             self.canvas.configure(background=background)
 
-    def sync_layout(self, event: Optional[Any] = None) -> None:
+    def sync_layout(self, event: Any | None = None) -> None:
         """Synchronize embedded content dimensions and scrollbar visibility with canvas size."""
         if event is not None:
             canvas_w = event.width
@@ -237,7 +238,7 @@ class ScrollableFrame(ttk.Frame):
             self.vscroll_visible = False
             self.canvas.yview_moveto(0.0)
 
-    def _on_content_configure(self, _event: Optional[tk.Event] = None) -> None:
+    def _on_content_configure(self, _event: tk.Event | None = None) -> None:
         req_size = (
             self.content_frame.winfo_reqwidth(),
             self.content_frame.winfo_reqheight(),

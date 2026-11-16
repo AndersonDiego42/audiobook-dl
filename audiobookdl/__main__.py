@@ -1,5 +1,5 @@
 import sys
-from typing import Optional, Sequence
+from collections.abc import Sequence
 import requests
 
 from audiobookdl import __version__, args, logging
@@ -17,7 +17,7 @@ from audiobookdl.utils.archive import DownloadArchive, default_archive_path
 from audiobookdl.utils.updater import check_for_updates
 
 
-def _build_pack_overrides(pack_opts: args.PackOptions) -> Optional[PackOverrides]:
+def _build_pack_overrides(pack_opts: args.PackOptions) -> PackOverrides | None:
     if not any((
         pack_opts.title,
         pack_opts.authors,
@@ -41,7 +41,7 @@ def _build_pack_overrides(pack_opts: args.PackOptions) -> Optional[PackOverrides
     )
 
 
-def _resolve_archive_path(config_location: Optional[str], archive_path: Optional[str]) -> str:
+def _resolve_archive_path(config_location: str | None, archive_path: str | None) -> str:
     cfg = load_config(config_location)
     db_dir = cfg.database_directory or args.default_database_directory()
     return archive_path or cfg.download_archive or default_archive_path(db_dir)
@@ -98,7 +98,7 @@ def _run_library_command(lib_opts: args.LibraryOptions) -> int:
 def _run_scan_command(scan_opts: args.ScanOptions) -> int:
     """Execute `audiobook-dl scan` against local library folders."""
     import json
-    from .utils.library_scanner import scan_local_library
+    from audiobookdl.utils.library_scanner import scan_local_library
 
     archive_path = _resolve_archive_path(scan_opts.config_location, scan_opts.archive_path)
     archive = DownloadArchive(archive_path)
@@ -127,7 +127,7 @@ def _run_scan_command(scan_opts: args.ScanOptions) -> int:
 
 def _run_export_command(export_opts: args.ExportOptions) -> int:
     """Execute `audiobook-dl export` against `downloads.db`."""
-    from .utils.export import export_library_entries
+    from audiobookdl.utils.export import export_library_entries
 
     archive_path = _resolve_archive_path(export_opts.config_location, export_opts.archive_path)
     archive = DownloadArchive(archive_path)
@@ -142,7 +142,7 @@ def _run_export_command(export_opts: args.ExportOptions) -> int:
     return 0
 
 
-def main(argv: Optional[Sequence[str]] = None) -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     """CLI entry point for `audiobook-dl`."""
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     if raw_argv and raw_argv[0] == "library":
@@ -155,12 +155,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         export_opts = args.parse_export_arguments(raw_argv[1:])
         sys.exit(_run_export_command(export_opts))
     if raw_argv and raw_argv[0] == "sync":
-        from .sync import run_sync_loop
+        from audiobookdl.sync import run_sync_loop
 
         sync_opts = args.parse_sync_arguments(raw_argv[1:])
         sys.exit(run_sync_loop(sync_opts))
     if raw_argv and raw_argv[0] == "serve":
-        from .web import serve_web_ui
+        from audiobookdl.web import serve_web_ui
 
         serve_opts = args.parse_serve_arguments(raw_argv[1:])
         sys.exit(serve_web_ui(serve_opts))

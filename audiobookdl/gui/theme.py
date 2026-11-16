@@ -8,11 +8,10 @@ import sys
 import tkinter as tk
 from tkinter import font as tkfont
 from tkinter import ttk
-from typing import Dict, Optional, Tuple
 
 
-THEME_MODES: Tuple[str, ...] = ("system", "light", "dark")
-THEME_LABELS: Dict[str, str] = {
+THEME_MODES: tuple[str, ...] = ("system", "light", "dark")
+THEME_LABELS: dict[str, str] = {
     "system": "System (Auto)",
     "light": "Light",
     "dark": "Dark",
@@ -95,7 +94,7 @@ DARK_PALETTE = ThemePalette(
 )
 
 
-def normalize_theme_mode(raw: Optional[str]) -> str:
+def normalize_theme_mode(raw: str | None) -> str:
     """Normalize a theme preference string to `'system'`, `'light'`, or `'dark'`."""
     if not raw:
         return "system"
@@ -149,7 +148,7 @@ def detect_system_theme() -> str:
     return "light"
 
 
-def resolve_palette(theme_mode: Optional[str]) -> ThemePalette:
+def resolve_palette(theme_mode: str | None) -> ThemePalette:
     """Resolve a theme mode (`'system'`, `'light'`, `'dark'`) to a concrete `ThemePalette`."""
     normalized = normalize_theme_mode(theme_mode)
     resolved = detect_system_theme() if normalized == "system" else normalized
@@ -178,7 +177,7 @@ def enable_high_dpi_awareness() -> None:
         pass
 
 
-def get_dpi_scale(widget: Optional[tk.Misc]) -> float:
+def get_dpi_scale(widget: tk.Misc | None) -> float:
     """Return the display DPI scale factor relative to 96 DPI (snapped to 1.0 near 100%)."""
     if widget is None:
         return 1.0
@@ -192,7 +191,7 @@ def get_dpi_scale(widget: Optional[tk.Misc]) -> float:
     return max(1.0, min(4.0, scale))
 
 
-def scale_px(widget: Optional[tk.Misc], px: int) -> int:
+def scale_px(widget: tk.Misc | None, px: int) -> int:
     """Scale a logical pixel dimension by the widget's DPI scale factor."""
     return max(1, round(px * get_dpi_scale(widget)))
 
@@ -465,7 +464,7 @@ def apply_theme_to_window(window: tk.Toplevel, palette: ThemePalette) -> None:
     _apply_windows_titlebar_theme(window, is_dark=(palette.mode == "dark"))
 
 
-def apply_theme(root: tk.Misc, style: ttk.Style, theme_mode: Optional[str]) -> ThemePalette:
+def apply_theme(root: tk.Misc, style: ttk.Style, theme_mode: str | None) -> ThemePalette:
     """Apply `theme_mode` (`'system'`, `'light'`, `'dark'`) to `style`, `root`, and all child widgets."""
     palette = resolve_palette(theme_mode)
     available = style.theme_names()

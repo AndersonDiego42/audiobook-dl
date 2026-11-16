@@ -4,7 +4,7 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
-from typing import Callable, Optional
+from collections.abc import Callable
 
 from audiobookdl.gui.controller import GuiController, QueuedJob
 from audiobookdl.gui.formatting import format_duration, format_speed
@@ -55,10 +55,10 @@ class ActivityQueuePanel(ttk.LabelFrame):
         self.ui_item_total = 0
         self.ui_book_index = 0
         self.ui_book_total = 0
-        self._run_start_time: Optional[float] = None
+        self._run_start_time: float | None = None
         self._last_pct = 0.0
         self._last_speed_bps = 0.0
-        self._last_eta_seconds: Optional[float] = None
+        self._last_eta_seconds: float | None = None
         self._last_metrics_render_at = 0.0
 
         self._build_widgets()
@@ -203,7 +203,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
             self.download_btn.configure(state="disabled" if is_running else "normal")
             self.cancel_btn.configure(state="normal" if is_running else "disabled")
 
-    def toggle_pause(self, *, is_running: Optional[bool] = None) -> None:
+    def toggle_pause(self, *, is_running: bool | None = None) -> None:
         """Toggle pause/resume state for remaining queued jobs."""
         active = self._controller.worker_has_active_run if is_running is None else is_running
         if not active:
@@ -427,11 +427,11 @@ class ActivityQueuePanel(ttk.LabelFrame):
 
     def finish_run(
         self,
-        summary: Optional[DownloadSummary],
-        exc: Optional[Exception],
+        summary: DownloadSummary | None,
+        exc: Exception | None,
         *,
         notify_enabled: bool,
-        notifier: Optional[Callable[[str, str], None]] = None,
+        notifier: Callable[[str, str], None] | None = None,
     ) -> None:
         """Reset progress/metrics UI and report run completion/failure/cancellation."""
         notify_fn = notifier or send_os_notification_async

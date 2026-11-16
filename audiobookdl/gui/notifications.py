@@ -7,15 +7,14 @@ import shutil
 import subprocess
 import sys
 import threading
-from typing import Optional, Tuple
 
 from audiobookdl.pipeline import DownloadSummary
 
 
 def format_completion_notification(
-    summary: Optional[DownloadSummary],
-    exc: Optional[Exception],
-) -> Optional[Tuple[str, str]]:
+    summary: DownloadSummary | None,
+    exc: Exception | None,
+) -> tuple[str, str] | None:
     """
     Build a `(title, message)` pair for desktop notification when a run ends.
 
@@ -134,7 +133,7 @@ def send_os_notification(
     message: str,
     *,
     app_name: str = "audiobook-dl",
-    platform_name: Optional[str] = None,
+    platform_name: str | None = None,
     timeout: float = 5.0,
 ) -> bool:
     """Send a best-effort native OS desktop notification without raising."""
@@ -151,7 +150,7 @@ def send_os_notification_async(
     message: str,
     *,
     app_name: str = "audiobook-dl",
-    platform_name: Optional[str] = None,
+    platform_name: str | None = None,
     timeout: float = 5.0,
 ) -> threading.Thread:
     """Dispatch `send_os_notification` on a daemon thread so GUI responsiveness stays snappy."""

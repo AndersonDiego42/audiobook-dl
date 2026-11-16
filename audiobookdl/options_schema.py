@@ -4,18 +4,19 @@ import argparse
 from dataclasses import dataclass
 import math
 import os
-from typing import Any, Callable, Dict, FrozenSet, Mapping, Optional, Tuple, Union
+from typing import Any
+from collections.abc import Callable, Mapping
 
 from audiobookdl.utils import normalize_audio_bitrate
 
 
-MEDIA_TYPE_CHOICES: Tuple[str, ...] = ("auto", "audiobook", "ebook", "both")
-OUTPUT_PRESET_CHOICES: Tuple[str, ...] = ("default", "audiobookshelf", "plex", "kavita")
-GUI_OUTPUT_FORMATS: Tuple[str, ...] = ("Original", "m4b", "mp3", "m4a", "flac", "opus")
-GUI_MEDIA_TYPE_OPTIONS: Tuple[str, ...] = ("Auto", "Audiobook", "Ebook", "Both")
-GUI_OVERWRITE_OPTIONS: Tuple[str, ...] = ("Ask", "Overwrite", "Keep existing")
+MEDIA_TYPE_CHOICES: tuple[str, ...] = ("auto", "audiobook", "ebook", "both")
+OUTPUT_PRESET_CHOICES: tuple[str, ...] = ("default", "audiobookshelf", "plex", "kavita")
+GUI_OUTPUT_FORMATS: tuple[str, ...] = ("Original", "m4b", "mp3", "m4a", "flac", "opus")
+GUI_MEDIA_TYPE_OPTIONS: tuple[str, ...] = ("Auto", "Audiobook", "Ebook", "Both")
+GUI_OVERWRITE_OPTIONS: tuple[str, ...] = ("Ask", "Overwrite", "Keep existing")
 
-GUI_CONFIG_KEYS: FrozenSet[str] = frozenset(
+GUI_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         "window_geometry",
         "output_dir",
@@ -25,7 +26,7 @@ GUI_CONFIG_KEYS: FrozenSet[str] = frozenset(
         "notify_on_complete",
     }
 )
-SOURCE_CONFIG_KEYS: FrozenSet[str] = frozenset({"username", "password", "library", "cookie_file"})
+SOURCE_CONFIG_KEYS: frozenset[str] = frozenset({"username", "password", "library", "cookie_file"})
 
 _MISSING: Any = object()
 
@@ -78,37 +79,37 @@ def parse_non_negative_float_arg(value: str) -> float:
     return parsed
 
 
-def _validate_str(key: str, raw: Any) -> Tuple[Optional[str], Optional[str]]:
+def _validate_str(key: str, raw: Any) -> tuple[str | None, str | None]:
     if not isinstance(raw, str):
         return None, f"Warning: invalid '{key}' in config (expected string); ignoring"
     return raw, None
 
 
-def _validate_bool(key: str, raw: Any) -> Tuple[Optional[bool], Optional[str]]:
+def _validate_bool(key: str, raw: Any) -> tuple[bool | None, str | None]:
     if not isinstance(raw, bool):
         return None, f"Warning: invalid '{key}' in config (expected boolean); ignoring"
     return raw, None
 
 
-def _validate_positive_int(key: str, raw: Any) -> Tuple[Optional[int], Optional[str]]:
+def _validate_positive_int(key: str, raw: Any) -> tuple[int | None, str | None]:
     if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 1:
         return raw, None
     return None, f"Warning: invalid '{key}' in config (expected integer >= 1); ignoring"
 
 
-def _validate_non_negative_float(key: str, raw: Any) -> Tuple[Optional[float], Optional[str]]:
+def _validate_non_negative_float(key: str, raw: Any) -> tuple[float | None, str | None]:
     if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw >= 0:
         return float(raw), None
     return None, f"Warning: invalid '{key}' in config (expected number >= 0); ignoring"
 
 
-def _validate_positive_float(key: str, raw: Any) -> Tuple[Optional[float], Optional[str]]:
+def _validate_positive_float(key: str, raw: Any) -> tuple[float | None, str | None]:
     if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
         return float(raw), None
     return None, f"Warning: invalid '{key}' in config (expected number > 0); ignoring"
 
 
-def _validate_audio_bitrate(key: str, raw: Any) -> Tuple[Optional[str], Optional[str]]:
+def _validate_audio_bitrate(key: str, raw: Any) -> tuple[str | None, str | None]:
     val, warning = _validate_str(key, raw)
     if warning is not None or val is None:
         return None, warning
@@ -139,7 +140,7 @@ def parse_limit_rate_arg(value: str) -> str:
     return value.strip() if parsed else ""
 
 
-def _validate_enrich_providers(key: str, raw: Any) -> Tuple[Optional[str], Optional[str]]:
+def _validate_enrich_providers(key: str, raw: Any) -> tuple[str | None, str | None]:
     val, warning = _validate_str(key, raw)
     if warning is not None or val is None:
         return None, warning
@@ -153,7 +154,7 @@ def _validate_enrich_providers(key: str, raw: Any) -> Tuple[Optional[str], Optio
         return None, f"Warning: invalid '{key}' in config ('{val}'); ignoring"
 
 
-def _validate_media_type(key: str, raw: Any) -> Tuple[Optional[str], Optional[str]]:
+def _validate_media_type(key: str, raw: Any) -> tuple[str | None, str | None]:
     val, warning = _validate_str(key, raw)
     if warning is not None or val is None:
         return None, warning
@@ -163,7 +164,7 @@ def _validate_media_type(key: str, raw: Any) -> Tuple[Optional[str], Optional[st
     return None, f"Warning: invalid '{key}' in config ('{val}'); ignoring"
 
 
-def _validate_limit_rate(key: str, raw: Any) -> Tuple[Optional[str], Optional[str]]:
+def _validate_limit_rate(key: str, raw: Any) -> tuple[str | None, str | None]:
     val, warning = _validate_str(key, raw)
     if warning is not None or val is None:
         return None, warning
@@ -179,7 +180,7 @@ def _validate_limit_rate(key: str, raw: Any) -> Tuple[Optional[str], Optional[st
     return cleaned, None
 
 
-_CONFIG_VALIDATORS: Mapping[str, Callable[[str, Any], Tuple[Any, Optional[str]]]] = {
+_CONFIG_VALIDATORS: Mapping[str, Callable[[str, Any], tuple[Any, str | None]]] = {
     "str": _validate_str,
     "bool": _validate_bool,
     "positive_int": _validate_positive_int,
@@ -192,7 +193,7 @@ _CONFIG_VALIDATORS: Mapping[str, Callable[[str, Any], Tuple[Any, Optional[str]]]
 }
 
 
-def validate_config_value(key: str, value_kind: str, raw: Any) -> Tuple[Any, Optional[str]]:
+def validate_config_value(key: str, value_kind: str, raw: Any) -> tuple[Any, str | None]:
     """Validate and normalize a raw TOML value according to `value_kind`."""
     if raw is None:
         return None, None
@@ -202,39 +203,39 @@ def validate_config_value(key: str, value_kind: str, raw: Any) -> Tuple[Any, Opt
     return validator(key, raw)
 
 
-def _serialize_bool(val: Any) -> Tuple[bool, Any]:
+def _serialize_bool(val: Any) -> tuple[bool, Any]:
     return True, bool(val)
 
 
-def _serialize_non_empty_str(val: Any) -> Tuple[bool, Any]:
+def _serialize_non_empty_str(val: Any) -> tuple[bool, Any]:
     return (True, val) if val else (False, None)
 
 
-def _serialize_audio_bitrate(val: Any) -> Tuple[bool, Any]:
+def _serialize_audio_bitrate(val: Any) -> tuple[bool, Any]:
     normalized = normalize_audio_bitrate(val)
     return (True, normalized) if normalized else (False, None)
 
 
-def _serialize_media_type(val: Any) -> Tuple[bool, Any]:
+def _serialize_media_type(val: Any) -> tuple[bool, Any]:
     normalized = str(val).strip().lower() if val else ""
     if normalized and normalized != "auto":
         return True, normalized
     return False, None
 
 
-def _serialize_optional_bool(val: Any) -> Tuple[bool, Any]:
+def _serialize_optional_bool(val: Any) -> tuple[bool, Any]:
     if val is None:
         return False, None
     return True, bool(val)
 
 
-def _serialize_positive_int(val: Any) -> Tuple[bool, Any]:
+def _serialize_positive_int(val: Any) -> tuple[bool, Any]:
     if val is None:
         return False, None
     return True, int(val)
 
 
-def _serialize_positive_float(val: Any) -> Tuple[bool, Any]:
+def _serialize_positive_float(val: Any) -> tuple[bool, Any]:
     if val is None or float(val) <= 0:
         return False, None
     return True, float(val)
@@ -245,7 +246,7 @@ def _gui_init_output_format(cfg_val: Any) -> str:
     return val if val in GUI_OUTPUT_FORMATS else "Original"
 
 
-def _gui_read_output_format(raw: Any) -> Optional[str]:
+def _gui_read_output_format(raw: Any) -> str | None:
     cleaned = str(raw).strip()
     return None if cleaned in ("", "Original") else cleaned
 
@@ -272,7 +273,7 @@ def _gui_init_audio_bitrate(cfg_val: Any) -> str:
     return cleaned
 
 
-def _gui_read_audio_bitrate(raw: Any) -> Optional[str]:
+def _gui_read_audio_bitrate(raw: Any) -> str | None:
     cleaned = str(raw).strip()
     return None if cleaned in ("", "Auto", "auto") else cleaned
 
@@ -289,12 +290,12 @@ def _gui_init_optional_str(cfg_val: Any) -> str:
     return "" if cfg_val is None else str(cfg_val)
 
 
-def _gui_read_optional_str(raw: Any) -> Optional[str]:
+def _gui_read_optional_str(raw: Any) -> str | None:
     cleaned = str(raw).strip()
     return cleaned or None
 
 
-def _gui_read_enrich_providers(raw: Any) -> Optional[str]:
+def _gui_read_enrich_providers(raw: Any) -> str | None:
     cleaned = str(raw).strip()
     if not cleaned:
         return None
@@ -303,7 +304,7 @@ def _gui_read_enrich_providers(raw: Any) -> Optional[str]:
     return ",".join(parse_provider_list(cleaned))
 
 
-def _gui_read_limit_rate(raw: Any) -> Optional[str]:
+def _gui_read_limit_rate(raw: Any) -> str | None:
     cleaned = str(raw).strip()
     if not cleaned:
         return None
@@ -329,7 +330,7 @@ def _gui_init_overwrite(cfg_val: Any) -> str:
     return "Ask"
 
 
-def _gui_read_overwrite(raw: Any) -> Optional[bool]:
+def _gui_read_overwrite(raw: Any) -> bool | None:
     cleaned = str(raw).strip().lower()
     if cleaned == "overwrite":
         return True
@@ -342,7 +343,7 @@ def _gui_init_max_workers(cfg_val: Any) -> str:
     return "" if cfg_val is None else str(cfg_val)
 
 
-def _gui_read_max_workers(raw: Any) -> Optional[int]:
+def _gui_read_max_workers(raw: Any) -> int | None:
     cleaned = str(raw).strip()
     if not cleaned or cleaned.lower() in ("auto", "default"):
         return None
@@ -383,7 +384,7 @@ def _gui_init_timeout(cfg_val: Any) -> str:
     return _gui_format_number(cfg_val, default_str="")
 
 
-def _gui_read_timeout(raw: Any) -> Optional[float]:
+def _gui_read_timeout(raw: Any) -> float | None:
     cleaned = str(raw).strip()
     if not cleaned or cleaned.lower() in ("auto", "default"):
         return None
@@ -400,13 +401,13 @@ def _gui_read_timeout(raw: Any) -> Optional[float]:
 class CliFlag:
     """Single argparse flag or positional argument definition bound to an `OptionSpec`."""
 
-    flags: Tuple[str, ...]
-    action: Optional[str] = None
+    flags: tuple[str, ...]
+    action: str | None = None
     const: Any = _MISSING
-    nargs: Optional[str] = None
-    choices: Optional[Tuple[str, ...]] = None
-    arg_type: Optional[Callable[[str], Any]] = None
-    help: Union[str, Callable[[], str], None] = None
+    nargs: str | None = None
+    choices: tuple[str, ...] | None = None
+    arg_type: Callable[[str], Any] | None = None
+    help: str | Callable[[], str] | None = None
 
 
 @dataclass(frozen=True)
@@ -416,8 +417,8 @@ class GuiBinding:
     var_attr: str
     var_type: str  # "bool" | "str"
     gui_default: Any
-    from_config: Optional[Callable[[Any], Any]] = None
-    to_option: Optional[Callable[[Any], Any]] = None
+    from_config: Callable[[Any], Any] | None = None
+    to_option: Callable[[Any], Any] | None = None
     persisted_in_output_prefs: bool = False
 
     def init_value(self, config_value: Any) -> Any:
@@ -441,17 +442,17 @@ class OptionSpec:
 
     name: str
     default: Any = None
-    default_factory: Optional[Callable[[], Any]] = None
+    default_factory: Callable[[], Any] | None = None
     in_download_options: bool = True
-    cli_flags: Tuple[CliFlag, ...] = ()
-    config_key: Optional[str] = None
-    config_kind: Optional[str] = None
-    toml_serializer: Optional[Callable[[Any], Tuple[bool, Any]]] = None
+    cli_flags: tuple[CliFlag, ...] = ()
+    config_key: str | None = None
+    config_kind: str | None = None
+    toml_serializer: Callable[[Any], tuple[bool, Any]] | None = None
     merge_from_config: bool = False
     merge_only_if_default: bool = False
     merge_require_truthy: bool = False
-    merge_cast: Optional[Callable[[Any], Any]] = None
-    gui: Optional[GuiBinding] = None
+    merge_cast: Callable[[Any], Any] | None = None
+    gui: GuiBinding | None = None
 
     def resolve_default(self) -> Any:
         if self.default_factory is not None:
@@ -460,7 +461,7 @@ class OptionSpec:
 
     def add_cli_arguments(self, parser: argparse.ArgumentParser) -> None:
         for cli in self.cli_flags:
-            kwargs: Dict[str, Any] = {}
+            kwargs: dict[str, Any] = {}
             is_positional = not any(f.startswith("-") for f in cli.flags)
             if not is_positional:
                 kwargs["dest"] = self.name
@@ -479,7 +480,7 @@ class OptionSpec:
             parser.add_argument(*cli.flags, **kwargs)
 
 
-OPTION_REGISTRY: Tuple[OptionSpec, ...] = (
+OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="urls",
         default_factory=list,
@@ -1396,23 +1397,23 @@ OPTION_REGISTRY: Tuple[OptionSpec, ...] = (
     ),
 )
 
-OPTIONS_BY_NAME: Dict[str, OptionSpec] = {spec.name: spec for spec in OPTION_REGISTRY}
-DOWNLOAD_OPTION_SPECS: Tuple[OptionSpec, ...] = tuple(
+OPTIONS_BY_NAME: dict[str, OptionSpec] = {spec.name: spec for spec in OPTION_REGISTRY}
+DOWNLOAD_OPTION_SPECS: tuple[OptionSpec, ...] = tuple(
     spec for spec in OPTION_REGISTRY if spec.in_download_options
 )
-CONFIG_OPTION_SPECS: Tuple[OptionSpec, ...] = tuple(
+CONFIG_OPTION_SPECS: tuple[OptionSpec, ...] = tuple(
     spec for spec in OPTION_REGISTRY if spec.config_key is not None
 )
-MERGEABLE_OPTION_SPECS: Tuple[OptionSpec, ...] = tuple(
+MERGEABLE_OPTION_SPECS: tuple[OptionSpec, ...] = tuple(
     spec for spec in OPTION_REGISTRY if spec.merge_from_config and spec.config_key is not None
 )
-GUI_OPTION_SPECS: Tuple[OptionSpec, ...] = tuple(
+GUI_OPTION_SPECS: tuple[OptionSpec, ...] = tuple(
     spec for spec in OPTION_REGISTRY if spec.gui is not None
 )
-PERSISTED_GUI_OPTION_SPECS: Tuple[OptionSpec, ...] = tuple(
+PERSISTED_GUI_OPTION_SPECS: tuple[OptionSpec, ...] = tuple(
     spec for spec in OPTION_REGISTRY if spec.gui is not None and spec.gui.persisted_in_output_prefs
 )
-KNOWN_TOP_LEVEL_CONFIG_KEYS: FrozenSet[str] = frozenset(
+KNOWN_TOP_LEVEL_CONFIG_KEYS: frozenset[str] = frozenset(
     {"sources", "gui", "audiobookshelf"}
     | {spec.config_key for spec in CONFIG_OPTION_SPECS if spec.config_key is not None}
 )

@@ -1,7 +1,6 @@
 from datetime import date
 from io import BytesIO
-from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+from typing import Any
 
 from PIL import Image
 import pycountry
@@ -48,9 +47,9 @@ class _FakeResponse:
 class _RoutingSession:
     """Fake `requests.Session` dispatching URLs to scripted responses and recording calls."""
 
-    def __init__(self, routes: Dict[str, Any]) -> None:
+    def __init__(self, routes: dict[str, Any]) -> None:
         self.routes = routes
-        self.calls: List[str] = []
+        self.calls: list[str] = []
 
     def get(self, url: str, **kwargs: Any) -> _FakeResponse:
         self.calls.append(url)
@@ -171,9 +170,9 @@ def test_audnexus_catalog_discovery_fills_metadata_cover_and_chapters():
 
 def test_itunes_provider_upgrades_artwork_and_extracts_fields():
     jpeg_bytes = _make_jpeg_bytes()
-    requested_urls: List[str] = []
+    requested_urls: list[str] = []
 
-    def _cover_handler(url: str, _kwargs: Dict[str, Any]) -> bytes:
+    def _cover_handler(url: str, _kwargs: dict[str, Any]) -> bytes:
         requested_urls.append(url)
         return jpeg_bytes
 
@@ -322,7 +321,7 @@ def test_enrichment_cache_hit_ttl_expiry_and_bypass(tmp_path):
 
     http_calls = 0
 
-    def _google_handler(_url: str, _kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    def _google_handler(_url: str, _kwargs: dict[str, Any]) -> dict[str, Any]:
         nonlocal http_calls
         http_calls += 1
         return {
@@ -399,9 +398,9 @@ def test_interactive_selector_chooses_candidate_or_skips():
         metadata=AudiobookMetadata(title="Dune", authors=["Frank Herbert"]),
         files=[],
     )
-    seen_providers: List[str] = []
+    seen_providers: list[str] = []
 
-    def _pick_second(provider: str, cands: Any) -> Optional[int]:
+    def _pick_second(provider: str, cands: Any) -> int | None:
         seen_providers.append(provider)
         assert len(cands) == 2
         return 1

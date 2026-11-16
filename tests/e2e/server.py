@@ -9,7 +9,7 @@ import json
 import re
 import threading
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from collections.abc import Callable
 from urllib.parse import urlsplit
 
 from tests.e2e.diagnostics import E2EDiagnosticRecorder
@@ -27,7 +27,7 @@ class RouteRequest:
     host: str
     path: str
     query: str
-    headers: Dict[str, str]
+    headers: dict[str, str]
     body: bytes
 
 
@@ -38,7 +38,7 @@ class RouteResponse:
     body: bytes
     content_type: str = "application/octet-stream"
     status_code: int = 200
-    headers: Dict[str, str] = field(default_factory=dict)
+    headers: dict[str, str] = field(default_factory=dict)
     support_range: bool = True
 
 
@@ -54,7 +54,7 @@ class RecordedRequest:
     host: str
     path: str
     status_code: int
-    headers: Dict[str, str]
+    headers: dict[str, str]
     body: bytes
 
 
@@ -71,13 +71,13 @@ class LocalAudiobookServer:
         self,
         host: str = "127.0.0.1",
         port: int = 0,
-        diagnostics: Optional[E2EDiagnosticRecorder] = None,
+        diagnostics: E2EDiagnosticRecorder | None = None,
     ) -> None:
         self.host = host
         self._diagnostics = diagnostics
         self._lock = threading.Lock()
-        self._routes: Dict[Tuple[str, Optional[str], str], RouteHandler] = {}
-        self._recorded: List[RecordedRequest] = []
+        self._routes: dict[tuple[str, str | None, str], RouteHandler] = {}
+        self._recorded: list[RecordedRequest] = []
 
         parent = self
 
@@ -109,7 +109,7 @@ class LocalAudiobookServer:
         """Base HTTP URL of the running server."""
         return f"http://{self.host}:{self.port}"
 
-    def start(self, ready_timeout: float = 5.0) -> "LocalAudiobookServer":
+    def start(self, ready_timeout: float = 5.0) -> LocalAudiobookServer:
         """Start serving in the background and block until `/__health` responds 200."""
         self._thread.start()
         self.wait_until_ready(timeout=ready_timeout)
@@ -118,9 +118,9 @@ class LocalAudiobookServer:
     def wait_until_ready(self, timeout: float = 5.0) -> None:
         """Poll the server's `/__health` endpoint over TCP until healthy or timeout expires."""
         deadline = time.monotonic() + timeout
-        last_error: Optional[Exception] = None
+        last_error: Exception | None = None
         while time.monotonic() < deadline:
-            conn: Optional[http.client.HTTPConnection] = None
+            conn: http.client.HTTPConnection | None = None
             try:
                 conn = http.client.HTTPConnection(self.host, self.port, timeout=1.0)
                 conn.request("GET", "/__health")
@@ -144,7 +144,7 @@ class LocalAudiobookServer:
         self._httpd.server_close()
         self._thread.join(timeout=5.0)
 
-    def __enter__(self) -> "LocalAudiobookServer":
+    def __enter__(self) -> LocalAudiobookServer:
         return self.start()
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
@@ -157,9 +157,9 @@ class LocalAudiobookServer:
         *,
         content_type: str = "application/octet-stream",
         status_code: int = 200,
-        headers: Optional[Dict[str, str]] = None,
+        headers: dict[str, str] | None = None,
         method: str = "GET",
-        host: Optional[str] = None,
+        host: str | None = None,
         support_range: bool = True,
     ) -> None:
         """Register a deterministic static byte response."""
@@ -179,7 +179,7 @@ class LocalAudiobookServer:
         *,
         status_code: int = 200,
         method: str = "GET",
-        host: Optional[str] = None,
+        host: str | None = None,
     ) -> None:
         """Register a static JSON response."""
         self.add_route(
@@ -198,7 +198,7 @@ class LocalAudiobookServer:
         path: str,
         handler: RouteHandler,
         *,
-        host: Optional[str] = None,
+        host: str | None = None,
     ) -> None:
         """Register a dynamic handler callable for `(method, host, path)`."""
         with self._lock:
@@ -210,12 +210,12 @@ class LocalAudiobookServer:
             self._routes.clear()
             self._recorded.clear()
 
-    def recorded_requests(self) -> List[RecordedRequest]:
+    def recorded_requests(self) -> list[RecordedRequest]:
         """Return a snapshot list of all requests handled so far."""
         with self._lock:
             return list(self._recorded)
 
-    def _lookup_handler(self, method: str, host: str, path: str) -> Optional[RouteHandler]:
+    def _lookup_handler(self, method: str, host: str, path: str) -> RouteHandler | None:
         with self._lock:
             exact = self._routes.get((method, host.lower(), path))
             if exact is not None:

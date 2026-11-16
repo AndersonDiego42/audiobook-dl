@@ -7,7 +7,6 @@ import json
 from pathlib import Path
 import subprocess
 import threading
-from typing import Dict, List, Tuple
 
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
@@ -64,10 +63,10 @@ def _make_jpeg_bytes() -> bytes:
 
 
 class _CookieGatedMediaHandler(BaseHTTPRequestHandler):
-    routes: Dict[str, Tuple[str, bytes]] = {}
+    routes: dict[str, tuple[str, bytes]] = {}
     expected_cookie: str = ""
-    expected_header: Tuple[str, str] = ("", "")
-    recorded_requests: List[Tuple[str, str, str]] = []
+    expected_header: tuple[str, str] = ("", "")
+    recorded_requests: list[tuple[str, str, str]] = []
 
     def log_message(self, format: str, *args) -> None:  # noqa: A002
         return
@@ -174,21 +173,21 @@ def test_downloader_hls_aes_combine_and_metadata_integration(tmp_path, monkeypat
     cover_bytes = _make_jpeg_bytes()
 
     playlist = (
-        "#EXTM3U\n"
-        "#EXT-X-VERSION:3\n"
-        "#EXT-X-TARGETDURATION:2\n"
-        '#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x00000000000000000000000000000001\n'
-        "#EXTINF:1.0,\n"
-        "seg0.ts\n"
-        '#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x00000000000000000000000000000002\n'
-        "#EXTINF:1.0,\n"
-        "seg1.ts\n"
-        "#EXT-X-ENDLIST\n"
-    ).encode("utf-8")
+        b"#EXTM3U\n"
+        b"#EXT-X-VERSION:3\n"
+        b"#EXT-X-TARGETDURATION:2\n"
+        b'#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x00000000000000000000000000000001\n'
+        b"#EXTINF:1.0,\n"
+        b"seg0.ts\n"
+        b'#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x00000000000000000000000000000002\n'
+        b"#EXTINF:1.0,\n"
+        b"seg1.ts\n"
+        b"#EXT-X-ENDLIST\n"
+    )
 
     # Serve everything over a real local HTTP server requiring session cookies + stream token
-    recorded_requests: List[Tuple[str, str, str]] = []
-    routes: Dict[str, Tuple[str, bytes]] = {}
+    recorded_requests: list[tuple[str, str, str]] = []
+    routes: dict[str, tuple[str, bytes]] = {}
 
     class _Handler(_CookieGatedMediaHandler):
         pass
@@ -264,7 +263,7 @@ def test_downloader_hls_aes_combine_and_metadata_integration(tmp_path, monkeypat
             combine=True,
             write_json_metadata=True,
         )
-        events: List[DownloadEvent] = []
+        events: list[DownloadEvent] = []
         downloader = Downloader(config=config, options=options, on_event=events.append)
         summary = downloader.download([book_url])
     finally:
@@ -419,7 +418,7 @@ def test_downloader_multipart_convert_output_m4b_integration(tmp_path):
         )
         return p.read_bytes()
 
-    routes: Dict[str, Tuple[str, bytes]] = {
+    routes: dict[str, tuple[str, bytes]] = {
         "/parts/part1.mp3": ("audio/mpeg", _make_mp3_bytes("src_p1.mp3", 440)),
         "/parts/part2.mp3": ("audio/mpeg", _make_mp3_bytes("src_p2.mp3", 660)),
         "/parts/cover.jpg": ("image/jpeg", _make_jpeg_bytes()),

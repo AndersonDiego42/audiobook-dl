@@ -22,7 +22,7 @@ from dataclasses import dataclass
 import importlib.metadata
 import re
 import threading
-from typing import Iterable, List, Optional, Tuple, Type
+from collections.abc import Iterable
 
 
 @dataclass(frozen=True)
@@ -30,13 +30,13 @@ class ServiceInfo:
     """Metadata describing a supported audiobook service."""
     key: str
     label: str
-    auth_methods: Tuple[str, ...]
-    login_fields: Tuple[str, ...]
+    auth_methods: tuple[str, ...]
+    login_fields: tuple[str, ...]
     supports_search: bool = False
     supports_library: bool = False
 
 
-def get_available_services() -> List[ServiceInfo]:
+def get_available_services() -> list[ServiceInfo]:
     """Return sorted metadata for all supported audiobook services."""
     services = [
         ServiceInfo(
@@ -53,7 +53,7 @@ def get_available_services() -> List[ServiceInfo]:
     return sorted(services, key=lambda s: s.label.lower())
 
 
-def find_source_by_name(service_name: str) -> Type[Source]:
+def find_source_by_name(service_name: str) -> type[Source]:
     """Resolve a service class by canonical name or configured alias."""
     from audiobookdl.config import normalize_source_key
 
@@ -65,7 +65,7 @@ def find_source_by_name(service_name: str) -> Type[Source]:
     raise NoSourceFound
 
 
-def detect_service_key(url: str) -> Optional[str]:
+def detect_service_key(url: str) -> str | None:
     """Return the canonical service key matching `url`, or `None` if unrecognized."""
     candidate = url.strip()
     if not candidate:
@@ -96,7 +96,7 @@ def _refresh_ereolen_domains_once() -> None:
             pass
 
 
-def find_compatible_source(url: str) -> Type[Source]:
+def find_compatible_source(url: str) -> type[Source]:
     """Finds the first source that supports the given url"""
     sources = get_source_classes()
     for source in sources:
@@ -111,7 +111,7 @@ def find_compatible_source(url: str) -> Type[Source]:
     raise NoSourceFound
 
 
-_BUILTIN_SOURCES: Tuple[Type[Source], ...] = (
+_BUILTIN_SOURCES: tuple[type[Source], ...] = (
     ArchiveOrgSource,
     AudiobooksdotcomSource,
     BlinkistSource,
@@ -131,11 +131,11 @@ _BUILTIN_SOURCES: Tuple[Type[Source], ...] = (
 )
 
 
-def _discover_plugin_sources() -> List[Type[Source]]:
+def _discover_plugin_sources() -> list[type[Source]]:
     """Discover third-party `Source` subclasses via the `audiobookdl.sources` entry point group."""
     from audiobookdl import logging
 
-    discovered: List[Type[Source]] = []
+    discovered: list[type[Source]] = []
     try:
         eps = importlib.metadata.entry_points(group="audiobookdl.sources")
     except Exception as exc:
@@ -161,7 +161,7 @@ def _discover_plugin_sources() -> List[Type[Source]]:
     return discovered
 
 
-def get_source_classes() -> List[Type[Source]]:
+def get_source_classes() -> list[type[Source]]:
     """Returns a list of all built-in and entry-point plugin sources."""
     classes = list(_BUILTIN_SOURCES)
     seen = set(classes)
@@ -177,7 +177,7 @@ def get_source_names() -> Iterable[str]:
     Returns the names of all sources available
     There are sometimes multiple names for the same source
     """
-    results: List[str] = []
+    results: list[str] = []
     for source in get_source_classes():
         for source_name in source.names:
             results.append(source_name)

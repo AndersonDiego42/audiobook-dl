@@ -5,7 +5,7 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, List, Union
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -895,7 +895,7 @@ def test_gui_preview_audiobook_with_cover_and_series_checklist(tmp_path, monkeyp
 
         series_dialog = app._preview_dialog
         assert series_dialog is not None
-        check_vars = getattr(series_dialog, "_check_vars")
+        check_vars = series_dialog._check_vars
         assert len(check_vars) == 3
         check_vars[1].set(False)
         selected = [i for i, v in enumerate(check_vars) if v.get()]
@@ -1230,7 +1230,7 @@ def test_gui_series_preview_filter_and_shift_range(tmp_path):
         (tmp_path / "Alpha Book.m4b").write_bytes(b"existing")
 
         sess = requests.Session()
-        books: List[Union[Audiobook, BookId[Any]]] = [
+        books: list[Audiobook | BookId[Any]] = [
             Audiobook(
                 session=sess,
                 metadata=AudiobookMetadata(title="Alpha Book", authors=["Author"]),

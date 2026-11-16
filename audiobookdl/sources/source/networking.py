@@ -6,7 +6,6 @@ from audiobookdl.utils.http import (
     is_transient_network_error,
 )
 
-from typing import Dict, List, Optional
 import json
 import os
 import random
@@ -21,7 +20,7 @@ DEFAULT_MAX_RETRIES = 3
 MAX_RETRY_DELAY = 30.0
 
 
-def _retry_delay_seconds(attempt: int, resp: Optional[requests.Response]) -> float:
+def _retry_delay_seconds(attempt: int, resp: requests.Response | None) -> float:
     """Compute retry backoff with jitter, honoring numeric `Retry-After` when present."""
     if resp is not None:
         raw_retry = resp.headers.get("Retry-After") if hasattr(resp, "headers") and resp.headers else None
@@ -70,7 +69,7 @@ def request(
             return self._session.post(url, timeout=timeout, **kwargs)
         return self._session.request(method, url, timeout=timeout, **kwargs)
 
-    last_exc: Optional[BaseException] = None
+    last_exc: BaseException | None = None
     for attempt in range(max_retries + 1):
         try:
             resp = _send()
@@ -150,10 +149,10 @@ def _segment_extension(uri: str) -> str:
 def get_stream_files(
     self,
     url: str,
-    headers: Optional[Dict[str, str]] = None,
+    headers: dict[str, str] | None = None,
     extension=None,
     expected_content_type="application/octet-stream",
-) -> List[AudiobookFile]:
+) -> list[AudiobookFile]:
     """Creates a list of audio files from an m3u8 file"""
     base_headers = dict(headers) if headers else {}
     content = self.get(url, headers=base_headers).decode("utf-8")
@@ -196,7 +195,7 @@ def get_stream_files(
     return files
 
 
-def _get_all_cookies(session: requests.Session) -> Dict[str, str]:
+def _get_all_cookies(session: requests.Session) -> dict[str, str]:
     """
     Retrieves all cookies from session
 

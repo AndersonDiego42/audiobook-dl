@@ -7,15 +7,15 @@ import json
 import os
 from pathlib import Path
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 
 _SENSITIVE_HEADER_NAMES = frozenset({"authorization", "cookie", "set-cookie", "proxy-authorization"})
 _SENSITIVE_ENV_FRAGMENTS = ("TOKEN", "SECRET", "PASSWORD", "KEY")
 
 
-def _redact_headers(headers: Dict[str, str]) -> Dict[str, str]:
-    redacted: Dict[str, str] = {}
+def _redact_headers(headers: dict[str, str]) -> dict[str, str]:
+    redacted: dict[str, str] = {}
     for key, val in headers.items():
         if key.lower() in _SENSITIVE_HEADER_NAMES:
             redacted[key] = "<redacted>" if val else ""
@@ -24,8 +24,8 @@ def _redact_headers(headers: Dict[str, str]) -> Dict[str, str]:
     return redacted
 
 
-def _redact_env(env: Dict[str, str]) -> Dict[str, str]:
-    cleaned: Dict[str, str] = {}
+def _redact_env(env: dict[str, str]) -> dict[str, str]:
+    cleaned: dict[str, str] = {}
     for key, val in sorted(env.items()):
         upper = key.upper()
         if any(fragment in upper for fragment in _SENSITIVE_ENV_FRAGMENTS):
@@ -43,14 +43,14 @@ def _sanitize_nodeid(nodeid: str) -> str:
 class SubprocessRecord:
     """Captured details for a single CLI or GUI subprocess invocation."""
 
-    command: List[str]
+    command: list[str]
     cwd: str
-    returncode: Optional[int]
+    returncode: int | None
     duration_seconds: float
     timed_out: bool
     stdout: str
     stderr: str
-    env_overrides: Dict[str, str] = field(default_factory=dict)
+    env_overrides: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -62,7 +62,7 @@ class HttpExchangeRecord:
     normalized_path: str
     status_code: int
     bytes_sent: int
-    headers: Dict[str, str] = field(default_factory=dict)
+    headers: dict[str, str] = field(default_factory=dict)
     body_preview: str = ""
 
 
@@ -71,11 +71,11 @@ class E2EDiagnosticRecorder:
 
     def __init__(self, nodeid: str) -> None:
         self.nodeid = nodeid
-        self.subprocesses: List[SubprocessRecord] = []
-        self.http_exchanges: List[HttpExchangeRecord] = []
-        self.gui_snapshots: List[Dict[str, Any]] = []
-        self.notes: List[str] = []
-        self.workspace_root: Optional[Path] = None
+        self.subprocesses: list[SubprocessRecord] = []
+        self.http_exchanges: list[HttpExchangeRecord] = []
+        self.gui_snapshots: list[dict[str, Any]] = []
+        self.notes: list[str] = []
+        self.workspace_root: Path | None = None
 
     def set_workspace_root(self, root: Path) -> None:
         self.workspace_root = root
@@ -86,14 +86,14 @@ class E2EDiagnosticRecorder:
     def record_subprocess(
         self,
         *,
-        command: List[str],
+        command: list[str],
         cwd: str,
-        returncode: Optional[int],
+        returncode: int | None,
         duration_seconds: float,
         timed_out: bool,
         stdout: str,
         stderr: str,
-        env_overrides: Optional[Dict[str, str]] = None,
+        env_overrides: dict[str, str] | None = None,
     ) -> None:
         self.subprocesses.append(
             SubprocessRecord(
@@ -116,7 +116,7 @@ class E2EDiagnosticRecorder:
         normalized_path: str,
         status_code: int,
         bytes_sent: int,
-        headers: Optional[Dict[str, str]] = None,
+        headers: dict[str, str] | None = None,
         body_preview: str = "",
     ) -> None:
         self.http_exchanges.append(
@@ -131,13 +131,13 @@ class E2EDiagnosticRecorder:
             )
         )
 
-    def record_gui_snapshot(self, snapshot: Dict[str, Any]) -> None:
+    def record_gui_snapshot(self, snapshot: dict[str, Any]) -> None:
         self.gui_snapshots.append(snapshot)
 
-    def _collect_workspace_tree(self) -> List[str]:
+    def _collect_workspace_tree(self) -> list[str]:
         if self.workspace_root is None or not self.workspace_root.exists():
             return []
-        entries: List[str] = []
+        entries: list[str] = []
         for dirpath, _, filenames in os.walk(self.workspace_root):
             rel_dir = os.path.relpath(dirpath, self.workspace_root)
             for name in sorted(filenames):
@@ -152,7 +152,7 @@ class E2EDiagnosticRecorder:
 
     def render_report(self) -> str:
         """Render a human-readable summary of all captured E2E state."""
-        lines: List[str] = [f"=== E2E Diagnostics: {self.nodeid} ==="]
+        lines: list[str] = [f"=== E2E Diagnostics: {self.nodeid} ==="]
 
         if self.notes:
             lines.append("\n[Notes]")

@@ -1,8 +1,6 @@
-from audiobookdl import AudiobookFile, Source, logging, Audiobook
+from audiobookdl import logging, Audiobook
 from audiobookdl.args import DownloadOptions
 from audiobookdl.exceptions import (
-    UserNotAuthorized,
-    NoFilesFound,
     DownloadError,
     DownloadCancelled,
     FailedCombining,
@@ -35,13 +33,14 @@ import uuid
 from datetime import datetime, timezone
 import requests
 from functools import partial
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
-from rich.progress import Progress, BarColumn, ProgressColumn, SpinnerColumn, TimeRemainingColumn
+from typing import Any
+from collections.abc import Callable, Iterable, Sequence
+from rich.progress import BarColumn, ProgressColumn, SpinnerColumn, TimeRemainingColumn
 from pathlib import Path
 from math import log10
 
 
-DOWNLOAD_PROGRESS: List[Union[str, ProgressColumn]] = [
+DOWNLOAD_PROGRESS: list[str | ProgressColumn] = [
     SpinnerColumn(),
     "{task.description}",
     BarColumn(),
@@ -64,8 +63,8 @@ MAX_RETRY_DELAY = 60.0
 def download(
     audiobook: Audiobook,
     options: DownloadOptions,
-    interaction: Optional[logging.InteractionHandler] = None,
-    cancel_event: Optional[threading.Event] = None,
+    interaction: logging.InteractionHandler | None = None,
+    cancel_event: threading.Event | None = None,
 ):
     """
     Download contents of audiobook
@@ -95,7 +94,7 @@ def download(
 def _all_output_parts_exist(
     audiobook: Audiobook,
     output_dir: str,
-    output_format: Optional[str],
+    output_format: str | None,
 ) -> bool:
     """Return True when every expected multi-part output file already exists on disk."""
     if not os.path.isdir(output_dir) or not audiobook.files:
@@ -117,8 +116,8 @@ def download_audiobook(
     audiobook: Audiobook,
     output_dir: str,
     options: DownloadOptions,
-    interaction: Optional[logging.InteractionHandler] = None,
-    cancel_event: Optional[threading.Event] = None,
+    interaction: logging.InteractionHandler | None = None,
+    cancel_event: threading.Event | None = None,
 ):
     """Download, convert, combine, and add metadata to files from `Audiobook` object"""
     # Check if file/dir exists and should be skipped or confirmed before overwriting
@@ -170,10 +169,10 @@ def download_audiobook(
         )
 
     use_staging_dir = (not options.resume) and (len(audiobook.files) > 1 or splitting)
-    stage_dir: Optional[str] = None
+    stage_dir: str | None = None
     work_output_dir = output_dir
     download_output_dir = output_dir
-    staged_combined_path: Optional[str] = None
+    staged_combined_path: str | None = None
 
     if use_staging_dir:
         if not is_single_file and os.path.isdir(output_dir):
@@ -216,7 +215,7 @@ def download_audiobook(
             None if ebook else options.output_format,
             filepaths,
         )
-        probe_cache: Dict[str, Any] = {}
+        probe_cache: dict[str, Any] = {}
         chapters_embedded = False
         cover_embedded = False
         if not ebook:
@@ -267,7 +266,7 @@ def download_audiobook(
         )
         use_loudnorm = bool(getattr(options, "loudnorm", False))
         use_mono = bool(getattr(options, "mono", False))
-        audio_filter_kwargs: Dict[str, Any] = {}
+        audio_filter_kwargs: dict[str, Any] = {}
         if use_loudnorm:
             audio_filter_kwargs["loudnorm"] = True
         if use_mono:
@@ -462,8 +461,8 @@ _AUDIO_MEDIA_EXTENSIONS = frozenset({
 
 def _resolve_total_duration_seconds(
     paths: Sequence[str],
-    probe_cache: Optional[Dict[str, Any]] = None,
-) -> Optional[float]:
+    probe_cache: dict[str, Any] | None = None,
+) -> float | None:
     """Return total duration in seconds across non-ebook audio `paths`, or `None`."""
     total_sec = 0.0
     for path in paths:
@@ -509,7 +508,7 @@ def _resolve_abs_sidecar_path(filepath: str, metadata_obj: AudiobookMetadata) ->
         import json
 
         try:
-            with open(default_path, "r", encoding="utf-8") as existing_f:
+            with open(default_path, encoding="utf-8") as existing_f:
                 existing_payload = json.load(existing_f)
             existing_title = str(existing_payload.get("title") or "").strip().lower()
             current_title = str(metadata_obj.title or "").strip().lower()
@@ -531,10 +530,10 @@ def add_metadata_to_file(
     audiobook: Audiobook,
     filepath: str,
     options: DownloadOptions,
-    cancel_event: Optional[threading.Event] = None,
+    cancel_event: threading.Event | None = None,
     chapters_embedded: bool = False,
     cover_embedded: bool = False,
-    probe_cache: Optional[Dict[str, Any]] = None,
+    probe_cache: dict[str, Any] | None = None,
 ):
     """
     Embed metadata into a single file
@@ -584,7 +583,7 @@ def add_metadata_to_file(
                 metadata.add_metadata(filepath, audiobook.metadata, cover=cover_for_meta)
             )
     stem = os.path.splitext(filepath)[0]
-    cover_sidecar_name: Optional[str] = None
+    cover_sidecar_name: str | None = None
     if audiobook.cover and options.write_cover:
         cover_path = f"{stem}.{audiobook.cover.extension}"
         sidecars.write_sidecar_cover(audiobook.cover, cover_path)
@@ -629,7 +628,7 @@ def add_metadata_to_dir(
     filepaths: Iterable[str],
     output_dir: str,
     options: DownloadOptions,
-    probe_cache: Optional[Dict[str, Any]] = None,
+    probe_cache: dict[str, Any] | None = None,
 ):
     """
     Add metadata to a directory with audio files
@@ -644,7 +643,7 @@ def add_metadata_to_dir(
     for filepath in file_list:
         if not is_ebook_extension(os.path.splitext(filepath)[1]):
             metadata.add_metadata(filepath, audiobook.metadata)
-    cover_sidecar_name: Optional[str] = None
+    cover_sidecar_name: str | None = None
     if audiobook.cover:
         logging.book_update("Adding cover")
         cover_sidecar_name = f"cover.{audiobook.cover.extension}"
@@ -683,15 +682,15 @@ def add_metadata_to_dir(
 def download_files_with_cli_output(
     audiobook: Audiobook,
     output_dir: str,
-    interaction: Optional[logging.InteractionHandler] = None,
-    cancel_event: Optional[threading.Event] = None,
+    interaction: logging.InteractionHandler | None = None,
+    cancel_event: threading.Event | None = None,
     resume: bool = False,
     confirm_overwrite: bool = True,
-    overwrite: Optional[bool] = None,
-    max_workers: Optional[int] = None,
-    timeout: Optional[float] = None,
-    limit_rate: Optional[str] = None,
-) -> List[str]:
+    overwrite: bool | None = None,
+    max_workers: int | None = None,
+    timeout: float | None = None,
+    limit_rate: str | None = None,
+) -> list[str]:
     """
     Download `audiobook` with cli progress bar
 
@@ -768,7 +767,7 @@ def download_files_with_cli_output(
         raise
 
 
-def create_filepath(audiobook: Audiobook, output_dir: str, index: int) -> Tuple[str, str]:
+def create_filepath(audiobook: Audiobook, output_dir: str, index: int) -> tuple[str, str]:
     """
     Create output file path for file number `index` in `audibook`
 
@@ -788,7 +787,7 @@ def create_filepath(audiobook: Audiobook, output_dir: str, index: int) -> Tuple[
     return path, path_tmp
 
 
-def _get_header_ci(headers: Any, name: str) -> Optional[Any]:
+def _get_header_ci(headers: Any, name: str) -> Any | None:
     """Return header value case-insensitively for both CaseInsensitiveDict and plain dicts."""
     value = headers.get(name)
     if value is not None:
@@ -800,7 +799,7 @@ def _get_header_ci(headers: Any, name: str) -> Optional[Any]:
     return None
 
 
-def _parse_retry_after(value: Optional[Any]) -> Optional[float]:
+def _parse_retry_after(value: Any | None) -> float | None:
     """Parse an HTTP `Retry-After` header (delta seconds or HTTP-date) clamped to `MAX_RETRY_DELAY`."""
     if value is None:
         return None
@@ -820,7 +819,7 @@ def _parse_retry_after(value: Optional[Any]) -> Optional[float]:
     return max(0.0, min(MAX_RETRY_DELAY, seconds))
 
 
-def _compute_retry_delay(attempt: int, retry_after: Optional[Any] = None) -> float:
+def _compute_retry_delay(attempt: int, retry_after: Any | None = None) -> float:
     """Compute bounded exponential backoff (with jitter) or honor `Retry-After`."""
     header_delay = _parse_retry_after(retry_after)
     if header_delay is not None:
@@ -828,7 +827,7 @@ def _compute_retry_delay(attempt: int, retry_after: Optional[Any] = None) -> flo
     return min(MAX_RETRY_DELAY, float(2 ** attempt) + random.uniform(0.0, 0.5))
 
 
-def _sleep_or_cancel(delay: float, cancel_event: Optional[threading.Event]) -> None:
+def _sleep_or_cancel(delay: float, cancel_event: threading.Event | None) -> None:
     """Sleep for `delay` seconds while respecting `cancel_event`."""
     if delay <= 0:
         if cancel_event is not None and cancel_event.is_set():
@@ -858,8 +857,8 @@ _CONTENT_RANGE_TOTAL_RE = re.compile(r"^bytes\s+\*/(\d+)$", re.IGNORECASE)
 
 
 def _parse_content_range(
-    header_val: Optional[Any],
-) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    header_val: Any | None,
+) -> tuple[int | None, int | None, int | None]:
     """Parse HTTP `Content-Range` into `(start, end, total)` byte offsets."""
     if not isinstance(header_val, str):
         return None, None, None
@@ -882,14 +881,11 @@ PROGRESS_FLUSH_INTERVAL = 0.05
 
 
 def download_file(
-    args: Union[
-        Tuple[Audiobook, str, int, Any, Optional[threading.Event]],
-        Tuple[Audiobook, str, int, Any, Optional[threading.Event], Optional[Callable[[int], None]]],
-    ],
+    args: tuple[Audiobook, str, int, Any, threading.Event | None] | tuple[Audiobook, str, int, Any, threading.Event | None, Callable[[int], None] | None],
     *,
     resume: bool = False,
-    timeout: Optional[float] = None,
-    rate_limiter: Optional[TokenBucketRateLimiter] = None,
+    timeout: float | None = None,
+    rate_limiter: TokenBucketRateLimiter | None = None,
 ) -> str:
     # Prepare download
     if len(args) == 6:
@@ -962,7 +958,7 @@ def download_file(
                     reset_stale_tmp = True
                     continue
 
-            content_type: Optional[str] = _get_header_ci(request.headers, "Content-Type")
+            content_type: str | None = _get_header_ci(request.headers, "Content-Type")
 
             expected = file.expected_content_type
             if isinstance(expected, (list, tuple, set)):
@@ -1051,7 +1047,7 @@ def download_file(
 
             # Stream AES-CBC decryption inline when writing from byte 0 without needing
             # range-based ciphertext resume (no resume, multi-segment HLS streams, or Accept-Ranges: none).
-            stream_decryptor: Optional[AESStreamDecryptor] = None
+            stream_decryptor: AESStreamDecryptor | None = None
             accept_ranges = (_get_header_ci(request.headers, "Accept-Ranges") or "").strip().lower()
             can_inline_aes = (
                 not resume
@@ -1074,14 +1070,14 @@ def download_file(
             pending_bytes = 0
             last_flush = time.monotonic()
 
-            def _flush_progress() -> None:
+            def _flush_progress(file_total_size: int = total_filesize) -> None:
                 nonlocal pending_bytes, last_flush, advanced
                 if pending_bytes <= 0:
                     return
                 if record_bytes is not None:
                     record_bytes(pending_bytes)
-                if total_filesize > 0:
-                    delta = pending_bytes / total_filesize
+                if file_total_size > 0:
+                    delta = pending_bytes / file_total_size
                     update_progress(delta)
                     advanced += delta
                 pending_bytes = 0
@@ -1203,19 +1199,19 @@ def download_files(
     audiobook: Audiobook,
     output_dir: str,
     update_progress,
-    cancel_event: Optional[threading.Event] = None,
-    record_bytes: Optional[Callable[[int], None]] = None,
+    cancel_event: threading.Event | None = None,
+    record_bytes: Callable[[int], None] | None = None,
     resume: bool = False,
-    max_workers: Optional[int] = None,
-    timeout: Optional[float] = None,
-    limit_rate: Optional[str] = None,
-) -> List[str]:
+    max_workers: int | None = None,
+    timeout: float | None = None,
+    limit_rate: str | None = None,
+) -> list[str]:
     """Download files from audiobook and return paths of the downloaded files"""
     file_count = len(audiobook.files)
     if file_count == 0:
         return []
     if record_bytes is not None:
-        arguments: List[Any] = [
+        arguments: list[Any] = [
             (audiobook, output_dir, index, update_progress, cancel_event, record_bytes)
             for index in range(file_count)
         ]
@@ -1248,7 +1244,7 @@ def download_files(
     )
 
 
-def get_output_audio_format(option: Optional[str], files: Sequence[str]) -> Tuple[str, str]:
+def get_output_audio_format(option: str | None, files: Sequence[str]) -> tuple[str, str]:
     """
     Get output format for files
 
@@ -1267,8 +1263,8 @@ def get_output_audio_format(option: Optional[str], files: Sequence[str]) -> Tupl
 
 def confirm_overwrite_file(
     path: str,
-    interaction: Optional[logging.InteractionHandler] = None,
-    overwrite: Optional[bool] = None,
+    interaction: logging.InteractionHandler | None = None,
+    overwrite: bool | None = None,
 ) -> None:
     """Prompt before overwriting an existing output file; raise `DownloadCancelled` if declined."""
     if os.path.exists(path):
@@ -1286,8 +1282,8 @@ def confirm_overwrite_file(
 
 def _confirm_overwrite_dir(
     path: str,
-    interaction: Optional[logging.InteractionHandler] = None,
-    overwrite: Optional[bool] = None,
+    interaction: logging.InteractionHandler | None = None,
+    overwrite: bool | None = None,
 ) -> None:
     """Confirm before replacing an existing output directory without deleting it prematurely."""
     if not os.path.isdir(path):
@@ -1331,8 +1327,8 @@ def _atomic_replace_dir(stage_dir: str, target_dir: str) -> None:
 
 def setup_download_dir(
     path: str,
-    interaction: Optional[logging.InteractionHandler] = None,
-    overwrite: Optional[bool] = None,
+    interaction: logging.InteractionHandler | None = None,
+    overwrite: bool | None = None,
 ) -> None:
     """
     Creates output folder for the audiobook.

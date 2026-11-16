@@ -6,7 +6,6 @@ from datetime import datetime
 import json
 import lxml.html
 import re
-from typing import List, Optional
 from urllib.parse import urljoin
 
 
@@ -73,7 +72,7 @@ class YourCloudLibrarySource(Source):
         )
 
     @staticmethod
-    def get_files(playlist: dict) -> List[AudiobookFile]:
+    def get_files(playlist: dict) -> list[AudiobookFile]:
         files = []
         for f in playlist["playlist"]:
             files.append(
@@ -85,7 +84,7 @@ class YourCloudLibrarySource(Source):
         return files
 
     @staticmethod
-    def get_metadata(book_info: dict, *, url: Optional[str] = None) -> AudiobookMetadata:
+    def get_metadata(book_info: dict, *, url: str | None = None) -> AudiobookMetadata:
         publisher_raw = book_info.get("publisher")
         publisher = (
             publisher_raw.get("name")
@@ -126,7 +125,7 @@ class YourCloudLibrarySource(Source):
         return Cover(cover_data, "jpg")
 
     @staticmethod
-    def create_chapters(book_info: dict) -> List[Chapter]:
+    def create_chapters(book_info: dict) -> list[Chapter]:
         chapters = []
         elapsed = 0
         for chapter in book_info["chapters"]:
@@ -199,16 +198,16 @@ class YourCloudLibrarySource(Source):
         if isinstance(payload, dict) and self._is_failed_login_payload(payload):
             raise UserNotAuthorized
 
-    def list_library(self) -> List[CatalogBook]:
+    def list_library(self) -> list[CatalogBook]:
         """List currently borrowed audiobooks from the patron's CloudLibrary shelf."""
-        library: Optional[str] = getattr(self, "_library_id", None) or getattr(
+        library: str | None = getattr(self, "_library_id", None) or getattr(
             self._options, "library", None
         )
         if not library:
             return []
         shelf_url = f"https://ebook.yourcloudlibrary.com/library/{library}/shelf"
         raw = self._get_page(shelf_url, use_cache=False).decode("utf-8", errors="replace")
-        results: List[CatalogBook] = []
+        results: list[CatalogBook] = []
         seen = set()
         try:
             data = json.loads(raw)

@@ -14,7 +14,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from collections.abc import Callable, Sequence
 from urllib.parse import urlparse
 
 from platformdirs import user_data_dir
@@ -22,7 +22,7 @@ from platformdirs import user_data_dir
 from audiobookdl.utils.fs import atomic_write_text
 
 
-BROWSER_LABELS: Tuple[Tuple[str, str], ...] = (
+BROWSER_LABELS: tuple[tuple[str, str], ...] = (
     ("firefox", "Firefox"),
     ("edge", "Microsoft Edge"),
     ("chrome", "Google Chrome"),
@@ -31,7 +31,7 @@ BROWSER_LABELS: Tuple[Tuple[str, str], ...] = (
     ("opera", "Opera"),
 )
 
-SERVICE_COOKIE_DOMAINS: Dict[str, Tuple[str, ...]] = {
+SERVICE_COOKIE_DOMAINS: dict[str, tuple[str, ...]] = {
     "audiobooks.com": ("audiobooks.com",),
     "blinkist": ("blinkist.com",),
     "chirp": ("chirpbooks.com",),
@@ -59,11 +59,11 @@ class CookieImportResult:
     """Result returned by extracting browser cookies for a service."""
 
     browser: str
-    domains: Tuple[str, ...]
-    cookies: List[http.cookiejar.Cookie]
+    domains: tuple[str, ...]
+    cookies: list[http.cookiejar.Cookie]
     total_scanned: int
     profile_used: str
-    warnings: List[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 def default_imported_cookie_path(service_key: str) -> str:
@@ -74,7 +74,7 @@ def default_imported_cookie_path(service_key: str) -> str:
     return os.path.join(user_data_dir("audiobook-dl"), "cookies", f"{safe_key}.txt")
 
 
-def default_domains_for_service(service_key: str) -> List[str]:
+def default_domains_for_service(service_key: str) -> list[str]:
     """Return suggested cookie domain filters for `service_key`."""
     normalized = (service_key or "").strip().lower()
     if normalized in SERVICE_COOKIE_DOMAINS:
@@ -85,7 +85,7 @@ def default_domains_for_service(service_key: str) -> List[str]:
     source_cls = find_source_by_name(normalized)
     if source_cls is None:
         return []
-    domains: List[str] = []
+    domains: list[str] = []
     seen = set()
     for pattern in getattr(source_cls, "match", ()):
         # Extract literal hostnames from simple URL match patterns.
@@ -106,11 +106,11 @@ def default_domains_for_service(service_key: str) -> List[str]:
     return domains
 
 
-def parse_domain_filter(text: str) -> List[str]:
+def parse_domain_filter(text: str) -> list[str]:
     """Parse user-entered domain filter text into normalized bare hostnames."""
     if not text or not text.strip():
         return []
-    domains: List[str] = []
+    domains: list[str] = []
     seen = set()
     for token in re.split(r"[\s,;]+", text.strip()):
         if not token:
@@ -150,14 +150,14 @@ def _build_cookie(
     name: str,
     value: str,
     path: str = "/",
-    expires: Optional[int] = None,
+    expires: int | None = None,
     secure: bool = False,
     http_only: bool = False,
 ) -> http.cookiejar.Cookie:
     """Construct a standard `http.cookiejar.Cookie` ready for Netscape serialization."""
     domain_clean = domain.strip()
     initial_dot = domain_clean.startswith(".")
-    rest: Dict[str, Optional[str]] = {"HttpOnly": None} if http_only else {}
+    rest: dict[str, str | None] = {"HttpOnly": None} if http_only else {}
     return http.cookiejar.Cookie(
         version=0,
         name=name,
@@ -228,9 +228,9 @@ def _copy_sqlite_to_temp(db_path: Path, tmp_dir: Path) -> Path:
     return dest
 
 
-def _firefox_profile_roots() -> List[Path]:
+def _firefox_profile_roots() -> list[Path]:
     home = Path.home()
-    roots: List[Path] = []
+    roots: list[Path] = []
     if sys.platform.startswith("win"):
         appdata = os.environ.get("APPDATA")
         if appdata:
@@ -245,11 +245,11 @@ def _firefox_profile_roots() -> List[Path]:
 
 
 def discover_firefox_cookie_dbs(
-    profile_roots: Optional[Sequence[Path]] = None,
-) -> List[Tuple[str, Path]]:
+    profile_roots: Sequence[Path] | None = None,
+) -> list[tuple[str, Path]]:
     """Return `(profile_name, cookies.sqlite)` pairs found for Firefox."""
     roots = list(profile_roots) if profile_roots is not None else _firefox_profile_roots()
-    found: List[Tuple[str, Path]] = []
+    found: list[tuple[str, Path]] = []
     for root in roots:
         if not root.is_dir():
             continue
@@ -263,10 +263,10 @@ def discover_firefox_cookie_dbs(
     return found
 
 
-def _chromium_user_data_roots(browser: str) -> List[Path]:
+def _chromium_user_data_roots(browser: str) -> list[Path]:
     home = Path.home()
     browser = browser.lower()
-    roots: List[Path] = []
+    roots: list[Path] = []
     if sys.platform.startswith("win"):
         local_appdata = os.environ.get("LOCALAPPDATA")
         appdata = os.environ.get("APPDATA")
@@ -311,18 +311,18 @@ def _chromium_user_data_roots(browser: str) -> List[Path]:
 
 def discover_chromium_cookie_dbs(
     browser: str,
-    user_data_roots: Optional[Sequence[Path]] = None,
-) -> List[Tuple[str, Path, Optional[Path]]]:
+    user_data_roots: Sequence[Path] | None = None,
+) -> list[tuple[str, Path, Path | None]]:
     """Return `(profile_name, cookie_db_path, local_state_path)` tuples for Chromium browsers."""
     roots = list(user_data_roots) if user_data_roots is not None else _chromium_user_data_roots(browser)
-    found: List[Tuple[str, Path, Optional[Path]]] = []
+    found: list[tuple[str, Path, Path | None]] = []
     for root in roots:
         if not root.is_dir():
             continue
         local_state = root / "Local State"
         local_state_path = local_state if local_state.is_file() else None
 
-        profile_dirs: List[Path] = []
+        profile_dirs: list[Path] = []
         # Opera keeps Network/Cookies directly in user data root.
         for direct_rel in (Path("Network") / "Cookies", Path("Cookies")):
             direct_db = root / direct_rel
@@ -347,9 +347,9 @@ def discover_chromium_cookie_dbs(
     return found
 
 
-def detect_available_browsers() -> Dict[str, bool]:
+def detect_available_browsers() -> dict[str, bool]:
     """Return mapping of browser key -> whether local cookie profiles were found."""
-    available: Dict[str, bool] = {}
+    available: dict[str, bool] = {}
     for key, _label in BROWSER_LABELS:
         if key == "firefox":
             available[key] = len(discover_firefox_cookie_dbs()) > 0
@@ -361,7 +361,7 @@ def detect_available_browsers() -> Dict[str, bool]:
 def read_firefox_cookies(
     db_path: Path,
     target_domains: Sequence[str],
-) -> Tuple[List[http.cookiejar.Cookie], int]:
+) -> tuple[list[http.cookiejar.Cookie], int]:
     """Read and filter cookies from a Firefox `cookies.sqlite` file."""
     with tempfile.TemporaryDirectory(prefix="abdl-ff-") as tmp:
         copied = _copy_sqlite_to_temp(db_path, Path(tmp))
@@ -373,7 +373,7 @@ def read_firefox_cookies(
         finally:
             conn.close()
 
-    matched: List[http.cookiejar.Cookie] = []
+    matched: list[http.cookiejar.Cookie] = []
     for host, name, value, path, expiry, is_secure, is_httponly in rows:
         host_str = str(host or "")
         if not cookie_matches_domains(host_str, target_domains):
@@ -425,7 +425,7 @@ def _dpapi_unprotect(encrypted_bytes: bytes) -> bytes:
         kernel32.LocalFree(blob_out.pbData)
 
 
-def _load_chromium_master_key(local_state_path: Optional[Path]) -> Optional[bytes]:
+def _load_chromium_master_key(local_state_path: Path | None) -> bytes | None:
     if local_state_path is None or not local_state_path.is_file():
         return None
     try:
@@ -458,9 +458,9 @@ def _aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes) ->
 def _decrypt_chromium_value(
     host_key: str,
     plain_value: str,
-    encrypted_value: Optional[bytes],
+    encrypted_value: bytes | None,
     *,
-    master_key: Optional[bytes],
+    master_key: bytes | None,
     db_version: int,
     dpapi_decrypt: Callable[[bytes], bytes] = _dpapi_unprotect,
 ) -> str:
@@ -502,7 +502,7 @@ def _decrypt_chromium_value(
     raise BrowserCookieError("Unsupported Chromium cookie encryption format.")
 
 
-def _chromium_expires_to_unix(expires_utc: Optional[int]) -> Optional[int]:
+def _chromium_expires_to_unix(expires_utc: int | None) -> int | None:
     if not expires_utc:
         return None
     try:
@@ -514,11 +514,11 @@ def _chromium_expires_to_unix(expires_utc: Optional[int]) -> Optional[int]:
 
 def read_chromium_cookies(
     db_path: Path,
-    local_state_path: Optional[Path],
+    local_state_path: Path | None,
     target_domains: Sequence[str],
     *,
-    master_key: Optional[bytes] = None,
-) -> Tuple[List[http.cookiejar.Cookie], int, List[str]]:
+    master_key: bytes | None = None,
+) -> tuple[list[http.cookiejar.Cookie], int, list[str]]:
     """Read and filter cookies from a Chromium `Cookies` SQLite database."""
     try:
         with tempfile.TemporaryDirectory(prefix="abdl-cr-") as tmp:
@@ -548,9 +548,9 @@ def read_chromium_cookies(
         raise BrowserCookieError(f"Could not read browser cookie database: {exc}") from exc
 
     resolved_key = master_key if master_key is not None else _load_chromium_master_key(local_state_path)
-    matched: List[http.cookiejar.Cookie] = []
-    warnings: List[str] = []
-    app_bound_error: Optional[BrowserCookieError] = None
+    matched: list[http.cookiejar.Cookie] = []
+    warnings: list[str] = []
+    app_bound_error: BrowserCookieError | None = None
 
     for host_key, name, value, encrypted_value, path, expires_utc, is_secure, is_httponly in rows:
         host_str = str(host_key or "")
@@ -590,7 +590,7 @@ def read_chromium_cookies(
     return matched, len(rows), warnings
 
 
-def _try_browser_cookie3(browser: str, target_domains: Sequence[str]) -> Optional[List[http.cookiejar.Cookie]]:
+def _try_browser_cookie3(browser: str, target_domains: Sequence[str]) -> list[http.cookiejar.Cookie] | None:
     """Use optional `browser_cookie3` package when installed."""
     try:
         import browser_cookie3  # type: ignore[import-not-found]
@@ -611,8 +611,8 @@ def extract_browser_cookies(
     browser: str,
     target_domains: Sequence[str],
     *,
-    db_path: Optional[Path] = None,
-    local_state_path: Optional[Path] = None,
+    db_path: Path | None = None,
+    local_state_path: Path | None = None,
 ) -> CookieImportResult:
     """
     Extract cookies for `target_domains` from `browser`.
@@ -622,7 +622,7 @@ def extract_browser_cookies(
     """
     browser_key = (browser or "firefox").strip().lower()
     domains_tuple = tuple(target_domains)
-    warnings: List[str] = []
+    warnings: list[str] = []
 
     if browser_key == "firefox":
         if db_path is not None:
@@ -638,9 +638,9 @@ def extract_browser_cookies(
         profiles = discover_firefox_cookie_dbs()
         if not profiles:
             raise BrowserCookieError("No Firefox profile with cookies was found on this system.")
-        all_cookies: List[http.cookiejar.Cookie] = []
+        all_cookies: list[http.cookiejar.Cookie] = []
         total_scanned = 0
-        used_profiles: List[str] = []
+        used_profiles: list[str] = []
         for profile_name, path in profiles:
             cookies, scanned = read_firefox_cookies(path, domains_tuple)
             total_scanned += scanned
@@ -684,7 +684,7 @@ def extract_browser_cookies(
     all_cookies = []
     total_scanned = 0
     used_profiles = []
-    last_error: Optional[BrowserCookieError] = None
+    last_error: BrowserCookieError | None = None
     for profile_name, path, state_path in chromium_profiles:
         try:
             cookies, scanned, read_warnings = read_chromium_cookies(path, state_path, domains_tuple)

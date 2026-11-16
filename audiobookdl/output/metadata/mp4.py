@@ -1,6 +1,5 @@
 import os
 from datetime import date
-from typing import Dict, List, Optional, Tuple
 
 from audiobookdl import AudiobookMetadata, Cover
 from ._cover import normalize_cover_image
@@ -11,7 +10,7 @@ MP4_EXTENSIONS = ("mp4", "m4a", "m4p", "m4b", "m4r", "m4v")
 # iTunes Media Kind atom value for Audiobooks
 MP4_MEDIA_KIND_AUDIOBOOK = 2
 
-MP4_TEXT_ATOMS: Dict[str, str] = {
+MP4_TEXT_ATOMS: dict[str, str] = {
     "authors": "\xa9ART",
     "narrators": "\xa9nrt",
     "publisher": "\xa9pub",
@@ -20,7 +19,7 @@ MP4_TEXT_ATOMS: Dict[str, str] = {
     "genres": "\xa9gen",
 }
 
-MP4_FREEFORM_NAMES: Dict[str, str] = {
+MP4_FREEFORM_NAMES: dict[str, str] = {
     "scrape_url": "URL",
     "isbn": "ISBN",
     "asin": "ASIN",
@@ -39,14 +38,14 @@ def is_mp4_file(filepath: str) -> bool:
     return ext in MP4_EXTENSIONS
 
 
-def _freeform_atom(name: str, value: str) -> Tuple[str, List[MP4FreeForm]]:
+def _freeform_atom(name: str, value: str) -> tuple[str, list[MP4FreeForm]]:
     return (
         f"----:com.apple.iTunes:{name}",
         [MP4FreeForm(value.encode("utf-8"))],
     )
 
 
-def _build_mp4_cover(cover: Cover) -> Optional[MP4Cover]:
+def _build_mp4_cover(cover: Cover) -> MP4Cover | None:
     image_data, ext = normalize_cover_image(cover)
     if ext not in MP4_COVER_FORMATS:
         return None
@@ -56,7 +55,7 @@ def _build_mp4_cover(cover: Cover) -> Optional[MP4Cover]:
 def add_mp4_metadata(
     filepath: str,
     metadata: AudiobookMetadata,
-    cover: Optional[Cover] = None,
+    cover: Cover | None = None,
 ) -> bool:
     """Add mp4 metadata tags (and optional cover art) in a single save pass."""
     mp4_cover = _build_mp4_cover(cover) if cover is not None else None

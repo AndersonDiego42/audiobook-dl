@@ -1,5 +1,4 @@
 import os
-from typing import Optional
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 from audiobookdl.utils.audiobook import AudiobookFileEncryption, AESEncryption
@@ -44,7 +43,7 @@ class AESStreamDecryptor:
 def decrypt_file(
     path: str,
     encryption_method: AudiobookFileEncryption,
-    output_path: Optional[str] = None,
+    output_path: str | None = None,
 ) -> None:
     """Decrypt encrypted file in place, or atomically into `output_path` when provided."""
     if isinstance(encryption_method, AESEncryption):
@@ -62,7 +61,7 @@ def decrypt_file_aes(
     path: str,
     key: bytes,
     iv: bytes,
-    output_path: Optional[str] = None,
+    output_path: str | None = None,
 ) -> None:
     """Stream-decrypt a PKCS7-padded AES-CBC file via a sibling temp file and replace atomically."""
     target = output_path or path

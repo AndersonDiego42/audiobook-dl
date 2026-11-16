@@ -4,7 +4,7 @@ from pathlib import Path
 import shutil
 import subprocess
 from types import SimpleNamespace
-from typing import Sequence
+from collections.abc import Sequence
 from unittest.mock import MagicMock
 
 from PIL import Image

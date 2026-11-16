@@ -4,18 +4,18 @@ from audiobookdl.exceptions import RequestError
 
 import lxml.html
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any
 from urllib.parse import quote
 
 
-def _strip_html(raw: Optional[str]) -> Optional[str]:
+def _strip_html(raw: str | None) -> str | None:
     if not raw or not isinstance(raw, str):
         return None
     cleaned = " ".join(re.sub(r"<[^>]+>", " ", raw).split())
     return cleaned or None
 
 
-def _parse_playtime_ms(raw: Any) -> Optional[int]:
+def _parse_playtime_ms(raw: Any) -> int | None:
     """Parse LibriVox `playtime` (`HH:MM:SS`, `MM:SS`, or seconds) into milliseconds."""
     if raw is None or raw == "":
         return None
@@ -34,7 +34,7 @@ def _parse_playtime_ms(raw: Any) -> Optional[int]:
 
 
 class LibrivoxSource(Source):
-    _authentication_methods: List[str] = []
+    _authentication_methods: list[str] = []
 
     names = ["Librivox"]
     supports_search = True
@@ -44,7 +44,7 @@ class LibrivoxSource(Source):
         r"https?://(?:www\.)?librivox\.org/.+",
     ]
 
-    def _fetch_api_book(self, url: str) -> Optional[Dict[str, Any]]:
+    def _fetch_api_book(self, url: str) -> dict[str, Any] | None:
         """
         Look up LibriVox JSON API book payload when an RSS project id is present in page HTML.
         """
@@ -80,17 +80,17 @@ class LibrivoxSource(Source):
             chapters=chapters,
         )
 
-    def get_metadata(self, url: str, api_book: Optional[Dict[str, Any]] = None) -> AudiobookMetadata:
+    def get_metadata(self, url: str, api_book: dict[str, Any] | None = None) -> AudiobookMetadata:
         title = self.find_elem_in_page(url, ".content-wrap h1")
         page_html = self._get_page(url).decode("utf-8", errors="replace")
         tree = lxml.html.fromstring(page_html)
 
-        authors: List[str] = []
-        narrators: List[str] = []
-        genres: List[str] = []
-        language: Optional[str] = None
-        description: Optional[str] = None
-        release_date: Optional[str] = None
+        authors: list[str] = []
+        narrators: list[str] = []
+        genres: list[str] = []
+        language: str | None = None
+        description: str | None = None
+        release_date: str | None = None
 
         if isinstance(api_book, dict):
             if api_book.get("title"):
@@ -152,14 +152,14 @@ class LibrivoxSource(Source):
 
     @staticmethod
     def get_chapters(
-        api_book: Optional[Dict[str, Any]],
-        files: List[AudiobookFile],
-    ) -> List[Chapter]:
+        api_book: dict[str, Any] | None,
+        files: list[AudiobookFile],
+    ) -> list[Chapter]:
         """Build chapters from LibriVox API `sections` when available."""
         if not isinstance(api_book, dict):
             return []
         sections = api_book.get("sections") or []
-        chapters: List[Chapter] = []
+        chapters: list[Chapter] = []
         offset_ms = 0
         for idx, section in enumerate(sections, start=1):
             if not isinstance(section, dict):
@@ -180,7 +180,7 @@ class LibrivoxSource(Source):
         cover_data = self.get(cover_url)
         return Cover(cover_data, "jpg")
 
-    def get_files(self, url: str) -> List[AudiobookFile]:
+    def get_files(self, url: str) -> list[AudiobookFile]:
         parts = self.find_elems_in_page(url, ".chapter-download .chapter-name")
         files = []
         for part in parts:
@@ -194,8 +194,8 @@ class LibrivoxSource(Source):
         return files
 
     @staticmethod
-    def _parse_feed_books(payload: dict) -> List[CatalogBook]:
-        results: List[CatalogBook] = []
+    def _parse_feed_books(payload: dict) -> list[CatalogBook]:
+        results: list[CatalogBook] = []
         raw_books = payload.get("books") if isinstance(payload, dict) else []
         if isinstance(raw_books, dict):
             raw_books = list(raw_books.values())
@@ -224,12 +224,12 @@ class LibrivoxSource(Source):
             )
         return results
 
-    def search(self, query: str) -> List[CatalogBook]:
+    def search(self, query: str) -> list[CatalogBook]:
         cleaned = query.strip()
         if not cleaned:
             return []
         encoded = quote(cleaned)
-        results: List[CatalogBook] = []
+        results: list[CatalogBook] = []
         seen_urls = set()
         for param in ("title", "author"):
             try:
@@ -244,6 +244,6 @@ class LibrivoxSource(Source):
                     results.append(item)
         return results
 
-    def list_library(self) -> List[CatalogBook]:
+    def list_library(self) -> list[CatalogBook]:
         """Raise NotImplementedError: LibriVox has no personal user library."""
         raise NotImplementedError("LibriVox has no user accounts or personal library")

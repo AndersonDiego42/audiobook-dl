@@ -1,5 +1,6 @@
 import math
-from typing import Any, Callable, List, Optional, Sequence, Tuple
+from typing import Any
+from collections.abc import Callable, Sequence
 
 from mutagen import MutagenError
 
@@ -7,7 +8,7 @@ from audiobookdl import Chapter, logging
 from audiobookdl.utils import ffprobe_duration
 
 
-BoundedChapter = Tuple[int, int, str]
+BoundedChapter = tuple[int, int, str]
 
 
 def resolve_audio_duration_ms(
@@ -15,7 +16,7 @@ def resolve_audio_duration_ms(
     mutagen_opener: Callable[[str], Any],
 ) -> int:
     """Return the duration of `filepath` in milliseconds, falling back to `ffprobe`."""
-    length_sec: Optional[float] = None
+    length_sec: float | None = None
     try:
         audio = mutagen_opener(filepath)
     except (MutagenError, OSError, EOFError, ValueError) as exc:
@@ -46,7 +47,7 @@ def resolve_audio_duration_ms(
 def normalize_chapters(
     chapters: Sequence[Chapter],
     duration_ms: int,
-) -> List[BoundedChapter]:
+) -> list[BoundedChapter]:
     """Sort chapters by `start`, clamp bounds to `[0, duration_ms]`, and skip empty spans."""
     if not chapters or duration_ms <= 0:
         return []
@@ -54,7 +55,7 @@ def normalize_chapters(
     ordered = sorted(chapters, key=lambda ch: int(ch.start))
     clamped_starts = [max(0, min(int(ch.start), duration_ms)) for ch in ordered]
 
-    bounded: List[BoundedChapter] = []
+    bounded: list[BoundedChapter] = []
     for i, chapter in enumerate(ordered):
         start = clamped_starts[i]
         end = clamped_starts[i + 1] if i + 1 < len(ordered) else duration_ms
@@ -68,7 +69,7 @@ def build_bounded_chapters(
     filepath: str,
     chapters: Sequence[Chapter],
     mutagen_opener: Callable[[str], Any],
-) -> List[BoundedChapter]:
+) -> list[BoundedChapter]:
     """Resolve `filepath` duration and normalize `chapters` into valid `(start, end, title)` spans."""
     if not chapters:
         return []

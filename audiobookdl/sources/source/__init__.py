@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # Internal imports
 from . import networking
-from audiobookdl import logging, AudiobookFile, Chapter, AudiobookMetadata, Cover, Result, Audiobook, BookId
+from audiobookdl import logging, Result, Audiobook
 from audiobookdl.exceptions import DataNotPresent, GenericAudiobookDLException
 from audiobookdl.utils import CustomSSLContextHTTPAdapter
 from audiobookdl.utils.http import (
@@ -21,7 +21,7 @@ import os
 import weakref
 from dataclasses import dataclass
 from http.cookiejar import MozillaCookieJar
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, TypeVar, Generic
+from typing import TYPE_CHECKING, Any, TypeVar, Generic
 from ssl import SSLContext
 import urllib3
 
@@ -32,8 +32,8 @@ T = TypeVar("T")
 
 
 def _close_sessions(
-    primary: Optional[requests.Session],
-    children: Optional[List[requests.Session]],
+    primary: requests.Session | None,
+    children: list[requests.Session] | None,
 ) -> None:
     """Close `primary` and all child sessions without raising."""
     if primary is not None and hasattr(primary, "close"):
@@ -58,9 +58,9 @@ class CatalogBook:
     title: str
     url: str
     author: str = ""
-    series: Optional[str] = None
+    series: str | None = None
     source: str = ""
-    series_order: Optional[int] = None
+    series_order: int | None = None
     item_type: str = "book"
 
 
@@ -69,13 +69,13 @@ class Source(Generic[T]):
     online source."""
 
     # Data required for logging in
-    login_data: List[str] = [ "username", "password" ]
+    login_data: list[str] = [ "username", "password" ]
     # A list of regexes that indicates which website a service supports
-    match: List[str] = []
+    match: list[str] = []
     # list of names
-    names: List[str] = []
+    names: list[str] = []
     # Methods for authenticating
-    _authentication_methods: List[str] = [ "cookies" ]
+    _authentication_methods: list[str] = [ "cookies" ]
     # Create database directory for source
     create_storage_dir: bool = False
     # Discovery capabilities
@@ -84,12 +84,12 @@ class Source(Generic[T]):
 
     def __init__(self, options: DownloadOptions):
         self.__authenticated: bool = False
-        self.__pages: Dict[str, bytes] = {}
+        self.__pages: dict[str, bytes] = {}
         self._options: DownloadOptions = options
         self.database_directory = os.path.join(options.database_directory, self.name)
         self.skip_downloaded = options.skip_downloaded
         self._session: requests.Session = self.create_session(options)
-        self._child_sessions: List[requests.Session] = []
+        self._child_sessions: list[requests.Session] = []
         self._session_finalizer = weakref.finalize(
             self,
             _close_sessions,
@@ -158,7 +158,7 @@ class Source(Generic[T]):
             return os.path.join(self.database_directory, f"session_cookies_{safe_profile}.txt")
         return os.path.join(self.database_directory, "session_cookies.txt")
 
-    def save_cookie_file(self, cookie_file: Optional[str] = None) -> str:
+    def save_cookie_file(self, cookie_file: str | None = None) -> str:
         """Atomically persist current session cookies in Netscape format and return path written."""
         from audiobookdl.utils.browser_cookies import export_cookies_netscape
 
@@ -166,11 +166,11 @@ class Source(Generic[T]):
         cookies = extract_session_cookies(self._session)
         return export_cookies_netscape(cookies, target)
 
-    def search(self, query: str) -> List[CatalogBook]:
+    def search(self, query: str) -> list[CatalogBook]:
         """Search the service catalog for audiobooks matching `query`."""
         raise NotImplementedError(f"{self.name} does not support catalog search")
 
-    def list_library(self) -> List[CatalogBook]:
+    def list_library(self) -> list[CatalogBook]:
         """Return audiobook entries from the user's bookshelf/library or feed."""
         raise NotImplementedError(f"{self.name} does not support library listing")
 
@@ -280,7 +280,7 @@ class Source(Generic[T]):
     get_json = networking.get_json
     get_stream_files = networking.get_stream_files
 
-    def create_ssl_context(self, options: Optional[DownloadOptions] = None) -> SSLContext:
+    def create_ssl_context(self, options: DownloadOptions | None = None) -> SSLContext:
         try:
             ssl_context: SSLContext = urllib3.util.create_urllib3_context()  # type: ignore[attr-defined]
 
@@ -293,10 +293,12 @@ class Source(Generic[T]):
             # See issue #106
             ssl_context.options &= ~(1 << 4) # SSL_OP_TLSEXT_PADDING
             return ssl_context
-        except AttributeError: # AttributeError: module 'urllib3.util' has no attribute 'create_urllib3_context'
-            raise GenericAudiobookDLException(f"Please update urllib3 to version >= 2 using the command 'pip install -U urllib3'")
+        except AttributeError as error: # AttributeError: module 'urllib3.util' has no attribute 'create_urllib3_context'
+            raise GenericAudiobookDLException(
+                "Please update urllib3 to version >= 2 using the command 'pip install -U urllib3'"
+            ) from error
 
-    def create_session(self, options: Optional[DownloadOptions] = None) -> requests.Session:
+    def create_session(self, options: DownloadOptions | None = None) -> requests.Session:
         proxy = getattr(options, "proxy", None) if options is not None else None
         impersonate = (getattr(options, "impersonate", None) or "").strip() if options is not None else ""
         if impersonate:

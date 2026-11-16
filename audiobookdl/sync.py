@@ -5,7 +5,8 @@ import json
 import signal
 import sys
 import threading
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any
+from collections.abc import Callable, Sequence
 
 from audiobookdl import args, logging
 from audiobookdl.config import (
@@ -39,9 +40,9 @@ class ProfileSyncStats:
     downloaded: int = 0
     skipped: int = 0
     failed: int = 0
-    error: Optional[str] = None
+    error: str | None = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "service": self.service,
             "profile": self.profile,
@@ -67,10 +68,10 @@ class SyncCycleResult:
     skipped: int = 0
     failed: int = 0
     cancelled: bool = False
-    details: List[ProfileSyncStats] = field(default_factory=list)
-    errors: List[str] = field(default_factory=list)
+    details: list[ProfileSyncStats] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "profiles_checked": self.profiles_checked,
             "books_discovered": self.books_discovered,
@@ -95,15 +96,15 @@ def _lookup_source_class(service_name: str):
 def _resolve_sync_targets(
     config: Config,
     requested_services: Sequence[str],
-    requested_profile: Optional[str],
-) -> Tuple[List[Tuple[str, str]], List[str]]:
+    requested_profile: str | None,
+) -> tuple[list[tuple[str, str]], list[str]]:
     """Resolve `(service_key, profile_name)` targets to synchronize."""
     norm_req_services = [normalize_source_key(s) for s in requested_services if s.strip()]
     norm_req_profile = normalize_profile_name(requested_profile) if requested_profile else None
 
     configured = [(svc, prof) for svc, prof, _cfg in list_configured_source_profiles(config)]
-    targets: List[Tuple[str, str]] = []
-    errors: List[str] = []
+    targets: list[tuple[str, str]] = []
+    errors: list[str] = []
     seen = set()
 
     if norm_req_services:
@@ -161,8 +162,8 @@ def _build_sync_download_options(
 def run_sync_once(
     sync_opts: args.SyncOptions,
     *,
-    config: Optional[Config] = None,
-    cancel_event: Optional[threading.Event] = None,
+    config: Config | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> SyncCycleResult:
     """Perform one sync cycle: poll account libraries, update ledger, download new pending items."""
     resolved_config = config if config is not None else load_config(sync_opts.config_location)
@@ -195,7 +196,7 @@ def run_sync_once(
                 stats.newly_added = inserted
                 cycle.newly_added += inserted
 
-            pending_urls: List[str] = []
+            pending_urls: list[str] = []
             for book in books:
                 if not book.url:
                     continue
@@ -253,13 +254,13 @@ def _emit_cycle_output(cycle: SyncCycleResult, *, json_output: bool) -> None:
 def run_sync_loop(
     sync_opts: args.SyncOptions,
     *,
-    stop_event: Optional[threading.Event] = None,
-    max_cycles: Optional[int] = None,
-    on_cycle: Optional[Callable[[SyncCycleResult], None]] = None,
+    stop_event: threading.Event | None = None,
+    max_cycles: int | None = None,
+    on_cycle: Callable[[SyncCycleResult], None] | None = None,
 ) -> int:
     """Run one sync pass or poll continuously when `sync_opts.watch` is True."""
     cancel = stop_event if stop_event is not None else threading.Event()
-    installed_handlers: List[Tuple[int, Any]] = []
+    installed_handlers: list[tuple[int, Any]] = []
     if threading.current_thread() is threading.main_thread() and stop_event is None:
         def _handle_sig(_signum: int, _frame: Any) -> None:
             cancel.set()

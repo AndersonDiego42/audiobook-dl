@@ -1,7 +1,7 @@
 import base64
 from io import BytesIO
 import os
-from typing import Any, Optional, Sequence
+from typing import Any
 
 from mutagen import File as MutagenFile
 from mutagen.flac import FLAC, Picture
@@ -32,7 +32,7 @@ def _as_tag_values(value: object) -> list[str]:
     return [text] if text else []
 
 
-def _build_vorbis_picture(cover: Cover) -> Optional[Picture]:
+def _build_vorbis_picture(cover: Cover) -> Picture | None:
     image_data, ext = normalize_cover_image(cover)
     mimetype = _EXTENSION_TO_MIMETYPE.get(ext)
     if not mimetype:
@@ -67,7 +67,7 @@ def _attach_vorbis_picture(audio: Any, picture: Picture) -> None:
 def add_vorbis_metadata(
     filepath: str,
     metadata: AudiobookMetadata,
-    cover: Optional[Cover] = None,
+    cover: Cover | None = None,
 ) -> bool:
     """Write VorbisComment metadata tags (and optional cover art) in a single save pass."""
     audio = MutagenFile(filepath)

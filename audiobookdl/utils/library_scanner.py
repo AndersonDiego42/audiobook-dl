@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 import os
-from typing import Callable, List, Optional, Sequence, Tuple
+from collections.abc import Callable, Sequence
 
 from audiobookdl.output.metadata.reader import read_sidecar_metadata, read_track_tags
 from audiobookdl.pack import (
@@ -23,7 +23,7 @@ class ScannedLocalBook:
     author: str
     output_path: str
     audio_format: str
-    entry_id: Optional[int] = None
+    entry_id: int | None = None
     source: str = "local"
 
 
@@ -36,9 +36,9 @@ class LocalScanResult:
     registered: int = 0
     missing: int = 0
     dry_run: bool = False
-    items: List[ScannedLocalBook] = field(default_factory=list)
-    missing_paths: List[str] = field(default_factory=list)
-    errors: List[str] = field(default_factory=list)
+    items: list[ScannedLocalBook] = field(default_factory=list)
+    missing_paths: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -69,7 +69,7 @@ def _is_supported_audio(path: str) -> bool:
     return bool(ext and ext in SUPPORTED_PACK_EXTENSIONS)
 
 
-def _split_folder_units(walk_root: str, audio_paths: List[str]) -> List[Tuple[str, List[str], str]]:
+def _split_folder_units(walk_root: str, audio_paths: list[str]) -> list[tuple[str, list[str], str]]:
     """Split audio files inside `walk_root` into `(source_root, tracks, output_path)` book units."""
     if len(audio_paths) == 1:
         p = audio_paths[0]
@@ -90,13 +90,13 @@ def _split_folder_units(walk_root: str, audio_paths: List[str]) -> List[Tuple[st
     return [(walk_root, audio_paths, walk_root)]
 
 
-def _discover_local_units(paths: Sequence[str]) -> Tuple[List[Tuple[str, List[str], str]], List[str]]:
+def _discover_local_units(paths: Sequence[str]) -> tuple[list[tuple[str, list[str], str]], list[str]]:
     """Walk `paths` and return `(units, errors)` without mutating the database."""
-    units: List[Tuple[str, List[str], str]] = []
-    errors: List[str] = []
+    units: list[tuple[str, list[str], str]] = []
+    errors: list[str] = []
     seen_outputs: set[str] = set()
 
-    def _add_unit(unit: Tuple[str, List[str], str]) -> None:
+    def _add_unit(unit: tuple[str, list[str], str]) -> None:
         key = os.path.normcase(os.path.abspath(unit[2]))
         if key not in seen_outputs:
             seen_outputs.add(key)
@@ -133,9 +133,9 @@ def _discover_local_units(paths: Sequence[str]) -> Tuple[List[Tuple[str, List[st
 
 def _build_local_book_key(
     *,
-    scrape_url: Optional[str],
-    isbn: Optional[str],
-    asin: Optional[str],
+    scrape_url: str | None,
+    isbn: str | None,
+    asin: str | None,
     output_path: str,
 ) -> str:
     if scrape_url and scrape_url.strip():
@@ -154,7 +154,7 @@ def scan_local_library(
     profile: str = "default",
     verify_missing: bool = False,
     dry_run: bool = False,
-    on_progress: Optional[Callable[[str], None]] = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> LocalScanResult:
     """Scan local directories/files, match or register books in `archive`, and optionally check missing files."""
     result = LocalScanResult(dry_run=dry_run)
@@ -216,7 +216,7 @@ def scan_local_library(
                         asin=meta.asin,
                         output_path=unit_output_path,
                     )
-                    entry_id: Optional[int] = None
+                    entry_id: int | None = None
                     if not dry_run:
                         entry_id = archive.record(
                             src,

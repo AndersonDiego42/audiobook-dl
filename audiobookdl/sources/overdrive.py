@@ -1,10 +1,10 @@
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, BookId, Chapter, Cover, Result, Series
-from audiobookdl.exceptions import DataNotPresent, RequestError, UserNotAuthorized
+from audiobookdl.exceptions import RequestError, UserNotAuthorized
 
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any
 from urllib.parse import urljoin
 from urllib3.util import parse_url
 
@@ -96,7 +96,7 @@ class OverdriveSource(Source):
                     raise UserNotAuthorized(
                         message="No active Libby loans were found on this shelf."
                     )
-                books: List[BookId[str] | Audiobook] = []
+                books: list[BookId[str] | Audiobook] = []
                 for item in loans:
                     loan_match = re.search(r"/open/loan/([^/?#]+)", item.url)
                     bid = loan_match.group(1) if loan_match else item.url
@@ -106,7 +106,7 @@ class OverdriveSource(Source):
         return self._download_listen_url(url)
 
     @staticmethod
-    def _extract_isbn(book_info: Dict[str, Any]) -> Optional[str]:
+    def _extract_isbn(book_info: dict[str, Any]) -> str | None:
         if isinstance(book_info.get("isbn"), str) and book_info["isbn"].strip():
             return book_info["isbn"].strip()
         for ident in book_info.get("identifiers") or []:
@@ -115,7 +115,7 @@ class OverdriveSource(Source):
                     return str(ident["value"]).strip()
         return None
 
-    def get_metadata(self, book_info: Dict[str, Any], url: Optional[str] = None) -> AudiobookMetadata:
+    def get_metadata(self, book_info: dict[str, Any], url: str | None = None) -> AudiobookMetadata:
         title = book_info["title"]["main"]
 
         desc_raw = book_info.get("description")
@@ -136,8 +136,8 @@ class OverdriveSource(Source):
         else:
             publisher = None
 
-        series_name: Optional[str] = None
-        series_order: Optional[int] = None
+        series_name: str | None = None
+        series_order: int | None = None
         series_raw = book_info.get("series")
         if isinstance(series_raw, dict):
             series_name = str(series_raw.get("name") or series_raw.get("title") or "").strip() or None
@@ -175,16 +175,16 @@ class OverdriveSource(Source):
         cover_data = self.get(cover_url)
         return Cover(cover_data, "jpg")
 
-    def _compute_part_offsets(self, book_info) -> List[float]:
+    def _compute_part_offsets(self, book_info) -> list[float]:
         """Return cumulative start offsets in seconds for each spine part."""
-        offsets: List[float] = []
+        offsets: list[float] = []
         elapsed = 0.0
         for part in book_info["spine"]:
             offsets.append(elapsed)
             elapsed += part["audio-duration"]
         return offsets
 
-    def get_chapters(self, book_info) -> List[Chapter]:
+    def get_chapters(self, book_info) -> list[Chapter]:
         part_offsets = self._compute_part_offsets(book_info)
         chapters = []
         for chapter in book_info["nav"]["toc"]:
@@ -201,8 +201,8 @@ class OverdriveSource(Source):
         return chapters
 
     @staticmethod
-    def _flatten_toc(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        flat: List[Dict[str, Any]] = []
+    def _flatten_toc(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        flat: list[dict[str, Any]] = []
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -212,11 +212,11 @@ class OverdriveSource(Source):
                 flat.extend(OverdriveSource._flatten_toc(nested))
         return flat
 
-    def get_files(self, prefix: str, book_info) -> List[AudiobookFile]:
+    def get_files(self, prefix: str, book_info) -> list[AudiobookFile]:
         toc_entries = (book_info.get("nav") or {}).get("toc") or []
         has_nested = any(isinstance(part, dict) and "contents" in part for part in toc_entries)
-        part_titles: Dict[str, str] = {}
-        flat_titles: List[str] = []
+        part_titles: dict[str, str] = {}
+        flat_titles: list[str] = []
         for entry in self._flatten_toc(toc_entries):
             title = str(entry.get("title") or "").strip()
             path = str(entry.get("path") or "").split("#", 1)[0].strip()
@@ -249,10 +249,10 @@ class OverdriveSource(Source):
             )
         return files
 
-    def list_library(self) -> List[CatalogBook]:
+    def list_library(self) -> list[CatalogBook]:
         """List active OverDrive/Libby audiobook loans from Sentry chip API."""
         chip = self.get_json("https://sentry-read.svc.overdrive.com/chip")
-        results: List[CatalogBook] = []
+        results: list[CatalogBook] = []
         for loan in chip.get("loans") or []:
             if not isinstance(loan, dict):
                 continue

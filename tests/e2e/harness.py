@@ -9,7 +9,8 @@ import site
 import subprocess
 import time
 import tkinter as tk
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any
+from collections.abc import Callable, Sequence
 
 import pytest
 
@@ -34,7 +35,7 @@ _PROXY_ENV_KEYS = (
 )
 
 
-def require_ffmpeg(config: E2EConfig) -> Tuple[str, str]:
+def require_ffmpeg(config: E2EConfig) -> tuple[str, str]:
     """Verify `ffmpeg` and `ffprobe` readiness, skipping or failing per `config`."""
     ffmpeg_dir = str(config.ffmpeg_dir) if config.ffmpeg_dir is not None else None
     with logging.job_context(logging.JobContext(ffmpeg_dir=ffmpeg_dir)):
@@ -114,15 +115,15 @@ class E2EWorkspace:
     def build_env(
         self,
         *,
-        proxy_url: Optional[str] = None,
-        extra_env: Optional[Dict[str, str]] = None,
-    ) -> Tuple[Dict[str, str], Dict[str, str]]:
+        proxy_url: str | None = None,
+        extra_env: dict[str, str] | None = None,
+    ) -> tuple[dict[str, str], dict[str, str]]:
         """Return `(full_env, overrides_only)` isolated from host user state."""
         env = dict(os.environ)
         for key in _PROXY_ENV_KEYS:
             env.pop(key, None)
 
-        overrides: Dict[str, str] = {
+        overrides: dict[str, str] = {
             "HOME": str(self.home_dir),
             "USERPROFILE": str(self.home_dir),
             "APPDATA": str(self.appdata_dir),
@@ -158,8 +159,8 @@ class E2EWorkspace:
 class CliResult:
     """Result returned by `CliRunner` subprocess execution."""
 
-    command: List[str]
-    returncode: Optional[int]
+    command: list[str]
+    returncode: int | None
     stdout: str
     stderr: str
     duration_seconds: float
@@ -174,7 +175,7 @@ class CliRunner:
         config: E2EConfig,
         workspace: E2EWorkspace,
         diagnostics: E2EDiagnosticRecorder,
-        proxy_url: Optional[str] = None,
+        proxy_url: str | None = None,
     ) -> None:
         self.config = config
         self.workspace = workspace
@@ -183,12 +184,12 @@ class CliRunner:
 
     def _exec(
         self,
-        command: List[str],
+        command: list[str],
         *,
         use_proxy: bool = True,
-        timeout: Optional[float] = None,
-        extra_env: Optional[Dict[str, str]] = None,
-        stdin_text: Optional[str] = None,
+        timeout: float | None = None,
+        extra_env: dict[str, str] | None = None,
+        stdin_text: str | None = None,
     ) -> CliResult:
         effective_timeout = timeout or self.config.timeout_seconds
         env, overrides = self.workspace.build_env(
@@ -210,7 +211,7 @@ class CliRunner:
                 timeout=effective_timeout,
                 check=False,
             )
-            returncode: Optional[int] = proc.returncode
+            returncode: int | None = proc.returncode
             stdout = proc.stdout
             stderr = proc.stderr
         except subprocess.TimeoutExpired as exc:
@@ -262,9 +263,9 @@ class CliRunner:
         args: Sequence[str],
         *,
         use_proxy: bool = True,
-        timeout: Optional[float] = None,
-        extra_env: Optional[Dict[str, str]] = None,
-        stdin_text: Optional[str] = None,
+        timeout: float | None = None,
+        extra_env: dict[str, str] | None = None,
+        stdin_text: str | None = None,
     ) -> CliResult:
         """Invoke `audiobook-dl` with `args` inside the isolated E2E workspace."""
         return self._exec(
@@ -275,7 +276,7 @@ class CliRunner:
             stdin_text=stdin_text,
         )
 
-    def run_gui_self_test(self, *, timeout: Optional[float] = None) -> CliResult:
+    def run_gui_self_test(self, *, timeout: float | None = None) -> CliResult:
         """Invoke `audiobookdl.gui --self-test` in the isolated E2E workspace."""
         return self._exec(
             self.config.gui_self_test_command(),
@@ -296,8 +297,8 @@ class GuiHarness:
         self.config = config
         self.workspace = workspace
         self.diagnostics = diagnostics
-        self.root: Optional[tk.Tk] = None
-        self.app: Optional[AudiobookDLApp] = None
+        self.root: tk.Tk | None = None
+        self.app: AudiobookDLApp | None = None
         self._closed = False
 
     def start(self) -> AudiobookDLApp:
@@ -321,7 +322,7 @@ class GuiHarness:
         self.diagnostics.record_gui_snapshot(self.snapshot())
         return app
 
-    def snapshot(self) -> Dict[str, Any]:
+    def snapshot(self) -> dict[str, Any]:
         """Capture current UI state for diagnostics."""
         if self.app is None:
             return {"state": "not_started"}
@@ -348,7 +349,7 @@ class GuiHarness:
         self,
         predicate: Callable[[], bool],
         *,
-        timeout: Optional[float] = None,
+        timeout: float | None = None,
         description: str = "condition",
     ) -> None:
         """Pump the Tk event loop until `predicate()` returns True or `timeout` expires."""

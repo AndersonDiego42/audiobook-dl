@@ -3,13 +3,13 @@ import importlib
 import re
 import threading
 import time
-from typing import Any, List, Optional, Tuple
+from typing import Any
 import requests
 
 from audiobookdl.exceptions import DownloadCancelled, GenericAudiobookDLException
 
 
-DEFAULT_HTTP_TIMEOUT: Tuple[int, int] = (15, 60)
+DEFAULT_HTTP_TIMEOUT: tuple[int, int] = (15, 60)
 DEFAULT_USER_AGENT: str = "audiobook-dl"
 
 _RATE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kmg]?)(?:i?b)?(?:/s)?\s*$", re.IGNORECASE)
@@ -21,7 +21,7 @@ _RATE_UNITS = {
 }
 
 
-def parse_byte_rate(raw: Optional[str]) -> Optional[int]:
+def parse_byte_rate(raw: str | None) -> int | None:
     """Parse a human-readable bandwidth cap (e.g. ``'500K'``, ``'2M'``) into bytes/sec."""
     if raw is None:
         return None
@@ -55,7 +55,7 @@ class TokenBucketRateLimiter:
     def acquire(
         self,
         num_bytes: int,
-        cancel_event: Optional[threading.Event] = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         """Consume `num_bytes` tokens, sleeping in cancellable increments as needed."""
         if num_bytes <= 0:
@@ -91,7 +91,7 @@ class TokenBucketRateLimiter:
 def create_impersonated_session(
     browser: str,
     *,
-    proxy: Optional[str] = None,
+    proxy: str | None = None,
 ) -> Any:
     """
     Build a `curl_cffi.requests.Session` impersonating `browser` TLS/HTTP2 fingerprints.
@@ -125,7 +125,7 @@ def create_impersonated_session(
     return session
 
 
-def extract_session_cookies(session: Any) -> List[Cookie]:
+def extract_session_cookies(session: Any) -> list[Cookie]:
     """Return `Cookie` objects from a `requests.Session` or `curl_cffi` session."""
     raw_cookies = getattr(session, "cookies", None)
     if raw_cookies is None:
@@ -169,8 +169,8 @@ def is_transient_network_error(exc: BaseException) -> bool:
 def redirect_of(
     url: str,
     amount: int = 1,
-    session: Optional[requests.Session] = None,
-) -> Optional[str]:
+    session: requests.Session | None = None,
+) -> str | None:
     """
     Get the location where a url redirects to.
 

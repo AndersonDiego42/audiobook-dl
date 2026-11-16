@@ -4,7 +4,7 @@ import os
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
-from typing import Callable, Dict, List, Optional, Tuple
+from collections.abc import Callable
 
 from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, apply_theme_to_window, scale_px
 from audiobookdl.gui.widgets import (
@@ -37,15 +37,15 @@ class ArchiveLedgerDialog(tk.Toplevel):
         parent: tk.Misc,
         archive_path: str,
         *,
-        on_queue_urls: Optional[Callable[[List[str]], None]] = None,
-        palette: Optional[ThemePalette] = None,
+        on_queue_urls: Callable[[list[str]], None] | None = None,
+        palette: ThemePalette | None = None,
     ) -> None:
         super().__init__(parent)
         self._archive_path = archive_path
-        self._ledger: Optional[DownloadArchive] = None
-        self._debounce_after_id: Optional[str] = None
+        self._ledger: DownloadArchive | None = None
+        self._debounce_after_id: str | None = None
         self._on_queue_urls = on_queue_urls
-        self._entries_by_id: Dict[int, ArchiveEntry] = {}
+        self._entries_by_id: dict[int, ArchiveEntry] = {}
         self._palette = palette or LIGHT_PALETTE
 
         self.title("Library & Download Ledger")
@@ -135,7 +135,7 @@ class ArchiveLedgerDialog(tk.Toplevel):
         self._refresh()
         apply_theme_to_window(self, self._palette)
 
-    def _get_ledger(self, *, create: bool = False) -> Optional[DownloadArchive]:
+    def _get_ledger(self, *, create: bool = False) -> DownloadArchive | None:
         if self._ledger is None:
             if not create and not os.path.exists(self._archive_path):
                 return None
@@ -156,7 +156,7 @@ class ArchiveLedgerDialog(tk.Toplevel):
         return entry.source
 
     @classmethod
-    def _format_entry_values(cls, entry: ArchiveEntry) -> Tuple[str, ...]:
+    def _format_entry_values(cls, entry: ArchiveEntry) -> tuple[str, ...]:
         series_text = entry.series or ""
         if series_text and entry.series_order is not None:
             series_text = f"{series_text} #{entry.series_order}"
@@ -224,8 +224,8 @@ class ArchiveLedgerDialog(tk.Toplevel):
                 pass
         self._debounce_after_id = self.after(180, self._refresh)
 
-    def _selected_entry_ids(self) -> List[int]:
-        out: List[int] = []
+    def _selected_entry_ids(self) -> list[int]:
+        out: list[int] = []
         for iid in resolve_selected_leaf_iids(self._tree):
             try:
                 out.append(int(iid))
@@ -236,7 +236,7 @@ class ArchiveLedgerDialog(tk.Toplevel):
     def _queue_selected(self) -> None:
         if self._on_queue_urls is None:
             return
-        urls: List[str] = []
+        urls: list[str] = []
         for entry_id in self._selected_entry_ids():
             entry = self._entries_by_id.get(entry_id)
             if entry and entry.url and entry.url not in urls:
@@ -340,13 +340,13 @@ class ArchiveLedgerDialog(tk.Toplevel):
             return
         self.scan_folder(folder, background=True)
 
-    def scan_folder(self, folder: str, *, background: bool = False) -> Optional[LocalScanResult]:
+    def scan_folder(self, folder: str, *, background: bool = False) -> LocalScanResult | None:
         """Scan `folder` into `downloads.db` and refresh the library grid."""
         self._get_ledger(create=True)
         self._scan_btn.configure(state="disabled")
         self._status_var.set(f"Scanning '{folder}'...")
 
-        def _finish(result: Optional[LocalScanResult], error: Optional[str]) -> None:
+        def _finish(result: LocalScanResult | None, error: str | None) -> None:
             if not self.winfo_exists():
                 return
             self._scan_btn.configure(state="normal")

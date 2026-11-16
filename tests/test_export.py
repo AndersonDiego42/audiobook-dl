@@ -63,7 +63,7 @@ def test_export_csv_and_json_via_api_and_cli(tmp_path, capsys):
     assert exc_csv.value.code == 0
     assert "Exported 1 book(s)" in capsys.readouterr().out
 
-    with open(csv_path, "r", encoding="utf-8", newline="") as f:
+    with open(csv_path, encoding="utf-8", newline="") as f:
         rows = list(csv.DictReader(f))
     assert len(rows) == 1
     assert rows[0]["title"] == "Dune"

@@ -4,7 +4,8 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
-from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
+from typing import Any
+from collections.abc import Callable, Sequence
 
 from audiobookdl.gui.formatting import (
     apply_audiobook_metadata_edits,
@@ -37,11 +38,11 @@ class ChoiceDialog(tk.Toplevel):
         title: str,
         choices: Sequence[str],
         *,
-        default: Optional[int] = None,
-        palette: Optional[ThemePalette] = None,
+        default: int | None = None,
+        palette: ThemePalette | None = None,
     ) -> None:
         super().__init__(parent)
-        self.selected_index: Optional[int] = None
+        self.selected_index: int | None = None
         self._palette = palette or LIGHT_PALETTE
         self.title(title)
         self.transient(parent)  # type: ignore[arg-type]
@@ -112,10 +113,10 @@ class _EnrichmentPickerDialog(tk.Toplevel):
         parent: tk.Misc,
         candidates: Sequence[EnrichmentCandidate],
         *,
-        palette: Optional[ThemePalette] = None,
+        palette: ThemePalette | None = None,
     ) -> None:
         super().__init__(parent)
-        self.selected_candidate: Optional[EnrichmentCandidate] = None
+        self.selected_candidate: EnrichmentCandidate | None = None
         self._candidates = list(candidates)
         self._palette = palette or LIGHT_PALETTE
 
@@ -140,7 +141,7 @@ class _EnrichmentPickerDialog(tk.Toplevel):
         self._tree = table.tree
 
         for idx, cand in enumerate(self._candidates):
-            extras: List[str] = []
+            extras: list[str] = []
             if cand.release_date:
                 extras.append(str(cand.release_date.year))
             if cand.asin:
@@ -206,11 +207,11 @@ class PreviewDialog(tk.Toplevel):
         *,
         is_running: bool,
         skip_downloaded: bool,
-        series_book_exists: Callable[[Union[BookId[Any], Audiobook]], bool],
-        on_confirm: Callable[[str, Tuple[Source, Result], Optional[List[int]]], None],
-        palette: Optional[ThemePalette] = None,
-        on_search_enrichment: Optional[Callable[[Audiobook], List[EnrichmentCandidate]]] = None,
-        on_apply_enrichment: Optional[Callable[[Audiobook, EnrichmentCandidate], Tuple[List[str], bool, bool]]] = None,
+        series_book_exists: Callable[[BookId[Any] | Audiobook], bool],
+        on_confirm: Callable[[str, tuple[Source, Result], list[int] | None], None],
+        palette: ThemePalette | None = None,
+        on_search_enrichment: Callable[[Audiobook], list[EnrichmentCandidate]] | None = None,
+        on_apply_enrichment: Callable[[Audiobook, EnrichmentCandidate], tuple[list[str], bool, bool]] | None = None,
     ) -> None:
         super().__init__(parent)
         self._url = url
@@ -224,13 +225,13 @@ class PreviewDialog(tk.Toplevel):
         self._on_search_enrichment = on_search_enrichment
         self._on_apply_enrichment = on_apply_enrichment
 
-        self._cover_photo: Optional[Any] = None
-        self._pending_cover: Optional[Cover] = result.cover if isinstance(result, Audiobook) else None
+        self._cover_photo: Any | None = None
+        self._pending_cover: Cover | None = result.cover if isinstance(result, Audiobook) else None
         self._cover_modified = False
-        self._cover_label: Optional[ttk.Label] = None
-        self._clear_cover_btn: Optional[ttk.Button] = None
-        self._readonly_frame: Optional[ttk.Frame] = None
-        self._enrich_btn: Optional[ttk.Button] = None
+        self._cover_label: ttk.Label | None = None
+        self._clear_cover_btn: ttk.Button | None = None
+        self._readonly_frame: ttk.Frame | None = None
+        self._enrich_btn: ttk.Button | None = None
         self._enrich_status_var = tk.StringVar(value="")
 
         self._title_var = tk.StringVar()
@@ -239,11 +240,11 @@ class PreviewDialog(tk.Toplevel):
         self._series_var = tk.StringVar()
         self._series_order_var = tk.StringVar()
 
-        self._check_vars: List[tk.BooleanVar] = []
+        self._check_vars: list[tk.BooleanVar] = []
         self._filter_var = tk.StringVar()
-        self._item_labels: List[str] = []
-        self._last_clicked_index: Optional[int] = None
-        self._tree: Optional[ttk.Treeview] = None
+        self._item_labels: list[str] = []
+        self._last_clicked_index: int | None = None
+        self._tree: ttk.Treeview | None = None
 
         self.title(f"Preview \u2014 {result.title}")
         self.transient(parent)  # type: ignore[arg-type]
@@ -373,7 +374,7 @@ class PreviewDialog(tk.Toplevel):
         meta_frame.grid(row=0, column=1, sticky="nsew")
         meta_frame.columnconfigure(1, weight=1)
 
-        editable_rows: Tuple[Tuple[str, tk.StringVar, Optional[int]], ...] = (
+        editable_rows: tuple[tuple[str, tk.StringVar, int | None], ...] = (
             ("Title", self._title_var, None),
             ("Author(s)", self._authors_var, None),
             ("Narrator(s)", self._narrators_var, None),
@@ -497,7 +498,7 @@ class PreviewDialog(tk.Toplevel):
         def _worker() -> None:
             try:
                 candidates = search_fn(audiobook)
-                exc: Optional[Exception] = None
+                exc: Exception | None = None
             except Exception as err:
                 candidates = []
                 exc = err
@@ -512,8 +513,8 @@ class PreviewDialog(tk.Toplevel):
     def _on_enrichment_search_done(
         self,
         audiobook: Audiobook,
-        candidates: List[EnrichmentCandidate],
-        exc: Optional[Exception],
+        candidates: list[EnrichmentCandidate],
+        exc: Exception | None,
     ) -> None:
         if self._enrich_btn is not None:
             self._enrich_btn.configure(state="normal")
@@ -550,7 +551,7 @@ class PreviewDialog(tk.Toplevel):
         def _apply_worker() -> None:
             try:
                 fields, cover_updated, chapters_updated = apply_fn(audiobook, chosen)
-                err_exc: Optional[Exception] = None
+                err_exc: Exception | None = None
             except Exception as err:
                 fields, cover_updated, chapters_updated = [], False, False
                 err_exc = err
@@ -574,10 +575,10 @@ class PreviewDialog(tk.Toplevel):
     def _on_enrichment_applied(
         self,
         audiobook: Audiobook,
-        fields: List[str],
+        fields: list[str],
         cover_updated: bool,
         chapters_updated: bool,
-        exc: Optional[Exception],
+        exc: Exception | None,
     ) -> None:
         if self._enrich_btn is not None:
             self._enrich_btn.configure(state="normal")
@@ -699,7 +700,7 @@ class PreviewDialog(tk.Toplevel):
         ).pack(side=tk.RIGHT)
         ttk.Button(btn_bar, text="Close", command=self.destroy).pack(side=tk.RIGHT, padx=(0, 6))
 
-    def _update_selected_count(self, book_count: Optional[int] = None) -> None:
+    def _update_selected_count(self, book_count: int | None = None) -> None:
         total = len(self._check_vars) if book_count is None else book_count
         chosen = sum(1 for v in self._check_vars if v.get())
         self._selected_count_var.set(f"Selected: {chosen} / {total}")
@@ -734,7 +735,7 @@ class PreviewDialog(tk.Toplevel):
         self._sync_tree_marks()
         self._update_selected_count()
 
-    def _on_tree_click(self, event: tk.Event) -> Optional[str]:
+    def _on_tree_click(self, event: tk.Event) -> str | None:
         if self._tree is None:
             return None
         row_iid = self._tree.identify_row(event.y)

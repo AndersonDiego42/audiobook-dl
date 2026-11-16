@@ -3,7 +3,7 @@
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
-from typing import Callable, List, Optional, Tuple
+from collections.abc import Callable
 
 from audiobookdl.config import AudiobookshelfConfig, save_audiobookshelf_config
 from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, apply_theme_to_window, scale_px
@@ -18,15 +18,15 @@ class AudiobookshelfDialog(tk.Toplevel):
         parent: tk.Misc,
         current: AudiobookshelfConfig,
         *,
-        config_location: Optional[str] = None,
-        on_saved: Optional[Callable[[AudiobookshelfConfig], None]] = None,
-        palette: Optional[ThemePalette] = None,
+        config_location: str | None = None,
+        on_saved: Callable[[AudiobookshelfConfig], None] | None = None,
+        palette: ThemePalette | None = None,
     ) -> None:
         super().__init__(parent)
         self._config_location = config_location
         self._on_saved = on_saved
         self._palette = palette or LIGHT_PALETTE
-        self._libraries: List[Tuple[str, str]] = []
+        self._libraries: list[tuple[str, str]] = []
 
         self.title("Audiobookshelf Integration")
         self.transient(parent)  # type: ignore[arg-type]
@@ -106,7 +106,7 @@ class AudiobookshelfDialog(tk.Toplevel):
             finally:
                 client.close()
 
-        def _done(username: str, libs: List[Tuple[str, str]], error: Optional[str]) -> None:
+        def _done(username: str, libs: list[tuple[str, str]], error: str | None) -> None:
             if not self.winfo_exists():
                 return
             self._test_btn.configure(state="normal")

@@ -6,7 +6,8 @@ import os
 import re
 import subprocess
 import sys
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple
+from typing import Any
+from collections.abc import Callable, Sequence
 import shutil
 from urllib3.poolmanager import PoolManager
 from requests.adapters import HTTPAdapter
@@ -21,7 +22,7 @@ MP4_CONTAINERS = ("mp4", "m4a", "m4b", "mov")
 _BITRATE_RE = re.compile(r"^(\d+)k?$", re.IGNORECASE)
 
 
-def normalize_audio_bitrate(bitrate: Optional[str]) -> Optional[str]:
+def normalize_audio_bitrate(bitrate: str | None) -> str | None:
     """
     Normalize an AAC bitrate option (`None`/`"auto"` -> `None`, `"128k"`/`"128"` -> `"128k"`).
 
@@ -57,7 +58,7 @@ def read_asset_file(path: str) -> str:
         .read_text(encoding="utf8")
 
 
-def get_ffmpeg_dir() -> Optional[str]:
+def get_ffmpeg_dir() -> str | None:
     """Return the configured custom FFmpeg directory from the active `JobContext`."""
     from audiobookdl import logging
 
@@ -69,7 +70,7 @@ def get_ffmpeg_dir() -> Optional[str]:
     return None
 
 
-def resolve_ffmpeg_dir(directory: str) -> Optional[str]:
+def resolve_ffmpeg_dir(directory: str) -> str | None:
     """
     Resolve `directory` (or its `bin/` child) if it contains an `ffmpeg` executable.
 
@@ -87,7 +88,7 @@ def resolve_ffmpeg_dir(directory: str) -> Optional[str]:
     return None
 
 
-def validate_executable(path: str, *, probe_args: Sequence[str] = ("-version",)) -> Optional[str]:
+def validate_executable(path: str, *, probe_args: Sequence[str] = ("-version",)) -> str | None:
     """
     Verify that `path` can be executed on this host.
 
@@ -121,7 +122,7 @@ def validate_executable(path: str, *, probe_args: Sequence[str] = ("-version",))
     return None
 
 
-def validate_ffmpeg_dir(directory: str) -> Tuple[Optional[str], Optional[str]]:
+def validate_ffmpeg_dir(directory: str) -> tuple[str | None, str | None]:
     """
     Resolve `directory` (or its `bin/` child) and verify its `ffmpeg`/`ffprobe` binaries execute.
 
@@ -144,7 +145,7 @@ def validate_ffmpeg_dir(directory: str) -> Tuple[Optional[str], Optional[str]]:
     return resolved, None
 
 
-def find_executable(program: str) -> Optional[str]:
+def find_executable(program: str) -> str | None:
     """
     Locate an external executable (e.g. ffmpeg, ffprobe).
 
@@ -186,15 +187,15 @@ class AudioProbeInfo:
     """Consolidated media metadata returned by a single `ffprobe` JSON call."""
 
     duration: float = 0.0
-    bitrate: Optional[int] = None
+    bitrate: int | None = None
     codec_name: str = ""
     format_name: str = ""
-    sample_rate: Optional[int] = None
-    channels: Optional[int] = None
-    probe_error: Optional[str] = None
+    sample_rate: int | None = None
+    channels: int | None = None
+    probe_error: str | None = None
 
 
-def _parse_positive_int(raw: Any) -> Optional[int]:
+def _parse_positive_int(raw: Any) -> int | None:
     if raw is None:
         return None
     try:
@@ -274,15 +275,15 @@ def ffprobe_duration(path: str) -> float:
     return probe_audio_info(path).duration
 
 
-def ffprobe_audio_bitrate(path: str) -> Optional[int]:
+def ffprobe_audio_bitrate(path: str) -> int | None:
     """Return the bitrate of `path` in bits/sec via `ffprobe`, or `None` if unavailable."""
     return probe_audio_info(path).bitrate
 
 
 def resolve_audio_bitrate(
     source_path: str,
-    audio_bitrate: Optional[str] = None,
-    probe_bps: Optional[Callable[[str], Optional[int]]] = None,
+    audio_bitrate: str | None = None,
+    probe_bps: Callable[[str], int | None] | None = None,
 ) -> str:
     """
     Determine the target AAC bitrate when transcoding `source_path` to an MP4 container.
@@ -302,9 +303,9 @@ def resolve_audio_bitrate(
     return f"{kbps}k"
 
 
-def subprocess_kwargs(capture_output: bool = True) -> Dict[str, Any]:
+def subprocess_kwargs(capture_output: bool = True) -> dict[str, Any]:
     """Return platform-specific subprocess kwargs to avoid console flashes in windowed GUI apps."""
-    kwargs: Dict[str, Any] = {}
+    kwargs: dict[str, Any] = {}
     if (
         os.name == "nt"
         and hasattr(subprocess, "CREATE_NO_WINDOW")

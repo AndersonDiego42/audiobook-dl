@@ -7,7 +7,8 @@ import base64
 from datetime import datetime
 import os
 import re
-from typing import Any, Dict, List, MutableMapping, Optional, Union
+from typing import Any
+from collections.abc import MutableMapping
 from urllib.parse import quote_plus
 import uuid
 
@@ -41,7 +42,7 @@ class BookBeatSource(Source):
         device_file = os.path.join(self.database_directory, "bookbeat_device_id.txt")
         if os.path.isfile(device_file):
             try:
-                with open(device_file, "r", encoding="utf-8") as fh:
+                with open(device_file, encoding="utf-8") as fh:
                     existing = fh.read().strip()
                 if existing:
                     return existing
@@ -55,7 +56,7 @@ class BookBeatSource(Source):
         return generated
 
     def _login(self, url: str, username: str, password: str):
-        headers: MutableMapping[str, Union[str, bytes]] = {
+        headers: MutableMapping[str, str | bytes] = {
             "accept": "application/hal+json",
             "bb-client": "BookBeatApp",
             "bb-device": self._get_or_create_device_id(),
@@ -70,12 +71,12 @@ class BookBeatSource(Source):
         self._session.headers.update({"authorization": f"Bearer {token}"})
         self.saved_books = self._fetch_saved_books()
 
-    def _fetch_saved_books(self) -> Dict[str, Any]:
+    def _fetch_saved_books(self) -> dict[str, Any]:
         """Fetch all saved books from BookBeat across paginated responses."""
         limit = 100
         offset = 0
-        all_saved: List[Dict[str, Any]] = []
-        next_url: Optional[str] = f"https://api.bookbeat.com/api/my/books/saved?offset={offset}&limit={limit}"
+        all_saved: list[dict[str, Any]] = []
+        next_url: str | None = f"https://api.bookbeat.com/api/my/books/saved?offset={offset}&limit={limit}"
         seen_urls = set()
         while next_url and next_url not in seen_urls:
             seen_urls.add(next_url)
@@ -92,7 +93,7 @@ class BookBeatSource(Source):
                 next_url = None
         return {"_embedded": {"savedBooks": all_saved}}
 
-    def _build_ebook(self, book_info: Dict[str, Any], dl_entry: Dict[str, Any], url: str) -> Audiobook:
+    def _build_ebook(self, book_info: dict[str, Any], dl_entry: dict[str, Any], url: str) -> Audiobook:
         license_url = (dl_entry.get("_links") or {}).get("license", {}).get("href")
         if not license_url:
             raise BookHasNoEbook
@@ -137,7 +138,7 @@ class BookBeatSource(Source):
             return self._build_ebook(book_info, ebook_entry, url)
 
         if mode == "both":
-            items: List[Audiobook] = []
+            items: list[Audiobook] = []
             if audio_entry is not None:
                 items.append(
                     Audiobook(
@@ -169,7 +170,7 @@ class BookBeatSource(Source):
             return self._build_ebook(book_info, ebook_entry, url)
         raise BookHasNoAudiobook
 
-    def _get_download_entries(self, book_info: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _get_download_entries(self, book_info: dict[str, Any]) -> list[dict[str, Any]]:
         cached = book_info.get("_downloads")
         if isinstance(cached, list):
             return cached
@@ -186,7 +187,7 @@ class BookBeatSource(Source):
                 return dl["_links"]["license"]["href"]
         raise MissingBookAccess
 
-    def _get_license(self, book_info: Dict[str, Any]) -> Dict[str, Any]:
+    def _get_license(self, book_info: dict[str, Any]) -> dict[str, Any]:
         cached = book_info.get("license")
         if isinstance(cached, dict):
             return cached
@@ -195,7 +196,7 @@ class BookBeatSource(Source):
         book_info["license"] = lic
         return lic
 
-    def get_files(self, book_info: Dict) -> List[AudiobookFile]:
+    def get_files(self, book_info: dict) -> list[AudiobookFile]:
         lic = self._get_license(book_info)
         if "_links" in lic:
             return [
@@ -209,9 +210,9 @@ class BookBeatSource(Source):
 
     def get_metadata(
         self,
-        book_info: Dict,
+        book_info: dict,
         *,
-        url: Optional[str] = None,
+        url: str | None = None,
         is_ebook: bool = False,
     ) -> AudiobookMetadata:
         meta = book_info["metadata"]
@@ -272,7 +273,7 @@ class BookBeatSource(Source):
                     metadata.add_narrator(name)
         return metadata
 
-    def get_chapters(self, book_info: Dict) -> List[Chapter]:
+    def get_chapters(self, book_info: dict) -> list[Chapter]:
         lic = self._get_license(book_info)
         chapters = []
         for chapter_number, track in enumerate(lic.get("tracks") or []):
@@ -282,12 +283,12 @@ class BookBeatSource(Source):
             chapters.append(Chapter(track["start"], ch_title))
         return chapters
 
-    def get_cover(self, book_info: Dict) -> Cover:
+    def get_cover(self, book_info: dict) -> Cover:
         cover_url = book_info["metadata"]["cover"]
         cover_data = self.get(cover_url)
         return Cover(cover_data, "jpg")
 
-    def find_book_info(self, book_id: str) -> Dict:
+    def find_book_info(self, book_id: str) -> dict:
         """Find book metadata by id, checking `saved_books` first and falling back to catalog API."""
         saved_list = self.saved_books.get("_embedded", {}).get("savedBooks", [])
         for book in saved_list:
@@ -305,7 +306,7 @@ class BookBeatSource(Source):
         }
 
     @staticmethod
-    def _entry_to_catalog_book(entry: Dict[str, Any]) -> Optional[CatalogBook]:
+    def _entry_to_catalog_book(entry: dict[str, Any]) -> CatalogBook | None:
         embedded_book = entry.get("_embedded", {}).get("book") if isinstance(entry.get("_embedded"), dict) else None
         source_obj = embedded_book if isinstance(embedded_book, dict) else entry
         book_id = entry.get("bookid") or source_obj.get("bookid") or source_obj.get("id")
@@ -333,17 +334,17 @@ class BookBeatSource(Source):
             source="bookbeat",
         )
 
-    def list_library(self) -> List[CatalogBook]:
+    def list_library(self) -> list[CatalogBook]:
         if not self.saved_books.get("_embedded", {}).get("savedBooks"):
             self.saved_books = self._fetch_saved_books()
-        books: List[CatalogBook] = []
+        books: list[CatalogBook] = []
         for entry in self.saved_books.get("_embedded", {}).get("savedBooks", []):
             item = self._entry_to_catalog_book(entry)
             if item is not None:
                 books.append(item)
         return books
 
-    def search(self, query: str) -> List[CatalogBook]:
+    def search(self, query: str) -> list[CatalogBook]:
         cleaned = query.strip()
         if not cleaned:
             return []
@@ -354,7 +355,7 @@ class BookBeatSource(Source):
             or payload.get("items")
             or []
         )
-        books: List[CatalogBook] = []
+        books: list[CatalogBook] = []
         for entry in raw_items:
             if not isinstance(entry, dict):
                 continue

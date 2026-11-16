@@ -16,7 +16,7 @@ from audiobookdl.utils.http import DEFAULT_HTTP_TIMEOUT
 
 from datetime import datetime
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any
 from urllib3.util import parse_url
 
 
@@ -128,7 +128,7 @@ class PodimoSource(Source[dict]):
         )
         return data["data"]["podcastById"]
 
-    def download_podcast_episode_ids(self, podcast_id: str) -> List:
+    def download_podcast_episode_ids(self, podcast_id: str) -> list:
         episodes = []
         limit = 100
         offset = 0
@@ -161,12 +161,12 @@ class PodimoSource(Source[dict]):
             cover=self.download_cover(episode_info.get("imageUrl")),
         )
 
-    def _stream_or_file(self, file_url: str) -> List[AudiobookFile]:
+    def _stream_or_file(self, file_url: str) -> list[AudiobookFile]:
         if ".m3u8" in file_url:
             return self.get_stream_files(file_url)
         return [AudiobookFile(url=file_url, ext="mp3")]
 
-    def get_podcast_file(self, episode_id: str, podcast_id: str) -> List[AudiobookFile]:
+    def get_podcast_file(self, episode_id: str, podcast_id: str) -> list[AudiobookFile]:
         """Download url of podcast episode, resolving HLS streams when present."""
         data = self.graphql_request(
             operation_name="ShortLivedPodcastMediaUrlQuery",
@@ -197,9 +197,9 @@ class PodimoSource(Source[dict]):
         return metadata
 
     @staticmethod
-    def get_chapters(book_info: Dict[str, Any]) -> List[Chapter]:
+    def get_chapters(book_info: dict[str, Any]) -> list[Chapter]:
         raw = book_info.get("chapters") or book_info.get("timestamps") or []
-        chapters: List[Chapter] = []
+        chapters: list[Chapter] = []
         for idx, ch in enumerate(raw, start=1):
             if not isinstance(ch, dict):
                 continue
@@ -220,7 +220,7 @@ class PodimoSource(Source[dict]):
             chapters=self.get_chapters(book_info),
         )
 
-    def get_audiobook_files(self, audiobook_id: str) -> List[AudiobookFile]:
+    def get_audiobook_files(self, audiobook_id: str) -> list[AudiobookFile]:
         data = self.graphql_request(
             operation_name="ShortLivedAudiobookMediaUrlQuery",
             query="files",
@@ -246,7 +246,7 @@ class PodimoSource(Source[dict]):
         metadata.description = book_info.get("description")
         return metadata
 
-    def download_cover(self, cover_url: Optional[str]) -> Optional[Cover]:
+    def download_cover(self, cover_url: str | None) -> Cover | None:
         if not cover_url:
             return None
         session = self.create_unauthenticated_session()
@@ -260,7 +260,7 @@ class PodimoSource(Source[dict]):
         finally:
             session.close()
 
-    def search(self, query: str) -> List[CatalogBook]:
+    def search(self, query: str) -> list[CatalogBook]:
         cleaned = query.strip()
         if not cleaned:
             return []
@@ -278,7 +278,7 @@ class PodimoSource(Source[dict]):
             },
         )
         search_data = (payload or {}).get("data", {}).get("search", {})
-        results: List[CatalogBook] = []
+        results: list[CatalogBook] = []
         for item in search_data.get("audiobooks") or []:
             if isinstance(item, dict) and item.get("id") and item.get("title"):
                 authors = [
@@ -304,7 +304,7 @@ class PodimoSource(Source[dict]):
                 )
         return results
 
-    def list_library(self) -> List[CatalogBook]:
+    def list_library(self) -> list[CatalogBook]:
         payload = self.post_json(
             "https://podimo.com/graphql",
             headers={"User-Agent": "JS GraphQL"},
@@ -319,7 +319,7 @@ class PodimoSource(Source[dict]):
             },
         )
         lib = (payload or {}).get("data", {}).get("userLibrary", {})
-        results: List[CatalogBook] = []
+        results: list[CatalogBook] = []
         for item in lib.get("audiobooks") or []:
             if isinstance(item, dict) and item.get("id") and item.get("title"):
                 authors = [

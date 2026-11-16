@@ -8,14 +8,13 @@ import os
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from collections.abc import Callable, Sequence
 
 from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, apply_theme_to_window, scale_px
 from audiobookdl.gui.widgets import ScrolledTreeview, TreeColumnSpec
 from audiobookdl.sources import ServiceInfo
 from audiobookdl.utils.browser_cookies import (
     BROWSER_LABELS,
-    BrowserCookieError,
     CookieImportResult,
     default_domains_for_service,
     default_imported_cookie_path,
@@ -26,7 +25,7 @@ from audiobookdl.utils.browser_cookies import (
 )
 
 
-def _format_expiry(expires: Optional[int]) -> str:
+def _format_expiry(expires: int | None) -> str:
     if expires is None or expires <= 0:
         return "Session"
     try:
@@ -37,7 +36,7 @@ def _format_expiry(expires: Optional[int]) -> str:
 
 
 def _format_cookie_flags(cookie: http.cookiejar.Cookie) -> str:
-    flags: List[str] = []
+    flags: list[str] = []
     if cookie.secure:
         flags.append("Secure")
     if "HttpOnly" in getattr(cookie, "_rest", {}):
@@ -63,9 +62,9 @@ class CookieImportDialog(tk.Toplevel):
         initial_service_key: str = "",
         initial_cookie_path: str = "",
         on_apply: Callable[[str, str, int], None],
-        palette: Optional[ThemePalette] = None,
+        palette: ThemePalette | None = None,
         extractor: Callable[[str, Sequence[str]], CookieImportResult] = extract_browser_cookies,
-        browser_detector: Callable[[], Dict[str, bool]] = detect_available_browsers,
+        browser_detector: Callable[[], dict[str, bool]] = detect_available_browsers,
     ) -> None:
         super().__init__(parent)
         self._cookie_services = [s for s in services if "cookies" in s.auth_methods]
@@ -78,12 +77,12 @@ class CookieImportDialog(tk.Toplevel):
         self._extractor = extractor
         self._detected_browsers = browser_detector()
 
-        self._matched_cookies: List[http.cookiejar.Cookie] = []
+        self._matched_cookies: list[http.cookiejar.Cookie] = []
         self._is_scanning = False
         self._custom_output_path = bool(initial_cookie_path.strip())
 
-        self._browser_key_by_display: Dict[str, str] = {}
-        self._browser_displays: List[str] = []
+        self._browser_key_by_display: dict[str, str] = {}
+        self._browser_displays: list[str] = []
         default_browser_display = ""
         for key, label in BROWSER_LABELS:
             display = f"{label} (Detected)" if self._detected_browsers.get(key) else label
@@ -193,16 +192,16 @@ class CookieImportDialog(tk.Toplevel):
         apply_theme_to_window(self, self._palette)
         self._scan_btn.focus_set()
 
-    def _current_service(self) -> Optional[ServiceInfo]:
+    def _current_service(self) -> ServiceInfo | None:
         return self._services_by_label.get(self._service_var.get())
 
     def _selected_browser_key(self) -> str:
         return self._browser_key_by_display.get(self._browser_var.get(), "firefox")
 
-    def _on_output_edited(self, _event: Optional[tk.Event] = None) -> None:
+    def _on_output_edited(self, _event: tk.Event | None = None) -> None:
         self._custom_output_path = True
 
-    def _on_service_changed(self, _event: Optional[tk.Event] = None) -> None:
+    def _on_service_changed(self, _event: tk.Event | None = None) -> None:
         service = self._current_service()
         if service is None:
             return
@@ -261,8 +260,8 @@ class CookieImportDialog(tk.Toplevel):
         self._set_status(f"Scanning {self._browser_var.get()} cookies...", "Muted.TLabel")
 
         def _worker() -> None:
-            result: Optional[CookieImportResult] = None
-            err: Optional[Exception] = None
+            result: CookieImportResult | None = None
+            err: Exception | None = None
             try:
                 result = self._extractor(browser_key, domains)
             except Exception as exc:
@@ -274,8 +273,8 @@ class CookieImportDialog(tk.Toplevel):
 
     def _on_scan_finished(
         self,
-        result: Optional[CookieImportResult],
-        error: Optional[Exception],
+        result: CookieImportResult | None,
+        error: Exception | None,
     ) -> None:
         if not self.winfo_exists():
             return

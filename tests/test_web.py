@@ -32,7 +32,8 @@ def test_parse_serve_arguments_defaults_and_overrides(monkeypatch):
 
 def test_web_ui_server_endpoints_auth_and_download_queue(tmp_path, monkeypatch):
     cfg_path = tmp_path / "audiobook-dl.toml"
-    cfg_path.write_text(f'database_directory = "{str(tmp_path / "db").replace("\\", "/")}"\n', encoding="utf-8")
+    db_dir = (tmp_path / "db").as_posix()
+    cfg_path.write_text(f'database_directory = "{db_dir}"\n', encoding="utf-8")
 
     monkeypatch.setattr(
         "audiobookdl.gui.controller.run_downloads",

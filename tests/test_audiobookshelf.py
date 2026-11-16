@@ -1,7 +1,6 @@
 import json
 import tkinter as tk
 from datetime import date
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -23,7 +22,7 @@ from audiobookdl.integrations.audiobookshelf import (
 )
 from audiobookdl.output.download import add_metadata_to_file
 from audiobookdl.output.metadata.reader import read_sidecar_metadata
-from audiobookdl.output.metadata.sidecars import build_abs_metadata_dict, write_sidecar_abs_metadata
+from audiobookdl.output.metadata.sidecars import build_abs_metadata_dict
 from audiobookdl.pipeline import process_audiobook
 from audiobookdl.utils.audiobook import Audiobook, AudiobookFile, AudiobookMetadata, Chapter
 

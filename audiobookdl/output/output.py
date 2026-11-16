@@ -14,13 +14,10 @@ from audiobookdl.utils import (
     MIN_AUTO_M4B_BITRATE_KBPS,
     DEFAULT_M4B_BITRATE,
     MP4_CONTAINERS,
-    ffprobe_audio_bitrate,
-    ffprobe_duration,
     find_executable,
     normalize_audio_bitrate,
     probe_audio_info,
     resolve_audio_bitrate,
-    subprocess_kwargs,
 )
 from audiobookdl.utils.concurrency import (
     ffmpeg_progress_callback,
@@ -32,11 +29,11 @@ import os
 import re
 import shutil
 import platform
-import subprocess
 import tempfile
 import threading
 import uuid
-from typing import Any, Dict, List, Optional, Sequence, Mapping
+from typing import Any
+from collections.abc import Sequence, Mapping
 from urllib.parse import urlparse
 
 LOCATION_DEFAULTS = {
@@ -60,7 +57,7 @@ LOCATION_DEFAULTS = {
     'source': '',
 }
 
-OUTPUT_TEMPLATE_PRESETS: Dict[str, str] = {
+OUTPUT_TEMPLATE_PRESETS: dict[str, str] = {
     "default": "{title}",
     "audiobookshelf": "{author}/{series?{series}/}{series_order?Book {series_order_padded} - }{title}",
     "plex": "{author}/{title}/{title}",
@@ -100,7 +97,7 @@ def _probe_audio_info(path: str) -> AudioProbeInfo:
 
 def _get_cached_probe(
     path: str,
-    probe_cache: Optional[Dict[str, AudioProbeInfo]] = None,
+    probe_cache: dict[str, AudioProbeInfo] | None = None,
 ) -> AudioProbeInfo:
     """Return cached `AudioProbeInfo` for `path`, probing once and storing on miss."""
     if probe_cache is not None and path in probe_cache:
@@ -126,7 +123,7 @@ def verify_audio_integrity(
     *,
     expected_duration: float = 0.0,
     min_duration_ratio: float = 0.98,
-    probe_cache: Optional[Dict[str, AudioProbeInfo]] = None,
+    probe_cache: dict[str, AudioProbeInfo] | None = None,
     require_ffprobe: bool = False,
 ) -> AudioProbeInfo:
     """
@@ -171,7 +168,7 @@ def verify_audio_integrity(
     return info
 
 
-def _ffprobe_audio_bitrate(path: str) -> Optional[int]:
+def _ffprobe_audio_bitrate(path: str) -> int | None:
     """Return the bitrate of `path` in bits/sec via `ffprobe`, or `None` if unavailable."""
     return _probe_audio_info(path).bitrate
 
@@ -179,7 +176,7 @@ def _ffprobe_audio_bitrate(path: str) -> Optional[int]:
 def _resolve_aac_bitrate_from_info(
     source_path: str,
     info: AudioProbeInfo,
-    audio_bitrate: Optional[str] = None,
+    audio_bitrate: str | None = None,
 ) -> str:
     """Resolve AAC bitrate using already-probed `info` without re-invoking `ffprobe`."""
     explicit = normalize_audio_bitrate(audio_bitrate)
@@ -192,7 +189,7 @@ def _resolve_aac_bitrate_from_info(
     return f"{kbps}k"
 
 
-def resolve_aac_bitrate(source_path: str, audio_bitrate: Optional[str] = None) -> str:
+def resolve_aac_bitrate(source_path: str, audio_bitrate: str | None = None) -> str:
     """
     Determine the target AAC bitrate when transcoding `source_path` to an MP4 container.
 
@@ -207,7 +204,7 @@ def _run_mpegts_part(
     source: str,
     ts_path: str,
     codec_args: Sequence[str],
-    cancel_event: Optional[threading.Event] = None,
+    cancel_event: threading.Event | None = None,
 ) -> bool:
     """Run an FFmpeg step producing a single MPEG-TS segment at `ts_path`."""
     ffmpeg = _require_executable("ffmpeg")
@@ -232,7 +229,7 @@ def _run_mpegts_part(
 def _remux_to_mpegts(
     source: str,
     ts_path: str,
-    cancel_event: Optional[threading.Event] = None,
+    cancel_event: threading.Event | None = None,
 ) -> bool:
     """
     Remux a single audio file into an MPEG-TS container.
@@ -251,12 +248,12 @@ def _encode_to_aac_mpegts(
     source: str,
     ts_path: str,
     target_bitrate: str,
-    sample_rate: Optional[int] = None,
-    channels: Optional[int] = None,
-    cancel_event: Optional[threading.Event] = None,
+    sample_rate: int | None = None,
+    channels: int | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> bool:
     """Transcode a single non-AAC segment directly into an AAC MPEG-TS part."""
-    codec_args: List[str] = ["-c:a", "aac", "-b:a", target_bitrate]
+    codec_args: list[str] = ["-c:a", "aac", "-b:a", target_bitrate]
     if sample_rate is not None and sample_rate > 0:
         codec_args += ["-ar", str(sample_rate)]
     if channels is not None and channels > 0:
@@ -266,9 +263,9 @@ def _encode_to_aac_mpegts(
 
 def _probe_uncached_audio_info(
     paths: Sequence[str],
-    cache: Dict[str, AudioProbeInfo],
-    cancel_event: Optional[threading.Event] = None,
-) -> List[AudioProbeInfo]:
+    cache: dict[str, AudioProbeInfo],
+    cancel_event: threading.Event | None = None,
+) -> list[AudioProbeInfo]:
     """Populate `cache` for any uncached `paths` in parallel and return infos in order."""
     uncached = [p for p in dict.fromkeys(paths) if p not in cache]
     if uncached:
@@ -278,7 +275,7 @@ def _probe_uncached_audio_info(
             max_workers=COMBINE_REMUX_THREADS,
             cancel_event=cancel_event,
         )
-        for path, info in zip(uncached, probed):
+        for path, info in zip(uncached, probed, strict=True):
             cache[path] = info
     return [cache[p] for p in paths]
 
@@ -307,7 +304,7 @@ def _is_mpegts_file(path: str) -> bool:
 
 def _all_inputs_mpegts(
     filepaths: Sequence[str],
-    probe_cache: Optional[Dict[str, AudioProbeInfo]] = None,
+    probe_cache: dict[str, AudioProbeInfo] | None = None,
 ) -> bool:
     """Return True when every input segment is already a valid MPEG-TS file."""
     if not filepaths or not all(_is_mpegts_file(path) for path in filepaths):
@@ -320,9 +317,9 @@ def _all_inputs_mpegts(
 
 def _write_ffmetadata(
     chapter_path: str,
-    chapters: Optional[Sequence[Chapter]] = None,
+    chapters: Sequence[Chapter] | None = None,
     duration_sec: float = 0.0,
-    metadata: Optional[AudiobookMetadata] = None,
+    metadata: AudiobookMetadata | None = None,
 ) -> tuple[bool, bool]:
     """Write FFMETADATA1 global tags and/or bounded chapters; return ``(chapters_written, metadata_written)``."""
     meta_text = ffmpeg_metadata.create_metadata_text(metadata)
@@ -357,10 +354,10 @@ def _write_ffmetadata_chapters(
 
 
 def _prepare_ffmpeg_cover_file(
-    cover: Optional[Cover],
+    cover: Cover | None,
     output_ext: str,
     cover_base_path: str,
-) -> Optional[str]:
+) -> str | None:
     """Materialize a normalized cover image on disk when inline FFmpeg attachment is supported."""
     if cover is None or output_ext not in MP4_CONTAINERS:
         return None
@@ -372,16 +369,16 @@ def _prepare_ffmpeg_cover_file(
 
 
 def _append_ffmetadata_and_cover_args(
-    command: List[str],
+    command: list[str],
     meta_file: str,
     chapters_written: bool,
     meta_written: bool,
-    cover_path: Optional[str],
+    cover_path: str | None,
 ) -> None:
     """Append `-i` and stream mapping flags for inline chapters, metadata tags, and cover art."""
     next_input = 1
-    meta_idx: Optional[int] = None
-    cover_idx: Optional[int] = None
+    meta_idx: int | None = None
+    cover_idx: int | None = None
     if chapters_written or meta_written:
         command += ["-i", meta_file]
         meta_idx = next_input
@@ -408,15 +405,15 @@ def _build_reencode_codec_args(
     target_ext: str,
     source_path: str,
     info: AudioProbeInfo,
-    audio_bitrate: Optional[str],
+    audio_bitrate: str | None,
     faststart: bool = True,
     *,
     loudnorm: bool = False,
     mono: bool = False,
-) -> List[str]:
+) -> list[str]:
     """Return FFmpeg codec/container flags forcing re-encode into `target_ext`."""
     explicit_bitrate = normalize_audio_bitrate(audio_bitrate)
-    filter_args: List[str] = []
+    filter_args: list[str] = []
     if loudnorm:
         filter_args += ["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"]
     if mono:
@@ -445,12 +442,12 @@ def _build_mux_codec_args(
     target_ext: str,
     source_path: str,
     info: AudioProbeInfo,
-    audio_bitrate: Optional[str],
+    audio_bitrate: str | None,
     faststart: bool = True,
     *,
     loudnorm: bool = False,
     mono: bool = False,
-) -> List[str]:
+) -> list[str]:
     """Return FFmpeg codec/container flags for muxing or transcoding to `target_ext`."""
     if loudnorm or mono:
         return _build_reencode_codec_args(
@@ -482,11 +479,11 @@ def _build_mux_codec_args(
     return []
 
 
-def apply_chapter_offset(chapters: Sequence[Chapter], offset_ms: int) -> List[Chapter]:
+def apply_chapter_offset(chapters: Sequence[Chapter], offset_ms: int) -> list[Chapter]:
     """Shift chapter markers (preserving initial marker at `0`) by `offset_ms` milliseconds."""
     if not chapters or offset_ms == 0:
         return list(chapters)
-    shifted: List[Chapter] = []
+    shifted: list[Chapter] = []
     for idx, ch in enumerate(chapters):
         if idx == 0 and int(ch.start) == 0:
             shifted.append(Chapter(start=0, title=ch.title))
@@ -503,8 +500,8 @@ def detect_silence_chapters(
     *,
     noise_db: float = -35.0,
     min_silence_sec: float = 1.8,
-    cancel_event: Optional[threading.Event] = None,
-) -> List[Chapter]:
+    cancel_event: threading.Event | None = None,
+) -> list[Chapter]:
     """Run FFmpeg `silencedetect` on `filepath` and synthesize chapter markers at pauses."""
     ffmpeg = _require_executable("ffmpeg")
     command = [
@@ -548,12 +545,12 @@ def combine_audiofiles(
     filepaths: Sequence[str],
     tmp_dir: str,
     output_path: str,
-    cancel_event: Optional[threading.Event] = None,
-    chapters: Optional[Sequence[Chapter]] = None,
-    audio_bitrate: Optional[str] = None,
-    metadata: Optional[AudiobookMetadata] = None,
-    cover: Optional[Cover] = None,
-    probe_cache: Optional[Dict[str, AudioProbeInfo]] = None,
+    cancel_event: threading.Event | None = None,
+    chapters: Sequence[Chapter] | None = None,
+    audio_bitrate: str | None = None,
+    metadata: AudiobookMetadata | None = None,
+    cover: Cover | None = None,
+    probe_cache: dict[str, AudioProbeInfo] | None = None,
     faststart: bool = True,
     loudnorm: bool = False,
     mono: bool = False,
@@ -571,7 +568,7 @@ def combine_audiofiles(
         raise DownloadCancelled
     normalize_audio_bitrate(audio_bitrate)
     ffmpeg = _require_executable("ffmpeg")
-    cache: Dict[str, AudioProbeInfo] = probe_cache if probe_cache is not None else {}
+    cache: dict[str, AudioProbeInfo] = probe_cache if probe_cache is not None else {}
     output_extension = get_extension(output_path)
     source_extension = get_extension(filepaths[0])
     work_dir = f"{os.path.normpath(tmp_dir)}.work"
@@ -579,7 +576,7 @@ def combine_audiofiles(
     combined_ts = os.path.join(work_dir, "combined.ts")
     chapter_file = os.path.join(work_dir, "ffmetadata.txt")
     cover_base_path = os.path.join(work_dir, "cover")
-    cover_tmp_path: Optional[str] = None
+    cover_tmp_path: str | None = None
     os.makedirs(work_dir, exist_ok=True)
     chapters_embedded = False
     try:
@@ -589,10 +586,10 @@ def combine_audiofiles(
             ts_paths = list(filepaths)
         else:
             os.makedirs(ts_dir, exist_ok=True)
-            input_infos: Optional[List[AudioProbeInfo]] = None
+            input_infos: list[AudioProbeInfo] | None = None
             target_bitrate = ""
-            target_sr: Optional[int] = None
-            target_ch: Optional[int] = None
+            target_sr: int | None = None
+            target_ch: int | None = None
             if len(filepaths) > 1 and output_extension in MP4_CONTAINERS:
                 input_infos = _probe_uncached_audio_info(filepaths, cache, cancel_event=cancel_event)
                 sample_rates = {i.sample_rate for i in input_infos if i.sample_rate}
@@ -810,7 +807,7 @@ def get_extension(path: str) -> str:
 def combine_supports_direct_output(
     sample_path: str,
     output_format: str,
-    probe_cache: Optional[Dict[str, AudioProbeInfo]] = None,
+    probe_cache: dict[str, AudioProbeInfo] | None = None,
 ) -> bool:
     """Return True when `combine_audiofiles` can remux directly into `output_format`."""
     current = get_extension(sample_path).lower()
@@ -840,14 +837,14 @@ def can_copy_codec(input_format: str, output_format: str) -> bool:
 def convert_single_file(
     old_path: str,
     output_format: str,
-    cancel_event: Optional[threading.Event] = None,
-    audio_bitrate: Optional[str] = None,
-    chapters: Optional[Sequence[Chapter]] = None,
+    cancel_event: threading.Event | None = None,
+    audio_bitrate: str | None = None,
+    chapters: Sequence[Chapter] | None = None,
     remove_source: bool = True,
-    metadata: Optional[AudiobookMetadata] = None,
-    cover: Optional[Cover] = None,
-    probe_cache: Optional[Dict[str, AudioProbeInfo]] = None,
-    output_path: Optional[str] = None,
+    metadata: AudiobookMetadata | None = None,
+    cover: Cover | None = None,
+    probe_cache: dict[str, AudioProbeInfo] | None = None,
+    output_path: str | None = None,
     faststart: bool = True,
     loudnorm: bool = False,
     mono: bool = False,
@@ -874,7 +871,7 @@ def convert_single_file(
     capture = not logging.is_ffmpeg_output()
     info = _get_cached_probe(old_path, probe_cache)
     chapter_file = f"{new_path}.chapters.tmp.txt"
-    cover_tmp_path: Optional[str] = None
+    cover_tmp_path: str | None = None
     chapters_embedded = False
 
     chapters_written, meta_written = _write_ffmetadata(
@@ -994,7 +991,7 @@ _HLS_SMART_MERGE_EXTS = {"ts", "aac"}
 def should_smart_merge_hls(
     filepaths: Sequence[str],
     chapters: Sequence[Chapter],
-    probe_cache: Optional[Dict[str, AudioProbeInfo]] = None,
+    probe_cache: dict[str, AudioProbeInfo] | None = None,
 ) -> bool:
     """
     Return True when many uncombined HLS segment files should be grouped into chapters.
@@ -1018,7 +1015,7 @@ def _split_single_chapter(
     master_path: str,
     out_path: str,
     start_sec: float,
-    duration_sec: Optional[float],
+    duration_sec: float | None,
     chapter_index: int,
     chapter_title: str,
     fast_codec_args: Sequence[str],
@@ -1026,7 +1023,7 @@ def _split_single_chapter(
     format_args: Sequence[str],
     accurate: bool,
     capture: bool,
-    cancel_event: Optional[threading.Event],
+    cancel_event: threading.Event | None,
 ) -> str:
     """Export one chapter slice from `master_path` to `out_path`."""
     duration_args = ["-t", f"{duration_sec:.3f}"] if duration_sec is not None else []
@@ -1128,12 +1125,12 @@ def split_audio_by_chapters(
     master_path: str,
     output_dir: str,
     chapters: Sequence[Chapter],
-    output_format: Optional[str] = None,
-    cancel_event: Optional[threading.Event] = None,
-    audio_bitrate: Optional[str] = None,
+    output_format: str | None = None,
+    cancel_event: threading.Event | None = None,
+    audio_bitrate: str | None = None,
     accurate: bool = False,
-    probe_cache: Optional[Dict[str, AudioProbeInfo]] = None,
-) -> List[str]:
+    probe_cache: dict[str, AudioProbeInfo] | None = None,
+) -> list[str]:
     """
     Split `master_path` into individual zero-padded chapter files inside `output_dir`.
     """
@@ -1165,7 +1162,7 @@ def split_audio_by_chapters(
     tasks = []
     for idx, chapter in enumerate(chapters):
         start_sec = max(0.0, chapter.start / 1000.0)
-        duration_sec: Optional[float] = None
+        duration_sec: float | None = None
         if idx + 1 < len(chapters):
             next_start = max(0.0, chapters[idx + 1].start / 1000.0)
             duration_sec = max(0.05, next_start - start_sec)
@@ -1178,8 +1175,8 @@ def split_audio_by_chapters(
 
     batch_abort = threading.Event()
     state_lock = threading.Lock()
-    created: List[str] = []
-    first_error: Optional[BaseException] = None
+    created: list[str] = []
+    first_error: BaseException | None = None
 
     class _CancelMonitor:
         def is_set(self) -> bool:
@@ -1191,7 +1188,7 @@ def split_audio_by_chapters(
         with logging.progress([]) as split_prog:
             task_bar = split_prog.add_task(f"Splitting ({len(chapters)} chapters)", total=len(chapters))
 
-            def _run_task(item: tuple[int, float, Optional[float], str, str]) -> str:
+            def _run_task(item: tuple[int, float, float | None, str, str]) -> str:
                 nonlocal first_error
                 idx, start_sec, duration_sec, out_path, title = item
                 try:
@@ -1244,17 +1241,17 @@ def merge_hls_segments_into_chapters(
     filepaths: Sequence[str],
     output_dir: str,
     chapters: Sequence[Chapter],
-    output_format: Optional[str] = None,
-    cancel_event: Optional[threading.Event] = None,
-    audio_bitrate: Optional[str] = None,
-    probe_cache: Optional[Dict[str, AudioProbeInfo]] = None,
-) -> List[str]:
+    output_format: str | None = None,
+    cancel_event: threading.Event | None = None,
+    audio_bitrate: str | None = None,
+    probe_cache: dict[str, AudioProbeInfo] | None = None,
+) -> list[str]:
     """
     Combine fine-grained HLS segment files seamlessly and split cleanly by `chapters`.
     """
     if not filepaths:
         return []
-    cache: Dict[str, AudioProbeInfo] = probe_cache if probe_cache is not None else {}
+    cache: dict[str, AudioProbeInfo] = probe_cache if probe_cache is not None else {}
     target_format = (output_format or get_extension(filepaths[0])).lstrip(".").lower()
     master_ext = "m4a" if get_extension(filepaths[0]) in ("ts", "aac") and target_format in MP4_CONTAINERS else target_format
     if master_ext == "ts":
@@ -1292,8 +1289,8 @@ def merge_hls_segments_into_chapters(
 def convert_output(
     filenames: Sequence[str],
     output_format: str,
-    cancel_event: Optional[threading.Event] = None,
-    audio_bitrate: Optional[str] = None,
+    cancel_event: threading.Event | None = None,
+    audio_bitrate: str | None = None,
 ):
     """Converts a list of audio files into another format and return new
     files"""
@@ -1314,7 +1311,7 @@ def convert_output(
 
     batch_abort = threading.Event()
     error_lock = threading.Lock()
-    first_error: Optional[BaseException] = None
+    first_error: BaseException | None = None
 
     class _CancelMonitor:
         def is_set(self) -> bool:
@@ -1342,8 +1339,8 @@ def convert_output(
             raise
         return old_path, new_path, (target_format != old_ext)
 
-    new_paths: List[str] = []
-    converted_pairs: List[tuple[str, str]] = []
+    new_paths: list[str] = []
+    converted_pairs: list[tuple[str, str]] = []
     try:
         results = run_cancellable_pool(
             _convert_one,
@@ -1444,12 +1441,12 @@ def _truncate_utf16_units(text: str, max_units: int) -> str:
 
 
 def _sanitize_metadata_dict(
-    metadata: Optional[AudiobookMetadata],
+    metadata: AudiobookMetadata | None,
     remove_chars: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Return metadata mapping with all string values sanitized for filesystem paths."""
     props = metadata.all_properties_dict() if metadata is not None else {}
-    raw: Dict[str, Any] = {**LOCATION_DEFAULTS, **props}
+    raw: dict[str, Any] = {**LOCATION_DEFAULTS, **props}
     if metadata is not None:
         if metadata.release_date is not None:
             raw["year"] = str(metadata.release_date.year)
@@ -1468,7 +1465,7 @@ def _sanitize_metadata_dict(
                 or getattr(metadata.language, "alpha_2", None)
                 or str(metadata.language)
             )
-    sanitized: Dict[str, Any] = {}
+    sanitized: dict[str, Any] = {}
     for key, value in raw.items():
         if isinstance(value, str):
             cleaned = _fix_output(value)
@@ -1482,7 +1479,7 @@ def _sanitize_metadata_dict(
 
 def _expand_conditional_blocks(template: str, metadata_dict: Mapping[str, Any]) -> str:
     """Resolve balanced `{key?true_branch}` / `{key?true_branch|false_branch}` expressions."""
-    out: List[str] = []
+    out: list[str] = []
     i = 0
     n = len(template)
     while i < n:
@@ -1536,7 +1533,7 @@ def _expand_conditional_blocks(template: str, metadata_dict: Mapping[str, Any]) 
 
 def _join_segments(segments: Sequence[str], seps: Sequence[str]) -> str:
     parts = [segments[0]]
-    for sep, seg in zip(seps, segments[1:]):
+    for sep, seg in zip(seps, segments[1:], strict=False):
         parts.append(sep)
         parts.append(seg)
     return "".join(parts)
@@ -1544,7 +1541,7 @@ def _join_segments(segments: Sequence[str], seps: Sequence[str]) -> str:
 
 def gen_output_location(
     template: str,
-    metadata: Optional[AudiobookMetadata],
+    metadata: AudiobookMetadata | None,
     remove_chars: str,
 ) -> str:
     """
@@ -1565,9 +1562,9 @@ def gen_output_location(
     tokens = re.split(r"([/\\])", resolved_template)
     raw_segments = tokens[0::2]
     seps = tokens[1::2]
-    segments: List[str] = []
-    kept_seps: List[str] = []
-    dynamic_indices: List[int] = []
+    segments: list[str] = []
+    kept_seps: list[str] = []
+    dynamic_indices: list[int] = []
     last_idx = len(raw_segments) - 1
 
     for idx, raw_seg in enumerate(raw_segments):

@@ -16,12 +16,12 @@ from datetime import date, datetime
 import os
 import pycountry
 import re
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 from urllib.parse import quote_plus, urlparse
 import uuid
 
 
-_TLD_LOCALES: Dict[str, str] = {
+_TLD_LOCALES: dict[str, str] = {
     "se": "sv_SE",
     "fi": "fi_FI",
     "de": "de_DE",
@@ -50,7 +50,7 @@ class NextorySource(Source):
     def __init__(self, options) -> None:
         super().__init__(options)
         # Keep want-to-read cache isolated per source instance.
-        self._wantlist_cache: Optional[List[dict]] = None
+        self._wantlist_cache: list[dict] | None = None
 
     @staticmethod
     def create_device_id() -> str:
@@ -62,7 +62,7 @@ class NextorySource(Source):
         device_file = os.path.join(self.database_directory, "nextory_device_id.txt")
         if os.path.isfile(device_file):
             try:
-                with open(device_file, "r", encoding="utf-8") as fh:
+                with open(device_file, encoding="utf-8") as fh:
                     existing = fh.read().strip()
                 if existing:
                     return existing
@@ -100,7 +100,7 @@ class NextorySource(Source):
         return f"{d.year}-{d.month}-{d.day}"
 
     @staticmethod
-    def _select_profile(profiles: List[Dict[str, Any]], preferred: Optional[str] = None) -> Dict[str, Any]:
+    def _select_profile(profiles: list[dict[str, Any]], preferred: str | None = None) -> dict[str, Any]:
         """Select a Nextory profile by name/id when `preferred` matches, otherwise `profiles[0]`."""
         if not profiles:
             raise UserNotAuthorized()
@@ -206,7 +206,7 @@ class NextorySource(Source):
         than a specific book, e.g. ``https://nextory.com/se/want-to-read``."""
         return "want-to-read" in url.lower()
 
-    def _get_wantlist(self) -> List[dict]:
+    def _get_wantlist(self) -> list[dict]:
         """Return the want-to-read list, fetching it at most once per source."""
         if self._wantlist_cache is None:
             self._wantlist_cache = self.download_want_to_read_list()
@@ -214,7 +214,7 @@ class NextorySource(Source):
 
     def _download_wantlist(self) -> Series[int]:
         """Build a Series of every audiobook currently on the want-to-read list."""
-        books: List[Union[BookId[int], Audiobook]] = []
+        books: list[BookId[int] | Audiobook] = []
         for book_info in self._get_wantlist():
             try:
                 self.find_format_data(book_info)
@@ -253,9 +253,9 @@ class NextorySource(Source):
                 return product_list["id"]
         raise DataNotPresent
 
-    def download_want_to_read_list(self) -> List[dict]:
+    def download_want_to_read_list(self) -> list[dict]:
         want_to_read_id = self.download_want_to_read_id()
-        all_products: List[dict] = []
+        all_products: list[dict] = []
         per = 100
         page = 0
         while True:
@@ -290,7 +290,7 @@ class NextorySource(Source):
                 return fmt
         raise DataNotPresent
 
-    def _resolve_stream_uri(self, uri: str, session_headers: Dict[str, str]) -> List[AudiobookFile]:
+    def _resolve_stream_uri(self, uri: str, session_headers: dict[str, str]) -> list[AudiobookFile]:
         """Resolve HLS playlist URI directly via session redirects, falling back cleanly."""
         try:
             files = self.get_stream_files(
@@ -311,9 +311,9 @@ class NextorySource(Source):
             )
         return []
 
-    def get_files(self, audio_data) -> List[AudiobookFile]:
+    def get_files(self, audio_data) -> list[AudiobookFile]:
         files = []
-        session_headers: Dict[str, str] = {
+        session_headers: dict[str, str] = {
             str(k): v.decode("latin-1") if isinstance(v, bytes) else str(v)
             for k, v in self._session.headers.items()
         }
@@ -380,10 +380,10 @@ class NextorySource(Source):
         return name, position
 
     @staticmethod
-    def get_chapters(audio_data: dict) -> List[Chapter]:
+    def get_chapters(audio_data: dict) -> list[Chapter]:
         raw_chapters = audio_data.get("chapters")
         if isinstance(raw_chapters, list) and raw_chapters:
-            chapters: List[Chapter] = []
+            chapters: list[Chapter] = []
             for index, ch in enumerate(raw_chapters):
                 if not isinstance(ch, dict):
                     continue
@@ -405,8 +405,8 @@ class NextorySource(Source):
         return Cover(cover_data, "jpg")
 
     @staticmethod
-    def _products_to_catalog(products: Any) -> List[CatalogBook]:
-        results: List[CatalogBook] = []
+    def _products_to_catalog(products: Any) -> list[CatalogBook]:
+        results: list[CatalogBook] = []
         for product in products or ():
             if not isinstance(product, dict):
                 continue
@@ -429,10 +429,10 @@ class NextorySource(Source):
             )
         return results
 
-    def list_library(self) -> List[CatalogBook]:
+    def list_library(self) -> list[CatalogBook]:
         return self._products_to_catalog(self.download_want_to_read_list())
 
-    def search(self, query: str) -> List[CatalogBook]:
+    def search(self, query: str) -> list[CatalogBook]:
         cleaned = query.strip()
         if not cleaned:
             return []

@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import date
 import json
 from pathlib import Path
-from typing import Dict, List
 
 from mutagen.mp4 import MP4, MP4Cover
 import pycountry
@@ -112,21 +111,21 @@ def test_authenticated_login_credential_store_hls_aes_and_selective_series(
     cover = media_factory.make_jpeg()
 
     playlist = (
-        "#EXTM3U\n"
-        "#EXT-X-VERSION:3\n"
-        "#EXT-X-TARGETDURATION:2\n"
-        '#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x00000000000000000000000000000001\n'
-        "#EXTINF:1.0,\n"
-        "seg0.ts\n"
-        '#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x00000000000000000000000000000002\n'
-        "#EXTINF:1.0,\n"
-        "seg1.ts\n"
-        "#EXT-X-ENDLIST\n"
-    ).encode("utf-8")
+        b"#EXTM3U\n"
+        b"#EXT-X-VERSION:3\n"
+        b"#EXT-X-TARGETDURATION:2\n"
+        b'#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x00000000000000000000000000000001\n'
+        b"#EXTINF:1.0,\n"
+        b"seg0.ts\n"
+        b'#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x00000000000000000000000000000002\n'
+        b"#EXTINF:1.0,\n"
+        b"seg1.ts\n"
+        b"#EXT-X-ENDLIST\n"
+    )
 
     expected_token = "e2e-bearer-secret"
     expected_cookie = "e2e_session=valid-session-99"
-    login_attempts: List[Dict[str, str]] = []
+    login_attempts: list[dict[str, str]] = []
 
     def login_handler(req: RouteRequest) -> RouteResponse:
         creds = json.loads(req.body.decode("utf-8"))
@@ -234,7 +233,7 @@ def test_authenticated_login_credential_store_hls_aes_and_selective_series(
             combine=True,
             write_json_metadata=True,
         )
-        events: List[DownloadEvent] = []
+        events: list[DownloadEvent] = []
         downloader = Downloader(config=loaded_cfg, options=options, on_event=events.append)
 
         # Phase 1: Authenticate + fetch series metadata without downloading audio

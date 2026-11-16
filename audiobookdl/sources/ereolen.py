@@ -3,12 +3,12 @@ from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Co
 from audiobookdl.exceptions import BookHasNoAudiobook, DataNotPresent, RequestError
 
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any
 from urllib.parse import urlparse
 import requests
 
 
-def _parse_playing_time_ms(raw: Any) -> Optional[int]:
+def _parse_playing_time_ms(raw: Any) -> int | None:
     """Parse ISO-8601 durations (`PT12M34S`), numeric seconds, or `HH:MM:SS` into milliseconds."""
     if raw is None or raw == "":
         return None
@@ -57,9 +57,9 @@ class EreolenSource(Source):
     @classmethod
     def refresh_library_domains(
         cls,
-        session: Optional[requests.Session] = None,
+        session: requests.Session | None = None,
         timeout: float = 10.0,
-    ) -> List[str]:
+    ) -> list[str]:
         """
         Fetch current Danish library domains from eReolen and update `library_domains` and `match`.
 
@@ -80,11 +80,11 @@ class EreolenSource(Source):
             html,
             flags=re.IGNORECASE,
         )
-        cleaned: List[str] = []
+        cleaned: list[str] = []
         seen = set(cls.library_domains)
         cleaned.extend(cls.library_domains)
         for domain in discovered:
-            host = domain.lower().lstrip("www.")
+            host = domain.lower().removeprefix("www.")
             if host and host not in seen and "ereolen.dk" not in host and "dbc.dk" not in host:
                 seen.add(host)
                 cleaned.append(host)
@@ -126,7 +126,7 @@ class EreolenSource(Source):
         logging.debug(f"user_token={logging.mask_secret(user_token)}")
 
     @staticmethod
-    def _extract_isbn(manifestation: Dict[str, Any]) -> Optional[str]:
+    def _extract_isbn(manifestation: dict[str, Any]) -> str | None:
         for ident in manifestation.get("identifiers") or []:
             if not isinstance(ident, dict):
                 continue
@@ -137,10 +137,10 @@ class EreolenSource(Source):
         return None
 
     @staticmethod
-    def _extract_chapters(manifestation: Dict[str, Any]) -> List[Chapter]:
+    def _extract_chapters(manifestation: dict[str, Any]) -> list[Chapter]:
         contents = manifestation.get("contents") or {}
         entries = contents.get("entries") or [] if isinstance(contents, dict) else []
-        chapters: List[Chapter] = []
+        chapters: list[Chapter] = []
         offset_ms = 0
         for idx, entry in enumerate(entries, start=1):
             if not isinstance(entry, dict):
@@ -160,8 +160,8 @@ class EreolenSource(Source):
 
     @staticmethod
     def _build_metadata(
-        work_meta: Dict[str, Any],
-        audiobook_manifestation: Dict[str, Any],
+        work_meta: dict[str, Any],
+        audiobook_manifestation: dict[str, Any],
         url: str,
     ) -> AudiobookMetadata:
         title = work_meta["titles"]["full"][0]
@@ -182,8 +182,8 @@ class EreolenSource(Source):
         isbn = EreolenSource._extract_isbn(audiobook_manifestation)
         description = (work_meta.get("abstract") or "").strip() or None
 
-        series_name: Optional[str] = None
-        series_order: Optional[int] = None
+        series_name: str | None = None
+        series_order: int | None = None
         raw_series = work_meta.get("series") or []
         if isinstance(raw_series, list) and raw_series:
             first_series = raw_series[0]
@@ -206,7 +206,7 @@ class EreolenSource(Source):
             for g in (work_meta.get("genreAndForm") or [])
             if isinstance(g, str) and g.strip()
         ]
-        language: Optional[str] = None
+        language: str | None = None
         langs = work_meta.get("mainLanguages") or []
         if isinstance(langs, list) and langs and isinstance(langs[0], dict):
             language = langs[0].get("isoCode") or langs[0].get("display")
@@ -227,12 +227,12 @@ class EreolenSource(Source):
 
     def get_cover(
         self,
-        work_meta: Dict[str, Any],
+        work_meta: dict[str, Any],
         page_url: str,
-        loan: Optional[Dict[str, Any]] = None,
-    ) -> Optional[Cover]:
+        loan: dict[str, Any] | None = None,
+    ) -> Cover | None:
         """Extract cover image URL from GraphQL metadata, loan payload, or cached page og:image."""
-        cover_url: Optional[str] = None
+        cover_url: str | None = None
         cover_obj = work_meta.get("cover")
         if isinstance(cover_obj, dict):
             for key in ("detail", "large", "original", "thumbnail", "url"):
@@ -298,8 +298,8 @@ class EreolenSource(Source):
         metadata = metadata["data"]["work"]
 
         # Extract book id and matching audiobook manifestation
-        book_id: Optional[str] = None
-        audiobook_manifestation: Dict[str, Any] = {}
+        book_id: str | None = None
+        audiobook_manifestation: dict[str, Any] = {}
         for manifestation in metadata["manifestations"]["all"]:
             if manifestation["materialTypes"][0]["materialTypeSpecific"]["display"] == "lydbog (online)":
                 book_id = manifestation["identifiers"][0]["value"]
@@ -311,8 +311,8 @@ class EreolenSource(Source):
         # Fetch loans
         loans = self.get_json("https://pubhub-openplatform.dbc.dk/v1/user/loans?")
         logging.debug(f"{loans=}")
-        order_id: Optional[str] = None
-        matched_loan: Optional[Dict[str, Any]] = None
+        order_id: str | None = None
+        matched_loan: dict[str, Any] | None = None
         for loan in loans["loans"]:
             if loan["libraryBook"]["identifier"] == book_id:
                 order_id = loan["orderId"]
@@ -331,16 +331,16 @@ class EreolenSource(Source):
             chapters=self._extract_chapters(audiobook_manifestation),
         )
 
-    def get_files(self, order_id: str) -> List[AudiobookFile]:
+    def get_files(self, order_id: str) -> list[AudiobookFile]:
         return self.get_stream_files(
             f"https://audio.api.streaming.pubhub.dk/v1/stream/hls/{order_id}/playlist.m3u8",
             extension="ts",
         )
 
-    def list_library(self) -> List[CatalogBook]:
+    def list_library(self) -> list[CatalogBook]:
         """Return currently loaned audiobooks from PubHub openplatform loans API."""
         payload = self.get_json("https://pubhub-openplatform.dbc.dk/v1/user/loans?")
-        results: List[CatalogBook] = []
+        results: list[CatalogBook] = []
         for loan in (payload.get("loans") or []) if isinstance(payload, dict) else []:
             if not isinstance(loan, dict):
                 continue

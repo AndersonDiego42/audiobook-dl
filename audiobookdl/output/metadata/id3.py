@@ -1,5 +1,4 @@
 import os
-from datetime import date
 from audiobookdl import logging, Chapter, AudiobookMetadata, Cover
 from ._chapters import build_bounded_chapters
 from ._cover import normalize_cover_image
@@ -10,7 +9,8 @@ from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, APIC, CHAP, TIT2, CTOC, CTOCFlags, WCOM, ID3NoHeaderError
 from requests import utils
 
-from typing import Any, List, Optional, Sequence
+from typing import Any
+from collections.abc import Sequence
 
 EasyID3.RegisterTextKey("comment", "COMM")
 EasyID3.RegisterTextKey("year", "TYER")
@@ -18,7 +18,7 @@ EasyID3.RegisterTextKey("originalreleaseyear", "TORY")
 for _easy_key, _txxx_desc in (("isbn", "ISBN"), ("asin", "ASIN"), ("source", "Source")):
     EasyID3.RegisterTXXXKey(_easy_key, _txxx_desc)
 
-def commercialurl_get(id3: Any, key: str) -> List[str]:
+def commercialurl_get(id3: Any, key: str) -> list[str]:
     urls = [frame.url for frame in id3.getall("WCOM")]
     if urls:
         return urls
@@ -137,7 +137,7 @@ def embed_id3_cover(filepath: str, cover: Cover) -> None:
 def add_id3_chapter(audio: ID3, start: int, end: int, title: str, index: int) -> None:
     """Adds a single chapter to the given audio file"""
     audio.add(CHAP(
-        element_id=u"chp"+str(index),
+        element_id="chp"+str(index),
         start_time=int(start),
         end_time=int(end),
         sub_frames=[TIT2(text=[title])]
@@ -151,8 +151,8 @@ def add_id3_chapters(filepath: str, chapters: Sequence[Chapter]) -> None:
 
 def add_id3_chapters_and_cover(
     filepath: str,
-    chapters: Optional[Sequence[Chapter]] = None,
-    cover: Optional[Cover] = None,
+    chapters: Sequence[Chapter] | None = None,
+    cover: Cover | None = None,
 ) -> bool:
     """Embed ID3 chapters and optional APIC cover art in a single `ID3.save()` pass.
 

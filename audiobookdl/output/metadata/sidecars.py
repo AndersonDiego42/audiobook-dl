@@ -1,5 +1,5 @@
 import os
-from typing import Optional, Sequence
+from collections.abc import Sequence
 from xml.sax.saxutils import escape, quoteattr
 
 from audiobookdl import AudiobookMetadata, Chapter, Cover
@@ -16,7 +16,7 @@ def _cue_timestamp(ms: int) -> str:
 
 def build_opf_xml(
     metadata: AudiobookMetadata,
-    cover_filename: Optional[str] = None,
+    cover_filename: str | None = None,
 ) -> str:
     """Build an OPF 2.0 XML sidecar document compatible with Audiobookshelf and Calibre."""
     lines = [
@@ -113,7 +113,7 @@ def write_sidecar_cover(cover: Cover, target_path: str) -> str:
 def write_sidecar_opf(
     metadata: AudiobookMetadata,
     target_path: str,
-    cover_filename: Optional[str] = None,
+    cover_filename: str | None = None,
 ) -> str:
     """Write an OPF XML metadata sidecar file to `target_path`."""
     content = build_opf_xml(metadata, cover_filename=cover_filename)
@@ -147,7 +147,7 @@ def build_abs_metadata_dict(
     tags: Sequence[str] = (),
     explicit: bool = False,
     abridged: bool = False,
-    duration_seconds: Optional[float] = None,
+    duration_seconds: float | None = None,
 ) -> dict:
     """Build an Audiobookshelf-compatible `metadata.json` dictionary."""
     series_list = []
@@ -208,7 +208,7 @@ def write_sidecar_abs_metadata(
     tags: Sequence[str] = (),
     explicit: bool = False,
     abridged: bool = False,
-    duration_seconds: Optional[float] = None,
+    duration_seconds: float | None = None,
 ) -> str:
     """Write an Audiobookshelf-compatible `metadata.json` sidecar file to `target_path`."""
     import json

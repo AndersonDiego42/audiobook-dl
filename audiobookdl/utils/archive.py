@@ -6,13 +6,13 @@ import re
 import shlex
 import sqlite3
 import threading
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from collections.abc import Iterable, Iterator, Sequence
 
 from audiobookdl.sources.source import CatalogBook
 from audiobookdl.utils.audiobook import Audiobook, is_ebook
 
 
-VALID_LIBRARY_STATUSES: Tuple[str, ...] = ("pending", "downloaded", "trashed")
+VALID_LIBRARY_STATUSES: tuple[str, ...] = ("pending", "downloaded", "trashed")
 _SCHEMA_VERSION = 2
 _TAG_CLEAN_RE = re.compile(r"[^a-z0-9_-]+")
 
@@ -24,22 +24,22 @@ class ArchiveEntry:
     id: int
     source: str
     book_key: str
-    url: Optional[str]
+    url: str | None
     title: str
     author: str
-    output_path: Optional[str]
-    audio_format: Optional[str]
+    output_path: str | None
+    audio_format: str | None
     downloaded_at: str
     profile: str = "default"
     status: str = "downloaded"
-    series: Optional[str] = None
-    series_order: Optional[int] = None
+    series: str | None = None
+    series_order: int | None = None
     narrator: str = ""
-    duration_seconds: Optional[float] = None
-    isbn: Optional[str] = None
-    asin: Optional[str] = None
-    last_seen_at: Optional[str] = None
-    tags: Tuple[str, ...] = ()
+    duration_seconds: float | None = None
+    isbn: str | None = None
+    asin: str | None = None
+    last_seen_at: str | None = None
+    tags: tuple[str, ...] = ()
 
     @property
     def is_hidden(self) -> bool:
@@ -51,7 +51,7 @@ class ArchiveEntry:
 class SearchTerm:
     """Parsed token from a library search query."""
 
-    field: Optional[str]
+    field: str | None
     value: str
     negated: bool = False
 
@@ -62,10 +62,10 @@ def normalize_tag(raw: str) -> str:
     return cleaned
 
 
-def parse_tags_input(raw: str) -> List[str]:
+def parse_tags_input(raw: str) -> list[str]:
     """Parse space- or comma-separated tags into unique normalized tags."""
     tokens = re.split(r"[\s,]+", raw.strip())
-    out: List[str] = []
+    out: list[str] = []
     for token in tokens:
         tag = normalize_tag(token)
         if tag and tag not in out:
@@ -73,7 +73,7 @@ def parse_tags_input(raw: str) -> List[str]:
     return out
 
 
-def parse_library_query(query: str) -> List[SearchTerm]:
+def parse_library_query(query: str) -> list[SearchTerm]:
     """
     Parse a Libation-style search query supporting quoted phrases, negation (`-`),
     and field prefixes (`author:`, `title:`, `narrator:`, `series:`, `source:`,
@@ -99,14 +99,14 @@ def parse_library_query(query: str) -> List[SearchTerm]:
         "isbn",
         "asin",
     }
-    terms: List[SearchTerm] = []
+    terms: list[SearchTerm] = []
     for token in tokens:
         negated = False
         body = token
         if body.startswith("-") and len(body) > 1:
             negated = True
             body = body[1:]
-        field: Optional[str] = None
+        field: str | None = None
         value = body
         if ":" in body:
             prefix, rest = body.split(":", 1)
@@ -129,27 +129,27 @@ class ArchiveMatchIndex:
     """In-memory normalized identifier/path/title index for O(1) bulk ledger matching."""
 
     def __init__(self) -> None:
-        self._by_url: Dict[str, int] = {}
-        self._by_asin: Dict[str, int] = {}
-        self._by_isbn: Dict[str, int] = {}
-        self._by_path: Dict[str, int] = {}
-        self._by_title: Dict[str, List[Tuple[int, str]]] = {}
+        self._by_url: dict[str, int] = {}
+        self._by_asin: dict[str, int] = {}
+        self._by_isbn: dict[str, int] = {}
+        self._by_path: dict[str, int] = {}
+        self._by_title: dict[str, list[tuple[int, str]]] = {}
 
     @staticmethod
-    def _norm_text(raw: Optional[str]) -> str:
+    def _norm_text(raw: str | None) -> str:
         return " ".join((raw or "").casefold().split())
 
     def add(
         self,
         entry_id: int,
         *,
-        book_key: Optional[str] = None,
-        url: Optional[str] = None,
+        book_key: str | None = None,
+        url: str | None = None,
         title: str = "",
         author: str = "",
-        output_path: Optional[str] = None,
-        isbn: Optional[str] = None,
-        asin: Optional[str] = None,
+        output_path: str | None = None,
+        isbn: str | None = None,
+        asin: str | None = None,
     ) -> None:
         if book_key:
             self._by_url.setdefault(book_key.strip(), entry_id)
@@ -175,11 +175,11 @@ class ArchiveMatchIndex:
         *,
         title: str = "",
         author: str = "",
-        isbn: Optional[str] = None,
-        asin: Optional[str] = None,
-        scrape_url: Optional[str] = None,
-        output_path: Optional[str] = None,
-    ) -> Optional[int]:
+        isbn: str | None = None,
+        asin: str | None = None,
+        scrape_url: str | None = None,
+        output_path: str | None = None,
+    ) -> int | None:
         norm_url = (scrape_url or "").strip()
         if norm_url and norm_url in self._by_url:
             return self._by_url[norm_url]
@@ -210,7 +210,7 @@ class ArchiveMatchIndex:
         return None
 
 
-def make_book_key(source_name: str, audiobook: Audiobook, fallback_url: Optional[str] = None) -> str:
+def make_book_key(source_name: str, audiobook: Audiobook, fallback_url: str | None = None) -> str:
     """Build a stable deduplication key for an `Audiobook`."""
     scrape_url = (audiobook.metadata.scrape_url or "").strip()
     if scrape_url:
@@ -252,7 +252,7 @@ class DownloadArchive:
         self.db_path = os.path.abspath(db_path)
         self._persistent = persistent
         self._lock = threading.RLock()
-        self._conn: Optional[sqlite3.Connection] = None
+        self._conn: sqlite3.Connection | None = None
         parent = os.path.dirname(self.db_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -400,7 +400,7 @@ class DownloadArchive:
             ).fetchone()
             return row is not None
 
-    def get_entry_status(self, source: str, book_key: str) -> Optional[str]:
+    def get_entry_status(self, source: str, book_key: str) -> str | None:
         """Return the stored status for `(source, book_key)` or `None` if absent."""
         with self._connection() as conn:
             row = conn.execute(
@@ -416,17 +416,17 @@ class DownloadArchive:
         *,
         title: str,
         author: str = "",
-        url: Optional[str] = None,
-        output_path: Optional[str] = None,
-        audio_format: Optional[str] = None,
+        url: str | None = None,
+        output_path: str | None = None,
+        audio_format: str | None = None,
         profile: str = "default",
         status: str = "downloaded",
-        series: Optional[str] = None,
-        series_order: Optional[int] = None,
+        series: str | None = None,
+        series_order: int | None = None,
         narrator: str = "",
-        duration_seconds: Optional[float] = None,
-        isbn: Optional[str] = None,
-        asin: Optional[str] = None,
+        duration_seconds: float | None = None,
+        isbn: str | None = None,
+        asin: str | None = None,
     ) -> int:
         """Insert or update a library/download entry and return its row id."""
         if status not in VALID_LIBRARY_STATUSES:
@@ -434,7 +434,7 @@ class DownloadArchive:
         timestamp = _utc_now()
         norm_profile = (profile or "default").strip().lower() or "default"
         with self._connection() as conn:
-            cur = conn.execute(
+            conn.execute(
                 """
                 INSERT INTO downloads (
                     source, book_key, url, title, author, output_path, format, downloaded_at,
@@ -490,7 +490,7 @@ class DownloadArchive:
         books: Sequence[CatalogBook],
         *,
         profile: str = "default",
-    ) -> Tuple[int, int]:
+    ) -> tuple[int, int]:
         """
         Insert unseen `CatalogBook`s as `'pending'` and refresh metadata on existing entries
         without overwriting `'downloaded'` or `'trashed'` status.
@@ -571,10 +571,10 @@ class DownloadArchive:
             )
             return cur.rowcount > 0
 
-    def _fetch_tags_for_ids(self, conn: sqlite3.Connection, item_ids: Sequence[int]) -> Dict[int, Tuple[str, ...]]:
+    def _fetch_tags_for_ids(self, conn: sqlite3.Connection, item_ids: Sequence[int]) -> dict[int, tuple[str, ...]]:
         if not item_ids:
             return {}
-        grouped: Dict[int, List[str]] = {}
+        grouped: dict[int, list[str]] = {}
         chunk_size = 500
         for start in range(0, len(item_ids), chunk_size):
             batch = [int(i) for i in item_ids[start : start + chunk_size]]
@@ -587,12 +587,12 @@ class DownloadArchive:
                 grouped.setdefault(int(row["item_id"]), []).append(str(row["tag"]))
         return {k: tuple(v) for k, v in grouped.items()}
 
-    def get_tags(self, entry_id: int) -> Tuple[str, ...]:
+    def get_tags(self, entry_id: int) -> tuple[str, ...]:
         """Return sorted normalized tags assigned to `entry_id`."""
         with self._connection() as conn:
             return self._fetch_tags_for_ids(conn, [entry_id]).get(int(entry_id), ())
 
-    def add_tags(self, entry_id: int, tags: Iterable[str]) -> Tuple[str, ...]:
+    def add_tags(self, entry_id: int, tags: Iterable[str]) -> tuple[str, ...]:
         """Add one or more normalized tags to `entry_id` and return updated tags."""
         normalized = [t for t in (normalize_tag(raw) for raw in tags) if t]
         with self._connection() as conn:
@@ -603,7 +603,7 @@ class DownloadArchive:
                 )
             return self._fetch_tags_for_ids(conn, [entry_id]).get(int(entry_id), ())
 
-    def remove_tags(self, entry_id: int, tags: Iterable[str]) -> Tuple[str, ...]:
+    def remove_tags(self, entry_id: int, tags: Iterable[str]) -> tuple[str, ...]:
         """Remove one or more normalized tags from `entry_id` and return updated tags."""
         normalized = [t for t in (normalize_tag(raw) for raw in tags) if t]
         with self._connection() as conn:
@@ -614,7 +614,7 @@ class DownloadArchive:
                 )
             return self._fetch_tags_for_ids(conn, [entry_id]).get(int(entry_id), ())
 
-    def set_tags(self, entry_id: int, tags: Iterable[str]) -> Tuple[str, ...]:
+    def set_tags(self, entry_id: int, tags: Iterable[str]) -> tuple[str, ...]:
         """Replace all tags on `entry_id` with normalized `tags`."""
         normalized = sorted({t for t in (normalize_tag(raw) for raw in tags) if t})
         with self._connection() as conn:
@@ -626,7 +626,7 @@ class DownloadArchive:
                 )
             return tuple(normalized)
 
-    def _build_entry(self, row: sqlite3.Row, tags: Tuple[str, ...]) -> ArchiveEntry:
+    def _build_entry(self, row: sqlite3.Row, tags: tuple[str, ...]) -> ArchiveEntry:
         return ArchiveEntry(
             id=int(row["id"]),
             source=str(row["source"]),
@@ -702,8 +702,8 @@ class DownloadArchive:
         limit: int = 500,
         include_trashed: bool = False,
         include_hidden: bool = True,
-        status: Optional[str] = None,
-    ) -> List[ArchiveEntry]:
+        status: str | None = None,
+    ) -> list[ArchiveEntry]:
         """Return library/ledger rows filtered by rich `query`, status, and visibility flags."""
         terms = parse_library_query(query)
         explicit_status_query = any(t.field == "status" for t in terms)
@@ -719,8 +719,8 @@ class DownloadArchive:
                    profile, status, series, series_order, narrator, duration_seconds, isbn, asin, last_seen_at
             FROM downloads
         """
-        clauses: List[str] = []
-        params: List[object] = []
+        clauses: list[str] = []
+        params: list[object] = []
         if status is not None:
             clauses.append("status = ?")
             params.append(status)
@@ -792,7 +792,7 @@ class DownloadArchive:
             sql += " LIMIT ?"
             params.append(effective_limit)
 
-        results: List[ArchiveEntry] = []
+        results: list[ArchiveEntry] = []
         with self._connection() as conn:
             cursor = conn.execute(sql, tuple(params))
             while True:
@@ -811,7 +811,7 @@ class DownloadArchive:
                         return results
         return results
 
-    def get_entry(self, entry_id: int) -> Optional[ArchiveEntry]:
+    def get_entry(self, entry_id: int) -> ArchiveEntry | None:
         """Fetch a single `ArchiveEntry` by row id, or `None` if not found."""
         with self._connection() as conn:
             row = conn.execute(
@@ -827,7 +827,7 @@ class DownloadArchive:
             tags = self._fetch_tags_for_ids(conn, [int(entry_id)]).get(int(entry_id), ())
             return self._build_entry(row, tags)
 
-    def get_entry_by_key(self, source: str, book_key: str) -> Optional[ArchiveEntry]:
+    def get_entry_by_key(self, source: str, book_key: str) -> ArchiveEntry | None:
         """Fetch a single `ArchiveEntry` by `(source, book_key)` or return `None`."""
         with self._connection() as conn:
             row = conn.execute(
@@ -849,11 +849,11 @@ class DownloadArchive:
         *,
         title: str = "",
         author: str = "",
-        isbn: Optional[str] = None,
-        asin: Optional[str] = None,
-        scrape_url: Optional[str] = None,
-        output_path: Optional[str] = None,
-    ) -> Optional[int]:
+        isbn: str | None = None,
+        asin: str | None = None,
+        scrape_url: str | None = None,
+        output_path: str | None = None,
+    ) -> int | None:
         """Find an existing ledger row matching identifiers, path, or title/author."""
         norm_url = (scrape_url or "").strip()
         norm_asin = (asin or "").strip().lower()
@@ -958,12 +958,12 @@ class DownloadArchive:
         entry_id: int,
         *,
         output_path: str,
-        audio_format: Optional[str] = None,
-        series: Optional[str] = None,
-        series_order: Optional[int] = None,
+        audio_format: str | None = None,
+        series: str | None = None,
+        series_order: int | None = None,
         narrator: str = "",
-        isbn: Optional[str] = None,
-        asin: Optional[str] = None,
+        isbn: str | None = None,
+        asin: str | None = None,
     ) -> bool:
         """Link an existing entry to a discovered local `output_path` and mark it `'downloaded'`."""
         timestamp = _utc_now()

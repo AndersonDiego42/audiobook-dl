@@ -542,7 +542,7 @@ def test_download_books_from_website_filters_by_headphone_icon_and_skip(tmp_path
         f'<a href="/se/sv/books/audio-skip-302"><svg><path d="{svg_headphone_path}"/></svg></a>'
         '<a href="/se/sv/books/ebook-only-303"><svg><path d="M0 0h10"/></svg></a>'
         "</body></html>"
-    ).encode("utf-8")
+    ).encode()
 
     src._session.get = MagicMock(return_value=_mock_resp(200, content=html))
     series = src.download("https://www.storytel.com/se/sv/categories/sci-fi-10")

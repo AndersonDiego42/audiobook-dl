@@ -1,6 +1,6 @@
 from .source import CatalogBook, Source
-from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, logging
-from audiobookdl.exceptions import BookNotFound, DataNotPresent
+from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover
+from audiobookdl.exceptions import BookNotFound
 from audiobookdl.utils.concurrency import run_cancellable_pool
 
 import base64
@@ -8,7 +8,6 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 import lxml.html
 import re
-from typing import List, Optional, Tuple
 from urllib.parse import urljoin
 
 LOGIN_URL = "https://www.chirpbooks.com/users/sign_in"
@@ -90,7 +89,7 @@ class ChirpSource(Source):
         cipher = AES.new(key, AES.MODE_CBC, iv)
         return unpad(cipher.decrypt(ciphertext), AES.block_size).decode("utf-8")
 
-    def get_files(self, book_id: int, key: bytes, iv: bytes, tracks) -> List[AudiobookFile]:
+    def get_files(self, book_id: int, key: bytes, iv: bytes, tracks) -> list[AudiobookFile]:
         def _fetch_track(track) -> AudiobookFile:
             return AudiobookFile(
                 url=self.get_audio_url(book_id, key, iv, track),
@@ -102,7 +101,7 @@ class ChirpSource(Source):
             return [_fetch_track(track) for track in tracks]
         return run_cancellable_pool(_fetch_track, tracks, max_workers=8)
 
-    def get_chapters(self, tracks) -> List[Chapter]:
+    def get_chapters(self, tracks) -> list[Chapter]:
         chapters = []
         start_time = 0
         for track in tracks:
@@ -111,7 +110,7 @@ class ChirpSource(Source):
             start_time += track["durationMs"]
         return chapters
 
-    def _create_key(self, url: str, user_id: int) -> Tuple[bytes, bytes]:
+    def _create_key(self, url: str, user_id: int) -> tuple[bytes, bytes]:
         """Creates key and iv to decrypt audio url"""
         key = bytes(self.find_elem_in_page(url, "div.user-audiobook", "data-dk"), "UTF-8")
         padding = "x" * (12 - len(str(user_id)))
@@ -133,9 +132,9 @@ class ChirpSource(Source):
         )
         return response["data"]["audiobook"]["tracks"]
 
-    def list_library(self) -> List[CatalogBook]:
+    def list_library(self) -> list[CatalogBook]:
         """Return purchased audiobooks from the user's Chirp library."""
-        books: List[CatalogBook] = []
+        books: list[CatalogBook] = []
         try:
             payload = self.post_json(
                 "https://www.chirpbooks.com/api/graphql",

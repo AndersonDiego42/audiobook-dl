@@ -1,5 +1,4 @@
 from io import BytesIO
-from typing import Optional, Tuple
 
 from PIL import Image
 
@@ -9,7 +8,7 @@ from audiobookdl import Cover
 SUPPORTED_COVER_EXTENSIONS = {"jpg", "jpeg", "png"}
 
 
-def _save_pillow_cover(img: Image.Image) -> Tuple[bytes, str]:
+def _save_pillow_cover(img: Image.Image) -> tuple[bytes, str]:
     buf = BytesIO()
     if img.mode in ("RGBA", "LA", "PA") or (
         img.mode == "P" and "transparency" in img.info
@@ -26,8 +25,8 @@ def normalize_cover_image(
     cover: Cover,
     *,
     square: bool = False,
-    max_size: Optional[int] = None,
-) -> Tuple[bytes, str]:
+    max_size: int | None = None,
+) -> tuple[bytes, str]:
     """Return cover bytes and a lowercase extension ('jpg', 'jpeg', or 'png').
 
     Converts unsupported formats (such as WebP), optionally letterboxes to `1:1`
@@ -44,7 +43,7 @@ def normalize_cover_image(
         if square and img.width != img.height:
             side = max(img.width, img.height)
             mode = "RGBA" if img.mode in ("RGBA", "LA", "PA") else "RGB"
-            bg: Tuple[int, ...] = (0, 0, 0, 255) if mode == "RGBA" else (0, 0, 0)
+            bg: tuple[int, ...] = (0, 0, 0, 255) if mode == "RGBA" else (0, 0, 0)
             canvas = Image.new(mode, (side, side), bg)
             if img.mode != mode:
                 img = img.convert(mode)
@@ -61,11 +60,11 @@ def normalize_cover_image(
 
 
 def apply_cover_postprocessing(
-    cover: Optional[Cover],
+    cover: Cover | None,
     *,
     square: bool = False,
-    max_size: Optional[int] = None,
-) -> Optional[Cover]:
+    max_size: int | None = None,
+) -> Cover | None:
     """Return `Cover` normalized according to `square` / `max_size`, or `None`."""
     if cover is None:
         return None

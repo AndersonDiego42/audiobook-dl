@@ -5,7 +5,7 @@ from audiobookdl.exceptions import RequestError
 import json
 import lxml.html
 import re
-from typing import Any, List, Optional
+from typing import Any
 from urllib.parse import quote_plus, urljoin
 
 
@@ -95,7 +95,7 @@ class EverandSource(Source[str]):
         )
         return json.loads(raw)
 
-    def get_files(self, book_info: dict) -> List[AudiobookFile]:
+    def get_files(self, book_info: dict) -> list[AudiobookFile]:
         """
         Format audio files
 
@@ -105,7 +105,7 @@ class EverandSource(Source[str]):
             return self.get_internal_files(book_info)
         return self.get_external_files(book_info)
 
-    def get_internal_files(self, book_info: dict) -> List[AudiobookFile]:
+    def get_internal_files(self, book_info: dict) -> list[AudiobookFile]:
         """
         Format audio files for internal books
 
@@ -121,7 +121,7 @@ class EverandSource(Source[str]):
             fallback_url = f"https://audio.production.scribd.com/audiobooks/{book_id}/96kbps.m3u8"
             return self.get_stream_files(fallback_url, headers=headers)
 
-    def get_external_files(self, book_info: dict) -> List[AudiobookFile]:
+    def get_external_files(self, book_info: dict) -> list[AudiobookFile]:
         """
         Format audio files for external books
 
@@ -167,7 +167,7 @@ class EverandSource(Source[str]):
             return f"https://www.everand.com/listen/{match.group(1)}"
         return url
 
-    def download_cover(self, metadata: dict) -> Optional[Cover]:
+    def download_cover(self, metadata: dict) -> Cover | None:
         """
         Download and clean cover
 
@@ -195,9 +195,9 @@ class EverandSource(Source[str]):
         return title
 
     @staticmethod
-    def format_metadata(book_info: dict, url: Optional[str] = None) -> AudiobookMetadata:
-        series_name: Optional[str] = None
-        series_order: Optional[int] = None
+    def format_metadata(book_info: dict, url: str | None = None) -> AudiobookMetadata:
+        series_name: str | None = None
+        series_order: int | None = None
         raw_series = book_info.get("series")
         if isinstance(raw_series, dict):
             series_name = str(raw_series.get("title") or raw_series.get("name") or "").strip() or None
@@ -260,7 +260,7 @@ class EverandSource(Source[str]):
         return f"Chapter {number}"
 
     @staticmethod
-    def get_chapters(book_info) -> List[Chapter]:
+    def get_chapters(book_info) -> list[Chapter]:
         chapters = []
         raw_chapters = book_info.get("chapters")
         if raw_chapters is None and isinstance(book_info.get("audiobook"), dict):
@@ -274,8 +274,8 @@ class EverandSource(Source[str]):
         return chapters
 
     @staticmethod
-    def _catalog_items_from_data(payload: Any) -> List[CatalogBook]:
-        results: List[CatalogBook] = []
+    def _catalog_items_from_data(payload: Any) -> list[CatalogBook]:
+        results: list[CatalogBook] = []
         if isinstance(payload, dict):
             raw_items = (
                 payload.get("results")
@@ -312,7 +312,7 @@ class EverandSource(Source[str]):
             )
         return results
 
-    def search(self, query: str) -> List[CatalogBook]:
+    def search(self, query: str) -> list[CatalogBook]:
         cleaned = query.strip()
         if not cleaned:
             return []
@@ -325,7 +325,7 @@ class EverandSource(Source[str]):
         except ValueError:
             pass
         tree = lxml.html.fromstring(raw)
-        books: List[CatalogBook] = []
+        books: list[CatalogBook] = []
         seen = set()
         for link in tree.cssselect('a[href*="/audiobook/"], a[href*="/listen/"], a[href*="/book/"]'):
             href = (link.get("href") or "").strip()
@@ -341,7 +341,7 @@ class EverandSource(Source[str]):
             books.append(CatalogBook(title=title, url=full_url, source="everand"))
         return books
 
-    def list_library(self) -> List[CatalogBook]:
+    def list_library(self) -> list[CatalogBook]:
         payload = self.get_json(
             "https://www.everand.com/saved/data",
             headers={"X-Requested-With": "XMLHttpRequest"},
