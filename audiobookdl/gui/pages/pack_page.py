@@ -1,4 +1,4 @@
-"""Modal dialog for discovering, previewing, and queuing local audiobook repackaging."""
+"""Page for discovering, previewing, and queuing local audiobook repackaging."""
 
 from __future__ import annotations
 
@@ -14,14 +14,14 @@ from audiobookdl.exceptions import AudiobookDLException
 from audiobookdl.gui.chapter_editor import ChapterEditorFrame
 from audiobookdl.gui.controller import GuiController, PackJobRequest
 from audiobookdl.gui.formatting import format_duration
-from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, apply_theme_to_window, scale_px
+from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, make_bold_font, scale_px
 from audiobookdl.gui.widgets import MainThreadCallbackQueue, ScrolledTreeview, TreeColumnSpec
 from audiobookdl.pack import PackBookSpec, PackOverrides, scope_overrides_for_batch
 from audiobookdl.utils.audiobook import Chapter, parse_language, parse_release_date
 
 
-class PackDialog(tk.Toplevel):
-    """Modal dialog for inspecting local audio folders and queuing `.m4b` repackaging."""
+class PackPage(ttk.Frame):
+    """Page for inspecting local audio folders and queuing `.m4b` repackaging."""
 
     _PREVIEW_COLUMNS = (
         TreeColumnSpec("title", "Title", width=180, stretch=True),
@@ -36,17 +36,19 @@ class PackDialog(tk.Toplevel):
         self,
         parent: tk.Misc,
         controller: GuiController,
-        options: args.DownloadOptions,
         *,
-        output_dir: str,
+        options_provider: Callable[[], args.DownloadOptions | None],
+        output_dir_provider: Callable[[], str],
+        ensure_ffmpeg: Callable[[args.DownloadOptions], bool],
         on_submit: Callable[[list[PackJobRequest], str], None],
         initial_paths: Sequence[str] = (),
         palette: ThemePalette | None = None,
     ) -> None:
-        super().__init__(parent)
+        super().__init__(parent, padding=scale_px(parent, 12))
         self._controller = controller
-        self._base_options = options
-        self._output_dir = output_dir
+        self._options_provider = options_provider
+        self._output_dir_provider = output_dir_provider
+        self._ensure_ffmpeg = ensure_ffmpeg
         self._on_submit = on_submit
         self._palette = palette or LIGHT_PALETTE
         self._paths: list[str] = []
@@ -56,15 +58,17 @@ class PackDialog(tk.Toplevel):
         self._is_scanning = False
         self._cb_queue = MainThreadCallbackQueue(self)
 
-        self.title("Pack Local Audiobooks")
-        self.transient(parent)  # type: ignore[arg-type]
-        self.grab_set()
-        self.geometry(f"{scale_px(self, 860)}x{scale_px(self, 680)}")
-        self.minsize(scale_px(self, 640), scale_px(self, 520))
+        default_fmt = "m4b"
+        try:
+            init_opts = options_provider()
+            if init_opts and init_opts.output_format:
+                default_fmt = init_opts.output_format
+        except Exception:
+            pass
 
         self.recursive_var = tk.BooleanVar(value=False)
         self.delete_source_var = tk.BooleanVar(value=False)
-        self.format_var = tk.StringVar(value=options.output_format or "m4b")
+        self.format_var = tk.StringVar(value=default_fmt)
         self.title_var = tk.StringVar()
         self.author_var = tk.StringVar()
         self.narrator_var = tk.StringVar()
@@ -79,26 +83,52 @@ class PackDialog(tk.Toplevel):
         self.language_var = tk.StringVar()
         self.description_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Add one or more local folders or audio tracks to preview.")
+        self._output_label_var = tk.StringVar(value=f"Output folder: {self._output_dir_provider()}")
 
         self._build_ui()
-        apply_theme_to_window(self, self._palette)
-        self.bind("<Escape>", lambda _e: self.destroy())
         if initial_paths:
-            for p in initial_paths:
-                if p and os.path.exists(p):
-                    self._append_path(p)
-            if self._paths:
-                self._start_scan()
+            self.add_initial_paths(initial_paths)
+
+    def add_initial_paths(self, paths: Sequence[str]) -> None:
+        """Append existing file/folder paths and trigger a metadata scan."""
+        added = False
+        for p in paths:
+            if p and os.path.exists(p):
+                before = len(self._paths)
+                self._append_path(p)
+                if len(self._paths) > before:
+                    added = True
+        if added or (paths and self._paths):
+            self._start_scan()
+
+    def on_show(self) -> None:
+        """Refresh output folder label when navigating to the Pack page."""
+        self._output_label_var.set(f"Output folder: {self._output_dir_provider()}")
+
+    def apply_theme(self, palette: ThemePalette) -> None:
+        self._palette = palette
+        if hasattr(self, "_chapter_editor"):
+            self._chapter_editor._palette = palette
 
     def _build_ui(self) -> None:
-        body = ttk.Frame(self, padding=scale_px(self, 12))
-        body.pack(fill=tk.BOTH, expand=True)
-        body.columnconfigure(0, weight=1)
-        body.rowconfigure(3, weight=1)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(4, weight=1)
 
-        # Row 0: Source Paths
-        sources_frame = ttk.LabelFrame(body, text="Local Sources", padding=scale_px(self, 8))
-        sources_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        header = ttk.Frame(self)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="Pack Local Audiobooks", font=make_bold_font(self, 13)).grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(
+            header,
+            text="Combine local audio folders or track files into tagged .m4b / audio packages.",
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, sticky="w")
+
+        # Row 1: Source Paths
+        sources_frame = ttk.LabelFrame(self, text="Local Sources", padding=scale_px(self, 8))
+        sources_frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         sources_frame.columnconfigure(0, weight=1)
 
         list_row = ttk.Frame(sources_frame)
@@ -112,7 +142,8 @@ class PackDialog(tk.Toplevel):
         src_btns.grid(row=0, column=1, sticky="ns")
         ttk.Button(src_btns, text="Add Folder...", command=self._add_folder).pack(fill=tk.X, pady=(0, 4))
         ttk.Button(src_btns, text="Add Tracks...", command=self._add_tracks).pack(fill=tk.X, pady=(0, 4))
-        ttk.Button(src_btns, text="Remove", command=self._remove_selected_paths).pack(fill=tk.X)
+        ttk.Button(src_btns, text="Remove", command=self._remove_selected_paths).pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(src_btns, text="Clear All", command=self._clear_all_paths).pack(fill=tk.X)
 
         opts_row = ttk.Frame(sources_frame)
         opts_row.grid(row=1, column=0, sticky="ew", pady=(6, 0))
@@ -138,9 +169,9 @@ class PackDialog(tk.Toplevel):
         format_combo.pack(side=tk.LEFT)
         format_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_scan_option_changed())
 
-        # Row 1: Optional Metadata Overrides (Basic & Extended tabs)
-        meta_nb = ttk.Notebook(body)
-        meta_nb.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        # Row 2: Optional Metadata Overrides (Basic & Extended tabs)
+        meta_nb = ttk.Notebook(self)
+        meta_nb.grid(row=2, column=0, sticky="ew", pady=(0, 8))
 
         meta_frame = ttk.Frame(meta_nb, padding=scale_px(self, 8))
         meta_frame.columnconfigure(1, weight=1)
@@ -197,9 +228,9 @@ class PackDialog(tk.Toplevel):
         ttk.Label(ext_frame, text="Description:").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
         ttk.Entry(ext_frame, textvariable=self.description_var).grid(row=2, column=1, columnspan=3, sticky="ew", pady=(6, 0))
 
-        # Row 2: Scan Bar
-        scan_bar = ttk.Frame(body)
-        scan_bar.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+        # Row 3: Scan Bar
+        scan_bar = ttk.Frame(self)
+        scan_bar.grid(row=3, column=0, sticky="ew", pady=(0, 6))
         scan_bar.columnconfigure(1, weight=1)
         self._scan_btn = ttk.Button(scan_bar, text="Scan & Preview", command=self._start_scan)
         self._scan_btn.grid(row=0, column=0, padx=(0, 10))
@@ -210,9 +241,9 @@ class PackDialog(tk.Toplevel):
         self._loading_bar.grid(row=0, column=2, sticky="e", padx=(8, 0))
         self._loading_bar.grid_remove()
 
-        # Row 3: Preview Tree & Chapters Editor Notebook
-        preview_nb = ttk.Notebook(body)
-        preview_nb.grid(row=3, column=0, sticky="nsew")
+        # Row 4: Preview Tree & Chapters Editor Notebook
+        preview_nb = ttk.Notebook(self)
+        preview_nb.grid(row=4, column=0, sticky="nsew")
 
         books_tab = ttk.Frame(preview_nb, padding=4)
         books_tab.columnconfigure(0, weight=1)
@@ -241,17 +272,21 @@ class PackDialog(tk.Toplevel):
         )
         self._chapter_editor.grid(row=0, column=0, sticky="nsew")
 
-        # Row 4: Footer Actions
-        btn_bar = ttk.Frame(body)
-        btn_bar.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        # Row 5: Footer Actions
+        btn_bar = ttk.Frame(self)
+        btn_bar.grid(row=5, column=0, sticky="ew", pady=(10, 0))
         ttk.Label(
             btn_bar,
-            text=f"Output folder: {self._output_dir}",
+            textvariable=self._output_label_var,
             style="Muted.TLabel",
         ).pack(side=tk.LEFT)
-        ttk.Button(btn_bar, text="Cancel", command=self.destroy).pack(side=tk.RIGHT)
-        self._pack_btn = ttk.Button(btn_bar, text="Pack / Queue", command=self._submit)
-        self._pack_btn.pack(side=tk.RIGHT, padx=(0, 8))
+        self._pack_btn = ttk.Button(
+            btn_bar,
+            text="Pack / Queue",
+            command=self._submit,
+            style="Accent.TButton",
+        )
+        self._pack_btn.pack(side=tk.RIGHT)
 
     def _append_path(self, path: str) -> None:
         normalized = os.path.abspath(path)
@@ -261,14 +296,14 @@ class PackDialog(tk.Toplevel):
         self._paths_listbox.insert(tk.END, normalized)
 
     def _add_folder(self) -> None:
-        chosen = filedialog.askdirectory(parent=self, title="Select Audiobook Folder")
+        chosen = filedialog.askdirectory(parent=self.winfo_toplevel(), title="Select Audiobook Folder")
         if chosen:
             self._append_path(chosen)
             self._start_scan()
 
     def _add_tracks(self) -> None:
         chosen = filedialog.askopenfilenames(
-            parent=self,
+            parent=self.winfo_toplevel(),
             title="Select Audio Tracks",
             filetypes=[
                 ("Audio files", "*.mp3 *.m4a *.m4b *.mp4 *.aac *.ogg *.opus *.flac *.wav *.wma"),
@@ -279,6 +314,11 @@ class PackDialog(tk.Toplevel):
             for item in chosen:
                 self._append_path(item)
             self._start_scan()
+
+    def _clear_all_paths(self) -> None:
+        self._paths.clear()
+        self._paths_listbox.delete(0, tk.END)
+        self._invalidate_preview("Add one or more local folders or audio tracks to preview.")
 
     def _invalidate_preview(self, message: str) -> None:
         self._scan_token += 1
@@ -353,7 +393,7 @@ class PackDialog(tk.Toplevel):
 
     def _browse_cover(self) -> None:
         chosen = filedialog.askopenfilename(
-            parent=self,
+            parent=self.winfo_toplevel(),
             title="Select Cover Image",
             filetypes=[("Image files", "*.jpg *.jpeg *.png *.webp"), ("All files", "*.*")],
         )
@@ -428,20 +468,30 @@ class PackDialog(tk.Toplevel):
             chapters=chapters,
         )
 
-    def _clone_options_for_pack(self) -> args.DownloadOptions:
+    def _clone_options_for_pack(self) -> args.DownloadOptions | None:
+        base = self._options_provider()
+        if base is None:
+            return None
         fmt = self.format_var.get().strip().lower() or "m4b"
-        cloned = dataclasses.replace(self._base_options, urls=[], output_format=fmt)
-        cloned._explicit_fields = frozenset(self._base_options._explicit_fields | {"output_format"})
+        cloned = dataclasses.replace(base, urls=[], output_format=fmt)
+        cloned._explicit_fields = frozenset(base._explicit_fields | {"output_format"})
         return cloned
 
     def _start_scan(self) -> None:
         if not self._paths:
-            messagebox.showwarning("No Sources", "Please add a folder or audio tracks first.", parent=self)
+            messagebox.showwarning(
+                "No Sources",
+                "Please add a folder or audio tracks first.",
+                parent=self.winfo_toplevel(),
+            )
             return
         try:
             overrides = self._build_overrides()
         except ValueError as exc:
-            messagebox.showerror("Invalid Override", str(exc), parent=self)
+            messagebox.showerror("Invalid Override", str(exc), parent=self.winfo_toplevel())
+            return
+        opts = self._clone_options_for_pack()
+        if opts is None:
             return
 
         self._scan_token += 1
@@ -455,8 +505,8 @@ class PackDialog(tk.Toplevel):
         self.status_var.set("Scanning tracks and reading metadata...")
         paths_snapshot = list(self._paths)
         recursive = bool(self.recursive_var.get())
-        opts = self._clone_options_for_pack()
-        output_dir = self._output_dir
+        output_dir = self._output_dir_provider()
+        self._output_label_var.set(f"Output folder: {output_dir}")
         def _apply(s: list[PackBookSpec] | None, e: str | None) -> None:
             if not self.winfo_exists() or token != self._scan_token:
                 return
@@ -524,13 +574,21 @@ class PackDialog(tk.Toplevel):
 
     def _submit(self) -> None:
         if not self._paths:
-            messagebox.showwarning("No Sources", "Please add at least one folder or track list.", parent=self)
+            messagebox.showwarning(
+                "No Sources",
+                "Please add at least one folder or track list.",
+                parent=self.winfo_toplevel(),
+            )
             return
         try:
             overrides = self._build_overrides()
         except ValueError as exc:
-            messagebox.showerror("Invalid Override", str(exc), parent=self)
+            messagebox.showerror("Invalid Override", str(exc), parent=self.winfo_toplevel())
             return
+        opts = self._clone_options_for_pack()
+        if opts is None or not self._ensure_ffmpeg(opts):
+            return
+        output_dir = self._output_dir_provider()
         fmt = self.format_var.get().strip().lower() or "m4b"
         recursive = bool(self.recursive_var.get())
         delete_source = bool(self.delete_source_var.get())
@@ -538,7 +596,7 @@ class PackDialog(tk.Toplevel):
             confirm = messagebox.askyesno(
                 "Confirm Source Deletion",
                 "Original source tracks will be deleted after successful packing.\nContinue?",
-                parent=self,
+                parent=self.winfo_toplevel(),
             )
             if not confirm:
                 return
@@ -550,7 +608,7 @@ class PackDialog(tk.Toplevel):
                     paths=[spec.source_root] if os.path.isdir(spec.source_root) else list(spec.track_paths),
                     recursive=False,
                     delete_source=delete_source,
-                    output_dir=self._output_dir,
+                    output_dir=output_dir,
                     overrides=batch_overrides,
                     label=spec.audiobook.title,
                     output_format=fmt,
@@ -568,7 +626,7 @@ class PackDialog(tk.Toplevel):
                     paths=list(self._paths),
                     recursive=recursive,
                     delete_source=delete_source,
-                    output_dir=self._output_dir,
+                    output_dir=output_dir,
                     overrides=overrides,
                     label=label,
                     output_format=fmt,
@@ -576,4 +634,4 @@ class PackDialog(tk.Toplevel):
             ]
 
         self._on_submit(requests, fmt)
-        self.destroy()
+        self.status_var.set(f"Queued {len(requests)} pack job{'s' if len(requests) != 1 else ''}.")

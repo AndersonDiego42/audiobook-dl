@@ -116,14 +116,11 @@ def test_export_xlsx_behavior_and_gui_export_to_path(tmp_path):
     try:
         app = AudiobookDLApp(root, config_location=str(cfg_path))
         app.controller.config.download_archive = str(db_path)
-        dialog = app._show_archive_ledger_dialog()
-        try:
-            gui_csv = tmp_path / "gui.csv"
-            exported_count = dialog.export_to_path(str(gui_csv))
-            # Show Hidden is unchecked by default, so 1 visible book exported
-            assert exported_count == 1
-            assert "Dune" in gui_csv.read_text(encoding="utf-8")
-        finally:
-            dialog.destroy()
+        tab = app.open_library_tab("archive").archive_tab
+        gui_csv = tmp_path / "gui.csv"
+        exported_count = tab.export_to_path(str(gui_csv))
+        # Show Hidden is unchecked by default, so 1 visible book exported
+        assert exported_count == 1
+        assert "Dune" in gui_csv.read_text(encoding="utf-8")
     finally:
         root.destroy()

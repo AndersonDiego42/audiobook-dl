@@ -1,6 +1,7 @@
 """Action bar, progress metrics, scrollable activity log, and job queue panel."""
 
 from collections import deque
+import json
 import os
 import sys
 import time
@@ -11,14 +12,69 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from audiobookdl.gui.controller import GuiController, QueuedJob
-from audiobookdl.gui.formatting import format_duration, format_speed
+from audiobookdl.gui.formatting import format_duration, format_speed, parse_url_text
 from audiobookdl.gui.notifications import format_completion_notification, send_os_notification_async
-from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, apply_theme_to_window, make_bold_font, scale_px
-from audiobookdl.gui.widgets import ScrolledTreeview, TreeColumnSpec
+from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, make_bold_font, scale_px
+from audiobookdl.gui.widgets import ModalDialog, ScrolledTreeview, TreeColumnSpec
 from audiobookdl.pipeline import DownloadSummary
 
 
-class JobInspectorDialog(tk.Toplevel):
+def export_queue_to_path(records: Sequence[Mapping[str, Any]], path: str) -> int:
+    """Export `records` as `.json` (full specs) or `.txt` (URLs); return exported count."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".txt":
+        urls = [
+            str(r.get("url") or "").strip()
+            for r in records
+            if r.get("job_kind", "download") == "download" and str(r.get("url") or "").strip()
+        ]
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(urls) + ("\n" if urls else ""))
+        return len(urls)
+
+    exported: list[dict[str, Any]] = []
+    for r in records:
+        item: dict[str, Any] = {
+            "url": str(r.get("url") or ""),
+            "job_kind": str(r.get("job_kind") or "download"),
+            "service": str(r.get("service") or ""),
+        }
+        if r.get("profile"):
+            item["profile"] = r["profile"]
+        if r.get("selected_indices") is not None:
+            item["selected_indices"] = list(r["selected_indices"])
+        if isinstance(r.get("job_overrides"), Mapping):
+            item["job_overrides"] = dict(r["job_overrides"])
+        if isinstance(r.get("pack_request"), Mapping):
+            item["pack_request"] = dict(r["pack_request"])
+        exported.append(item)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"version": 1, "jobs": exported}, fh, indent=2, ensure_ascii=False)
+    return len(exported)
+
+
+def load_queue_import_file(path: str) -> list[dict[str, Any]]:
+    """Load queued job descriptors from a `.json` or `.txt` file."""
+    ext = os.path.splitext(path)[1].lower()
+    with open(path, encoding="utf-8-sig") as fh:
+        raw_text = fh.read()
+    if ext == ".json":
+        parsed = json.loads(raw_text)
+        items = parsed.get("jobs") if isinstance(parsed, dict) else parsed
+        if not isinstance(items, list):
+            raise ValueError("JSON queue file must contain a list or {'jobs': [...]}.")
+        out: list[dict[str, Any]] = []
+        for entry in items:
+            if isinstance(entry, str) and entry.strip():
+                out.append({"job_kind": "download", "url": entry.strip()})
+            elif isinstance(entry, Mapping):
+                out.append(dict(entry))
+        return out
+
+    return [{"job_kind": "download", "url": u} for u in parse_url_text(raw_text)]
+
+
+class JobInspectorDialog(ModalDialog):
     """Themed modal dialog inspecting full job metadata, overrides, and error text."""
 
     def __init__(
@@ -28,14 +84,14 @@ class JobInspectorDialog(tk.Toplevel):
         *,
         palette: ThemePalette | None = None,
     ) -> None:
-        super().__init__(parent)
-        self._palette = palette or LIGHT_PALETTE
+        super().__init__(
+            parent,
+            "Job Inspector",
+            palette=palette,
+            default_size=(620, 420),
+            min_size=(560, 360),
+        )
         self._record = dict(record)
-        self.title("Job Inspector")
-        self.transient(parent)  # type: ignore[call-overload]
-        self.grab_set()
-        self.minsize(scale_px(self, 560), scale_px(self, 360))
-        self.bind("<Escape>", lambda _e: self.destroy())
 
         body = ttk.Frame(self, padding=scale_px(self, 12))
         body.pack(fill=tk.BOTH, expand=True)
@@ -77,9 +133,10 @@ class JobInspectorDialog(tk.Toplevel):
         )
         if record.get("output_path"):
             ttk.Button(btns, text="Copy Path", command=self._copy_path).pack(side=tk.LEFT)
-        ttk.Button(btns, text="Close", command=self.destroy).pack(side=tk.RIGHT)
+        close_btn = ttk.Button(btns, text="Close", command=self.destroy)
+        close_btn.pack(side=tk.RIGHT)
 
-        apply_theme_to_window(self, self._palette)
+        self.finalize_modal(initial_focus=close_btn)
 
     @staticmethod
     def _format_overrides(record: Mapping[str, Any]) -> str:
@@ -133,6 +190,11 @@ class ActivityQueuePanel(ttk.LabelFrame):
         on_preview_url: Callable[[str], None] | None = None,
         on_send_to_urls: Callable[[Sequence[str]], None] | None = None,
         on_open_path: Callable[[str, bool], None] | None = None,
+        on_import_queue: Callable[[list[dict[str, Any]]], None] | None = None,
+        on_queue_summary_changed: Callable[[int, int], None] | None = None,
+        on_progress_mode_changed: Callable[[str], None] | None = None,
+        progress_var: tk.DoubleVar | None = None,
+        active_job_var: tk.StringVar | None = None,
         palette: ThemePalette | None = None,
     ) -> None:
         super().__init__(master, text="Activity", padding=(10, 6))
@@ -143,6 +205,8 @@ class ActivityQueuePanel(ttk.LabelFrame):
         self.batch_var = batch_var
         self.stage_var = tk.StringVar(value="")
         self.metrics_var = metrics_var
+        self.progress_var = progress_var or tk.DoubleVar(value=0.0)
+        self.active_job_var = active_job_var or tk.StringVar(value="Idle")
         self._on_start_download = on_start_download
         self._on_cancel_download = on_cancel_download
         self._on_preview_metadata = on_preview_metadata
@@ -154,6 +218,9 @@ class ActivityQueuePanel(ttk.LabelFrame):
         self._on_preview_url = on_preview_url
         self._on_send_to_urls = on_send_to_urls
         self._on_open_path = on_open_path
+        self._on_import_queue = on_import_queue
+        self._on_queue_summary_changed = on_queue_summary_changed
+        self._on_progress_mode_changed = on_progress_mode_changed
 
         self.current_ui_run_id = 0
         self.ui_item_index = 0
@@ -226,7 +293,12 @@ class ActivityQueuePanel(ttk.LabelFrame):
         )
         self.metrics_label.grid(row=0, column=2, sticky="e")
 
-        self.progressbar = ttk.Progressbar(self, mode="determinate", maximum=100)
+        self.progressbar = ttk.Progressbar(
+            self,
+            mode="determinate",
+            maximum=100,
+            variable=self.progress_var,
+        )
         self.progressbar.grid(row=2, column=0, sticky="ew", pady=(0, 6))
 
         self.activity_notebook = ttk.Notebook(self)
@@ -366,7 +438,57 @@ class ActivityQueuePanel(ttk.LabelFrame):
         menu.add_command(label="Move to Bottom", command=lambda: self.move_selected_to_edge(to_top=False))
         menu.add_command(label="Remove Selected", command=self.remove_selected_item)
         menu.add_command(label="Clear Completed & Failed", command=self.clear_completed_history)
+        menu.add_separator()
+        menu.add_command(label="Export Queue...", command=self.export_queue_dialog)
+        if self._on_import_queue is not None:
+            menu.add_command(label="Import Queue...", command=self.import_queue_dialog)
         self._queue_menu = menu
+
+    def export_queue_dialog(self) -> None:
+        """Prompt for a file path and export current queue records as JSON or text URLs."""
+        with self._controller.queue_lock:
+            records = [
+                dict(self._controller.queue_records[jid])
+                for jid in self._queue_order
+                if jid in self._controller.queue_records
+            ]
+        if not records:
+            messagebox.showinfo("Queue Empty", "There are no queue items to export.", parent=self._window)
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self._window,
+            title="Export Queue",
+            defaultextension=".json",
+            filetypes=[("JSON Queue File", "*.json"), ("Text URL List", "*.txt")],
+        )
+        if not path:
+            return
+        try:
+            count = export_queue_to_path(records, path)
+            self.status_var.set(f"Exported {count} queue item(s)")
+        except Exception as exc:
+            messagebox.showerror("Export Failed", str(exc), parent=self._window)
+
+    def import_queue_dialog(self) -> None:
+        """Prompt for a `.json` or `.txt` queue file and enqueue imported jobs."""
+        if self._on_import_queue is None:
+            return
+        path = filedialog.askopenfilename(
+            parent=self._window,
+            title="Import Queue",
+            filetypes=[("Queue files", "*.json *.txt"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            items = load_queue_import_file(path)
+        except Exception as exc:
+            messagebox.showerror("Import Failed", str(exc), parent=self._window)
+            return
+        if not items:
+            messagebox.showinfo("Empty File", "No queue items found in the selected file.", parent=self._window)
+            return
+        self._on_import_queue(items)
 
     def apply_theme_palette(self, palette: ThemePalette) -> None:
         """Apply semantic log and queue status tag colors from `palette`."""
@@ -589,11 +711,25 @@ class ActivityQueuePanel(ttk.LabelFrame):
         elif "downloading" in lower:
             self.stage_var.set("Stage: Downloading")
 
+    def _set_progress(self, value: float, *, indeterminate: bool = False) -> None:
+        if indeterminate:
+            self.progressbar.configure(mode="indeterminate")
+            self.progress_var.set(0.0)
+            self.progressbar.start(12)
+            if self._on_progress_mode_changed is not None:
+                self._on_progress_mode_changed("indeterminate")
+            return
+        self.progressbar.stop()
+        self.progressbar.configure(mode="determinate")
+        if self._on_progress_mode_changed is not None:
+            self._on_progress_mode_changed("determinate")
+        self.progress_var.set(float(value))
+
     def prepare_run_ui_state(self, run_id: int, item_total: int, log_header: str) -> None:
         """Initialize progress, timer, and batch counters for a fresh queue run."""
-        self.progressbar.stop()
-        self.progressbar.configure(mode="determinate", value=0)
+        self._set_progress(0.0)
         self.status_var.set("Starting...")
+        self.active_job_var.set("Starting...")
         self.stage_var.set("Stage: Preparing")
         self._run_start_time = time.monotonic()
         self._last_pct = 0.0
@@ -682,6 +818,8 @@ class ActivityQueuePanel(ttk.LabelFrame):
             self.activity_notebook.tab(self._queue_tab, text=label)  # type: ignore[no-untyped-call]
         except tk.TclError:
             pass
+        if self._on_queue_summary_changed is not None:
+            self._on_queue_summary_changed(active, failed)
 
     def restore_saved_queue_history(self) -> None:
         """Restore unresolved queue items persisted across GUI restarts."""
@@ -1038,18 +1176,26 @@ class ActivityQueuePanel(ttk.LabelFrame):
                 self._update_stage_from_message(last_info)
             return True
         if kind == "batch_item":
-            _, run_id, item_index, item_total, _url = item
+            _, run_id, item_index, item_total, target_url = item
             if run_id == self.current_ui_run_id:
                 self.ui_item_index = item_index
                 self.ui_item_total = max(self.ui_item_total, item_total)
                 self.ui_book_index = 0
                 self.ui_book_total = 0
                 self.stage_var.set("Stage: Fetching metadata")
+                if target_url:
+                    self.active_job_var.set(str(target_url).strip()[:60])
                 self.refresh_batch_label()
             return True
         if kind == "job_status":
             _, job_id, status_text, detail = item
             self.update_queue_row(job_id, status_text, detail)
+            if status_text == "Running":
+                rec = self._controller.get_queue_record(job_id)
+                if rec is not None:
+                    label = str(rec.get("title") or rec.get("url") or "").strip()
+                    if label:
+                        self.active_job_var.set(label[:60])
             return True
         if kind == "job_meta":
             _, job_id, title_text, output_path = item
@@ -1058,36 +1204,42 @@ class ActivityQueuePanel(ttk.LabelFrame):
                 title=title_text or None,
                 output_path=output_path or None,
             )
+            if title_text:
+                self.active_job_var.set(str(title_text).strip()[:60])
             return True
         if kind == "item_progress":
-            _, run_id, book_index, book_total, _title = item
+            _, run_id, book_index, book_total, book_title = item
             if run_id == self.current_ui_run_id:
                 self.ui_book_index = book_index
                 self.ui_book_total = book_total
+                if book_title:
+                    self.active_job_var.set(str(book_title).strip()[:60])
                 self.refresh_batch_label()
             return True
         if kind == "progress_start":
             _, description, _total = item
-            self.progressbar.stop()
-            self.progressbar.configure(mode="determinate", value=0)
+            self._set_progress(0.0)
             self._last_pct = 0.0
             self._last_speed_bps = 0.0
             self._last_eta_seconds = None
             self.stage_var.set("Stage: Downloading")
             self.update_metrics_display(is_running=True, force=True)
             self.status_var.set(description[:80])
+            if description.strip():
+                self.active_job_var.set(description.strip()[:60])
             return True
         if kind == "progress_advance":
             _, completed, total = item
             pct = (completed / total * 100.0) if total > 0 else 0.0
             clamped = min(100.0, max(0.0, pct))
             self._last_pct = clamped
-            self.progressbar.configure(value=clamped)
+            self.progress_var.set(clamped)
             return True
         if kind == "progress_metrics":
             _, completed, total, _bytes_downloaded, speed_bps, _elapsed, eta_seconds = item
             pct = (completed / total * 100.0) if total > 0 else 0.0
             self._last_pct = min(100.0, max(0.0, pct))
+            self.progress_var.set(self._last_pct)
             self._last_speed_bps = speed_bps
             self._last_eta_seconds = eta_seconds
             self.update_metrics_display(is_running=True, force=True)
@@ -1095,7 +1247,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
         if kind == "progress_finish":
             self._last_pct = 100.0
             self._last_eta_seconds = 0.0
-            self.progressbar.configure(value=100.0)
+            self.progress_var.set(100.0)
             self.update_metrics_display(is_running=True, force=True)
             return True
         return False
@@ -1110,7 +1262,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
     ) -> None:
         """Reset progress/metrics UI and report run completion/failure/cancellation."""
         notify_fn = notifier or send_os_notification_async
-        self.progressbar.stop()
+        self._set_progress(0.0)
         final_elapsed = (
             format_duration(max(0.0, time.monotonic() - self._run_start_time))
             if self._run_start_time is not None
@@ -1120,9 +1272,10 @@ class ActivityQueuePanel(ttk.LabelFrame):
         self.batch_var.set("")
         self.stage_var.set("")
         if exc is not None:
-            self.progressbar.configure(value=0)
+            self._set_progress(0.0)
             self.metrics_var.set("")
             self.status_var.set("Error")
+            self.active_job_var.set("Idle (last run failed)")
             self.append_log(f"[ERROR] {exc}")
             if notify_enabled:
                 payload = format_completion_notification(summary, exc)
@@ -1132,23 +1285,27 @@ class ActivityQueuePanel(ttk.LabelFrame):
             return
 
         if summary is None or summary.cancelled:
-            self.progressbar.configure(value=0)
+            self._set_progress(0.0)
             self.metrics_var.set("")
             self.status_var.set("Cancelled")
+            self.active_job_var.set("Idle (cancelled)")
             return
 
         if summary.failed > 0 and summary.completed == 0:
-            self.progressbar.configure(value=0)
+            self._set_progress(0.0)
             self.metrics_var.set("")
             self.status_var.set("Failed")
+            self.active_job_var.set("Idle (failed)")
         elif summary.failed > 0:
-            self.progressbar.configure(value=100)
+            self._set_progress(100.0)
             self.metrics_var.set(f"Elapsed {final_elapsed}" if final_elapsed else "")
             self.status_var.set(f"Done ({summary.completed} ok, {summary.failed} failed)")
+            self.active_job_var.set(f"Done ({summary.completed} ok, {summary.failed} failed)")
         else:
-            self.progressbar.configure(value=100)
+            self._set_progress(100.0)
             self.metrics_var.set(f"Elapsed {final_elapsed}" if final_elapsed else "")
             self.status_var.set("Completed")
+            self.active_job_var.set("Completed")
             self.append_log("--- Completed ---")
         if notify_enabled:
             payload = format_completion_notification(summary, None)

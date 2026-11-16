@@ -98,7 +98,7 @@ This guarantees concurrent or embedded `Downloader` instances do not leak state 
 
 ### 3. Shared Controller for Desktop GUI & Headless Web UI
 Both the Tkinter desktop app ([`audiobookdl/gui/app.py`](../audiobookdl/gui/app.py)) and the stdlib HTTP server ([`audiobookdl/web.py`](../audiobookdl/web.py)) delegate queue persistence (`gui_queue.json`), pause/resume/cancel orchestration, catalog browsing, and background download workers to `GuiController` ([`audiobookdl/gui/controller.py`](../audiobookdl/gui/controller.py)):
-- **Desktop GUI**: Drains `GuiController` event tuples (`log`, `batch_item`, `job_status`, `progress_*`, `prompt_*`, `done`) via Tkinter timers.
+- **Desktop GUI**: [`audiobookdl/gui/app.py`](../audiobookdl/gui/app.py) hosts a left-sidebar navigation shell ([`audiobookdl/gui/shell.py`](../audiobookdl/gui/shell.py)) with persistent footer status and lazy-built pages under [`audiobookdl/gui/pages/`](../audiobookdl/gui/pages/) (`download_page.py`, `library_page.py`, `pack_page.py`, `accounts_page.py`, `settings_page.py`), standardized modal dialogs (`ModalDialog`), monitor-clamped window geometry/maximized/splitter persistence, and drains `GuiController` event tuples (`log`, `batch_item`, `job_status`, `progress_*`, `prompt_*`, `done`) via Tkinter timers.
 - **Headless Web UI**: `WebDashboardState` drains `GuiController` events on a daemon thread, serves a single-page HTML dashboard at `/`, and exposes JSON endpoints behind optional Bearer / `X-API-Token` authentication (`$AUDIOBOOK_DL_WEB_TOKEN`).
 
 ### 4. Extensible Source Adapters & Cookie Persistence

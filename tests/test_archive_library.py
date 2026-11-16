@@ -247,35 +247,33 @@ def test_gui_archive_dialog_tags_hide_trash_and_queue(tmp_path):
             [CatalogBook(title="Pending Book", url="https://librivox.org/pending", author="Jane Doe")],
         )
 
-        dialog = app._show_archive_ledger_dialog()
+        lib_page = app.open_library_tab("archive")
+        tab = lib_page.archive_tab
         root.update_idletasks()
-        try:
-            iids = dialog._tree.get_children()
-            assert len(iids) == 1
-            dialog._tree.selection_set(iids[0])
-            dialog._queue_selected()
-            assert "https://librivox.org/pending" in app.urls_text.get("1.0", tk.END)
+        iids = tab._tree.get_children()
+        assert len(iids) == 1
+        tab._tree.selection_set(iids[0])
+        tab._queue_selected()
+        assert "https://librivox.org/pending" in app.urls_text.get("1.0", tk.END)
 
-            dialog._toggle_hide_selected()
-            assert len(dialog._tree.get_children()) == 0
-            dialog._show_hidden_var.set(True)
-            dialog._refresh()
-            assert len(dialog._tree.get_children()) == 1
+        tab._toggle_hide_selected()
+        assert len(tab._tree.get_children()) == 0
+        tab._show_hidden_var.set(True)
+        tab._refresh()
+        assert len(tab._tree.get_children()) == 1
 
-            dialog._tree.selection_set(dialog._tree.get_children()[0])
-            dialog._toggle_trash_selected()
-            assert len(dialog._tree.get_children()) == 0
-            dialog._show_trash_var.set(True)
-            dialog._refresh()
-            assert len(dialog._tree.get_children()) == 1
-        finally:
-            dialog.destroy()
+        tab._tree.selection_set(tab._tree.get_children()[0])
+        tab._toggle_trash_selected()
+        assert len(tab._tree.get_children()) == 0
+        tab._show_trash_var.set(True)
+        tab._refresh()
+        assert len(tab._tree.get_children()) == 1
     finally:
         root.destroy()
 
 
 def test_gui_series_and_podcast_grouping_in_catalog_and_archive(tmp_path):
-    from audiobookdl.gui.catalog_dialog import CatalogBrowserDialog
+    from audiobookdl.gui.pages.library_page import CatalogTab
     from audiobookdl.sources import ServiceInfo
 
     try:
@@ -295,7 +293,7 @@ def test_gui_series_and_podcast_grouping_in_catalog_and_archive(tmp_path):
                 supports_library=True,
             )
         ]
-        dialog = CatalogBrowserDialog(
+        dialog = CatalogTab(
             root,
             services,
             services[0],
@@ -368,23 +366,20 @@ def test_gui_series_and_podcast_grouping_in_catalog_and_archive(tmp_path):
                 CatalogBook(title="Single", url="https://example.com/s", author="B"),
             ],
         )
-        arch_dialog = app._show_archive_ledger_dialog()
+        arch_tab = app.open_library_tab("archive").archive_tab
         root.update_idletasks()
-        try:
-            arch_roots = arch_dialog._tree.get_children()
-            assert len(arch_roots) == 2  # 1 group node ("Saga") + 1 standalone leaf
-            group_iid = next(r for r in arch_roots if arch_dialog._tree.get_children(r))
-            arch_dialog._tree.selection_set((group_iid,))
-            arch_dialog._queue_selected()
-            queued_text = app.urls_text.get("1.0", tk.END)
-            assert "https://example.com/b1" in queued_text
-            assert "https://example.com/b2" in queued_text
+        arch_roots = arch_tab._tree.get_children()
+        assert len(arch_roots) == 2  # 1 group node ("Saga") + 1 standalone leaf
+        group_iid = next(r for r in arch_roots if arch_tab._tree.get_children(r))
+        arch_tab._tree.selection_set((group_iid,))
+        arch_tab._queue_selected()
+        queued_text = app.urls_text.get("1.0", tk.END)
+        assert "https://example.com/b1" in queued_text
+        assert "https://example.com/b2" in queued_text
 
-            arch_dialog._group_var.set(False)
-            arch_dialog._refresh()
-            assert len(arch_dialog._tree.get_children()) == 3
-        finally:
-            arch_dialog.destroy()
+        arch_tab._group_var.set(False)
+        arch_tab._refresh()
+        assert len(arch_tab._tree.get_children()) == 3
     finally:
         root.destroy()
 

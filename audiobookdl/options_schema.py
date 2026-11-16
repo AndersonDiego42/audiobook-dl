@@ -19,6 +19,11 @@ GUI_OVERWRITE_OPTIONS: tuple[str, ...] = ("Ask", "Overwrite", "Keep existing")
 GUI_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         "window_geometry",
+        "window_maximized",
+        "download_split_ratio",
+        "active_page",
+        "options_collapsed",
+        "output_naming_collapsed",
         "output_dir",
         "output_template",
         "use_download_archive",

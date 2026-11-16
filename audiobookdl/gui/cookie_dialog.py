@@ -10,8 +10,13 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from collections.abc import Callable, Sequence
 
-from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, apply_theme_to_window, scale_px
-from audiobookdl.gui.widgets import MainThreadCallbackQueue, ScrolledTreeview, TreeColumnSpec
+from audiobookdl.gui.theme import ThemePalette, scale_px
+from audiobookdl.gui.widgets import (
+    MainThreadCallbackQueue,
+    ModalDialog,
+    ScrolledTreeview,
+    TreeColumnSpec,
+)
 from audiobookdl.sources import ServiceInfo
 from audiobookdl.utils.browser_cookies import (
     BROWSER_LABELS,
@@ -44,7 +49,7 @@ def _format_cookie_flags(cookie: http.cookiejar.Cookie) -> str:
     return ", ".join(flags) if flags else "Standard"
 
 
-class CookieImportDialog(tk.Toplevel):
+class CookieImportDialog(ModalDialog):
     """Modal `Toplevel` allowing users to scan browser profiles and export Netscape cookies."""
 
     _COLUMNS = (
@@ -66,14 +71,19 @@ class CookieImportDialog(tk.Toplevel):
         extractor: Callable[[str, Sequence[str]], CookieImportResult] = extract_browser_cookies,
         browser_detector: Callable[[], dict[str, bool]] = detect_available_browsers,
     ) -> None:
-        super().__init__(parent)
+        super().__init__(
+            parent,
+            "Import Browser Cookies",
+            palette=palette,
+            default_size=(660, 480),
+            min_size=(620, 440),
+        )
         self._cookie_services = [s for s in services if "cookies" in s.auth_methods]
         if not self._cookie_services:
             self._cookie_services = list(services)
         self._services_by_label = {s.label: s for s in self._cookie_services}
         self._services_by_key = {s.key: s for s in self._cookie_services}
         self._on_apply = on_apply
-        self._palette = palette or LIGHT_PALETTE
         self._extractor = extractor
         self._detected_browsers = browser_detector()
 
@@ -115,12 +125,6 @@ class CookieImportDialog(tk.Toplevel):
         self._status_var = tk.StringVar(
             value="Select your browser and click 'Scan Browser' to preview matching cookies."
         )
-
-        self.title("Import Browser Cookies")
-        self.transient(parent)  # type: ignore[arg-type]
-        self.grab_set()
-        self.minsize(scale_px(self, 620), scale_px(self, 440))
-        self.bind("<Escape>", lambda _e: self.destroy())
 
         body = ttk.Frame(self, padding=scale_px(self, 14))
         body.pack(fill=tk.BOTH, expand=True)
@@ -195,8 +199,7 @@ class CookieImportDialog(tk.Toplevel):
         )
         self._save_btn.pack(side=tk.RIGHT, padx=(0, 8))
 
-        apply_theme_to_window(self, self._palette)
-        self._scan_btn.focus_set()
+        self.finalize_modal(initial_focus=self._scan_btn)
 
     def _current_service(self) -> ServiceInfo | None:
         return self._services_by_label.get(self._service_var.get())

@@ -602,7 +602,7 @@ def test_gui_controller_executes_pack_job(tmp_path: Path):
 
 def test_pack_dialog_renders_and_submits(tmp_path: Path):
     import tkinter as tk
-    from audiobookdl.gui.pack_dialog import PackDialog
+    from audiobookdl.gui.pages.pack_page import PackPage
 
     try:
         root = tk.Tk()
@@ -614,21 +614,22 @@ def test_pack_dialog_renders_and_submits(tmp_path: Path):
     src_dir.mkdir()
     _create_empty_id3_mp3(src_dir / "01.mp3")
 
-    dlg: PackDialog | None = None
+    page: PackPage | None = None
     submitted: list = []
     controller = GuiController()
     opts = args.build_default_options(output_format="m4b")
     try:
-        dlg = PackDialog(
+        page = PackPage(
             root,
             controller,
-            opts,
-            output_dir=str(tmp_path),
+            options_provider=lambda: opts,
+            output_dir_provider=lambda: str(tmp_path),
+            ensure_ffmpeg=lambda _o: True,
             on_submit=lambda reqs, fmt: submitted.append((reqs, fmt)),
         )
-        dlg._append_path(str(src_dir))
-        dlg.title_var.set("Custom Dialog Title")
-        dlg._submit()
+        page._append_path(str(src_dir))
+        page.title_var.set("Custom Dialog Title")
+        page._submit()
         assert len(submitted) == 1
         reqs, fmt = submitted[0]
         assert fmt == "m4b"
@@ -637,7 +638,7 @@ def test_pack_dialog_renders_and_submits(tmp_path: Path):
         assert reqs[0].overrides.title == "Custom Dialog Title"
     finally:
         import gc
-        dlg = None
+        page = None
         gc.collect()
         controller.shutdown(is_running=False, is_previewing=False)
         root.destroy()
@@ -792,7 +793,7 @@ def test_pack_dialog_preserves_explicit_fields_passes_output_dir_and_keeps_globa
     import tkinter as tk
     from audiobookdl.config import load_config, save_output_preferences
     from audiobookdl.gui.app import AudiobookDLApp
-    from audiobookdl.gui.pack_dialog import PackDialog
+    from audiobookdl.gui.pages.pack_page import PackPage
 
     try:
         root = tk.Tk()
@@ -813,32 +814,34 @@ def test_pack_dialog_preserves_explicit_fields_passes_output_dir_and_keeps_globa
     app.output_format_var.set("mp3")
     submitted: list[tuple[list[PackJobRequest], str]] = []
     base_opts = args.build_default_options(output_format="mp3")
-    dlg: PackDialog | None = None
+    page: PackPage | None = None
     try:
-        dlg = PackDialog(
+        page = PackPage(
             root,
             app.controller,
-            base_opts,
-            output_dir=str(pack_out),
+            options_provider=lambda: base_opts,
+            output_dir_provider=lambda: str(pack_out),
+            ensure_ffmpeg=lambda _o: True,
             on_submit=lambda reqs, fmt: submitted.append((reqs, fmt)),
         )
-        dlg.format_var.set("m4b")
-        cloned = dlg._clone_options_for_pack()
+        page.format_var.set("m4b")
+        cloned = page._clone_options_for_pack()
+        assert cloned is not None
         assert cloned.output_format == "m4b"
         assert cloned._explicit_fields == frozenset({"output_format"})
 
-        dlg._append_path(str(src_dir))
+        page._append_path(str(src_dir))
         fake_probe = AudioProbeInfo(duration=10.0, bitrate=128_000, codec_name="mp3", format_name="mp3")
         with patch("audiobookdl.pack.probe_audio_info", return_value=fake_probe):
-            dlg._start_scan()
+            page._start_scan()
             deadline = time.monotonic() + 3.0
-            while time.monotonic() < deadline and dlg._is_scanning:
+            while time.monotonic() < deadline and page._is_scanning:
                 root.update()
                 time.sleep(0.01)
-        assert len(dlg._preview_specs) == 1
-        assert Path(dlg._preview_specs[0].output_path).parent == pack_out
+        assert len(page._preview_specs) == 1
+        assert Path(page._preview_specs[0].output_path).parent == pack_out
 
-        dlg._submit()
+        page._submit()
         assert len(submitted) == 1
         assert submitted[0][0][0].output_dir == str(pack_out)
 
@@ -848,7 +851,7 @@ def test_pack_dialog_preserves_explicit_fields_passes_output_dir_and_keeps_globa
         reloaded = load_config(str(cfg_path))
         assert reloaded.output_format == "mp3"
     finally:
-        dlg = None
+        page = None
         gc.collect()
         app.controller.shutdown(is_running=False, is_previewing=False)
         root.destroy()

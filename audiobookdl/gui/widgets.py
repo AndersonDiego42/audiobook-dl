@@ -10,7 +10,18 @@ from tkinter import ttk
 from typing import Any
 from collections.abc import Callable, Sequence
 
-from audiobookdl.gui.theme import ThemePalette, resolve_palette, scale_px
+from audiobookdl.gui.formatting import (
+    clamp_rect_to_monitor,
+    format_geometry,
+    get_monitor_work_areas,
+)
+from audiobookdl.gui.theme import (
+    LIGHT_PALETTE,
+    ThemePalette,
+    apply_theme_to_window,
+    resolve_palette,
+    scale_px,
+)
 
 
 _SORT_CHUNK_RE = re.compile(r"(\d+)")
@@ -398,16 +409,27 @@ class ScrollableFrame(ttk.Frame):
         if req_size != self._last_content_req_size:
             self.sync_layout()
 
+    @staticmethod
+    def _is_descendant(widget: tk.Misc | None, ancestor: tk.Misc) -> bool:
+        cur = widget
+        while cur is not None:
+            if cur is ancestor:
+                return True
+            cur = getattr(cur, "master", None)
+        return False
+
     def ensure_focus_visible(self, event: tk.Event) -> None:
         """Scroll the viewport when a focused child widget sits outside the visible area."""
-        if not self.vscroll_visible:
+        if not self.winfo_exists() or not self.vscroll_visible:
             return
         widget = getattr(event, "widget", None)
         toplevel = self.winfo_toplevel()
         if widget is None or widget in (toplevel, self.canvas, self.content_frame):
             return
+        if not self._is_descendant(widget, self.content_frame):
+            return
         try:
-            if widget.winfo_toplevel() is not toplevel:
+            if not self.winfo_ismapped() or widget.winfo_toplevel() is not toplevel:
                 return
             content_y = self.content_frame.winfo_rooty()
             widget_top = widget.winfo_rooty() - content_y
@@ -441,7 +463,14 @@ class ScrollableFrame(ttk.Frame):
         return False
 
     def on_mousewheel(self, event: tk.Event) -> None:
-        """Scroll the main canvas unless an inner scrollable widget handles the wheel."""
+        """Scroll this canvas when pointer is inside it and no inner scrollable handles the wheel."""
+        if not self.winfo_exists():
+            return
+        try:
+            if not self.winfo_ismapped():
+                return
+        except tk.TclError:
+            return
         widget = getattr(event, "widget", None)
         delta = getattr(event, "delta", 0)
         event_num = getattr(event, "num", None)
@@ -451,6 +480,8 @@ class ScrollableFrame(ttk.Frame):
                 if widget.winfo_toplevel() is not self.winfo_toplevel():
                     return
             except tk.TclError:
+                return
+            if not self._is_descendant(widget, self):
                 return
             if "popdown" in str(widget):
                 return
@@ -801,3 +832,125 @@ class CollapsibleSection(ttk.Frame):
             self._summary_label.grid_remove()
         if notify and self._on_toggle is not None:
             self._on_toggle(self._collapsed)
+
+
+class ModalDialog(tk.Toplevel):
+    """Base modal dialog with parent centering, monitor clamping, DPI sizing, Esc close, and focus restore."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        title: str,
+        *,
+        palette: ThemePalette | None = None,
+        default_size: tuple[int, int] | None = None,
+        min_size: tuple[int, int] | None = None,
+        resizable: tuple[bool, bool] = (True, True),
+    ) -> None:
+        super().__init__(parent)
+        self._palette = palette or LIGHT_PALETTE
+        self._owner = parent.winfo_toplevel()
+        self._default_size = default_size
+        self._min_size = min_size
+        self._opener_focus: tk.Misc | None = None
+        try:
+            self._opener_focus = self._owner.focus_get()
+        except (tk.TclError, KeyError):
+            self._opener_focus = None
+
+        self.withdraw()
+        self.title(title)
+        self.transient(self._owner)  # type: ignore[call-overload]
+        self.resizable(*resizable)
+        if min_size is not None:
+            self.minsize(scale_px(self, min_size[0]), scale_px(self, min_size[1]))
+        self.bind("<Escape>", self._on_escape)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.bind("<Map>", self._on_modal_map, add="+")
+        self._finalized = False
+
+    def _on_escape(self, _event: tk.Event | None = None) -> str:
+        self.destroy()
+        return "break"
+
+    def _on_modal_map(self, _event: tk.Event | None = None) -> None:
+        if not self._finalized:
+            return
+        try:
+            if self.winfo_exists() and self.grab_current() is None:
+                self.grab_set()
+        except tk.TclError:
+            pass
+
+    def finalize_modal(
+        self,
+        *,
+        initial_focus: tk.Misc | None = None,
+        monitors: Sequence[tuple[int, int, int, int]] | None = None,
+    ) -> None:
+        """Apply theme, size and center on owner clamped to monitor work area, show, grab, and focus."""
+        self._finalized = True
+        apply_theme_to_window(self, self._palette)
+        self.update_idletasks()
+        min_w = scale_px(self, self._min_size[0]) if self._min_size else scale_px(self, 240)
+        min_h = scale_px(self, self._min_size[1]) if self._min_size else scale_px(self, 160)
+        if self._default_size is not None:
+            req_w = max(min_w, scale_px(self, self._default_size[0]))
+            req_h = max(min_h, scale_px(self, self._default_size[1]))
+        else:
+            req_w = max(min_w, int(self.winfo_reqwidth()))
+            req_h = max(min_h, int(self.winfo_reqheight()))
+
+        mon_areas = list(monitors) if monitors is not None else get_monitor_work_areas(self._owner)
+        target_x: int | None = None
+        target_y: int | None = None
+        try:
+            if self._owner.winfo_exists() and self._owner.winfo_ismapped():
+                ow = int(self._owner.winfo_width())
+                oh = int(self._owner.winfo_height())
+                if ow > 1 and oh > 1:
+                    ox = int(self._owner.winfo_rootx())
+                    oy = int(self._owner.winfo_rooty())
+                    target_x = ox + (ow - req_w) // 2
+                    target_y = oy + (oh - req_h) // 2
+        except tk.TclError:
+            target_x = None
+            target_y = None
+
+        cw, ch, cx, cy = clamp_rect_to_monitor(
+            req_w,
+            req_h,
+            target_x,
+            target_y,
+            mon_areas,
+            min_width=min_w,
+            min_height=min_h,
+        )
+        self.geometry(format_geometry(cw, ch, cx, cy))
+        self.deiconify()
+        self.lift()
+        try:
+            self.grab_set()
+        except tk.TclError:
+            pass
+        focus_target = initial_focus if initial_focus is not None else self
+        try:
+            focus_target.focus_set()
+        except tk.TclError:
+            pass
+
+    def destroy(self) -> None:
+        opener = self._opener_focus
+        self._opener_focus = None
+        try:
+            if self.grab_current() is self:
+                self.grab_release()
+        except tk.TclError:
+            pass
+        super().destroy()
+        if opener is not None:
+            try:
+                if opener.winfo_exists():
+                    opener.focus_set()
+            except tk.TclError:
+                pass

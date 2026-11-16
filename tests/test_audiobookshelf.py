@@ -230,18 +230,14 @@ def test_gui_abs_dialog_saves_settings(tmp_path):
         cfg_path = tmp_path / "audiobook-dl.toml"
         cfg_path.write_text("", encoding="utf-8")
         app = AudiobookDLApp(root, config_location=str(cfg_path))
-        with patch("audiobookdl.gui.abs_dialog.save_audiobookshelf_config") as mock_save:
-            dialog = app._show_audiobookshelf_dialog()
-            try:
-                dialog._url_var.set("https://abs.myhost.tld/")
-                dialog._token_var.set("tok-123")
-                dialog._library_var.set("lib-99")
-                dialog._auto_upload_var.set(True)
-                dialog._save()
-                mock_save.assert_called_once()
-            finally:
-                if dialog.winfo_exists():
-                    dialog.destroy()
+        with patch("audiobookdl.gui.pages.settings_page.save_audiobookshelf_config") as mock_save:
+            page = app.navigate("settings")
+            page._url_var.set("https://abs.myhost.tld/")
+            page._token_var.set("tok-123")
+            page._library_var.set("lib-99")
+            page._auto_upload_var.set(True)
+            page._save()
+            mock_save.assert_called_once()
     finally:
         root.destroy()
 

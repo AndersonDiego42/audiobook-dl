@@ -130,15 +130,12 @@ def test_cli_scan_subcommand_json_and_gui_scan_folder(tmp_path, capsys):
     try:
         app = AudiobookDLApp(root, config_location=str(cfg_path))
         app.controller.config.download_archive = str(db_path)
-        dialog = app._show_archive_ledger_dialog()
-        try:
-            with patch("audiobookdl.pack.read_track_tags", return_value=TrackTagInfo()):
-                res = dialog.scan_folder(str(lib_root), background=False)
-            assert res is not None
-            assert res.matched == 1
-            assert len(dialog._tree.get_children()) == 1
-        finally:
-            dialog.destroy()
+        tab = app.open_library_tab("archive").archive_tab
+        with patch("audiobookdl.pack.read_track_tags", return_value=TrackTagInfo()):
+            res = tab.scan_folder(str(lib_root), background=False)
+        assert res is not None
+        assert res.matched == 1
+        assert len(tab._tree.get_children()) == 1
     finally:
         root.destroy()
 

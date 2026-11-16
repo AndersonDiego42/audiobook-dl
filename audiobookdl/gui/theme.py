@@ -319,6 +319,68 @@ def _configure_clam_palette(style: ttk.Style, palette: ThemePalette) -> None:
     )
     _configure_accent_button(style, palette)
 
+    style.configure("Sidebar.TFrame", background=palette.surface)
+    style.configure("Sidebar.TLabel", background=palette.surface, foreground=palette.fg)
+    style.configure("SidebarMuted.TLabel", background=palette.surface, foreground=palette.fg_muted)
+    style.configure(
+        "SidebarBadge.TLabel",
+        background=palette.surface_alt,
+        foreground=palette.fg_secondary,
+        padding=(6, 1),
+    )
+    style.configure(
+        "SidebarNav.TButton",
+        background=palette.surface,
+        foreground=palette.fg,
+        bordercolor=palette.surface,
+        anchor="w",
+        padding=(10, 7),
+        relief="flat",
+    )
+    style.map(
+        "SidebarNav.TButton",
+        background=[
+            ("pressed", palette.surface_hover),
+            ("active", palette.surface_hover),
+        ],
+        foreground=[("disabled", palette.fg_disabled)],
+    )
+    style.configure(
+        "SidebarNavActive.TButton",
+        background=palette.select_bg,
+        foreground=palette.select_fg,
+        bordercolor=palette.select_bg,
+        anchor="w",
+        padding=(10, 7),
+        relief="flat",
+    )
+    style.map(
+        "SidebarNavActive.TButton",
+        background=[
+            ("pressed", palette.select_bg),
+            ("active", palette.select_bg),
+        ],
+        foreground=[("disabled", palette.fg_disabled)],
+    )
+    style.configure("Banner.TFrame", background=palette.surface_alt, bordercolor=palette.warning)
+    style.configure("Banner.TLabel", background=palette.surface_alt, foreground=palette.warning)
+    style.configure(
+        "BannerMuted.TLabel",
+        background=palette.surface_alt,
+        foreground=palette.fg_secondary,
+    )
+    style.configure(
+        "Chip.TButton",
+        background=palette.surface_alt,
+        foreground=palette.fg_secondary,
+        bordercolor=palette.border,
+        padding=(8, 2),
+    )
+    style.map(
+        "Chip.TButton",
+        background=[("active", palette.surface_hover), ("pressed", palette.surface_hover)],
+    )
+
     style.configure("TCheckbutton", background=palette.bg, foreground=palette.fg)
     style.map(
         "TCheckbutton",

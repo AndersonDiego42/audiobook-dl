@@ -24,14 +24,17 @@ class FFmpegAssistant:
         status_var: tk.StringVar,
         ffmpeg_status_var: tk.StringVar,
         on_log: Callable[[str], None],
+        on_status_changed: Callable[[bool, str], None] | None = None,
     ) -> None:
         self._root = root
         self._controller = controller
         self._status_var = status_var
         self.status_var = ffmpeg_status_var
         self._on_log = on_log
+        self._on_status_changed = on_status_changed
         self._status_label: ttk.Label | None = None
         self.locate_btn: ttk.Button | None = None
+        self.is_available = True
 
     def build_controls(self, parent: ttk.Frame) -> ttk.Frame:
         """Build the header status label and Locate FFmpeg button inside `parent`."""
@@ -80,7 +83,7 @@ class FFmpegAssistant:
         return path, None
 
     def update_status(self) -> None:
-        """Probe FFmpeg/FFprobe availability and refresh header badge styling."""
+        """Probe FFmpeg/FFprobe availability and refresh status label, button, and banner callback."""
         ffmpeg_path, ffmpeg_err = self.check_tool("ffmpeg")
         ffprobe_path, ffprobe_err = self.check_tool("ffprobe")
         if ffmpeg_err or ffprobe_err:
@@ -88,26 +91,41 @@ class FFmpegAssistant:
             style_name = "Error.TLabel"
             cursor = "hand2"
             btn_text = "Locate FFmpeg..."
+            available = False
         elif ffmpeg_path and ffprobe_path:
             self.status_var.set("FFmpeg: Ready")
             style_name = "Success.TLabel"
             cursor = ""
             btn_text = "FFmpeg Folder..."
+            available = True
         elif ffmpeg_path:
             self.status_var.set("FFmpeg: Ready (ffprobe missing - click for help)")
             style_name = "Warning.TLabel"
             cursor = "hand2"
             btn_text = "Locate FFmpeg..."
+            available = False
         else:
             self.status_var.set("FFmpeg: Not found (click for setup help)")
             style_name = "Error.TLabel"
             cursor = "hand2"
             btn_text = "Locate FFmpeg..."
+            available = False
 
+        self.is_available = available
         if self._status_label is not None:
-            self._status_label.configure(style=style_name, cursor=cursor)
+            try:
+                if self._status_label.winfo_exists():
+                    self._status_label.configure(style=style_name, cursor=cursor)
+            except tk.TclError:
+                pass
         if self.locate_btn is not None:
-            self.locate_btn.configure(text=btn_text)
+            try:
+                if self.locate_btn.winfo_exists():
+                    self.locate_btn.configure(text=btn_text)
+            except tk.TclError:
+                pass
+        if self._on_status_changed is not None:
+            self._on_status_changed(available, self.status_var.get())
 
     def browse_dir(self) -> bool:
         """Let the user choose a folder containing `ffmpeg` and persist it in config."""

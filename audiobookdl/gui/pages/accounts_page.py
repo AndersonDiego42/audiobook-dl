@@ -1,4 +1,4 @@
-"""Overview dialog listing all services, configured profiles, vault backends, and quick actions."""
+"""Accounts page hosting service credential editing and the multi-profile accounts overview."""
 
 from __future__ import annotations
 
@@ -14,15 +14,16 @@ from audiobookdl.config import (
     make_source_profile_key,
 )
 from audiobookdl.credentials import get_credential_store
+from audiobookdl.gui.auth_panel import ServiceAuthCoordinator, ServiceAuthPanel
 from audiobookdl.gui.controller import GuiController
-from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, apply_theme_to_window, scale_px
+from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, make_bold_font, scale_px
 from audiobookdl.gui.widgets import MainThreadCallbackQueue, ScrolledTreeview, TreeColumnSpec
 from audiobookdl.pipeline import verify_service_auth
 from audiobookdl.sources import ServiceInfo
 
 
-class AccountsOverviewDialog(tk.Toplevel):
-    """Manage all supported audiobook services, profiles, credentials, and login verification."""
+class AccountsPage(ttk.Frame):
+    """Manage service authentication credentials, profiles, cookie import, and verification."""
 
     _COLUMNS = (
         TreeColumnSpec("service", "Service", width=165, stretch=True),
@@ -38,47 +39,56 @@ class AccountsOverviewDialog(tk.Toplevel):
         parent: tk.Misc,
         controller: GuiController,
         services: Sequence[ServiceInfo],
+        auth_coordinator: ServiceAuthCoordinator,
         *,
         on_import_cookies: Callable[[str], None] | None = None,
-        on_select_account: Callable[[str, str], None] | None = None,
-        on_credentials_changed: Callable[[], None] | None = None,
         palette: ThemePalette | None = None,
     ) -> None:
-        super().__init__(parent)
+        super().__init__(parent, padding=scale_px(parent, 12))
         self._controller = controller
         self._services = list(services)
         self._services_by_key = {s.key: s for s in self._services}
+        self._auth_coord = auth_coordinator
         self._on_import_cookies = on_import_cookies
-        self._on_select_account = on_select_account
-        self._on_credentials_changed = on_credentials_changed
         self._palette = palette or LIGHT_PALETTE
         self._cb_queue = MainThreadCallbackQueue(self)
         self._rows: list[tuple[str, str]] = []
         self._is_testing = False
 
-        self.title("Manage All Accounts & Services")
-        self.transient(parent)  # type: ignore[call-overload]
-        self.geometry(f"{scale_px(self, 820)}x{scale_px(self, 460)}")
-        self.minsize(scale_px(self, 640), scale_px(self, 320))
-        self.bind("<Escape>", lambda _e: self.destroy())
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(2, weight=1)
 
-        body = ttk.Frame(self, padding=scale_px(self, 12))
-        body.pack(fill=tk.BOTH, expand=True)
-        body.columnconfigure(0, weight=1)
-        body.rowconfigure(0, weight=1)
+        header = ttk.Frame(self)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="Accounts & Services", font=make_bold_font(self, 13)).grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(
+            header,
+            text="Configure logins, profiles, and session cookies across supported audiobook services.",
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, sticky="w")
 
-        self._scrolled = ScrolledTreeview(body, self._COLUMNS, selectmode="browse")
+        self.auth_panel = ServiceAuthPanel(self, auth_coordinator)
+        self.auth_panel.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+
+        overview_frame = ttk.LabelFrame(self, text="All Services & Profiles", padding=scale_px(self, 8))
+        overview_frame.grid(row=2, column=0, sticky="nsew")
+        overview_frame.columnconfigure(0, weight=1)
+        overview_frame.rowconfigure(0, weight=1)
+
+        self._scrolled = ScrolledTreeview(overview_frame, self._COLUMNS, selectmode="browse")
         self._scrolled.grid(row=0, column=0, sticky="nsew")
         self._tree = self._scrolled.tree
-        self._tree.tag_configure("ok", foreground=self._palette.success)
-        self._tree.tag_configure("err", foreground=self._palette.error)
+        self._tree.bind("<Double-1>", lambda _e: self._select_in_form())
 
         self._status_var = tk.StringVar(value="")
-        self._loading_bar = ttk.Progressbar(body, mode="indeterminate")
+        self._loading_bar = ttk.Progressbar(overview_frame, mode="indeterminate")
         self._loading_bar.grid(row=1, column=0, sticky="ew", pady=(4, 0))
         self._loading_bar.grid_remove()
 
-        btn_bar = ttk.Frame(body)
+        btn_bar = ttk.Frame(overview_frame)
         btn_bar.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         self._test_all_btn = ttk.Button(btn_bar, text="Test All Logins", command=self._test_all_logins)
         self._test_all_btn.pack(side=tk.LEFT, padx=(0, 6))
@@ -89,18 +99,28 @@ class AccountsOverviewDialog(tk.Toplevel):
         ttk.Button(btn_bar, text="Delete Profile", command=self._delete_selected_profile).pack(
             side=tk.LEFT, padx=(0, 6)
         )
-        if self._on_select_account is not None:
-            ttk.Button(btn_bar, text="Select in Main Window", command=self._select_in_main).pack(
-                side=tk.LEFT
-            )
-        ttk.Button(btn_bar, text="Close", command=self.destroy).pack(side=tk.RIGHT)
+        ttk.Button(btn_bar, text="Edit Selected", command=self._select_in_form).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        ttk.Button(btn_bar, text="Refresh", command=self.refresh).pack(side=tk.RIGHT)
 
-        ttk.Label(body, textvariable=self._status_var, style="Muted.TLabel").grid(
+        ttk.Label(overview_frame, textvariable=self._status_var, style="Muted.TLabel").grid(
             row=3, column=0, sticky="w", pady=(6, 0)
         )
 
+        self.apply_theme(self._palette)
         self.refresh()
-        apply_theme_to_window(self, self._palette)
+
+    def apply_theme(self, palette: ThemePalette) -> None:
+        self._palette = palette
+        self._tree.tag_configure("ok", foreground=palette.success)
+        self._tree.tag_configure("err", foreground=palette.error)
+
+    def on_show(self) -> None:
+        """Refresh profile statuses and active service form when Accounts is visited."""
+        self._auth_coord.load_service_into_form()
+        self._auth_coord.update_field_states()
+        self.refresh()
 
     def _vault_backend_label(self) -> str:
         loc = self._controller.config_location
@@ -171,14 +191,11 @@ class AccountsOverviewDialog(tk.Toplevel):
         self._on_import_cookies(picked[0] if picked else "")
         self.refresh()
 
-    def _select_in_main(self) -> None:
-        if self._on_select_account is None:
-            return
+    def _select_in_form(self) -> None:
         picked = self._selected_service_profile()
         if picked is None:
             return
-        self._on_select_account(picked[0], picked[1])
-        self.destroy()
+        self._auth_coord.select_service_profile(picked[0], picked[1])
 
     def _delete_selected_profile(self) -> None:
         picked = self._selected_service_profile()
@@ -188,12 +205,12 @@ class AccountsOverviewDialog(tk.Toplevel):
         if not messagebox.askyesno(
             "Delete Credentials",
             f"Remove saved credentials for {svc_key} ({prof})?",
-            parent=self,
+            parent=self.winfo_toplevel(),
         ):
             return
         self._controller.save_source_credentials(svc_key, profile=prof)
-        if self._on_credentials_changed is not None:
-            self._on_credentials_changed()
+        self._auth_coord.load_service_into_form()
+        self._auth_coord.update_field_states()
         self.refresh()
         self._status_var.set(f"Removed credentials for {svc_key} ({prof}).")
 

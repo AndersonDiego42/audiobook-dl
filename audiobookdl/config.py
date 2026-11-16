@@ -44,6 +44,11 @@ class SourceConfig:
 class GuiConfig:
     """Stores desktop GUI layout and output preferences"""
     window_geometry: str | None = None
+    window_maximized: bool | None = None
+    download_split_ratio: float | None = None
+    active_page: str | None = None
+    options_collapsed: bool | None = None
+    output_naming_collapsed: bool | None = None
     output_dir: str | None = None
     output_template: str | None = None
     use_download_archive: bool | None = None
@@ -120,6 +125,11 @@ class Config:
         }
         gui_copy = GuiConfig(
             window_geometry=self.gui.window_geometry,
+            window_maximized=self.gui.window_maximized,
+            download_split_ratio=self.gui.download_split_ratio,
+            active_page=self.gui.active_page,
+            options_collapsed=self.gui.options_collapsed,
+            output_naming_collapsed=self.gui.output_naming_collapsed,
             output_dir=self.gui.output_dir,
             output_template=self.gui.output_template,
             use_download_archive=self.gui.use_download_archive,
@@ -456,6 +466,28 @@ def _build_source_config_from_dict(
     )
 
 
+def _read_gui_bool(gui_section: dict[str, Any], key: str) -> bool | None:
+    """Return a boolean `[gui]` value, logging and ignoring non-boolean entries."""
+    raw = gui_section.get(key)
+    if raw is None:
+        return None
+    if not isinstance(raw, bool):
+        logging.log(f"Warning: config '[gui].{key}' must be a boolean; ignoring")
+        return None
+    return raw
+
+
+def _read_gui_split_ratio(gui_section: dict[str, Any]) -> float | None:
+    """Return `[gui].download_split_ratio` when it is a number strictly between 0 and 1."""
+    raw = gui_section.get("download_split_ratio")
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not 0.0 < float(raw) < 1.0:
+        logging.log("Warning: config '[gui].download_split_ratio' must be a number between 0 and 1; ignoring")
+        return None
+    return float(raw)
+
+
 def structure_config(
     config_location: str,
     config_dict: dict,
@@ -569,12 +601,7 @@ def structure_config(
         for key in gui_section:
             if key not in GUI_CONFIG_KEYS:
                 logging.log(f"Warning: unknown key '{key}' in '[gui]' ignored")
-        use_archive_raw = gui_section.get("use_download_archive")
-        if use_archive_raw is not None and not isinstance(use_archive_raw, bool):
-            logging.log("Warning: config '[gui].use_download_archive' must be a boolean; ignoring")
-            use_archive_val = None
-        else:
-            use_archive_val = use_archive_raw
+        use_archive_val = _read_gui_bool(gui_section, "use_download_archive")
         theme_raw = gui_section.get("theme")
         theme_val: str | None = None
         if theme_raw is not None:
@@ -584,14 +611,14 @@ def structure_config(
                 logging.log(
                     "Warning: config '[gui].theme' must be 'system', 'light', or 'dark'; ignoring"
                 )
-        notify_raw = gui_section.get("notify_on_complete")
-        if notify_raw is not None and not isinstance(notify_raw, bool):
-            logging.log("Warning: config '[gui].notify_on_complete' must be a boolean; ignoring")
-            notify_val = None
-        else:
-            notify_val = notify_raw
+        notify_val = _read_gui_bool(gui_section, "notify_on_complete")
         gui_config = GuiConfig(
             window_geometry=gui_section.get("window_geometry") if isinstance(gui_section.get("window_geometry"), str) else None,
+            window_maximized=_read_gui_bool(gui_section, "window_maximized"),
+            download_split_ratio=_read_gui_split_ratio(gui_section),
+            active_page=gui_section.get("active_page") if isinstance(gui_section.get("active_page"), str) else None,
+            options_collapsed=_read_gui_bool(gui_section, "options_collapsed"),
+            output_naming_collapsed=_read_gui_bool(gui_section, "output_naming_collapsed"),
             output_dir=gui_section.get("output_dir") if isinstance(gui_section.get("output_dir"), str) else None,
             output_template=gui_section.get("output_template") if isinstance(gui_section.get("output_template"), str) else None,
             use_download_archive=use_archive_val,
@@ -1051,22 +1078,28 @@ def save_gui_preferences(
     output_template: str | None = None,
     overwrite: str | None = None,
     *,
+    window_maximized: bool | None = None,
+    download_split_ratio: float | None = None,
+    active_page: str | None = None,
+    options_collapsed: bool | None = None,
+    output_naming_collapsed: bool | None = None,
     use_download_archive: bool | None = None,
     theme: str | None = None,
     notify_on_complete: bool | None = None,
 ) -> str:
-    """Persist GUI window geometry, output prefs, archive toggle, theme, and notifications in `audiobook-dl.toml`."""
+    """Persist GUI window state, output prefs, archive toggle, theme, and notifications in `audiobook-dl.toml`."""
     config_location = overwrite or get_config_location(None)
     with file_lock(config_location):
         config_dict = read_config(config_location)
         gui_dict = dict(config_dict.get("gui") or {})
-        updates = {
+        str_updates = {
             "window_geometry": window_geometry,
+            "active_page": active_page.strip().lower() if isinstance(active_page, str) else active_page,
             "output_dir": output_dir,
             "output_template": output_template,
             "theme": theme.strip().lower() if isinstance(theme, str) else theme,
         }
-        for key, val in updates.items():
+        for key, val in str_updates.items():
             if val is None:
                 continue
             cleaned = val.strip()
@@ -1074,10 +1107,18 @@ def save_gui_preferences(
                 gui_dict[key] = cleaned
             else:
                 gui_dict.pop(key, None)
-        if use_download_archive is not None:
-            gui_dict["use_download_archive"] = bool(use_download_archive)
-        if notify_on_complete is not None:
-            gui_dict["notify_on_complete"] = bool(notify_on_complete)
+        bool_updates = {
+            "window_maximized": window_maximized,
+            "options_collapsed": options_collapsed,
+            "output_naming_collapsed": output_naming_collapsed,
+            "use_download_archive": use_download_archive,
+            "notify_on_complete": notify_on_complete,
+        }
+        for key, val in bool_updates.items():
+            if val is not None:
+                gui_dict[key] = bool(val)
+        if download_split_ratio is not None and 0.0 < float(download_split_ratio) < 1.0:
+            gui_dict["download_split_ratio"] = round(float(download_split_ratio), 4)
         if gui_dict:
             config_dict["gui"] = gui_dict
         else:

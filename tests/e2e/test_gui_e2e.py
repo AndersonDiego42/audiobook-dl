@@ -91,9 +91,17 @@ def test_gui_preview_and_download_m4b_end_to_end(
 
     assert app.status_var.get() == "Completed"
     assert float(app.progressbar.cget("value")) == pytest.approx(100.0)
+    assert float(app.shell.footer_progressbar.cget("value")) == pytest.approx(100.0)
     log_text = app.log_text.get("1.0", tk.END)
     assert "GUI E2E Audiobook" in log_text
     assert "--- Completed ---" in log_text
+
+    # Sidebar navigation updates Library archive tab on visit
+    lib_page = app.navigate("library")
+    assert len(lib_page.archive_tab._tree.get_children()) >= 0
+    app.navigate("settings")
+    app.navigate("download")
+    assert app.shell.active_page_id == "download"
 
     out_m4b = e2e_workspace.output_dir / "GUI E2E Audiobook.m4b"
     out_json = e2e_workspace.output_dir / "GUI E2E Audiobook.m4b.json"

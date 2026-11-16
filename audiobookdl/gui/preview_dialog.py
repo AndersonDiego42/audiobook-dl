@@ -17,14 +17,17 @@ from audiobookdl.gui.formatting import (
     render_cover_thumbnail,
 )
 from audiobookdl.gui.theme import (
-    LIGHT_PALETTE,
     ThemePalette,
     apply_theme_to_widget_tree,
-    apply_theme_to_window,
     make_bold_font,
     scale_px,
 )
-from audiobookdl.gui.widgets import MainThreadCallbackQueue, ScrolledTreeview, TreeColumnSpec
+from audiobookdl.gui.widgets import (
+    MainThreadCallbackQueue,
+    ModalDialog,
+    ScrolledTreeview,
+    TreeColumnSpec,
+)
 from audiobookdl.sources.source import Source
 from audiobookdl.utils.audiobook import Audiobook, AudiobookMetadata, BookId, Cover, Result, Series
 from audiobookdl.utils.enrichment import (
@@ -50,7 +53,7 @@ _EDITABLE_PREVIEW_LABELS = frozenset(
 )
 
 
-class ChoiceDialog(tk.Toplevel):
+class ChoiceDialog(ModalDialog):
     """Modal selection dialog returning a 0-based index or `None` when skipped/cancelled."""
 
     def __init__(
@@ -62,14 +65,14 @@ class ChoiceDialog(tk.Toplevel):
         default: int | None = None,
         palette: ThemePalette | None = None,
     ) -> None:
-        super().__init__(parent)
+        super().__init__(
+            parent,
+            title,
+            palette=palette,
+            default_size=(540, 320),
+            min_size=(520, 280),
+        )
         self.selected_index: int | None = None
-        self._palette = palette or LIGHT_PALETTE
-        self.title(title)
-        self.transient(parent)  # type: ignore[arg-type]
-        self.grab_set()
-        self.minsize(scale_px(self, 520), scale_px(self, 280))
-        self.bind("<Escape>", lambda _e: self.destroy())
 
         body = ttk.Frame(self, padding=scale_px(self, 12))
         body.pack(fill=tk.BOTH, expand=True)
@@ -107,8 +110,7 @@ class ChoiceDialog(tk.Toplevel):
         ttk.Button(btns, text="Select", command=self._confirm).pack(side=tk.RIGHT)
         ttk.Button(btns, text="Skip", command=self.destroy).pack(side=tk.RIGHT, padx=(0, 6))
 
-        apply_theme_to_window(self, self._palette)
-        self._listbox.focus_set()
+        self.finalize_modal(initial_focus=self._listbox)
 
     def _confirm(self) -> None:
         sel = self._listbox.curselection()
@@ -117,7 +119,7 @@ class ChoiceDialog(tk.Toplevel):
         self.destroy()
 
 
-class _EnrichmentPickerDialog(tk.Toplevel):
+class _EnrichmentPickerDialog(ModalDialog):
     """Modal table allowing the user to inspect and select an `EnrichmentCandidate`."""
 
     _COLUMNS = (
@@ -137,17 +139,16 @@ class _EnrichmentPickerDialog(tk.Toplevel):
         current_metadata: AudiobookMetadata | None = None,
         palette: ThemePalette | None = None,
     ) -> None:
-        super().__init__(parent)
+        super().__init__(
+            parent,
+            "Select Enrichment Match",
+            palette=palette,
+            default_size=(820, 480),
+            min_size=(780, 440),
+        )
         self.selected_candidate: EnrichmentCandidate | None = None
         self._candidates = list(candidates)
         self._current_metadata = current_metadata
-        self._palette = palette or LIGHT_PALETTE
-
-        self.title("Select Enrichment Match")
-        self.transient(parent)  # type: ignore[arg-type]
-        self.grab_set()
-        self.minsize(scale_px(self, 780), scale_px(self, 440))
-        self.bind("<Escape>", lambda _e: self.destroy())
 
         body = ttk.Frame(self, padding=scale_px(self, 12))
         body.pack(fill=tk.BOTH, expand=True)
@@ -209,8 +210,7 @@ class _EnrichmentPickerDialog(tk.Toplevel):
         ttk.Button(btns, text="Apply Selected", command=self._apply_selected).pack(side=tk.RIGHT)
         ttk.Button(btns, text="Cancel", command=self.destroy).pack(side=tk.RIGHT, padx=(0, 6))
 
-        apply_theme_to_window(self, self._palette)
-        self._tree.focus_set()
+        self.finalize_modal(initial_focus=self._tree)
 
     def _render_candidate_diff(self, _event: tk.Event | None = None) -> None:
         sel = self._tree.selection()
@@ -251,7 +251,7 @@ class _EnrichmentPickerDialog(tk.Toplevel):
         self.destroy()
 
 
-class PreviewDialog(tk.Toplevel):
+class PreviewDialog(ModalDialog):
     """Modal `Toplevel` window hosting editable book metadata or a series selection checklist."""
 
     _SERIES_COLUMNS = (
@@ -274,7 +274,13 @@ class PreviewDialog(tk.Toplevel):
         on_search_enrichment: Callable[[Audiobook], list[EnrichmentCandidate]] | None = None,
         on_apply_enrichment: Callable[[Audiobook, EnrichmentCandidate], tuple[list[str], bool, bool]] | None = None,
     ) -> None:
-        super().__init__(parent)
+        super().__init__(
+            parent,
+            f"Preview \u2014 {result.title}",
+            palette=palette,
+            default_size=(820, 560) if isinstance(result, Audiobook) else (680, 520),
+            min_size=(560, 420),
+        )
         self._url = url
         self._source = source
         self._result = result
@@ -282,12 +288,12 @@ class PreviewDialog(tk.Toplevel):
         self._skip_downloaded = skip_downloaded
         self._series_book_exists = series_book_exists
         self._on_confirm = on_confirm
-        self._palette = palette or LIGHT_PALETTE
         self._on_search_enrichment = on_search_enrichment
         self._on_apply_enrichment = on_apply_enrichment
         self._source_transferred = False
         self._source_closed = False
         self._cb_queue = MainThreadCallbackQueue(self)
+        self._initial_focus_widget: tk.Misc | None = None
 
         self._cover_photo: Any | None = None
         self._pending_cover: Cover | None = result.cover if isinstance(result, Audiobook) else None
@@ -318,11 +324,6 @@ class PreviewDialog(tk.Toplevel):
         self._last_clicked_index: int | None = None
         self._tree: ttk.Treeview | None = None
 
-        self.title(f"Preview \u2014 {result.title}")
-        self.transient(parent)  # type: ignore[arg-type]
-        self.minsize(scale_px(self, 560), scale_px(self, 420))
-        self.bind("<Escape>", lambda _e: self.destroy())
-
         body = ttk.Frame(self, padding=scale_px(self, 14))
         body.pack(fill=tk.BOTH, expand=True)
         body.columnconfigure(0, weight=1)
@@ -332,7 +333,7 @@ class PreviewDialog(tk.Toplevel):
         else:
             self._build_series_view(body, result)
 
-        apply_theme_to_window(self, self._palette)
+        self.finalize_modal(initial_focus=self._initial_focus_widget)
         self.bind("<Destroy>", self._on_dialog_destroy, add="+")
 
     def _close_untransferred_source(self) -> None:
@@ -492,9 +493,12 @@ class PreviewDialog(tk.Toplevel):
                 text=f"{label}:",
                 font=make_bold_font(self, 9),
             ).grid(row=row_idx, column=0, sticky="w", padx=(0, 8), pady=2)
-            ttk.Entry(meta_frame, textvariable=var).grid(
+            entry = ttk.Entry(meta_frame, textvariable=var)
+            entry.grid(
                 row=row_idx, column=1, columnspan=3, sticky="ew", pady=2
             )
+            if self._initial_focus_widget is None:
+                self._initial_focus_widget = entry
             row_idx += 1
 
         ttk.Label(meta_frame, text="Series:", font=make_bold_font(self, 9)).grid(
@@ -813,7 +817,9 @@ class PreviewDialog(tk.Toplevel):
         )
         deselect_existing_btn.pack(side=tk.LEFT, padx=(0, 8))
         ttk.Label(toolbar, text="Filter:").pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Entry(toolbar, textvariable=self._filter_var, width=22).pack(side=tk.LEFT, padx=(0, 8))
+        filter_entry = ttk.Entry(toolbar, textvariable=self._filter_var, width=22)
+        filter_entry.pack(side=tk.LEFT, padx=(0, 8))
+        self._initial_focus_widget = filter_entry
         ttk.Label(
             toolbar,
             textvariable=self._selected_count_var,

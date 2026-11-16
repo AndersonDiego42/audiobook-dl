@@ -19,12 +19,11 @@ from audiobookdl.gui.theme import ThemePalette
 from audiobookdl.sources import ServiceInfo, detect_service_key, resolve_service_label
 
 
-class ServiceAuthPanel(ttk.LabelFrame):
-    """LabelFrame managing service/profile selection, login fields, and browser cookie import."""
+class ServiceAuthCoordinator:
+    """Headless service/profile auth state shared between DownloadPage chip, build_options, and AccountsPage."""
 
     def __init__(
         self,
-        master: tk.Misc,
         root: tk.Tk,
         controller: GuiController,
         services: Sequence[ServiceInfo],
@@ -44,9 +43,8 @@ class ServiceAuthPanel(ttk.LabelFrame):
         build_verify_options: Callable[[], args.DownloadOptions | None],
         is_running_provider: Callable[[], bool],
         on_log: Callable[[str], None],
-        on_manage_accounts: Callable[[], object] | None = None,
+        on_credentials_changed: Callable[[], None] | None = None,
     ) -> None:
-        super().__init__(master, text="Service & Authentication", padding=(10, 6))
         self._window = root
         self._controller = controller
         self._services = list(services)
@@ -55,6 +53,7 @@ class ServiceAuthPanel(ttk.LabelFrame):
         self._last_detected_service: str | None = None
         self._is_verifying_auth = False
         self._cookie_dialog: CookieImportDialog | None = None
+        self._panel: ServiceAuthPanel | None = None
 
         self._status_var = status_var
         self.service_label_var = service_label_var
@@ -72,9 +71,34 @@ class ServiceAuthPanel(ttk.LabelFrame):
         self._build_verify_options = build_verify_options
         self._is_running_provider = is_running_provider
         self._on_log = on_log
-        self._on_manage_accounts = on_manage_accounts
+        self._on_credentials_changed = on_credentials_changed
 
-        self._build_widgets()
+    def attach_panel(self, panel: "ServiceAuthPanel | None") -> None:
+        self._panel = panel
+        if panel is not None:
+            panel.bind(
+                "<Destroy>",
+                lambda ev, p=panel: self._on_panel_destroyed(ev, p),
+                add="+",
+            )
+            self.load_service_into_form()
+            panel.set_running_state(self._is_running_provider())
+
+    def _on_panel_destroyed(self, event: tk.Event, panel: "ServiceAuthPanel") -> None:
+        if getattr(event, "widget", None) is panel and self._panel is panel:
+            self._panel = None
+
+    def _active_panel(self) -> "ServiceAuthPanel | None":
+        panel = self._panel
+        if panel is None:
+            return None
+        try:
+            if panel.winfo_exists():
+                return panel
+        except tk.TclError:
+            pass
+        self._panel = None
+        return None
 
     @property
     def cookie_dialog(self) -> CookieImportDialog | None:
@@ -91,6 +115,373 @@ class ServiceAuthPanel(ttk.LabelFrame):
     @is_verifying_auth.setter
     def is_verifying_auth(self, value: bool) -> None:
         self._is_verifying_auth = value
+
+    def selected_service(self) -> ServiceInfo | None:
+        return self._services_by_label.get(self.service_label_var.get())
+
+    def service_label_for_url(self, url: str) -> str:
+        return resolve_service_label(url, self._services_by_key)
+
+    def select_service_profile(self, service_key: str, profile: str = DEFAULT_PROFILE) -> None:
+        svc = self._services_by_key.get(service_key)
+        if svc is not None:
+            self.service_label_var.set(svc.label)
+        self.profile_var.set(normalize_profile_name(profile))
+        self.load_service_into_form()
+        self.update_field_states()
+
+    def on_urls_changed(self, urls: Sequence[str]) -> None:
+        if not urls:
+            self._last_detected_service = None
+            return
+        detected = detect_service_key(urls[0])
+        if detected and detected != self._last_detected_service:
+            self._last_detected_service = detected
+            service = self._services_by_key.get(detected)
+            current = self.selected_service()
+            if service and current is not None and current.key == service.key:
+                return
+            if service and self.service_label_var.get() != service.label:
+                self.service_label_var.set(service.label)
+                configured_profiles = list_source_profiles(self._controller.config, service.key)
+                current_profile = normalize_profile_name(self.profile_var.get())
+                if current_profile not in configured_profiles:
+                    self.profile_var.set(DEFAULT_PROFILE)
+                self.load_service_into_form()
+                self.update_field_states()
+
+    def load_service_into_form(self) -> None:
+        """Populate auth variables (and attached form widgets) from saved config."""
+        service = self.selected_service()
+        if service is None:
+            return
+        cfg = self._controller.config
+        configured_profiles = list_source_profiles(cfg, service.key)
+        combo_values = [DEFAULT_PROFILE] + [p for p in configured_profiles if p != DEFAULT_PROFILE]
+        panel = self._active_panel()
+        if panel is not None:
+            panel.profile_combo.configure(values=combo_values)
+        active_profile = normalize_profile_name(self.profile_var.get())
+        if self.profile_var.get() != active_profile:
+            self.profile_var.set(active_profile)
+
+        saved: SourceConfig | None = get_source_config(cfg, service.key, active_profile)
+        self.username_var.set((saved.username or "") if saved else "")
+        self.password_var.set((saved.password or "") if saved else "")
+        self.library_var.set((saved.library or "") if saved else "")
+        self.cookie_file_var.set((saved.cookie_file or "") if saved else "")
+
+        has_saved = bool(
+            saved and any((saved.username, saved.password, saved.library, saved.cookie_file))
+        )
+        self.saved_badge_var.set("Saved" if has_saved else "")
+
+        supports_cookies = "cookies" in service.auth_methods
+        supports_login = "login" in service.auth_methods
+        needs_library = "library" in service.login_fields
+        if not service.auth_methods:
+            self.service_hint_var.set("No authentication required")
+        elif supports_cookies and supports_login:
+            suffix = " (+ Library)" if needs_library else ""
+            self.service_hint_var.set(f"Login{suffix} or Cookies file")
+        elif supports_login:
+            suffix = " (+ Library)" if needs_library else ""
+            self.service_hint_var.set(f"Username & Password{suffix}")
+        else:
+            self.service_hint_var.set("Cookies file required")
+
+    def update_field_states(self) -> None:
+        panel = self._active_panel()
+        if panel is not None:
+            panel.update_field_states()
+
+    def set_running_state(self, running: bool) -> None:
+        panel = self._active_panel()
+        if panel is not None:
+            panel.set_running_state(running)
+
+    def show_cookie_import_dialog(self, svc_key_override: str | None = None) -> None:
+        """Open or raise the interactive browser-cookie importer dialog."""
+        if self._cookie_dialog is not None and self._cookie_dialog.winfo_exists():
+            if svc_key_override:
+                svc = self._services_by_key.get(svc_key_override)
+                if svc is not None and "cookies" in svc.auth_methods:
+                    self._cookie_dialog._service_var.set(svc.label)
+            self._cookie_dialog.lift()
+            self._cookie_dialog.focus_set()
+            return
+        selected = (
+            self._services_by_key.get(svc_key_override)
+            if svc_key_override
+            else self.selected_service()
+        )
+        initial_key = selected.key if (selected and "cookies" in selected.auth_methods) else ""
+        initial_path = self.cookie_file_var.get().strip() if initial_key else ""
+        self._cookie_dialog = CookieImportDialog(
+            self._window,
+            self._services,
+            initial_service_key=initial_key,
+            initial_cookie_path=initial_path,
+            on_apply=self.on_cookies_imported,
+            palette=self._palette_provider(),
+        )
+
+    def on_cookies_imported(self, service_key: str, cookie_path: str, count: int) -> None:
+        """Apply an imported Netscape cookie file to the selected service form."""
+        service = self._services_by_key.get(service_key)
+        if service is not None and self.service_label_var.get() != service.label:
+            self.service_label_var.set(service.label)
+            self.load_service_into_form()
+            self.update_field_states()
+        self.cookie_file_var.set(cookie_path)
+        if self.remember_login_var.get() and service is not None and "cookies" in service.auth_methods:
+            self.save_current_credentials(quiet=True)
+        self._status_var.set(f"Imported {count} cookies to {os.path.basename(cookie_path)}")
+        self._on_log(f"Imported {count} browser cookie(s) to {cookie_path}")
+
+    def save_current_credentials(self, quiet: bool = False) -> None:
+        """Persist the selected service's login, password, library, and cookie path."""
+        service = self.selected_service()
+        if service is None or not service.auth_methods:
+            return
+        supports_cookies = "cookies" in service.auth_methods
+        supports_login = "login" in service.auth_methods
+        needs_library = supports_login and "library" in service.login_fields
+
+        username = self.username_var.get().strip() or None if supports_login else None
+        password = self.password_var.get() or None if supports_login else None
+        library = self.library_var.get().strip() or None if needs_library else None
+        cookie_file = self.cookie_file_var.get().strip() or None if supports_cookies else None
+
+        if quiet and not any((username, password, library, cookie_file)):
+            return
+
+        active_profile = normalize_profile_name(self.profile_var.get())
+        cfg = self._controller.save_source_credentials(
+            service.key,
+            username=username,
+            password=password,
+            library=library,
+            cookie_file=cookie_file,
+            profile=active_profile,
+        )
+        has_saved = get_source_config(cfg, service.key, active_profile) is not None
+        self.saved_badge_var.set("Saved" if has_saved else "")
+        self.load_service_into_form()
+        self.update_field_states()
+        if self._on_credentials_changed is not None:
+            self._on_credentials_changed()
+        profile_suffix = f" ({active_profile})" if active_profile != DEFAULT_PROFILE else ""
+        if not quiet:
+            if has_saved:
+                self._status_var.set(f"Saved credentials for {service.label}{profile_suffix}")
+                self._on_log(f"Saved login settings for {service.label}{profile_suffix}.")
+            else:
+                self._status_var.set(f"Cleared credentials for {service.label}{profile_suffix}")
+
+    def forget_current_credentials(self) -> None:
+        """Remove saved credentials for the currently selected service and profile."""
+        service = self.selected_service()
+        if service is None:
+            return
+        active_profile = normalize_profile_name(self.profile_var.get())
+        self._controller.save_source_credentials(service.key, profile=active_profile)
+        self.username_var.set("")
+        self.password_var.set("")
+        self.library_var.set("")
+        self.cookie_file_var.set("")
+        self.saved_badge_var.set("")
+        self.load_service_into_form()
+        self.update_field_states()
+        if self._on_credentials_changed is not None:
+            self._on_credentials_changed()
+        profile_suffix = f" ({active_profile})" if active_profile != DEFAULT_PROFILE else ""
+        self._status_var.set(f"Removed saved login for {service.label}{profile_suffix}")
+        self._on_log(f"Removed saved login settings for {service.label}{profile_suffix}.")
+
+    def verify_current_auth(self) -> None:
+        """Test authentication for the currently selected service in the background."""
+        if self._is_verifying_auth or self._is_running_provider():
+            return
+        service = self.selected_service()
+        if service is None or not service.auth_methods:
+            return
+        options = self._build_verify_options()
+        if options is None:
+            return
+        self._is_verifying_auth = True
+        panel = self._active_panel()
+        if panel is not None:
+            panel.test_auth_btn.configure(state="disabled")
+        self._status_var.set(f"Testing login for {service.label}...")
+        self._controller.start_auth_verification(service.key, service.label, options)
+
+    def handle_auth_verified(
+        self,
+        service_label: str,
+        ok: bool,
+        auth_exc: Exception | None,
+    ) -> None:
+        """Finish background login verification and notify the user."""
+        self._is_verifying_auth = False
+        self.update_field_states()
+        if auth_exc is not None:
+            self._status_var.set(f"Login failed for {service_label}")
+            self._on_log(f"[ERROR] Login check failed for {service_label}: {auth_exc}")
+            messagebox.showerror("Test Login Failed", str(auth_exc), parent=self._window)
+        elif ok:
+            self._status_var.set(f"Login OK: {service_label}")
+            self._on_log(f"Verified login for {service_label}.")
+            messagebox.showinfo(
+                "Test Login",
+                f"Authentication succeeded for {service_label}.",
+                parent=self._window,
+            )
+        else:
+            self._status_var.set(f"Login invalid: {service_label}")
+            messagebox.showwarning(
+                "Test Login",
+                f"Authentication failed for {service_label}.",
+                parent=self._window,
+            )
+
+    def validate_cookie_file(self) -> bool:
+        """Verify that any entered cookie file exists on disk."""
+        service = self.selected_service()
+        cookie_file = (
+            self.cookie_file_var.get().strip()
+            if (service is None or "cookies" in service.auth_methods)
+            else ""
+        )
+        if cookie_file and not os.path.isfile(cookie_file):
+            self._status_var.set("Cookie file not found")
+            messagebox.showerror(
+                "Invalid Cookie File",
+                f"File not found:\n{cookie_file}",
+                parent=self._window,
+            )
+            return False
+        return True
+
+    def warn_mixed_service_credentials(self, urls: Sequence[str]) -> bool:
+        """Warn before starting if batch URLs target an unconfigured auth service alongside another."""
+        selected = self.selected_service()
+        selected_key = selected.key if selected else None
+        detected_keys: list[str] = []
+        for url in urls:
+            key = detect_service_key(url)
+            if key and key not in detected_keys:
+                detected_keys.append(key)
+        if len(detected_keys) <= 1 and (not detected_keys or detected_keys[0] == selected_key):
+            return True
+        cfg = self._controller.config_snapshot()
+        missing: list[str] = []
+        for key in detected_keys:
+            if key == selected_key:
+                continue
+            info = self._services_by_key.get(key)
+            if info is None or not info.auth_methods:
+                continue
+            src_cfg = get_source_config(cfg, key)
+            if src_cfg is None:
+                for prof in list_source_profiles(cfg, key):
+                    src_cfg = get_source_config(cfg, key, prof)
+                    if src_cfg is not None:
+                        break
+            has_creds = src_cfg is not None and any((
+                src_cfg.username,
+                src_cfg.password,
+                src_cfg.cookie_file,
+                src_cfg.library,
+            ))
+            if not has_creds:
+                missing.append(info.label)
+        if not missing:
+            return True
+        return messagebox.askyesno(
+            "Missing Credentials for Batch Service",
+            "Some entered URLs target services without saved credentials:\n"
+            f"  {', '.join(missing)}\n\n"
+            "Continue anyway?",
+            parent=self._window,
+        )
+
+    def extract_options_auth(self, urls: Sequence[str]) -> dict[str, str | None]:
+        """Extract credential overrides when `urls` match or do not conflict with selected service."""
+        detected_keys = {k for k in (detect_service_key(u) for u in urls) if k}
+        service = self.selected_service()
+        apply_form_auth = (
+            service is not None
+            and (len(detected_keys) <= 1)
+            and (not detected_keys or service.key in detected_keys)
+        )
+        result: dict[str, str | None] = {
+            "username": None,
+            "password": None,
+            "library": None,
+            "cookie_file": None,
+            "profile": None,
+        }
+        if apply_form_auth and service is not None:
+            norm_profile = normalize_profile_name(self.profile_var.get())
+            if norm_profile != DEFAULT_PROFILE:
+                result["profile"] = norm_profile
+            if "cookies" in service.auth_methods:
+                result["cookie_file"] = self.cookie_file_var.get().strip() or None
+            if "login" in service.auth_methods:
+                result["username"] = self.username_var.get().strip() or None
+                result["password"] = self.password_var.get() or None
+                if "library" in service.login_fields:
+                    result["library"] = self.library_var.get().strip() or None
+        return result
+
+
+class ServiceAuthPanel(ttk.LabelFrame):
+    """LabelFrame managing service/profile selection, login fields, and browser cookie import."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        coordinator: ServiceAuthCoordinator,
+    ) -> None:
+        super().__init__(master, text="Service & Authentication", padding=(10, 6))
+        self._coord = coordinator
+        self._window = coordinator._window
+        self._controller = coordinator._controller
+        self._services = coordinator._services
+        self._services_by_label = coordinator._services_by_label
+        self._services_by_key = coordinator._services_by_key
+
+        self._status_var = coordinator._status_var
+        self.service_label_var = coordinator.service_label_var
+        self.profile_var = coordinator.profile_var
+        self.service_hint_var = coordinator.service_hint_var
+        self.saved_badge_var = coordinator.saved_badge_var
+        self.cookie_file_var = coordinator.cookie_file_var
+        self.username_var = coordinator.username_var
+        self.password_var = coordinator.password_var
+        self.library_var = coordinator.library_var
+        self.show_password_var = coordinator.show_password_var
+        self.remember_login_var = coordinator.remember_login_var
+
+        self._build_widgets()
+        self._coord.attach_panel(self)
+
+    @property
+    def cookie_dialog(self) -> CookieImportDialog | None:
+        return self._coord.cookie_dialog
+
+    @cookie_dialog.setter
+    def cookie_dialog(self, dlg: CookieImportDialog | None) -> None:
+        self._coord.cookie_dialog = dlg
+
+    @property
+    def is_verifying_auth(self) -> bool:
+        return self._coord.is_verifying_auth
+
+    @is_verifying_auth.setter
+    def is_verifying_auth(self, value: bool) -> None:
+        self._coord.is_verifying_auth = value
 
     def _build_widgets(self) -> None:
         self.columnconfigure(1, weight=1)
@@ -184,17 +575,12 @@ class ServiceAuthPanel(ttk.LabelFrame):
             auth_actions, text="Test Login", command=self.verify_current_auth
         )
         self.test_auth_btn.pack(side=tk.RIGHT, padx=(0, 4))
-        if self._on_manage_accounts is not None:
-            self.manage_accounts_btn = ttk.Button(
-                auth_actions, text="All Accounts...", command=self._on_manage_accounts
-            )
-            self.manage_accounts_btn.pack(side=tk.RIGHT, padx=(0, 4))
 
     def selected_service(self) -> ServiceInfo | None:
-        return self._services_by_label.get(self.service_label_var.get())
+        return self._coord.selected_service()
 
     def service_label_for_url(self, url: str) -> str:
-        return resolve_service_label(url, self._services_by_key)
+        return self._coord.service_label_for_url(url)
 
     def on_service_selected(self, _event: tk.Event | None = None) -> None:
         self.profile_var.set(DEFAULT_PROFILE)
@@ -209,62 +595,10 @@ class ServiceAuthPanel(ttk.LabelFrame):
         self.update_field_states()
 
     def on_urls_changed(self, urls: Sequence[str]) -> None:
-        if not urls:
-            self._last_detected_service = None
-            return
-        detected = detect_service_key(urls[0])
-        if detected and detected != self._last_detected_service:
-            self._last_detected_service = detected
-            service = self._services_by_key.get(detected)
-            current = self.selected_service()
-            if service and current is not None and current.key == service.key:
-                return
-            if service and self.service_label_var.get() != service.label:
-                self.service_label_var.set(service.label)
-                configured_profiles = list_source_profiles(self._controller.config, service.key)
-                current_profile = normalize_profile_name(self.profile_var.get())
-                if current_profile not in configured_profiles:
-                    self.profile_var.set(DEFAULT_PROFILE)
-                self.load_service_into_form()
-                self.update_field_states()
+        self._coord.on_urls_changed(urls)
 
     def load_service_into_form(self) -> None:
-        """Populate form fields and badge from saved config for the selected service/profile."""
-        service = self.selected_service()
-        if service is None:
-            return
-        cfg = self._controller.config
-        configured_profiles = list_source_profiles(cfg, service.key)
-        combo_values = [DEFAULT_PROFILE] + [p for p in configured_profiles if p != DEFAULT_PROFILE]
-        self.profile_combo.configure(values=combo_values)
-        active_profile = normalize_profile_name(self.profile_var.get())
-        if self.profile_var.get() != active_profile:
-            self.profile_var.set(active_profile)
-
-        saved: SourceConfig | None = get_source_config(cfg, service.key, active_profile)
-        self.username_var.set((saved.username or "") if saved else "")
-        self.password_var.set((saved.password or "") if saved else "")
-        self.library_var.set((saved.library or "") if saved else "")
-        self.cookie_file_var.set((saved.cookie_file or "") if saved else "")
-
-        has_saved = bool(
-            saved and any((saved.username, saved.password, saved.library, saved.cookie_file))
-        )
-        self.saved_badge_var.set("Saved" if has_saved else "")
-
-        supports_cookies = "cookies" in service.auth_methods
-        supports_login = "login" in service.auth_methods
-        needs_library = "library" in service.login_fields
-        if not service.auth_methods:
-            self.service_hint_var.set("No authentication required")
-        elif supports_cookies and supports_login:
-            suffix = " (+ Library)" if needs_library else ""
-            self.service_hint_var.set(f"Login{suffix} or Cookies file")
-        elif supports_login:
-            suffix = " (+ Library)" if needs_library else ""
-            self.service_hint_var.set(f"Username & Password{suffix}")
-        else:
-            self.service_hint_var.set("Cookies file required")
+        self._coord.load_service_into_form()
 
     def set_running_state(self, running: bool) -> None:
         """Disable all auth controls while running, or restore per-service states when idle."""
@@ -292,7 +626,7 @@ class ServiceAuthPanel(ttk.LabelFrame):
 
     def update_field_states(self) -> None:
         """Enable/disable credential fields based on the active service's auth requirements."""
-        if self._is_running_provider():
+        if self._coord._is_running_provider():
             return
         service = self.selected_service()
         if service is None:
@@ -316,7 +650,7 @@ class ServiceAuthPanel(ttk.LabelFrame):
         self.show_pw_btn.configure(state=login_state)
         self.lib_entry.configure(state=library_state)
         self.test_auth_btn.configure(
-            state="disabled" if self._is_verifying_auth else save_state
+            state="disabled" if self._coord.is_verifying_auth else save_state
         )
         self.save_auth_btn.configure(state=save_state)
         active_profile = normalize_profile_name(self.profile_var.get())
@@ -336,114 +670,19 @@ class ServiceAuthPanel(ttk.LabelFrame):
             self.cookie_file_var.set(chosen)
 
     def show_cookie_import_dialog(self, svc_key_override: str | None = None) -> None:
-        """Open or raise the interactive browser-cookie importer dialog."""
-        if self._cookie_dialog is not None and self._cookie_dialog.winfo_exists():
-            if svc_key_override:
-                svc = self._services_by_key.get(svc_key_override)
-                if svc is not None and "cookies" in svc.auth_methods:
-                    self._cookie_dialog._service_var.set(svc.label)
-            self._cookie_dialog.lift()
-            self._cookie_dialog.focus_set()
-            return
-        selected = (
-            self._services_by_key.get(svc_key_override)
-            if svc_key_override
-            else self.selected_service()
-        )
-        initial_key = selected.key if (selected and "cookies" in selected.auth_methods) else ""
-        initial_path = self.cookie_file_var.get().strip() if initial_key else ""
-        self._cookie_dialog = CookieImportDialog(
-            self._window,
-            self._services,
-            initial_service_key=initial_key,
-            initial_cookie_path=initial_path,
-            on_apply=self.on_cookies_imported,
-            palette=self._palette_provider(),
-        )
+        self._coord.show_cookie_import_dialog(svc_key_override=svc_key_override)
 
     def on_cookies_imported(self, service_key: str, cookie_path: str, count: int) -> None:
-        """Apply an imported Netscape cookie file to the selected service form."""
-        service = self._services_by_key.get(service_key)
-        if service is not None and self.service_label_var.get() != service.label:
-            self.service_label_var.set(service.label)
-            self.load_service_into_form()
-            self.update_field_states()
-        self.cookie_file_var.set(cookie_path)
-        if self.remember_login_var.get() and service is not None and "cookies" in service.auth_methods:
-            self.save_current_credentials(quiet=True)
-        self._status_var.set(f"Imported {count} cookies to {os.path.basename(cookie_path)}")
-        self._on_log(f"Imported {count} browser cookie(s) to {cookie_path}")
+        self._coord.on_cookies_imported(service_key, cookie_path, count)
 
     def save_current_credentials(self, quiet: bool = False) -> None:
-        """Persist the selected service's login, password, library, and cookie path."""
-        service = self.selected_service()
-        if service is None or not service.auth_methods:
-            return
-        supports_cookies = "cookies" in service.auth_methods
-        supports_login = "login" in service.auth_methods
-        needs_library = supports_login and "library" in service.login_fields
-
-        username = self.username_var.get().strip() or None if supports_login else None
-        password = self.password_var.get() or None if supports_login else None
-        library = self.library_var.get().strip() or None if needs_library else None
-        cookie_file = self.cookie_file_var.get().strip() or None if supports_cookies else None
-
-        if quiet and not any((username, password, library, cookie_file)):
-            return
-
-        active_profile = normalize_profile_name(self.profile_var.get())
-        cfg = self._controller.save_source_credentials(
-            service.key,
-            username=username,
-            password=password,
-            library=library,
-            cookie_file=cookie_file,
-            profile=active_profile,
-        )
-        has_saved = get_source_config(cfg, service.key, active_profile) is not None
-        self.saved_badge_var.set("Saved" if has_saved else "")
-        self.load_service_into_form()
-        self.update_field_states()
-        profile_suffix = f" ({active_profile})" if active_profile != DEFAULT_PROFILE else ""
-        if not quiet:
-            if has_saved:
-                self._status_var.set(f"Saved credentials for {service.label}{profile_suffix}")
-                self._on_log(f"Saved login settings for {service.label}{profile_suffix}.")
-            else:
-                self._status_var.set(f"Cleared credentials for {service.label}{profile_suffix}")
+        self._coord.save_current_credentials(quiet=quiet)
 
     def forget_current_credentials(self) -> None:
-        """Remove saved credentials for the currently selected service and profile."""
-        service = self.selected_service()
-        if service is None:
-            return
-        active_profile = normalize_profile_name(self.profile_var.get())
-        self._controller.save_source_credentials(service.key, profile=active_profile)
-        self.username_var.set("")
-        self.password_var.set("")
-        self.library_var.set("")
-        self.cookie_file_var.set("")
-        self.saved_badge_var.set("")
-        self.load_service_into_form()
-        self.update_field_states()
-        profile_suffix = f" ({active_profile})" if active_profile != DEFAULT_PROFILE else ""
-        self._status_var.set(f"Removed saved login for {service.label}{profile_suffix}")
-        self._on_log(f"Removed saved login settings for {service.label}{profile_suffix}.")
+        self._coord.forget_current_credentials()
 
     def verify_current_auth(self) -> None:
-        """Test authentication for the currently selected service in the background."""
-        if self._is_verifying_auth or self._is_running_provider():
-            return
-        service = self.selected_service()
-        if service is None or not service.auth_methods:
-            return
-        options = self._build_verify_options()
-        if options is None:
-            return
-        self._is_verifying_auth = True
-        self.test_auth_btn.configure(state="disabled")
-        self._status_var.set(f"Testing login for {service.label}...")
-        self._controller.start_auth_verification(service.key, service.label, options)
+        self._coord.verify_current_auth()
 
     def handle_auth_verified(
         self,
@@ -451,103 +690,13 @@ class ServiceAuthPanel(ttk.LabelFrame):
         ok: bool,
         auth_exc: Exception | None,
     ) -> None:
-        """Finish background login verification and notify the user."""
-        self._is_verifying_auth = False
-        self.update_field_states()
-        if auth_exc is not None:
-            self._status_var.set(f"Login failed for {service_label}")
-            self._on_log(f"[ERROR] Login check failed for {service_label}: {auth_exc}")
-            messagebox.showerror("Test Login Failed", str(auth_exc), parent=self._window)
-        elif ok:
-            self._status_var.set(f"Login OK: {service_label}")
-            self._on_log(f"Verified login for {service_label}.")
-            messagebox.showinfo("Test Login", f"Authentication succeeded for {service_label}.", parent=self._window)
-        else:
-            self._status_var.set(f"Login invalid: {service_label}")
-            messagebox.showwarning("Test Login", f"Authentication failed for {service_label}.", parent=self._window)
+        self._coord.handle_auth_verified(service_label, ok, auth_exc)
 
     def validate_cookie_file(self) -> bool:
-        """Verify that any entered cookie file exists on disk."""
-        service = self.selected_service()
-        cookie_file = (
-            self.cookie_file_var.get().strip()
-            if (service is None or "cookies" in service.auth_methods)
-            else ""
-        )
-        if cookie_file and not os.path.isfile(cookie_file):
-            self._status_var.set("Cookie file not found")
-            messagebox.showerror("Invalid Cookie File", f"File not found:\n{cookie_file}", parent=self._window)
-            return False
-        return True
+        return self._coord.validate_cookie_file()
 
     def warn_mixed_service_credentials(self, urls: Sequence[str]) -> bool:
-        """Warn before starting if batch URLs target an unconfigured auth service alongside another."""
-        selected = self.selected_service()
-        selected_key = selected.key if selected else None
-        detected_keys: list[str] = []
-        for url in urls:
-            key = detect_service_key(url)
-            if key and key not in detected_keys:
-                detected_keys.append(key)
-        if len(detected_keys) <= 1 and (not detected_keys or detected_keys[0] == selected_key):
-            return True
-        cfg = self._controller.config_snapshot()
-        missing: list[str] = []
-        for key in detected_keys:
-            if key == selected_key:
-                continue
-            info = self._services_by_key.get(key)
-            if info is None or not info.auth_methods:
-                continue
-            src_cfg = get_source_config(cfg, key)
-            if src_cfg is None:
-                for prof in list_source_profiles(cfg, key):
-                    src_cfg = get_source_config(cfg, key, prof)
-                    if src_cfg is not None:
-                        break
-            has_creds = src_cfg is not None and any((
-                src_cfg.username,
-                src_cfg.password,
-                src_cfg.cookie_file,
-                src_cfg.library,
-            ))
-            if not has_creds:
-                missing.append(info.label)
-        if not missing:
-            return True
-        return messagebox.askyesno(
-            "Missing Credentials for Batch Service",
-            "Some entered URLs target services without saved credentials:\n"
-            f"  {', '.join(missing)}\n\n"
-            "Continue anyway?",
-            parent=self._window,
-        )
+        return self._coord.warn_mixed_service_credentials(urls)
 
     def extract_options_auth(self, urls: Sequence[str]) -> dict[str, str | None]:
-        """Extract credential overrides when `urls` match or do not conflict with selected service."""
-        detected_keys = {k for k in (detect_service_key(u) for u in urls) if k}
-        service = self.selected_service()
-        apply_form_auth = (
-            service is not None
-            and (len(detected_keys) <= 1)
-            and (not detected_keys or service.key in detected_keys)
-        )
-        result: dict[str, str | None] = {
-            "username": None,
-            "password": None,
-            "library": None,
-            "cookie_file": None,
-            "profile": None,
-        }
-        if apply_form_auth and service is not None:
-            norm_profile = normalize_profile_name(self.profile_var.get())
-            if norm_profile != DEFAULT_PROFILE:
-                result["profile"] = norm_profile
-            if "cookies" in service.auth_methods:
-                result["cookie_file"] = self.cookie_file_var.get().strip() or None
-            if "login" in service.auth_methods:
-                result["username"] = self.username_var.get().strip() or None
-                result["password"] = self.password_var.get() or None
-                if "library" in service.login_fields:
-                    result["library"] = self.library_var.get().strip() or None
-        return result
+        return self._coord.extract_options_auth(urls)

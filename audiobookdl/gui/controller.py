@@ -444,6 +444,11 @@ class GuiController:
         self,
         *,
         window_geometry: str | None,
+        window_maximized: bool | None = None,
+        download_split_ratio: float | None = None,
+        active_page: str | None = None,
+        options_collapsed: bool | None = None,
+        output_naming_collapsed: bool | None = None,
         output_dir: str | None,
         output_template: str | None,
         use_download_archive: bool | None = None,
@@ -455,6 +460,11 @@ class GuiController:
             save_output_preferences(config_location=self.config_location, **output_prefs)
         save_gui_preferences(
             window_geometry=window_geometry,
+            window_maximized=window_maximized,
+            download_split_ratio=download_split_ratio,
+            active_page=active_page,
+            options_collapsed=options_collapsed,
+            output_naming_collapsed=output_naming_collapsed,
             output_dir=output_dir,
             output_template=output_template,
             overwrite=self.config_location,

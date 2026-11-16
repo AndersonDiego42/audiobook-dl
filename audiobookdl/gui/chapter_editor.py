@@ -10,8 +10,8 @@ from tkinter import filedialog, messagebox, ttk
 from collections.abc import Callable, Sequence
 
 from audiobookdl.gui.formatting import format_duration, format_timestamp_ms, parse_timestamp_ms
-from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, apply_theme_to_window, scale_px
-from audiobookdl.gui.widgets import ScrolledTreeview, TreeColumnSpec
+from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, scale_px
+from audiobookdl.gui.widgets import ModalDialog, ScrolledTreeview, TreeColumnSpec
 from audiobookdl.utils.audiobook import Chapter
 
 _CUE_TRACK_RE = re.compile(r"^\s*TRACK\s+\d+\s+", re.IGNORECASE)
@@ -74,7 +74,7 @@ def parse_chapters_from_file(path: str) -> list[Chapter]:
     raise ValueError(f"Unsupported chapter file extension '{ext}' (use .cue or .json).")
 
 
-class _ChapterEditDialog(tk.Toplevel):
+class _ChapterEditDialog(ModalDialog):
     """Small themed modal for editing a single chapter's title and start timestamp."""
 
     def __init__(
@@ -84,14 +84,13 @@ class _ChapterEditDialog(tk.Toplevel):
         *,
         palette: ThemePalette,
     ) -> None:
-        super().__init__(parent)
+        super().__init__(
+            parent,
+            "Edit Chapter",
+            palette=palette,
+            resizable=(False, False),
+        )
         self.result_chapter: Chapter | None = None
-        self._palette = palette
-        self.title("Edit Chapter")
-        self.transient(parent)  # type: ignore[call-overload]
-        self.grab_set()
-        self.resizable(False, False)
-        self.bind("<Escape>", lambda _e: self.destroy())
 
         body = ttk.Frame(self, padding=scale_px(self, 12))
         body.pack(fill=tk.BOTH, expand=True)
@@ -114,8 +113,7 @@ class _ChapterEditDialog(tk.Toplevel):
         ttk.Button(btns, text="Save", command=self._save).pack(side=tk.RIGHT, padx=(0, 6))
 
         self.bind("<Return>", lambda _e: self._save())
-        apply_theme_to_window(self, self._palette)
-        title_entry.focus_set()
+        self.finalize_modal(initial_focus=title_entry)
 
     def _save(self) -> None:
         title = self._title_var.get().strip()
@@ -138,7 +136,8 @@ class ChapterEditorFrame(ttk.Frame):
         TreeColumnSpec("num", "#", width=42, stretch=False, anchor="e", sort_kind="number"),
         TreeColumnSpec("start", "Start", width=95, stretch=False, anchor="e"),
         TreeColumnSpec("duration", "Duration", width=80, stretch=False, anchor="e", sort_kind="duration"),
-        TreeColumnSpec("title", "Title", width=260, stretch=True, anchor="w"),
+        TreeColumnSpec("title", "Title", width=220, stretch=True, anchor="w"),
+        TreeColumnSpec("source", "Source", width=80, stretch=False, anchor="w"),
     )
 
     def __init__(
@@ -152,6 +151,7 @@ class ChapterEditorFrame(ttk.Frame):
         self._palette = palette or LIGHT_PALETTE
         self._on_change = on_change
         self._chapters: list[Chapter] = []
+        self._chapter_sources: list[str] = []
         self._total_duration_ms: int | None = None
         self._source_label = ""
         self._info_var = tk.StringVar(value="No chapters")
@@ -189,14 +189,27 @@ class ChapterEditorFrame(ttk.Frame):
         total_duration_ms: int | None = None,
         source_label: str = "",
     ) -> None:
-        self._chapters = [Chapter(start=int(c.start), title=str(c.title)) for c in chapters]
-        self._chapters.sort(key=lambda c: c.start)
+        src = source_label or "Embedded"
+        paired = sorted(
+            [(Chapter(start=int(c.start), title=str(c.title)), src) for c in chapters],
+            key=lambda item: item[0].start,
+        )
+        self._chapters = [item[0] for item in paired]
+        self._chapter_sources = [item[1] for item in paired]
         self._total_duration_ms = total_duration_ms
         self._source_label = source_label
         self._render()
 
     def get_chapters(self) -> list[Chapter]:
         return [Chapter(start=c.start, title=c.title) for c in self._chapters]
+
+    def _sort_paired(self) -> None:
+        paired = sorted(
+            zip(self._chapters, self._chapter_sources, strict=False),
+            key=lambda item: item[0].start,
+        )
+        self._chapters = [item[0] for item in paired]
+        self._chapter_sources = [item[1] for item in paired]
 
     def _notify_changed(self) -> None:
         if self._on_change is not None:
@@ -214,11 +227,16 @@ class ChapterEditorFrame(ttk.Frame):
             elif self._total_duration_ms is not None and self._total_duration_ms >= ch.start:
                 end_ms = self._total_duration_ms
             dur_str = format_duration((end_ms - ch.start) / 1000.0) if end_ms is not None else "--"
+            row_src = (
+                self._chapter_sources[idx]
+                if idx < len(self._chapter_sources)
+                else (self._source_label or "Embedded")
+            )
             self.tree.insert(
                 "",
                 tk.END,
                 iid=str(idx),
-                values=(idx + 1, format_timestamp_ms(ch.start), dur_str, ch.title),
+                values=(idx + 1, format_timestamp_ms(ch.start), dur_str, ch.title, row_src),
             )
         src_suffix = f" ({self._source_label})" if self._source_label else ""
         self._info_var.set(f"{total} chapter{'s' if total != 1 else ''}{src_suffix}")
@@ -239,7 +257,9 @@ class ChapterEditorFrame(ttk.Frame):
         if dlg.result_chapter is None:
             return
         self._chapters[idx] = dlg.result_chapter
-        self._chapters.sort(key=lambda c: c.start)
+        if idx < len(self._chapter_sources):
+            self._chapter_sources[idx] = "Edited"
+        self._sort_paired()
         self._render()
         self._notify_changed()
 
@@ -251,6 +271,8 @@ class ChapterEditorFrame(ttk.Frame):
         for idx in indices:
             if 0 <= idx < len(self._chapters):
                 del self._chapters[idx]
+            if 0 <= idx < len(self._chapter_sources):
+                del self._chapter_sources[idx]
         self._render()
         self._notify_changed()
 
@@ -263,6 +285,8 @@ class ChapterEditorFrame(ttk.Frame):
             return
         # Keep current chapter's start & title, drop the following boundary.
         del self._chapters[idx + 1]
+        if idx + 1 < len(self._chapter_sources):
+            del self._chapter_sources[idx + 1]
         self._render()
         if self.tree.exists(str(idx)):
             self.tree.selection_set(str(idx))
@@ -285,6 +309,8 @@ class ChapterEditorFrame(ttk.Frame):
             messagebox.showinfo("No Chapters", "No chapters were found in the selected file.", parent=self)
             return
         self._chapters = loaded
+        ext_src = os.path.splitext(path)[1].lower() or "File"
+        self._chapter_sources = [ext_src] * len(loaded)
         self._source_label = os.path.basename(path)
         self._render()
         self._notify_changed()
