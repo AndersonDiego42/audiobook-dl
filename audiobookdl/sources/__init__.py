@@ -16,6 +16,7 @@ from .yourcloudlibrary import YourCloudLibrarySource
 
 from ..exceptions import NoSourceFound
 from dataclasses import dataclass
+import importlib.metadata
 import re
 from typing import Iterable, List, Optional, Tuple, Type
 
@@ -83,23 +84,62 @@ def find_compatible_source(url: str) -> Type[Source]:
     raise NoSourceFound
 
 
+_BUILTIN_SOURCES: Tuple[Type[Source], ...] = (
+    AudiobooksdotcomSource,
+    BlinkistSource,
+    BookBeatSource,
+    ChirpSource,
+    EreolenSource,
+    LibrivoxSource,
+    NextorySource,
+    OverdriveSource,
+    PodimoSource,
+    SaxoSource,
+    EverandSource,
+    StorytelSource,
+    YourCloudLibrarySource,
+)
+
+
+def _discover_plugin_sources() -> List[Type[Source]]:
+    """Discover third-party `Source` subclasses via the `audiobookdl.sources` entry point group."""
+    from audiobookdl import logging
+
+    discovered: List[Type[Source]] = []
+    try:
+        eps = importlib.metadata.entry_points(group="audiobookdl.sources")
+    except Exception as exc:
+        logging.debug(f"Failed querying source entry points: {exc}")
+        return discovered
+
+    for ep in eps:
+        try:
+            cls = ep.load()
+        except Exception as exc:
+            logging.debug(f"Failed loading source plugin '{getattr(ep, 'name', ep)}': {exc}")
+            continue
+        if (
+            isinstance(cls, type)
+            and issubclass(cls, Source)
+            and cls is not Source
+            and getattr(cls, "names", None)
+            and getattr(cls, "match", None)
+        ):
+            discovered.append(cls)
+        else:
+            logging.debug(f"Ignoring invalid source plugin entry point '{getattr(ep, 'name', ep)}': {cls!r}")
+    return discovered
+
+
 def get_source_classes() -> List[Type[Source]]:
-    """Returns a list of all available sources"""
-    return [
-        AudiobooksdotcomSource,
-        BlinkistSource,
-        BookBeatSource,
-        ChirpSource,
-        EreolenSource,
-        LibrivoxSource,
-        NextorySource,
-        OverdriveSource,
-        PodimoSource,
-        SaxoSource,
-        EverandSource,
-        StorytelSource,
-        YourCloudLibrarySource,
-    ]
+    """Returns a list of all built-in and entry-point plugin sources."""
+    classes = list(_BUILTIN_SOURCES)
+    seen = set(classes)
+    for plugin_cls in _discover_plugin_sources():
+        if plugin_cls not in seen:
+            seen.add(plugin_cls)
+            classes.append(plugin_cls)
+    return classes
 
 
 def get_source_names() -> Iterable[str]:

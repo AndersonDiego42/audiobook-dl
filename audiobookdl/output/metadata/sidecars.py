@@ -147,6 +147,7 @@ def build_abs_metadata_dict(
     tags: Sequence[str] = (),
     explicit: bool = False,
     abridged: bool = False,
+    duration_seconds: Optional[float] = None,
 ) -> dict:
     """Build an Audiobookshelf-compatible `metadata.json` dictionary."""
     series_list = []
@@ -161,6 +162,8 @@ def build_abs_metadata_dict(
         start_sec = round(max(0, int(ch.start)) / 1000.0, 3)
         if idx + 1 < len(chapters):
             end_sec = round(max(start_sec, int(chapters[idx + 1].start) / 1000.0), 3)
+        elif duration_seconds is not None and duration_seconds > start_sec:
+            end_sec = round(max(start_sec, float(duration_seconds)), 3)
         else:
             end_sec = start_sec
         abs_chapters.append(
@@ -205,6 +208,7 @@ def write_sidecar_abs_metadata(
     tags: Sequence[str] = (),
     explicit: bool = False,
     abridged: bool = False,
+    duration_seconds: Optional[float] = None,
 ) -> str:
     """Write an Audiobookshelf-compatible `metadata.json` sidecar file to `target_path`."""
     import json
@@ -215,6 +219,7 @@ def write_sidecar_abs_metadata(
         tags=tags,
         explicit=explicit,
         abridged=abridged,
+        duration_seconds=duration_seconds,
     )
     with open(target_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)

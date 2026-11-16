@@ -277,7 +277,7 @@ def test_gui_service_dropdown_saves_and_restores_credentials(tmp_path):
 
         # Select Storytel, enter login & password, save
         app.service_label_var.set("Storytel / Mofibo")
-        app._on_service_selected()
+        app._auth_panel.on_service_selected()
         app.username_var.set("alice@example.com")
         app.password_var.set("hunter2!")
         app.save_current_credentials()
@@ -285,7 +285,7 @@ def test_gui_service_dropdown_saves_and_restores_credentials(tmp_path):
 
         # Switch to Librivox (no auth), then back via URL auto-detection
         app.service_label_var.set("Librivox")
-        app._on_service_selected()
+        app._auth_panel.on_service_selected()
         assert app.username_var.get() == ""
         assert str(app.user_entry.cget("state")) == "disabled"
 
@@ -301,7 +301,7 @@ def test_gui_service_dropdown_saves_and_restores_credentials(tmp_path):
         root.withdraw()
         app2 = AudiobookDLApp(root, config_location=str(cfg_path))
         app2.service_label_var.set("Storytel / Mofibo")
-        app2._on_service_selected()
+        app2._auth_panel.on_service_selected()
         assert app2.username_var.get() == "alice@example.com"
         assert app2.password_var.get() == "hunter2!"
 
@@ -375,7 +375,7 @@ def test_gui_app_end_to_end_worker_and_prompts(tmp_path, monkeypatch):
         app.output_dir_var.set(str(tmp_path))
         app.urls_text.insert("1.0", "https://example.com/book1\n")
 
-        monkeypatch.setattr("audiobookdl.gui.app.find_executable", lambda name: name)
+        monkeypatch.setattr("audiobookdl.gui.ffmpeg_assistant.find_executable", lambda name: name)
         monkeypatch.setattr("audiobookdl.gui.app.simpledialog.askstring", lambda *a, **kw: "secret-user")
         monkeypatch.setattr("audiobookdl.gui.app.messagebox.askyesno", lambda *a, **kw: True)
 
@@ -393,7 +393,7 @@ def test_gui_app_end_to_end_worker_and_prompts(tmp_path, monkeypatch):
                 observed["confirmed"] = interaction.confirm("Override?")
             return DownloadSummary(completed=1, failed=0, cancelled=False)
 
-        monkeypatch.setattr("audiobookdl.gui.app.find_executable", lambda name: name)
+        monkeypatch.setattr("audiobookdl.gui.ffmpeg_assistant.find_executable", lambda name: name)
         monkeypatch.setattr("audiobookdl.gui.controller.run_downloads", fake_run_downloads)
 
         app.start_download()
@@ -506,14 +506,14 @@ def test_run_self_test_and_ffmpeg_guidance(tmp_path, monkeypatch):
     root.withdraw()
     try:
         shown = []
-        monkeypatch.setattr("audiobookdl.gui.app.find_executable", lambda _name: None)
+        monkeypatch.setattr("audiobookdl.gui.ffmpeg_assistant.find_executable", lambda _name: None)
         monkeypatch.setattr(
             "audiobookdl.gui.app.messagebox.showinfo",
             lambda title, message, parent=None: shown.append((title, message)),
         )
         app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
         assert "Not found" in app.ffmpeg_status_var.get()
-        app._show_ffmpeg_guidance()
+        app._ffmpeg_assistant.show_guidance()
         assert len(shown) == 1
         assert "Setup Guide" in shown[0][0]
         assert "ffmpeg.exe" in shown[0][1]
@@ -603,7 +603,7 @@ def test_gui_add_to_queue_while_running_and_batch_progress(tmp_path, monkeypatch
                     progress.advance(task_id, 2.0)
             return DownloadSummary(completed=1, failed=0, cancelled=False)
 
-        monkeypatch.setattr("audiobookdl.gui.app.find_executable", lambda name: name)
+        monkeypatch.setattr("audiobookdl.gui.ffmpeg_assistant.find_executable", lambda name: name)
         monkeypatch.setattr("audiobookdl.gui.controller.run_downloads", fake_run_downloads)
 
         app.start_download()
@@ -898,7 +898,7 @@ def test_gui_preview_audiobook_with_cover_and_series_checklist(tmp_path, monkeyp
             captured["prefetched"] = prefetched
             return DownloadSummary(completed=1, failed=0, cancelled=False)
 
-        monkeypatch.setattr("audiobookdl.gui.app.find_executable", lambda name: name)
+        monkeypatch.setattr("audiobookdl.gui.ffmpeg_assistant.find_executable", lambda name: name)
         monkeypatch.setattr("audiobookdl.gui.controller.run_downloads", fake_run_downloads)
 
         app.preview_metadata()
@@ -984,6 +984,8 @@ def test_gui_ffmpeg_locate_persists_and_updates_status(tmp_path, monkeypatch):
     (bin_dir / f"ffprobe{exe_suffix}").write_text("stub")
 
     monkeypatch.setattr("audiobookdl.utils.shutil.which", lambda _name: None)
+    monkeypatch.setattr("audiobookdl.utils.validate_executable", lambda _path: None)
+    monkeypatch.setattr("audiobookdl.gui.ffmpeg_assistant.validate_executable", lambda _path: None)
     monkeypatch.setattr("audiobookdl.gui.app.filedialog.askdirectory", lambda **_kw: str(ffmpeg_root))
 
     try:
@@ -1053,6 +1055,8 @@ def test_gui_start_download_validates_ffmpeg_upfront(tmp_path, monkeypatch):
             "audiobookdl.gui.app.filedialog.askdirectory",
             lambda **_kw: str(ffmpeg_dir),
         )
+        monkeypatch.setattr("audiobookdl.utils.validate_executable", lambda _path: None)
+        monkeypatch.setattr("audiobookdl.gui.ffmpeg_assistant.validate_executable", lambda _path: None)
         monkeypatch.setattr(
             "audiobookdl.gui.controller.run_downloads",
             lambda *_a, **_kw: DownloadSummary(completed=1, failed=0, cancelled=False),
@@ -1067,6 +1071,54 @@ def test_gui_start_download_validates_ffmpeg_upfront(tmp_path, monkeypatch):
             threading.Event().wait(0.02)
         assert not app.is_running
         assert app.status_var.get() == "Completed"
+    finally:
+        root.destroy()
+        utils.set_ffmpeg_dir(None)
+
+
+def test_gui_rejects_unrunnable_ffmpeg_and_resets_to_path(tmp_path, monkeypatch):
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    bad_dir = tmp_path / "bad-ffmpeg" / "bin"
+    bad_dir.mkdir(parents=True)
+    exe_suffix = ".exe" if os.name == "nt" else ""
+    (bad_dir / f"ffmpeg{exe_suffix}").write_text("not-an-executable")
+    (bad_dir / f"ffprobe{exe_suffix}").write_text("not-an-executable")
+
+    # Pre-seed config with an unrunnable ffmpeg_dir (e.g., wrong architecture build)
+    cfg_path.write_text(
+        f'ffmpeg_dir = "{str(bad_dir).replace(os.sep, "/")}"\n',
+        encoding="utf-8",
+    )
+
+    warnings: list[tuple[str, str]] = []
+    monkeypatch.setattr("audiobookdl.utils.shutil.which", lambda _name: None)
+    monkeypatch.setattr(
+        "audiobookdl.gui.app.messagebox.showwarning",
+        lambda title, msg, parent=None: warnings.append((title, msg)),
+    )
+    monkeypatch.setattr(
+        "audiobookdl.gui.app.filedialog.askdirectory",
+        lambda **_kw: str(bad_dir.parent),
+    )
+
+    try:
+        app = AudiobookDLApp(root, config_location=str(cfg_path))
+        assert "Unusable" in app.ffmpeg_status_var.get()
+
+        # Selecting an unrunnable binary is rejected and keeps config unchanged
+        assert app.browse_ffmpeg_dir() is False
+        assert warnings and warnings[-1][0] == "Invalid FFmpeg Binary"
+
+        # Resetting clears ffmpeg_dir and updates status
+        app.reset_ffmpeg_dir()
+        assert load_config(str(cfg_path)).ffmpeg_dir is None
+        assert "Not found" in app.ffmpeg_status_var.get()
     finally:
         root.destroy()
         utils.set_ffmpeg_dir(None)
@@ -1122,7 +1174,7 @@ def test_gui_log_caps_line_count(tmp_path):
     try:
         app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
         for i in range(AudiobookDLApp.MAX_LOG_LINES + 50):
-            app._append_log(f"line {i}")
+            app._queue_panel.append_log(f"line {i}")
         total_lines = int(app.log_text.index("end-1c").split(".")[0])
         assert total_lines <= AudiobookDLApp.MAX_LOG_LINES + 1
         assert "line 0" not in app.log_text.get("1.0", "2.0")
@@ -1149,18 +1201,18 @@ def test_gui_queue_move_remove_retry_and_clear(tmp_path, monkeypatch):
             ctrl.batch_total = 2
             ctrl.run_seen_urls = {job_a.url, job_b.url}
             ctrl.pending_jobs.extend([job_a, job_b])
-        app._register_queue_job(job_a)
-        app._register_queue_job(job_b)
+        app._queue_panel.register_queue_job(job_a)
+        app._queue_panel.register_queue_job(job_b)
 
         # Move job_b up before job_a
         app.queue_tree.selection_set("job_b")
-        app._move_selected_queue_item(-1)
+        app._queue_panel.move_selected_item(-1)
         assert [j.job_id for j in ctrl.pending_jobs if j is not None] == ["job_b", "job_a"]
         assert list(app.queue_tree.get_children()) == ["job_b", "job_a"]
 
         # Remove job_a
         app.queue_tree.selection_set("job_a")
-        app._remove_selected_queue_item()
+        app._queue_panel.remove_selected_item()
         assert [j.job_id for j in ctrl.pending_jobs if j is not None] == ["job_b"]
         assert list(app.queue_tree.get_children()) == ["job_b"]
         assert ctrl.batch_total == 1
@@ -1168,16 +1220,16 @@ def test_gui_queue_move_remove_retry_and_clear(tmp_path, monkeypatch):
         # Retry failed items and clear history
         ctrl.pending_jobs.clear()
         ctrl.worker_has_active_run = False
-        app._update_queue_row("job_b", "Failed", "timeout")
+        app._queue_panel.update_queue_row("job_b", "Failed", "timeout")
 
         retried = {}
-        monkeypatch.setattr(app, "_ensure_ffmpeg_available", lambda _opts: True)
+        monkeypatch.setattr(app._ffmpeg_assistant, "ensure_available", lambda _opts: True)
         monkeypatch.setattr(app, "_save_run_preferences", lambda _opts: None)
         monkeypatch.setattr(app, "_start_new_run", lambda specs: retried.setdefault("urls", [s[0] for s in specs]))
         app._retry_failed_queue_items()
         assert retried["urls"] == ["https://librivox.org/book-b"]
 
-        app._clear_completed_history()
+        app._queue_panel.clear_completed_history()
         assert list(app.queue_tree.get_children()) == []
     finally:
         root.destroy()
@@ -1259,21 +1311,21 @@ def test_gui_ignores_stale_item_progress_and_warns_mixed_services(tmp_path, monk
     root.withdraw()
     try:
         app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
-        app._current_ui_run_id = 2
+        app._queue_panel.current_ui_run_id = 2
         app._handle_event(("item_progress", 1, 3, 5, "Old Run Book"))
-        assert app._ui_book_index == 0
+        assert app._queue_panel.ui_book_index == 0
         app._handle_event(("item_progress", 2, 1, 4, "Current Run Book"))
-        assert app._ui_book_index == 1
-        assert app._ui_book_total == 4
+        assert app._queue_panel.ui_book_index == 1
+        assert app._queue_panel.ui_book_total == 4
 
         app.service_label_var.set("Storytel")
-        app._on_service_selected()
+        app._auth_panel.on_service_selected()
         asked = {}
         monkeypatch.setattr(
             "audiobookdl.gui.app.messagebox.askyesno",
             lambda title, msg, parent=None: asked.setdefault("msg", msg) and False,
         )
-        proceed = app._warn_mixed_service_credentials([
+        proceed = app._auth_panel.warn_mixed_service_credentials([
             "https://www.storytel.com/books/1",
             "https://www.nextory.com/book/2",
         ])
@@ -1367,9 +1419,9 @@ def test_gui_verify_auth_catalog_browser_and_update_handlers(tmp_path, monkeypat
             "audiobookdl.gui.app.messagebox.showinfo",
             lambda title, msg, parent=None: shown_info.append((title, msg)),
         )
-        app._is_verifying_auth = True
+        app._auth_panel.is_verifying_auth = True
         app._handle_event(("auth_verified", "Storytel", True, None))
-        assert not app._is_verifying_auth
+        assert not app._auth_panel.is_verifying_auth
         assert "Login OK: Storytel" in app.status_var.get()
         assert shown_info[-1][0] == "Test Login"
 
@@ -1483,8 +1535,8 @@ def test_gui_media_type_option_persistence_and_ffmpeg_bypass(tmp_path, monkeypat
         opts = app.build_options()
         assert opts.media_type == "ebook"
 
-        monkeypatch.setattr("audiobookdl.gui.app.find_executable", lambda _cmd: None)
-        assert app._ensure_ffmpeg_available(opts) is True
+        monkeypatch.setattr("audiobookdl.gui.ffmpeg_assistant.find_executable", lambda _cmd: None)
+        assert app._ffmpeg_assistant.ensure_available(opts) is True
 
         app._save_run_preferences(opts)
     finally:
@@ -1533,7 +1585,7 @@ def test_gui_failed_job_formats_book_error_tuple_as_string(tmp_path, monkeypatch
                 book_errors=[("https://example.com/broken-book", "Authentication failed")],
             )
 
-        monkeypatch.setattr("audiobookdl.gui.app.find_executable", lambda name: name)
+        monkeypatch.setattr("audiobookdl.gui.ffmpeg_assistant.find_executable", lambda name: name)
         monkeypatch.setattr("audiobookdl.gui.controller.run_downloads", fake_run_downloads)
 
         app.start_download()
@@ -1623,8 +1675,8 @@ def test_gui_cli_parity_controls_build_options_and_config_loading(tmp_path, monk
 
         # Cover-only preview & FFmpeg bypass even when combine/split_chapters are set
         assert app.template_preview_var.get().endswith("Dune.jpg")
-        monkeypatch.setattr("audiobookdl.gui.app.find_executable", lambda _cmd: None)
-        assert app._ensure_ffmpeg_available(opts) is True
+        monkeypatch.setattr("audiobookdl.gui.ffmpeg_assistant.find_executable", lambda _cmd: None)
+        assert app._ffmpeg_assistant.ensure_available(opts) is True
 
         # Splitting chapters without cover-only requires FFmpeg
         app.cover_only_var.set(False)
@@ -1634,7 +1686,7 @@ def test_gui_cli_parity_controls_build_options_and_config_loading(tmp_path, monk
         assert split_opts.split_chapters is True
         assert app.template_preview_var.get().endswith("/01.m4b")
         monkeypatch.setattr("audiobookdl.gui.app.messagebox.askyesnocancel", lambda *_a, **_kw: False)
-        assert app._ensure_ffmpeg_available(split_opts) is True
+        assert app._ffmpeg_assistant.ensure_available(split_opts) is True
 
         # Invalid numeric option shows error dialog and prevents run
         errors: list[tuple[str, str]] = []
@@ -2059,7 +2111,7 @@ def test_gui_cookie_import_dialog_states_and_apply(tmp_path):
             initial_service_key="overdrive",
             on_apply=lambda key, path, count: (
                 applied_paths.append((key, path, count)),
-                app._on_cookies_imported(key, path, count),
+                app._auth_panel.on_cookies_imported(key, path, count),
             ),
             palette=app._palette,
             browser_detector=lambda: {"firefox": True, "edge": False, "chrome": False, "brave": False, "chromium": False, "opera": False},
@@ -2122,12 +2174,12 @@ def test_gui_cookie_import_dialog_states_and_apply(tmp_path):
                 dialog.destroy()
 
         # Launching through app._show_cookie_import_dialog reuses singleton & wires palette
-        app._show_cookie_import_dialog()
-        assert app._cookie_dialog is not None
-        assert app._cookie_dialog.winfo_exists()
-        first_dlg = app._cookie_dialog
-        app._show_cookie_import_dialog()
-        assert app._cookie_dialog is first_dlg
+        app._auth_panel.show_cookie_import_dialog()
+        assert app._auth_panel.cookie_dialog is not None
+        assert app._auth_panel.cookie_dialog.winfo_exists()
+        first_dlg = app._auth_panel.cookie_dialog
+        app._auth_panel.show_cookie_import_dialog()
+        assert app._auth_panel.cookie_dialog is first_dlg
         first_dlg.destroy()
     finally:
         root.destroy()
@@ -2185,7 +2237,7 @@ def test_gui_completion_notifications_and_toggle_persistence(tmp_path, monkeypat
     cfg_path = tmp_path / "audiobook-dl.toml"
     sent_notifs = []
     monkeypatch.setattr(
-        "audiobookdl.gui.app.send_os_notification_async",
+        "audiobookdl.gui.queue_panel.send_os_notification_async",
         lambda title, msg, **_kw: sent_notifs.append((title, msg)),
     )
     try:
@@ -2309,6 +2361,51 @@ def test_gui_preview_cancel_enables_cancel_button_and_cancels_cleanly(tmp_path):
         assert str(app.cancel_btn.cget("state")) == "disabled"
     finally:
         root.destroy()
+
+
+def test_gui_persistent_queue_and_pause_resume_toggle(tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    cfg_path.write_text("", encoding="utf-8")
+    try:
+        app1 = AudiobookDLApp(root, config_location=str(cfg_path))
+        app1._set_running_state(True)
+        assert str(app1.pause_btn.cget("state")) == "normal"
+        assert app1.pause_btn.cget("text") == "Pause"
+        app1.toggle_pause_queue()
+        assert app1.controller.is_paused() is True
+        assert app1.pause_btn.cget("text") == "Resume"
+        app1.toggle_pause_queue()
+        assert app1.controller.is_paused() is False
+        assert app1.pause_btn.cget("text") == "Pause"
+        app1._set_running_state(False)
+
+        # Simulate unresolved & completed queue records before restart
+        j1 = QueuedJob(job_id="j_pend", run_id=1, url="https://librivox.org/pending", options=args.build_default_options(), interaction=MagicMock())
+        j2 = QueuedJob(job_id="j_done", run_id=1, url="https://librivox.org/done", options=args.build_default_options(), interaction=MagicMock())
+        app1._queue_panel.register_queue_job(j1)
+        app1._queue_panel.register_queue_job(j2)
+        app1._queue_panel.update_queue_row("j_done", "Completed", "1 ok")
+        app1.controller.shutdown(is_running=False, is_previewing=False)
+    finally:
+        root.destroy()
+
+    root2 = tk.Tk()
+    root2.withdraw()
+    try:
+        app2 = AudiobookDLApp(root2, config_location=str(cfg_path))
+        children = app2.queue_tree.get_children()
+        assert len(children) == 1
+        values = app2.queue_tree.item(children[0], "values")
+        assert values[1] == "https://librivox.org/pending"
+        assert values[2] == "Interrupted"
+        assert app2.controller.retryable_urls(children) == ["https://librivox.org/pending"]
+    finally:
+        root2.destroy()
 
 
 

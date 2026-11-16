@@ -10,7 +10,7 @@ from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, APIC, CHAP, TIT2, CTOC, CTOCFlags, WCOM, ID3NoHeaderError
 from requests import utils
 
-from typing import Optional, Sequence
+from typing import Any, List, Optional, Sequence
 
 EasyID3.RegisterTextKey("comment", "COMM")
 EasyID3.RegisterTextKey("year", "TYER")
@@ -18,14 +18,14 @@ EasyID3.RegisterTextKey("originalreleaseyear", "TORY")
 for _easy_key, _txxx_desc in (("isbn", "ISBN"), ("asin", "ASIN"), ("source", "Source")):
     EasyID3.RegisterTXXXKey(_easy_key, _txxx_desc)
 
-def commercialurl_get(id3, key):
+def commercialurl_get(id3: Any, key: str) -> List[str]:
     urls = [frame.url for frame in id3.getall("WCOM")]
     if urls:
         return urls
     else:
         raise EasyID3KeyError(key)
 
-def commercialurl_set(id3, key, value):
+def commercialurl_set(id3: Any, key: str, value: Sequence[str]) -> None:
     id3.delall("WCOM")
     for v in value:
         # scrape urls might contain characters in the unicode range
@@ -33,7 +33,7 @@ def commercialurl_set(id3, key, value):
         encoded_url = utils.requote_uri(v)
         id3.add(WCOM(url=encoded_url))
 
-def commercialurl_delete(id3, key):
+def commercialurl_delete(id3: Any, key: str) -> None:
     id3.delall("WCOM")
 
 EasyID3.RegisterKey("commercialurl", commercialurl_get, commercialurl_set, commercialurl_delete)
@@ -64,7 +64,7 @@ def is_id3_file(filepath: str) -> bool:
     return ext in ID3_FORMATS
 
 
-def add_id3_metadata(filepath: str, metadata: AudiobookMetadata):
+def add_id3_metadata(filepath: str, metadata: AudiobookMetadata) -> None:
     """Add ID3 metadata tags to the given audio file"""
     audio = MP3(filepath, ID3=EasyID3)
     # Adding tags
@@ -125,7 +125,7 @@ def _apply_id3_chapters(audio: ID3, filepath: str, chapters: Sequence[Chapter]) 
     return True
 
 
-def embed_id3_cover(filepath: str, cover: Cover):
+def embed_id3_cover(filepath: str, cover: Cover) -> None:
     try:
         audio = ID3(filepath)
     except ID3NoHeaderError:
@@ -134,7 +134,7 @@ def embed_id3_cover(filepath: str, cover: Cover):
         audio.save(filepath)
 
 
-def add_id3_chapter(audio: ID3, start: int, end: int, title: str, index: int):
+def add_id3_chapter(audio: ID3, start: int, end: int, title: str, index: int) -> None:
     """Adds a single chapter to the given audio file"""
     audio.add(CHAP(
         element_id=u"chp"+str(index),
@@ -144,7 +144,7 @@ def add_id3_chapter(audio: ID3, start: int, end: int, title: str, index: int):
     ))
 
 
-def add_id3_chapters(filepath: str, chapters: Sequence[Chapter]):
+def add_id3_chapters(filepath: str, chapters: Sequence[Chapter]) -> None:
     """Adds chapters to the given audio file"""
     add_id3_chapters_and_cover(filepath, chapters=chapters, cover=None)
 

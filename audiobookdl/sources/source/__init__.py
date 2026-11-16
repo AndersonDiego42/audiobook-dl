@@ -26,6 +26,26 @@ if TYPE_CHECKING:
 T = TypeVar("T")
 
 
+def _close_sessions(
+    primary: Optional[requests.Session],
+    children: Optional[List[requests.Session]],
+) -> None:
+    """Close `primary` and all child sessions without raising."""
+    if primary is not None and hasattr(primary, "close"):
+        try:
+            primary.close()
+        except Exception:
+            pass
+    if children:
+        for child in list(children):
+            if hasattr(child, "close"):
+                try:
+                    child.close()
+                except Exception:
+                    pass
+        children.clear()
+
+
 @dataclass(frozen=True)
 class CatalogBook:
     """Lightweight discovery entry returned by `Source.search` / `Source.list_library`."""
@@ -64,19 +84,26 @@ class Source(Generic[T]):
         self.database_directory = os.path.join(options.database_directory, self.name)
         self.skip_downloaded = options.skip_downloaded
         self._session: requests.Session = self.create_session(options)
-        self._session_finalizer = weakref.finalize(self, self._session.close)
+        self._child_sessions: List[requests.Session] = []
+        self._session_finalizer = weakref.finalize(
+            self,
+            _close_sessions,
+            self._session,
+            self._child_sessions,
+        )
         if self.create_storage_dir:
             os.makedirs(self.database_directory, exist_ok=True)
 
     def close(self) -> None:
-        """Close the HTTP session held by this source."""
+        """Close the HTTP session and any unauthenticated CDN sessions held by this source."""
         finalizer = getattr(self, "_session_finalizer", None)
         if finalizer is not None:
             finalizer()
             return
-        session = getattr(self, "_session", None)
-        if session is not None and hasattr(session, "close"):
-            session.close()
+        _close_sessions(
+            getattr(self, "_session", None),
+            getattr(self, "_child_sessions", None),
+        )
 
     def __enter__(self) -> Source[T]:
         return self
@@ -127,21 +154,12 @@ class Source(Generic[T]):
         return os.path.join(self.database_directory, "session_cookies.txt")
 
     def save_cookie_file(self, cookie_file: Optional[str] = None) -> str:
-        """Persist current session cookies in Netscape format and return path written."""
+        """Atomically persist current session cookies in Netscape format and return path written."""
+        from audiobookdl.utils.browser_cookies import export_cookies_netscape
+
         target = cookie_file or self.cached_cookie_path()
-        parent = os.path.dirname(os.path.abspath(target))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        jar = MozillaCookieJar(target)
-        for cookie in CookieJar.__iter__(self._session.cookies):
-            jar.set_cookie(cookie)
-        jar.save(target, ignore_discard=True, ignore_expires=True)
-        if os.name != "nt":
-            try:
-                os.chmod(target, 0o600)
-            except OSError:
-                pass
-        return target
+        cookies = list(CookieJar.__iter__(self._session.cookies))
+        return export_cookies_netscape(cookies, target)
 
     def search(self, query: str) -> List[CatalogBook]:
         """Search the service catalog for audiobooks matching `query`."""
@@ -291,4 +309,8 @@ class Source(Generic[T]):
 
     def create_unauthenticated_session(self) -> requests.Session:
         """Create a fresh pooled session without auth headers or cookies for CDN requests."""
-        return self.create_session(getattr(self, "_options", None))
+        session = self.create_session(getattr(self, "_options", None))
+        child_sessions = getattr(self, "_child_sessions", None)
+        if isinstance(child_sessions, list):
+            child_sessions.append(session)
+        return session

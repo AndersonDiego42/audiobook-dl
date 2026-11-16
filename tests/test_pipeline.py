@@ -1017,3 +1017,79 @@ def test_apply_runtime_options_isolates_ffmpeg_dir_per_job_context(tmp_path):
         utils.set_ffmpeg_dir(prev_global)
 
 
+def test_fetch_metadata_and_process_url_close_owned_source_sessions(tmp_path, monkeypatch):
+    from audiobookdl import AudiobookFile
+    from audiobookdl.pipeline import fetch_metadata, process_url
+
+    closed_flags = []
+
+    class _MockSource:
+        name = "mock"
+        skip_downloaded = False
+        requires_authentication = False
+        authenticated = True
+
+        def close(self):
+            closed_flags.append("closed")
+
+        def on_download_complete(self, _book):
+            pass
+
+        def download(self, url):
+            return Audiobook(
+                session=requests.Session(),
+                metadata=AudiobookMetadata(title="Cleanup Book", scrape_url=url),
+                files=[AudiobookFile(url="https://example.com/a.mp3", ext="mp3")],
+            )
+
+    monkeypatch.setattr(
+        "audiobookdl.pipeline.prepare_source_result",
+        lambda url, *_a, **_kw: (_MockSource(), _MockSource().download(url)),
+    )
+    opts = args.build_default_options(output_template=str(tmp_path / "{title}"), skip_downloaded=False)
+    cfg = Config(sources={}, output_template=None, database_directory=str(tmp_path), skip_downloaded=False)
+
+    fetch_metadata("https://example.com/book", opts, cfg)
+    assert len(closed_flags) == 1
+
+    monkeypatch.setattr("audiobookdl.pipeline.download_result", lambda *_a, **_kw: None)
+    process_url("https://example.com/book", opts, cfg)
+    assert len(closed_flags) == 2
+
+
+def test_cli_json_outputs_and_post_exec_hook(tmp_path, capsys, monkeypatch):
+    import json
+    from unittest.mock import patch
+    from audiobookdl.__main__ import main as cli_main
+    from audiobookdl.pipeline import run_post_exec_hook
+
+    # 1. --list-sources --json
+    cli_main(["--list-sources", "--json"])
+    sources_payload = json.loads(capsys.readouterr().out)
+    assert isinstance(sources_payload, list)
+    assert any(s["key"] == "librivox" for s in sources_payload)
+
+    # 2. run_post_exec_hook injects AUDIOBOOK_DL_* environment variables
+    captured_env = {}
+
+    def fake_subproc_run(cmd, shell=False, env=None, check=False):
+        captured_env["cmd"] = cmd
+        captured_env["shell"] = shell
+        captured_env["env"] = dict(env or {})
+        return type("_R", (), {"returncode": 0})()
+
+    with patch("audiobookdl.pipeline.subprocess.run", side_effect=fake_subproc_run):
+        rc = run_post_exec_hook(
+            "notify-hook",
+            output_path=str(tmp_path / "Book.m4b"),
+            metadata=AudiobookMetadata(title="Hook Book", authors=["Hook Author"], source="librivox"),
+            audio_format="m4b",
+        )
+    assert rc == 0
+    assert captured_env["cmd"] == "notify-hook"
+    assert captured_env["env"]["AUDIOBOOK_DL_TITLE"] == "Hook Book"
+    assert captured_env["env"]["AUDIOBOOK_DL_AUTHOR"] == "Hook Author"
+    assert captured_env["env"]["AUDIOBOOK_DL_FORMAT"] == "m4b"
+    assert captured_env["env"]["AUDIOBOOK_DL_SOURCE"] == "librivox"
+
+

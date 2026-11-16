@@ -1,5 +1,5 @@
 from io import BytesIO
-from typing import Tuple
+from typing import Optional, Tuple
 
 from PIL import Image
 
@@ -9,23 +9,67 @@ from audiobookdl import Cover
 SUPPORTED_COVER_EXTENSIONS = {"jpg", "jpeg", "png"}
 
 
-def normalize_cover_image(cover: Cover) -> Tuple[bytes, str]:
+def _save_pillow_cover(img: Image.Image) -> Tuple[bytes, str]:
+    buf = BytesIO()
+    if img.mode in ("RGBA", "LA", "PA") or (
+        img.mode == "P" and "transparency" in img.info
+    ):
+        img.save(buf, format="PNG")
+        return buf.getvalue(), "png"
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    img.save(buf, format="JPEG", quality=92)
+    return buf.getvalue(), "jpg"
+
+
+def normalize_cover_image(
+    cover: Cover,
+    *,
+    square: bool = False,
+    max_size: Optional[int] = None,
+) -> Tuple[bytes, str]:
     """Return cover bytes and a lowercase extension ('jpg', 'jpeg', or 'png').
 
-    Converts other formats (such as WebP) in memory using Pillow so ID3 and MP4
-    cover tags always receive a standard supported image format.
+    Converts unsupported formats (such as WebP), optionally letterboxes to `1:1`
+    when `square=True`, and downscales when `max_size` is provided.
     """
     ext = cover.extension.lower().lstrip(".")
-    if ext in SUPPORTED_COVER_EXTENSIONS:
+    needs_transform = square or (max_size is not None and max_size > 0)
+    if ext in SUPPORTED_COVER_EXTENSIONS and not needs_transform:
         return cover.image, ext
-    with Image.open(BytesIO(cover.image)) as img:
-        buf = BytesIO()
-        if img.mode in ("RGBA", "LA", "PA") or (
-            img.mode == "P" and "transparency" in img.info
-        ):
-            img.save(buf, format="PNG")
-            return buf.getvalue(), "png"
-        if img.mode != "RGB":
-            img = img.convert("RGB")
-        img.save(buf, format="JPEG")
-        return buf.getvalue(), "jpg"
+
+    with Image.open(BytesIO(cover.image)) as raw_img:
+        img: Image.Image = raw_img.copy()
+        transformed = False
+        if square and img.width != img.height:
+            side = max(img.width, img.height)
+            mode = "RGBA" if img.mode in ("RGBA", "LA", "PA") else "RGB"
+            bg: Tuple[int, ...] = (0, 0, 0, 255) if mode == "RGBA" else (0, 0, 0)
+            canvas = Image.new(mode, (side, side), bg)
+            if img.mode != mode:
+                img = img.convert(mode)
+            canvas.paste(img, ((side - img.width) // 2, (side - img.height) // 2))
+            img = canvas
+            transformed = True
+        if max_size is not None and max_size > 0 and max(img.width, img.height) > max_size:
+            resampling = getattr(Image, "Resampling", Image).LANCZOS
+            img.thumbnail((max_size, max_size), resampling)
+            transformed = True
+        if not transformed and ext in SUPPORTED_COVER_EXTENSIONS:
+            return cover.image, ext
+        return _save_pillow_cover(img)
+
+
+def apply_cover_postprocessing(
+    cover: Optional[Cover],
+    *,
+    square: bool = False,
+    max_size: Optional[int] = None,
+) -> Optional[Cover]:
+    """Return `Cover` normalized according to `square` / `max_size`, or `None`."""
+    if cover is None:
+        return None
+    if not square and not (max_size is not None and max_size > 0):
+        return cover
+    image_data, ext = normalize_cover_image(cover, square=square, max_size=max_size)
+    return Cover(image_data, ext)

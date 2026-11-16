@@ -399,3 +399,84 @@ def test_cli_mid_download_cancellation_leaves_no_final_output(
 
     assert proc.returncode != 0
     assert not (e2e_workspace.output_dir / "Cancelled Book.m4b").exists()
+
+
+@pytest.mark.ffmpeg
+def test_cli_pack_scan_library_export_json_lifecycle(
+    cli_runner: CliRunner,
+    e2e_workspace: E2EWorkspace,
+    media_factory: MediaFixtureFactory,
+    ffmpeg_tools: tuple,
+) -> None:
+    import json
+
+    _ = ffmpeg_tools
+    src_book = e2e_workspace.work_dir / "Raw Author - Subprocess Book"
+    src_book.mkdir(parents=True)
+    mp3_a = media_factory.make_mp3("01.mp3", duration_sec=0.8, freq_hz=440)
+    mp3_b = media_factory.make_mp3("02.mp3", duration_sec=0.8, freq_hz=550)
+    (src_book / "01 - Opening.mp3").write_bytes(mp3_a)
+    (src_book / "02 - Ending.mp3").write_bytes(mp3_b)
+
+    cfg_path = e2e_workspace.write_toml("")
+    db_path = e2e_workspace.db_dir / "downloads.db"
+
+    pack_res = cli_runner.run([
+        "pack",
+        str(src_book),
+        "--config", str(cfg_path),
+        "--output-dir", str(e2e_workspace.output_dir),
+        "--output-template", "{author}/{title}",
+        "--yes",
+        "--json",
+    ])
+    assert pack_res.returncode == 0, pack_res.stderr
+    pack_payload = json.loads(pack_res.stdout)
+    assert pack_payload["books_completed"] == 1
+    packed_file = e2e_workspace.output_dir / "Raw Author" / "Subprocess Book.m4b"
+    assert packed_file.is_file()
+
+    scan_res = cli_runner.run([
+        "scan",
+        str(e2e_workspace.output_dir),
+        "--config", str(cfg_path),
+        "--download-archive", str(db_path),
+        "--json",
+    ])
+    assert scan_res.returncode == 0, scan_res.stderr
+    scan_payload = json.loads(scan_res.stdout)
+    assert scan_payload["registered"] >= 1
+
+    list_res = cli_runner.run([
+        "library",
+        "--config", str(cfg_path),
+        "--download-archive", str(db_path),
+        "list",
+        "--json",
+    ])
+    assert list_res.returncode == 0, list_res.stderr
+    entries = json.loads(list_res.stdout)
+    assert len(entries) >= 1
+    entry_id = entries[0]["id"]
+
+    tag_res = cli_runner.run([
+        "library",
+        "--config", str(cfg_path),
+        "--download-archive", str(db_path),
+        "tag", str(entry_id),
+        "--add", "verified",
+    ])
+    assert tag_res.returncode == 0
+
+    export_file = e2e_workspace.work_dir / "library_export.json"
+    export_res = cli_runner.run([
+        "export",
+        str(export_file),
+        "--config", str(cfg_path),
+        "--download-archive", str(db_path),
+        "--query", "tag:verified",
+    ])
+    assert export_res.returncode == 0, export_res.stderr
+    exported = json.loads(export_file.read_text(encoding="utf-8"))
+    assert len(exported) == 1
+    assert exported[0]["title"] == "Subprocess Book"

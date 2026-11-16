@@ -1164,3 +1164,109 @@ def test_download_file_rejects_corrupt_audio_before_replacing_existing_file(tmp_
     assert not (tmp_path / "Existing.mp3.tmp").exists()
 
 
+@pytest.mark.real_integrity
+def test_download_file_surfaces_ffprobe_execution_error_without_false_integrity_message(tmp_path):
+    from audiobookdl.exceptions import GenericAudiobookDLException
+
+    target = tmp_path / "Existing.mp3"
+    target.write_bytes(b"valid-existing-audio")
+
+    session = MagicMock()
+    session.get.return_value = _mock_response(
+        headers={"Content-Length": "11"},
+        chunks=[b"valid-bytes"],
+    )
+    book = _make_audiobook(session)
+
+    with (
+        patch("audiobookdl.utils.find_executable", return_value="C:/bad/ffprobe.exe"),
+        patch(
+            "audiobookdl.utils.subprocess.run",
+            side_effect=OSError(216, "This version of %1 is not compatible"),
+        ),
+    ):
+        with pytest.raises(GenericAudiobookDLException) as exc_info:
+            download_file((book, str(tmp_path / "Existing"), 0, lambda _d: None, None))
+
+    heading = exc_info.value.data["heading"]
+    body = exc_info.value.data["body"]
+    assert "ffprobe could not run" in heading
+    assert "not compatible" in body
+    assert "failed media integrity verification" not in heading
+    assert target.read_bytes() == b"valid-existing-audio"
+
+
+def test_download_file_streams_inline_aes_on_multi_segment_hls_even_with_resume(tmp_path):
+    from audiobookdl.utils.audiobook import AESEncryption
+
+    key = b"0123456789abcdef"
+    iv = b"fedcba9876543210"
+    plaintext = b"0123456789abcdef" * 20 + b"hls-seg-tail"
+    ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(pad(plaintext, AES.block_size))
+
+    session = MagicMock()
+    session.get.return_value = _mock_response(
+        headers={"Content-Length": str(len(ciphertext))},
+        chunks=[ciphertext],
+    )
+    book = Audiobook(
+        session=session,
+        metadata=AudiobookMetadata(title="Multi HLS"),
+        files=[
+            AudiobookFile(url="https://example.com/seg0.ts", ext="ts", encryption_method=AESEncryption(key=key, iv=iv)),
+            AudiobookFile(url="https://example.com/seg1.ts", ext="ts", encryption_method=AESEncryption(key=key, iv=iv)),
+        ],
+    )
+    out_dir = tmp_path / "hls_dir"
+    out_dir.mkdir()
+    with patch("audiobookdl.output.download.encryption.decrypt_file") as mock_decrypt_file:
+        out_path = download_file((book, str(out_dir), 0, lambda _: None, None), resume=True)
+
+    mock_decrypt_file.assert_not_called()
+    assert open(out_path, "rb").read() == plaintext
+
+
+def test_download_audiobook_enables_faststart_on_combine_and_convert(tmp_path):
+    session = MagicMock()
+    session.get.return_value = _mock_response({"Content-Length": "3"}, [b"raw"])
+    book = Audiobook(
+        session=session,
+        metadata=AudiobookMetadata(title="Faststart Book"),
+        files=[AudiobookFile(url="https://example.com/p1.mp3", ext="mp3")],
+    )
+    opts = DownloadOptions(
+        output_format="m4b",
+        combine=True,
+        write_json_metadata=False,
+        no_chapters=True,
+        overwrite=True,
+        skip_downloaded=False,
+    )
+    with (
+        patch("audiobookdl.output.download.output.convert_single_file", return_value=(str(tmp_path / "Faststart Book.m4b"), False)) as mock_conv,
+        patch("audiobookdl.output.download.metadata.add_metadata"),
+    ):
+        (tmp_path / "Faststart Book.m4b").write_bytes(b"m4b")
+        download_audiobook(book, str(tmp_path / "Faststart Book"), opts)
+    assert mock_conv.call_args.kwargs["faststart"] is True
+
+
+def test_parse_byte_rate_and_token_bucket_rate_limiter():
+    from audiobookdl.utils.http import TokenBucketRateLimiter, parse_byte_rate
+
+    assert parse_byte_rate(None) is None
+    assert parse_byte_rate("") is None
+    assert parse_byte_rate("500K") == 500 * 1024
+    assert parse_byte_rate("2M/s") == 2 * 1024 * 1024
+    assert parse_byte_rate("1048576") == 1048576
+    with pytest.raises(ValueError):
+        parse_byte_rate("invalid-rate")
+
+    limiter = TokenBucketRateLimiter(128 * 1024)
+    cancel = threading.Event()
+    limiter.acquire(1024, cancel_event=cancel)
+    cancel.set()
+    with pytest.raises(DownloadCancelled):
+        limiter.acquire(1024, cancel_event=cancel)
+
+

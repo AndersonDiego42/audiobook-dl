@@ -417,3 +417,57 @@ def test_multi_profile_source_config_round_trip_and_migration(tmp_path):
     assert "legacy-profile-pw" not in cfg_path.read_text(encoding="utf-8")
 
 
+def test_env_config_var_overrides_config_dir_and_location(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    monkeypatch.delenv("AUDIOBOOK_DL_CONFIG", raising=False)
+    monkeypatch.delenv("AUDIOBOOKDL_CONFIG", raising=False)
+
+    custom_dir = tmp_path / "docker-config"
+    custom_cfg = custom_dir / "audiobook-dl.toml"
+    monkeypatch.setenv("AUDIOBOOK_DL_CONFIG", str(custom_cfg))
+    assert config_dir() == str(custom_dir)
+    assert get_config_location(None) == str(custom_cfg)
+    assert args.default_database_directory() == os.path.join(str(custom_dir), "db")
+
+    # Also supports legacy AUDIOBOOKDL_CONFIG spelling
+    monkeypatch.delenv("AUDIOBOOK_DL_CONFIG", raising=False)
+    legacy_cfg = tmp_path / "legacy-config" / "custom.toml"
+    monkeypatch.setenv("AUDIOBOOKDL_CONFIG", str(legacy_cfg))
+    assert config_dir() == str(legacy_cfg.parent)
+    assert get_config_location(None) == str(legacy_cfg)
+
+
+def test_path_locks_are_weakly_referenced_and_collected(tmp_path):
+    import gc
+    from audiobookdl.utils.fs import _PATH_LOCKS, file_lock
+
+    target = str(tmp_path / "locked.toml")
+    with file_lock(target):
+        assert os.path.abspath(target) in _PATH_LOCKS
+    gc.collect()
+    assert os.path.abspath(target) not in _PATH_LOCKS
+
+
+def test_toml_save_preserves_comments_inline_notes_and_custom_sections(tmp_path):
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    cfg_path.write_text(
+        "# Primary configuration\n"
+        'output_template = "{title}" # keep inline note\n'
+        "\n"
+        "# Custom metadata notes\n"
+        "[custom_tools]\n"
+        'my_tool = "kept"\n',
+        encoding="utf-8",
+    )
+    save_output_preferences("m4b", True, config_location=str(cfg_path))
+    updated = cfg_path.read_text(encoding="utf-8")
+    assert "# Primary configuration" in updated
+    assert "# keep inline note" in updated
+    assert "# Custom metadata notes" in updated
+    assert "[custom_tools]" in updated
+    assert 'my_tool = "kept"' in updated
+    assert 'output_format = "m4b"' in updated
+    assert "combine = true" in updated
+
+
+

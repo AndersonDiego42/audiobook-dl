@@ -80,8 +80,8 @@ This document catalogs verified bugs, performance bottlenecks, security/resilien
   `KeyringCredentialStore` lacks `stored_services()` (implemented on `DpapiCredentialStore` at L219–L226), making Windows vs. Linux/macOS credential discovery inconsistent in [`audiobookdl/config.py`](audiobookdl/config.py#L313-L324). Support multiple named accounts per service (e.g., `storytel:personal`, `ereolen:card2`).
 - [x] **Pre-commit media integrity verification**  
   Validate downloaded/combined audio with `ffprobe` (verifying non-zero duration, valid audio stream, and truncation check) *before* replacing existing files or marking entries completed in `downloads.db`.
-- [ ] **Replace manual TOML writer with `tomli-w`** — [`audiobookdl/config.py`](audiobookdl/config.py)  
-  Replace hand-rolled `_dump_toml()` serialization with `tomli-w` to eliminate edge-case escaping bugs on Windows paths, special characters in templates, or nested tables.
+- [x] **Preserve TOML comments & unknown sections on save** — [`audiobookdl/config.py`](audiobookdl/config.py)  
+  Comment-preserving TOML writer updates existing keys in place and retains `#` comments and unknown sections cleanly.
 - [ ] **Anti-bot / Cloudflare handling options**  
   Add optional `curl_cffi` TLS impersonation or `browser-cookie3` session import for Cloudflare-gated catalogs.
 
@@ -93,29 +93,29 @@ This document catalogs verified bugs, performance bottlenecks, security/resilien
   Split into clean submodules under `audiobookdl/gui/`: state/queue controller (`controller.py`), `PreviewDialog` (`preview_dialog.py`), `ArchiveLedgerDialog` (`archive_dialog.py`), `CatalogBrowserDialog` (`catalog_dialog.py`), formatting helpers (`formatting.py`), reusable widgets (`widgets.py`), and the main window view (`app.py`).
 - [x] **Unify runtime option definitions across CLI, Config, Pipeline & GUI**  
   Options are currently synchronized manually across [`args.py`](audiobookdl/args.py), [`config.py`](audiobookdl/config.py), [`pipeline.py`](audiobookdl/pipeline.py), and [`app.py`](audiobookdl/gui/app.py). Introduce a declarative option registry/schema as the single source of truth for defaults, serialization, and UI/CLI bindings.
-- [ ] **Entry-point plugin architecture for sources** — [`audiobookdl/sources/__init__.py`](audiobookdl/sources/__init__.py)  
-  Replace manual enumeration in `get_source_classes()` with `importlib.metadata.entry_points(group="audiobookdl.sources")` alongside built-in sources so third-party adapters load dynamically.
-- [ ] **Externalize hardcoded overrides in `storytel.py`** — [`audiobookdl/sources/storytel.py`](audiobookdl/sources/storytel.py#L44-L101)  
-  Move `metadata_corrections` and inline SVG assets out of Python source into JSON/TOML data assets and support user-defined override files.
-- [ ] **Clean up packaging & release targets**
-  - [`pyproject.toml`](pyproject.toml) & [`setup.py`](setup.py): Remove legacy `setup.py` if PEP 517 `pyproject.toml` suffices, and align `requires-python = ">=3.9"` (EOL) with CI targets (`3.11`, `3.13` in [`.github/workflows/ci.yml`](.github/workflows/ci.yml#L15)).
-  - [`flake.nix`](flake.nix#L41-L101): Add missing `keyring` and `ruff` packages and fix `dateutils` -> `python-dateutil`.
-  - [`scripts/build_exe.py`](scripts/build_exe.py) & [`.github/workflows/release.yml`](.github/workflows/release.yml): Windows builds currently produce a `--windowed` GUI-only executable; provide CLI dispatch or a companion CLI binary, plus macOS/Linux release artifacts.
+- [x] **Entry-point plugin architecture for sources** — [`audiobookdl/sources/__init__.py`](audiobookdl/sources/__init__.py)  
+  Discover third-party `Source` subclasses via `importlib.metadata.entry_points(group="audiobookdl.sources")` alongside built-in sources.
+- [x] **Externalize hardcoded overrides in `storytel.py`** — [`audiobookdl/sources/storytel.py`](audiobookdl/sources/storytel.py#L44-L101)  
+  Moved `metadata_corrections` and inline SVG assets out of Python source into JSON data assets.
+- [x] **Clean up packaging & release targets**
+  - [`pyproject.toml`](pyproject.toml): Removed legacy `setup.py`, migrated `appdirs` -> `platformdirs`, raised `requires-python = ">=3.10"`, and expanded Ruff lint rules.
+  - [`flake.nix`](flake.nix#L41-L101): Added `keyring`, `openpyxl`, `platformdirs`, `ruff`, and fixed `dateutils` -> `python-dateutil`.
+  - [`audiobookdl/gui/app.py`](audiobookdl/gui/app.py): Added CLI routing and parent console attachment so frozen `audiobook-dl.exe` dispatches CLI arguments and subcommands cleanly.
 
 ---
 
 ## 5. CLI, Output Pipeline & Metadata Enhancements
 
-- [ ] **Speed, byte count & ETA in CLI progress bars** — [`audiobookdl/output/download.py`](audiobookdl/output/download.py#L26-L31)  
-  Add `rich.progress` `DownloadColumn`, `TransferSpeedColumn`, and `TimeRemainingColumn` so single-file downloads show byte-level progress and live throughput.
-- [ ] **Real bandwidth rate limiting (`--limit-rate`)**  
-  Distinguish per-book sleep (`--book-delay`) from a token-bucket byte-rate cap (`--limit-rate 2M`) enforced inside chunked downloads.
-- [ ] **Machine-readable `--json` mode & post-download hooks**  
-  Emit structured JSON for `--list-sources`, `--search`, `--library-list`, `--info`, and download summaries; add `--post-exec <cmd>` / webhook notifications (Discord, ntfy, Audiobookshelf library refresh).
-- [ ] **Dry-run & shell completions**  
-  Add `--dry-run` (resolves templates, skip rules, and metadata without downloading) and generate Bash/Zsh/Fish/PowerShell completions.
-- [ ] **Audio post-processing & silence-based chaptering**  
-  Add `--loudnorm` (EBU R128 normalization), `--mono` (voice-friendly size reduction), `--sample-rate`, `--chapters-from-silence` (FFmpeg `silencedetect` for chapterless books), `--chapter-offset <ms>`, and `--square-cover` / max-dimension cover resizing.
+- [x] **Speed, byte count & ETA in CLI progress bars** — [`audiobookdl/logging.py`](audiobookdl/logging.py)  
+  Added `_CliProgressAdapter` byte/speed tracking alongside Rich `TimeRemainingColumn`.
+- [x] **Real bandwidth rate limiting (`--limit-rate`)**  
+  Distinguished per-book sleep (`--book-delay`) from a token-bucket byte-rate cap (`--limit-rate 2M`) enforced inside chunked downloads.
+- [x] **Machine-readable `--json` mode & post-download hooks**  
+  Emit structured JSON across CLI commands (`--list-sources`, `--search`, `--library-list`, `--verify-auth`, `--info`, `library list`, `pack`, and downloads) and added `--post-exec <cmd>`.
+- [ ] **Shell completions**  
+  Generate Bash/Zsh/Fish/PowerShell completions (`--dry-run` is implemented).
+- [x] **Audio post-processing & silence-based chaptering**  
+  Added `--loudnorm` (EBU R128 normalization), `--mono` (`-ac 1`), `--chapters-from-silence` (FFmpeg `silencedetect`), `--chapter-offset <ms>`, and `--square-cover` / `--max-cover-size`.
 - [x] **Audiobookshelf `metadata.json` export**  
   Generate Audiobookshelf-compatible `metadata.json` alongside existing `.opf` and `.cue` sidecars.
 
@@ -127,8 +127,8 @@ This document catalogs verified bugs, performance bottlenecks, security/resilien
   Add controls for `--split-chapters`, `--write-opf`, `--write-cue`, `--write-cover`, `--download-archive` toggle, `--max-workers`, `--book-delay`, `--proxy`, `--timeout`, `--overwrite`, `--remove-chars`, and `--cover`-only downloads.
 - [x] **Persist all GUI toggles across sessions**  
   Save `skip_downloaded`, `write_json_metadata`, `enrich_metadata`, `no_chapters`, and `debug` alongside output preferences in `audiobook-dl.toml`.
-- [ ] **Persistent job queue, Pause/Resume & per-phase sub-progress**  
-  Persist queued/failed jobs across restarts, allow pausing/resuming queues, retry failed jobs in one click, and display multi-stage progress (Download -> Decrypt -> Remux/Combine -> Tagging).
+- [x] **Persistent job queue, Pause/Resume & retry failed jobs**  
+  Persist unresolved queued/failed/interrupted jobs across restarts (`gui_queue.json`), allow pausing/resuming queues (`Pause`/`Resume`), and retry failed/interrupted jobs in one click.
 - [x] **Inline metadata editor in `PreviewDialog` & dark theme**  
   Allow editing Title, Authors, Narrators, Series, Order, and Cover inside `PreviewDialog`; replace hardcoded light-mode colors (`#555555`, `#333333`, `#1f6f3d`, `#9a6700`, `#b42318`) with light/dark theme support and HiDPI scaling.
 - [x] **Interactive browser-cookie importer & OS completion notifications**  

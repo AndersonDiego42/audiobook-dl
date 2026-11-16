@@ -687,3 +687,19 @@ def test_asin_metadata_across_mp4_id3_vorbis_opf_json_and_template(tmp_path):
     _create_silent_audio(flac_path, ["-c:a", "flac"])
     vorbis.add_vorbis_metadata(str(flac_path), meta)
     assert FLAC(str(flac_path))["asin"] == ["B08G9PRS1K"]
+
+
+def test_cover_square_padding_and_max_size_normalization():
+    from io import BytesIO
+    from PIL import Image
+    from audiobookdl import Cover
+    from audiobookdl.output.metadata._cover import normalize_cover_image
+
+    buf = BytesIO()
+    Image.new("RGB", (400, 200), (120, 60, 30)).save(buf, format="JPEG")
+    cover = Cover(image=buf.getvalue(), extension="jpg")
+
+    data, ext = normalize_cover_image(cover, square=True, max_size=128)
+    assert ext == "jpg"
+    with Image.open(BytesIO(data)) as out_img:
+        assert out_img.size == (128, 128)

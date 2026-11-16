@@ -139,6 +139,14 @@ def verify_audio_integrity(
         raise FailedCombining(message=f"Media file is missing or empty: {path}")
 
     info = _get_cached_probe(path, probe_cache)
+    if info.probe_error:
+        logging.debug(
+            f"Media integrity check aborted for '{os.path.basename(path)}': {info.probe_error}"
+        )
+        raise GenericAudiobookDLException(
+            "Media integrity verification failed because ffprobe could not run",
+            info.probe_error,
+        )
     ffprobe_available = require_ffprobe or (find_executable("ffprobe") is not None)
 
     if expected_duration > 0 and info.duration < expected_duration * min_duration_ratio:
@@ -402,12 +410,21 @@ def _build_reencode_codec_args(
     info: AudioProbeInfo,
     audio_bitrate: Optional[str],
     faststart: bool = True,
+    *,
+    loudnorm: bool = False,
+    mono: bool = False,
 ) -> List[str]:
     """Return FFmpeg codec/container flags forcing re-encode into `target_ext`."""
     explicit_bitrate = normalize_audio_bitrate(audio_bitrate)
+    filter_args: List[str] = []
+    if loudnorm:
+        filter_args += ["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"]
+    if mono:
+        filter_args += ["-ac", "1"]
+
     if target_ext in MP4_CONTAINERS:
         target_bitrate = _resolve_aac_bitrate_from_info(source_path, info, explicit_bitrate)
-        args = ["-c:a", "aac", "-b:a", target_bitrate]
+        args = [*filter_args, "-c:a", "aac", "-b:a", target_bitrate]
         if faststart:
             args += ["-movflags", "+faststart"]
         return args
@@ -417,10 +434,10 @@ def _build_reencode_codec_args(
             if info.bitrate and info.bitrate > 0
             else "192k"
         )
-        return ["-c:a", "libmp3lame", "-b:a", bitrate]
+        return [*filter_args, "-c:a", "libmp3lame", "-b:a", bitrate]
     if explicit_bitrate is not None and target_ext not in ffmpeg_metadata.LOSSLESS_CONTAINERS:
-        return ["-b:a", explicit_bitrate]
-    return []
+        return [*filter_args, "-b:a", explicit_bitrate]
+    return filter_args
 
 
 def _build_mux_codec_args(
@@ -430,8 +447,21 @@ def _build_mux_codec_args(
     info: AudioProbeInfo,
     audio_bitrate: Optional[str],
     faststart: bool = True,
+    *,
+    loudnorm: bool = False,
+    mono: bool = False,
 ) -> List[str]:
     """Return FFmpeg codec/container flags for muxing or transcoding to `target_ext`."""
+    if loudnorm or mono:
+        return _build_reencode_codec_args(
+            target_ext,
+            source_path,
+            info,
+            audio_bitrate,
+            faststart=faststart,
+            loudnorm=loudnorm,
+            mono=mono,
+        )
     explicit_bitrate = normalize_audio_bitrate(audio_bitrate)
     codec = info.codec_name
     if target_ext in MP4_CONTAINERS:
@@ -450,6 +480,60 @@ def _build_mux_codec_args(
     if explicit_bitrate is not None and target_ext not in ffmpeg_metadata.LOSSLESS_CONTAINERS:
         return ["-b:a", explicit_bitrate]
     return []
+
+
+def apply_chapter_offset(chapters: Sequence[Chapter], offset_ms: int) -> List[Chapter]:
+    """Shift chapter markers (preserving initial marker at `0`) by `offset_ms` milliseconds."""
+    if not chapters or offset_ms == 0:
+        return list(chapters)
+    shifted: List[Chapter] = []
+    for idx, ch in enumerate(chapters):
+        if idx == 0 and int(ch.start) == 0:
+            shifted.append(Chapter(start=0, title=ch.title))
+        else:
+            shifted.append(Chapter(start=max(0, int(ch.start) + int(offset_ms)), title=ch.title))
+    return shifted
+
+
+_SILENCE_END_RE = re.compile(r"silence_end:\s*(\d+(?:\.\d+)?)")
+
+
+def detect_silence_chapters(
+    filepath: str,
+    *,
+    noise_db: float = -35.0,
+    min_silence_sec: float = 1.8,
+    cancel_event: Optional[threading.Event] = None,
+) -> List[Chapter]:
+    """Run FFmpeg `silencedetect` on `filepath` and synthesize chapter markers at pauses."""
+    ffmpeg = _require_executable("ffmpeg")
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-i",
+        filepath,
+        "-af",
+        f"silencedetect=noise={noise_db}dB:d={min_silence_sec}",
+        "-f",
+        "null",
+        "-",
+    ]
+    result = run_cancellable_subprocess(command, capture_output=True, cancel_event=cancel_event)
+    if result.returncode != 0:
+        return []
+    stderr_text = (result.stderr or b"").decode("utf-8", errors="replace")
+    info = _probe_audio_info(filepath)
+    duration_ms = round(info.duration * 1000) if info.duration > 0 else None
+
+    starts = [0]
+    for match in _SILENCE_END_RE.finditer(stderr_text):
+        ts_ms = round(float(match.group(1)) * 1000)
+        if ts_ms <= starts[-1] + 5000:
+            continue
+        if duration_ms is not None and ts_ms >= max(0, duration_ms - 5000):
+            continue
+        starts.append(ts_ms)
+    return [Chapter(start=ms, title=f"Chapter {idx}") for idx, ms in enumerate(starts, start=1)]
 
 
 _MAX_CONCAT_ARG_CHARS = 16000
@@ -471,6 +555,8 @@ def combine_audiofiles(
     cover: Optional[Cover] = None,
     probe_cache: Optional[Dict[str, AudioProbeInfo]] = None,
     faststart: bool = True,
+    loudnorm: bool = False,
+    mono: bool = False,
 ) -> bool:
     """
     Combines the given audiofiles into `output_path` (optionally transcoding and
@@ -652,6 +738,8 @@ def combine_audiofiles(
             sample_info,
             audio_bitrate,
             faststart=faststart,
+            loudnorm=loudnorm,
+            mono=mono,
         )
         capture = not logging.is_ffmpeg_output()
         if capture and expected > 0:
@@ -700,7 +788,7 @@ def combine_audiofiles(
         if os.path.isdir(tmp_dir):
             shutil.rmtree(tmp_dir)
         return chapters_embedded
-    except (DownloadCancelled, FailedCombining):
+    except (DownloadCancelled, FailedCombining, GenericAudiobookDLException):
         if os.path.exists(output_path):
             os.remove(output_path)
         raise
@@ -761,6 +849,8 @@ def convert_single_file(
     probe_cache: Optional[Dict[str, AudioProbeInfo]] = None,
     output_path: Optional[str] = None,
     faststart: bool = True,
+    loudnorm: bool = False,
+    mono: bool = False,
 ) -> tuple[str, bool]:
     """
     Convert a single file to `output_format`, optionally embedding `chapters`,
@@ -772,8 +862,11 @@ def convert_single_file(
     path_without_ext, old_ext_raw = os.path.splitext(old_path)
     old_ext = old_ext_raw.lstrip(".").lower()
     new_path = output_path or f"{path_without_ext}.{target_format}"
-    if target_format == old_ext and (
-        output_path is None or os.path.abspath(new_path) == os.path.abspath(old_path)
+    if (
+        not loudnorm
+        and not mono
+        and target_format == old_ext
+        and (output_path is None or os.path.abspath(new_path) == os.path.abspath(old_path))
     ):
         return new_path, False
 
@@ -810,6 +903,8 @@ def convert_single_file(
         info,
         explicit_bitrate,
         faststart=faststart,
+        loudnorm=loudnorm,
+        mono=mono,
     )
     if capture and info.duration > 0:
         command += ["-progress", "pipe:1", "-nostats"]
@@ -881,6 +976,10 @@ def convert_single_file(
         raise GenericAudiobookDLException(
             f"Converted file '{os.path.basename(new_path)}' failed media integrity verification"
         ) from None
+    except GenericAudiobookDLException:
+        if os.path.exists(staged_path):
+            os.remove(staged_path)
+        raise
     os.replace(staged_path, new_path)
     if probe_cache is not None:
         probe_cache[new_path] = verified_info
@@ -1018,6 +1117,10 @@ def _split_single_chapter(
         raise GenericAudiobookDLException(
             f"Split chapter {chapter_index + 1} ('{chapter_title}') failed integrity check"
         ) from None
+    except GenericAudiobookDLException:
+        if os.path.exists(out_path):
+            os.remove(out_path)
+        raise
     return out_path
 
 

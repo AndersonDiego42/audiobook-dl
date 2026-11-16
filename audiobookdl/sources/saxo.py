@@ -1,4 +1,4 @@
-from .source import Source
+from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, logging
 from audiobookdl.exceptions import BookNotFound, NoSourceFound
 from audiobookdl.utils.audiobook import AESEncryption
@@ -9,13 +9,16 @@ import os
 import pycountry
 import re
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 
 class SaxoSource(Source):
     _authentication_methods = ["login"]
     names = ["Saxo"]
+    supports_search = True
+    supports_library = True
     match = [
-        r"https?://(www.)?saxo.(com|dk)/[^/]+/.+",
+        r"https?://(?:www\.)?saxo\.(?:com|dk)/[^/]+/.+",
     ]
     DEFAULT_APP_OS = "android"
     DEFAULT_APP_VERSION = "6.2.4"
@@ -184,3 +187,56 @@ class SaxoSource(Source):
         cover_url = book_info["bookMetadata"]["image"]["highQualityImageUrl"]
         data = self.get(cover_url)
         return Cover(data, "jpg")
+
+    @staticmethod
+    def _items_to_catalog(items: Any) -> List[CatalogBook]:
+        results: List[CatalogBook] = []
+        for item in items or ():
+            if not isinstance(item, dict):
+                continue
+            meta = item.get("bookMetadata") if isinstance(item.get("bookMetadata"), dict) else item
+            book_id = item.get("bookId") or meta.get("bookId") or meta.get("id")
+            isbn = meta.get("isbn13") or meta.get("isbn") or item.get("isbn") or book_id
+            title = str(meta.get("title") or item.get("title") or isbn or "").strip()
+            if not isbn or not title:
+                continue
+            authors = meta.get("authors") or item.get("authors") or []
+            if isinstance(authors, list):
+                author = ", ".join(
+                    str(a.get("name") if isinstance(a, dict) else a).strip()
+                    for a in authors
+                    if a
+                )
+            else:
+                author = str(authors or "").strip()
+            url = (
+                meta.get("url")
+                or item.get("url")
+                or f"https://www.saxo.com/dk/audiobook_{isbn}"
+            )
+            results.append(
+                CatalogBook(
+                    title=title,
+                    author=author,
+                    url=str(url),
+                    source="saxo",
+                )
+            )
+        return results
+
+    def search(self, query: str) -> List[CatalogBook]:
+        cleaned = query.strip()
+        if not cleaned:
+            return []
+        resp = self.get_json(
+            f"https://api-read.saxo.com/api/v2/search/user/{self.user_id}/premium/books/{quote(cleaned)}?booktypefilter=Audiobook",
+            headers=self._app_headers(),
+        )
+        return self._items_to_catalog(resp.get("items") or [])
+
+    def list_library(self) -> List[CatalogBook]:
+        resp = self.get_json(
+            f"https://api-read.saxo.com/api/v2/user/{self.user_id}/books?booktypefilter=Audiobook",
+            headers=self._app_headers(),
+        )
+        return self._items_to_catalog(resp.get("items") or [])

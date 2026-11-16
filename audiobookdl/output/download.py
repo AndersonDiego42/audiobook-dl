@@ -10,9 +10,16 @@ from audiobookdl.exceptions import (
 )
 from audiobookdl.output.encryption import AESStreamDecryptor
 from audiobookdl.output.metadata import id3
-from audiobookdl.utils.audiobook import AESEncryption, is_ebook, is_ebook_extension
+from audiobookdl.output.metadata._chapters import resolve_audio_duration_ms
+from audiobookdl.output.metadata._cover import apply_cover_postprocessing
+from audiobookdl.utils.audiobook import AESEncryption, AudiobookMetadata, is_ebook, is_ebook_extension
+from mutagen import File as MutagenFile
 from audiobookdl.utils.concurrency import run_cancellable_pool
-from audiobookdl.utils.http import DEFAULT_HTTP_TIMEOUT
+from audiobookdl.utils.http import (
+    DEFAULT_HTTP_TIMEOUT,
+    TokenBucketRateLimiter,
+    parse_byte_rate,
+)
 from . import metadata, output, encryption
 from .metadata import sidecars
 
@@ -29,7 +36,7 @@ from datetime import datetime, timezone
 import requests
 from functools import partial
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
-from rich.progress import Progress, BarColumn, ProgressColumn, SpinnerColumn
+from rich.progress import Progress, BarColumn, ProgressColumn, SpinnerColumn, TimeRemainingColumn
 from pathlib import Path
 from math import log10
 
@@ -38,7 +45,8 @@ DOWNLOAD_PROGRESS: List[Union[str, ProgressColumn]] = [
     SpinnerColumn(),
     "{task.description}",
     BarColumn(),
-    "[progress.percentage]{task.percentage:>3.0f}%"
+    "[progress.percentage]{task.percentage:>3.0f}%",
+    TimeRemainingColumn(),
 ]
 
 # Per-file download attempts before giving up (retries transient network/TLS errors and 429/5xx)
@@ -199,6 +207,7 @@ def download_audiobook(
             overwrite=options.overwrite,
             max_workers=options.max_workers,
             timeout=options.timeout,
+            limit_rate=getattr(options, "limit_rate", None),
         )
         if cancel_event is not None and cancel_event.is_set():
             raise DownloadCancelled
@@ -210,6 +219,33 @@ def download_audiobook(
         probe_cache: Dict[str, Any] = {}
         chapters_embedded = False
         cover_embedded = False
+        if not ebook:
+            if audiobook.cover is not None and (
+                getattr(options, "square_cover", False)
+                or getattr(options, "max_cover_size", None)
+            ):
+                audiobook.cover = apply_cover_postprocessing(
+                    audiobook.cover,
+                    square=bool(getattr(options, "square_cover", False)),
+                    max_size=getattr(options, "max_cover_size", None),
+                )
+            chapter_offset_ms = int(getattr(options, "chapter_offset_ms", 0) or 0)
+            if audiobook.chapters and chapter_offset_ms != 0:
+                audiobook.chapters = output.apply_chapter_offset(
+                    audiobook.chapters, chapter_offset_ms
+                )
+            if (
+                getattr(options, "chapters_from_silence", False)
+                and not audiobook.chapters
+                and not options.no_chapters
+                and len(filepaths) == 1
+            ):
+                detected = output.detect_silence_chapters(
+                    filepaths[0], cancel_event=cancel_event
+                )
+                if detected:
+                    audiobook.chapters = detected
+
         chapters_for_ffmpeg = (
             audiobook.chapters
             if (
@@ -229,6 +265,14 @@ def download_audiobook(
             )
             else None
         )
+        use_loudnorm = bool(getattr(options, "loudnorm", False))
+        use_mono = bool(getattr(options, "mono", False))
+        audio_filter_kwargs: Dict[str, Any] = {}
+        if use_loudnorm:
+            audio_filter_kwargs["loudnorm"] = True
+        if use_mono:
+            audio_filter_kwargs["mono"] = True
+
         if splitting:
             if len(filepaths) > 1:
                 master_ext = (
@@ -249,6 +293,7 @@ def download_audiobook(
                         cancel_event=cancel_event,
                         audio_bitrate=options.audio_bitrate,
                         probe_cache=probe_cache,
+                        **audio_filter_kwargs,
                     )
                     split_result = output.split_audio_by_chapters(
                         master_path,
@@ -301,7 +346,8 @@ def download_audiobook(
                         metadata=audiobook.metadata,
                         cover=cover_for_ffmpeg,
                         probe_cache=probe_cache,
-                        faststart=False,
+                        faststart=True,
+                        **audio_filter_kwargs,
                     )
                 )
                 os.replace(staged_combined_path, output_path)
@@ -309,6 +355,16 @@ def download_audiobook(
                 cover_embedded = cover_for_ffmpeg is not None
                 current_format = output_format
                 filepaths = [output_path]
+                if (
+                    getattr(options, "chapters_from_silence", False)
+                    and not audiobook.chapters
+                    and not options.no_chapters
+                ):
+                    detected = output.detect_silence_chapters(
+                        output_path, cancel_event=cancel_event
+                    )
+                    if detected:
+                        audiobook.chapters = detected
             except DownloadCancelled:
                 if os.path.isdir(work_output_dir) and (use_staging_dir or not options.resume):
                     shutil.rmtree(work_output_dir, ignore_errors=True)
@@ -331,7 +387,8 @@ def download_audiobook(
             current_format = output_format
         if cancel_event is not None and cancel_event.is_set():
             raise DownloadCancelled
-        if current_format != output_format and not splitting and not ebook:
+        needs_audio_reencode = use_loudnorm or use_mono
+        if (current_format != output_format or needs_audio_reencode) and not splitting and not ebook:
             logging.book_update("Converting files")
             if len(filepaths) == 1:
                 converted_path, chapters_embedded = output.convert_single_file(
@@ -343,7 +400,8 @@ def download_audiobook(
                     metadata=audiobook.metadata,
                     cover=cover_for_ffmpeg,
                     probe_cache=probe_cache,
-                    faststart=False,
+                    faststart=True,
+                    **audio_filter_kwargs,
                 )
                 cover_embedded = cover_for_ffmpeg is not None
                 filepaths = [converted_path]
@@ -365,9 +423,16 @@ def download_audiobook(
                 cancel_event=cancel_event,
                 chapters_embedded=chapters_embedded,
                 cover_embedded=cover_embedded,
+                probe_cache=probe_cache,
             )
         else:
-            add_metadata_to_dir(audiobook, filepaths, work_output_dir, options)
+            add_metadata_to_dir(
+                audiobook,
+                filepaths,
+                work_output_dir,
+                options,
+                probe_cache=probe_cache,
+            )
 
         if stage_dir is not None and not is_single_file:
             _atomic_replace_dir(stage_dir, output_dir)
@@ -382,6 +447,86 @@ def download_audiobook(
             shutil.rmtree(stage_dir, ignore_errors=True)
 
 
+_AUDIO_MEDIA_EXTENSIONS = frozenset({
+    ".m4b",
+    ".m4a",
+    ".mp3",
+    ".opus",
+    ".ogg",
+    ".flac",
+    ".aac",
+    ".wav",
+    ".wma",
+})
+
+
+def _resolve_total_duration_seconds(
+    paths: Sequence[str],
+    probe_cache: Optional[Dict[str, Any]] = None,
+) -> Optional[float]:
+    """Return total duration in seconds across non-ebook audio `paths`, or `None`."""
+    total_sec = 0.0
+    for path in paths:
+        if is_ebook_extension(os.path.splitext(path)[1]):
+            continue
+        if probe_cache is not None and path in probe_cache:
+            cached = probe_cache[path]
+            dur = getattr(cached, "duration", 0.0)
+            if isinstance(dur, (int, float)) and dur > 0:
+                total_sec += float(dur)
+                continue
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+            dur_ms = resolve_audio_duration_ms(path, MutagenFile)
+            if dur_ms > 0:
+                total_sec += dur_ms / 1000.0
+    return total_sec if total_sec > 0 else None
+
+
+def _resolve_abs_sidecar_path(filepath: str, metadata_obj: AudiobookMetadata) -> str:
+    """
+    Resolve the Audiobookshelf metadata sidecar path for a single-file output.
+
+    Uses `metadata.json` inside dedicated book folders, and avoids clobbering
+    another book's `metadata.json` when multiple books share a flat directory.
+    """
+    parent_dir = os.path.dirname(os.path.abspath(filepath))
+    stem = os.path.splitext(os.path.basename(filepath))[0]
+    default_path = os.path.join(parent_dir, "metadata.json")
+    shared_conflict = False
+    try:
+        for entry_name in os.listdir(parent_dir):
+            entry_stem, entry_ext = os.path.splitext(entry_name)
+            if (
+                entry_ext.lower() in _AUDIO_MEDIA_EXTENSIONS
+                and entry_stem.lower() != stem.lower()
+                and os.path.isfile(os.path.join(parent_dir, entry_name))
+            ):
+                shared_conflict = True
+                break
+    except OSError:
+        shared_conflict = False
+    if not shared_conflict and os.path.isfile(default_path):
+        import json
+
+        try:
+            with open(default_path, "r", encoding="utf-8") as existing_f:
+                existing_payload = json.load(existing_f)
+            existing_title = str(existing_payload.get("title") or "").strip().lower()
+            current_title = str(metadata_obj.title or "").strip().lower()
+            if existing_title and current_title and existing_title != current_title:
+                shared_conflict = True
+        except (OSError, ValueError):
+            pass
+    if shared_conflict:
+        logging.log(
+            f"[yellow]Warning:[/yellow] Shared output directory detected at '{parent_dir}'; "
+            f"writing '{stem}.metadata.json' instead of overwriting 'metadata.json'. "
+            "Use per-book folders (e.g. '--output-preset audiobookshelf')."
+        )
+        return os.path.join(parent_dir, f"{stem}.metadata.json")
+    return default_path
+
+
 def add_metadata_to_file(
     audiobook: Audiobook,
     filepath: str,
@@ -389,6 +534,7 @@ def add_metadata_to_file(
     cancel_event: Optional[threading.Event] = None,
     chapters_embedded: bool = False,
     cover_embedded: bool = False,
+    probe_cache: Optional[Dict[str, Any]] = None,
 ):
     """
     Embed metadata into a single file
@@ -447,13 +593,17 @@ def add_metadata_to_file(
         with open(f"{filepath}.json", "w", encoding="utf-8") as f:
             f.write(audiobook.metadata.as_json(chapters=audiobook.chapters))
     if getattr(options, "write_abs_metadata", False):
-        abs_sidecar_path = os.path.join(
-            os.path.dirname(os.path.abspath(filepath)), "metadata.json"
+        abs_sidecar_path = _resolve_abs_sidecar_path(filepath, audiobook.metadata)
+        duration_sec = (
+            None
+            if ebook_file
+            else _resolve_total_duration_seconds([filepath], probe_cache=probe_cache)
         )
         sidecars.write_sidecar_abs_metadata(
             audiobook.metadata,
             abs_sidecar_path,
             chapters=audiobook.chapters,
+            duration_seconds=duration_sec,
         )
     if options.write_opf:
         sidecars.write_sidecar_opf(
@@ -479,6 +629,7 @@ def add_metadata_to_dir(
     filepaths: Iterable[str],
     output_dir: str,
     options: DownloadOptions,
+    probe_cache: Optional[Dict[str, Any]] = None,
 ):
     """
     Add metadata to a directory with audio files
@@ -499,15 +650,20 @@ def add_metadata_to_dir(
         cover_sidecar_name = f"cover.{audiobook.cover.extension}"
         cover_path = os.path.join(output_dir, cover_sidecar_name)
         sidecars.write_sidecar_cover(audiobook.cover, cover_path)
+    write_abs = bool(getattr(options, "write_abs_metadata", False))
     if options.write_json_metadata:
-        metadata_file_path = os.path.join(output_dir, "metadata.json")
+        # Reserve `metadata.json` for Audiobookshelf when both sidecar formats are enabled.
+        json_filename = "audiobook.json" if write_abs else "metadata.json"
+        metadata_file_path = os.path.join(output_dir, json_filename)
         with open(metadata_file_path, "w", encoding="utf-8") as f:
             f.write(audiobook.metadata.as_json(chapters=audiobook.chapters))
-    if getattr(options, "write_abs_metadata", False):
+    if write_abs:
+        duration_sec = _resolve_total_duration_seconds(file_list, probe_cache=probe_cache)
         sidecars.write_sidecar_abs_metadata(
             audiobook.metadata,
             os.path.join(output_dir, "metadata.json"),
             chapters=audiobook.chapters,
+            duration_seconds=duration_sec,
         )
     if options.write_opf:
         sidecars.write_sidecar_opf(
@@ -534,6 +690,7 @@ def download_files_with_cli_output(
     overwrite: Optional[bool] = None,
     max_workers: Optional[int] = None,
     timeout: Optional[float] = None,
+    limit_rate: Optional[str] = None,
 ) -> List[str]:
     """
     Download `audiobook` with cli progress bar
@@ -589,6 +746,7 @@ def download_files_with_cli_output(
                 resume=resume,
                 max_workers=max_workers,
                 timeout=timeout,
+                limit_rate=limit_rate,
             )
             # Make sure progress bar is at 100%
             remaining_progress: float = progress.tasks[0].remaining or 0
@@ -731,6 +889,7 @@ def download_file(
     *,
     resume: bool = False,
     timeout: Optional[float] = None,
+    rate_limiter: Optional[TokenBucketRateLimiter] = None,
 ) -> str:
     # Prepare download
     if len(args) == 6:
@@ -891,9 +1050,10 @@ def download_file(
                         advanced += initial_progress
 
             # Stream AES-CBC decryption inline when writing from byte 0 without resume
+            # (or on multi-segment HLS streams where per-segment retry replaces byte-range resume).
             stream_decryptor: Optional[AESStreamDecryptor] = None
             if (
-                not resume
+                (not resume or len(audiobook.files) > 1)
                 and open_mode == "wb"
                 and isinstance(file.encryption_method, AESEncryption)
             ):
@@ -935,6 +1095,8 @@ def download_file(
                         else:
                             f.write(chunk)
                         chunk_len = len(chunk)
+                        if rate_limiter is not None:
+                            rate_limiter.acquire(chunk_len, cancel_event=cancel_event)
                         bytes_written += chunk_len
                         pending_bytes += chunk_len
                         if (
@@ -1040,6 +1202,7 @@ def download_files(
     resume: bool = False,
     max_workers: Optional[int] = None,
     timeout: Optional[float] = None,
+    limit_rate: Optional[str] = None,
 ) -> List[str]:
     """Download files from audiobook and return paths of the downloaded files"""
     file_count = len(audiobook.files)
@@ -1060,6 +1223,9 @@ def download_files(
         worker_kwargs["resume"] = True
     if timeout is not None:
         worker_kwargs["timeout"] = timeout
+    rate_bps = parse_byte_rate(limit_rate)
+    if rate_bps is not None:
+        worker_kwargs["rate_limiter"] = TokenBucketRateLimiter(rate_bps)
     worker_fn = partial(download_file, **worker_kwargs) if worker_kwargs else download_file
     workers = (
         min(MAX_DOWNLOAD_WORKERS, max(1, max_workers))

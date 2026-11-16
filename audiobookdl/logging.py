@@ -392,11 +392,106 @@ def simple_help() -> None:
     print_asset_file("assets/simple_help.txt")
 
 
+def _format_cli_bytes(num_bytes: float) -> str:
+    units = ("B", "KiB", "MiB", "GiB")
+    val = float(max(0.0, num_bytes))
+    for unit in units[:-1]:
+        if val < 1024.0:
+            return f"{val:.0f} {unit}" if unit == "B" else f"{val:.1f} {unit}"
+        val /= 1024.0
+    return f"{val:.2f} {units[-1]}"
+
+
+class _CliByteMetricsColumn(ProgressColumn):
+    """Display downloaded bytes and rolling transfer speed when byte metrics are recorded."""
+
+    def __init__(self, tracker: "_CliProgressAdapter") -> None:
+        super().__init__()
+        self._tracker = tracker
+
+    def render(self, task: Any) -> Text:
+        stats = self._tracker.get_byte_metrics(task.id)
+        if stats is None:
+            return Text("")
+        total_bytes, speed_bps = stats
+        if total_bytes <= 0:
+            return Text("")
+        if speed_bps > 0:
+            return Text(
+                f"{_format_cli_bytes(total_bytes)} ({_format_cli_bytes(speed_bps)}/s)",
+                style="cyan",
+            )
+        return Text(_format_cli_bytes(total_bytes), style="cyan")
+
+
+class _CliProgressAdapter:
+    """Wrap Rich `Progress` so CLI downloads also track byte counts, speed, and ETA."""
+
+    def __init__(self, progress_format: Sequence[Union[str, ProgressColumn]]) -> None:
+        self._lock = threading.Lock()
+        self._bytes_total: dict[Any, int] = {}
+        self._samples: dict[Any, Deque[Tuple[float, int]]] = {}
+        columns = list(progress_format)
+        if columns:
+            columns.append(_CliByteMetricsColumn(self))
+        self._progress = Progress(*columns, console=console)
+
+    @property
+    def tasks(self) -> Any:
+        return self._progress.tasks
+
+    def __enter__(self) -> "_CliProgressAdapter":
+        self._progress.__enter__()
+        return self
+
+    def __exit__(self, *args: Any) -> Any:
+        return self._progress.__exit__(*args)
+
+    def add_task(self, description: str, total: Optional[float] = 100.0, **kwargs: Any) -> Any:
+        task_id = self._progress.add_task(description, total=total, **kwargs)
+        with self._lock:
+            self._bytes_total[task_id] = 0
+            self._samples[task_id] = deque()
+        return task_id
+
+    def advance(self, task_id: Any, advance: float = 1.0) -> None:
+        self._progress.advance(task_id, advance)
+
+    def record_bytes(self, task_id: Any, num_bytes: int) -> None:
+        if num_bytes <= 0:
+            return
+        now = time.monotonic()
+        cutoff = now - _SPEED_WINDOW_SECONDS
+        with self._lock:
+            self._bytes_total[task_id] = self._bytes_total.get(task_id, 0) + int(num_bytes)
+            bucket = self._samples.setdefault(task_id, deque())
+            bucket.append((now, int(num_bytes)))
+            while bucket and bucket[0][0] < cutoff:
+                bucket.popleft()
+
+    def get_byte_metrics(self, task_id: Any) -> Optional[Tuple[int, float]]:
+        now = time.monotonic()
+        cutoff = now - _SPEED_WINDOW_SECONDS
+        with self._lock:
+            total = self._bytes_total.get(task_id, 0)
+            if total <= 0:
+                return None
+            bucket = self._samples.get(task_id)
+            if not bucket:
+                return total, 0.0
+            while bucket and bucket[0][0] < cutoff:
+                bucket.popleft()
+            window_bytes = sum(chunk for _, chunk in bucket)
+            span = max(0.25, now - bucket[0][0]) if bucket else 0.0
+            speed_bps = (window_bytes / span) if span > 0 else 0.0
+            return total, speed_bps
+
+
 def progress(progress_format: List[Union[str, ProgressColumn]]) -> Any:
     sink = get_ui_sink()
     if sink is not None:
         return _SinkProgressAdapter(sink)
-    return Progress(*progress_format, console=console)
+    return _CliProgressAdapter(progress_format)
 
 
 def print_traceback() -> None:

@@ -39,14 +39,15 @@
           ];
 
           dependencies = with python.pkgs; [
-            appdirs
             attrs
             cssselect
-            importlib-resources
+            keyring
             lxml
             m3u8
             mutagen
+            openpyxl
             pillow
+            platformdirs
             pycountry
             pycryptodome
             requests
@@ -70,6 +71,7 @@
             pkgs.ffmpeg
             (python.withPackages(ps: with ps; [
               mutagen
+              openpyxl
               requests
               rich
               lxml
@@ -77,17 +79,18 @@
               pillow
               m3u8
               pycryptodome
-              importlib-resources
-              appdirs
+              platformdirs
+              keyring
               tomli
               attrs
               pycountry
               urllib3
-              dateutils
+              python-dateutil
 
               # Test
               pytest
               mypy
+              ruff
               types-requests
               types-setuptools
 

@@ -6,10 +6,11 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Dict, Iterator
+from typing import Iterator
+import weakref
 
 _PATH_LOCKS_GUARD = threading.Lock()
-_PATH_LOCKS: Dict[str, threading.RLock] = {}
+_PATH_LOCKS: "weakref.WeakValueDictionary[str, threading.RLock]" = weakref.WeakValueDictionary()
 
 
 def _get_path_lock(abs_path: str) -> threading.RLock:

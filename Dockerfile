@@ -5,8 +5,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     XDG_CONFIG_HOME=/config \
     XDG_DATA_HOME=/config \
-    AUDIOBOOKDL_CONFIG=/config/audiobook-dl.toml \
-    AUDIOBOOKDL_ALLOW_PLAINTEXT_CREDENTIALS=1
+AUDIOBOOK_DL_CONFIG=/config/audiobook-dl.toml \
+    AUDIOBOOK_DL_ALLOW_PLAINTEXT_CREDENTIALS=1
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg ca-certificates && \

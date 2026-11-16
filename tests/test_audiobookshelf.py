@@ -228,3 +228,69 @@ def test_gui_abs_dialog_saves_settings(tmp_path):
                     dialog.destroy()
     finally:
         root.destroy()
+
+
+def test_abs_sidecar_sets_final_chapter_duration_and_avoids_clobbering(tmp_path):
+    import json
+
+    meta = AudiobookMetadata(title="Dune", authors=["Frank Herbert"])
+    chapters = [
+        Chapter(start=0, title="Part 1"),
+        Chapter(start=10000, title="Part 2"),
+    ]
+    payload = build_abs_metadata_dict(meta, chapters, duration_seconds=42.5)
+    assert payload["chapters"] == [
+        {"id": 0, "start": 0.0, "end": 10.0, "title": "Part 1"},
+        {"id": 1, "start": 10.0, "end": 42.5, "title": "Part 2"},
+    ]
+
+    # Co-existing --write-json-metadata and --write-abs-metadata in dir output should not clobber
+    book_dir = tmp_path / "Dune"
+    book_dir.mkdir()
+    part1 = book_dir / "01.mp3"
+    part1.write_bytes(b"mp3")
+    from audiobookdl.output.download import add_metadata_to_dir
+    from audiobookdl.utils import AudioProbeInfo
+
+    opts_both = args.build_default_options(write_json_metadata=True, write_abs_metadata=True)
+    probe_cache = {str(part1): AudioProbeInfo(duration=42.5)}
+    with patch("audiobookdl.output.download.metadata.add_metadata"):
+        add_metadata_to_dir(
+            Audiobook(session=requests.Session(), metadata=meta, files=[], chapters=chapters),
+            [str(part1)],
+            str(book_dir),
+            opts_both,
+            probe_cache=probe_cache,
+        )
+    assert (book_dir / "audiobook.json").is_file()
+    abs_json = json.loads((book_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert abs_json["chapters"][-1]["end"] == 42.5
+
+    # Shared flat directory with another audio stem avoids overwriting existing metadata.json
+    flat_dir = tmp_path / "Author"
+    flat_dir.mkdir()
+    first = flat_dir / "First Book.m4b"
+    second = flat_dir / "Second Book.m4b"
+    first.write_bytes(b"a")
+    second.write_bytes(b"b")
+    (flat_dir / "metadata.json").write_text('{"title": "First Book"}', encoding="utf-8")
+
+    opts_abs = args.build_default_options(write_abs_metadata=True)
+    with patch("audiobookdl.output.download.metadata.add_metadata"):
+        add_metadata_to_file(
+            Audiobook(
+                session=requests.Session(),
+                metadata=AudiobookMetadata(title="Second Book"),
+                files=[],
+                chapters=chapters,
+            ),
+            str(second),
+            opts_abs,
+            chapters_embedded=True,
+            cover_embedded=True,
+            probe_cache={str(second): AudioProbeInfo(duration=35.0)},
+        )
+    assert json.loads((flat_dir / "metadata.json").read_text(encoding="utf-8"))["title"] == "First Book"
+    sec_abs = json.loads((flat_dir / "Second Book.metadata.json").read_text(encoding="utf-8"))
+    assert sec_abs["title"] == "Second Book"
+    assert sec_abs["chapters"][-1]["end"] == 35.0

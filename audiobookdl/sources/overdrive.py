@@ -1,5 +1,5 @@
 from .source import CatalogBook, Source
-from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover
+from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, BookId, Chapter, Cover, Result, Series
 from audiobookdl.exceptions import DataNotPresent, RequestError, UserNotAuthorized
 
 import json
@@ -59,11 +59,7 @@ class OverdriveSource(Source):
             message="Could not find an active Libby loan matching this URL in your session."
         )
 
-    def download(self, url: str) -> Audiobook:
-        self._validate_auth_state(url)
-        if "libbyapp.com" in url:
-            url = self._resolve_libby_open_url(url)
-
+    def _download_listen_url(self, url: str) -> Audiobook:
         parsed_url = parse_url(url)
         hostname = parsed_url.hostname
         prefix = f"https://{hostname}"
@@ -83,6 +79,31 @@ class OverdriveSource(Source):
             cover=self.get_cover(prefix, book_info),
             chapters=self.get_chapters(book_info),
         )
+
+    def download_from_id(self, book_id: str) -> Audiobook:
+        """Download an active Libby loan by loan id, title id, or direct listen URL."""
+        target = book_id if "overdrive.com" in book_id else f"https://libbyapp.com/open/loan/{book_id}"
+        self._validate_auth_state(target)
+        listen_url = target if "libbyapp.com" not in target else self._resolve_libby_open_url(target)
+        return self._download_listen_url(listen_url)
+
+    def download(self, url: str) -> Result:
+        self._validate_auth_state(url)
+        if "libbyapp.com" in url:
+            if re.search(r"libbyapp\.com/shelf(?:[/?#]|$)", url, re.IGNORECASE):
+                loans = self.list_library()
+                if not loans:
+                    raise UserNotAuthorized(
+                        message="No active Libby loans were found on this shelf."
+                    )
+                books: List[BookId[str] | Audiobook] = []
+                for item in loans:
+                    loan_match = re.search(r"/open/loan/([^/?#]+)", item.url)
+                    bid = loan_match.group(1) if loan_match else item.url
+                    books.append(BookId(bid, title=item.title))
+                return Series(title="Libby Shelf", books=books)
+            url = self._resolve_libby_open_url(url)
+        return self._download_listen_url(url)
 
     @staticmethod
     def _extract_isbn(book_info: Dict[str, Any]) -> Optional[str]:
@@ -179,18 +200,46 @@ class OverdriveSource(Source):
             chapters.append(Chapter(start, chapter["title"]))
         return chapters
 
+    @staticmethod
+    def _flatten_toc(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        flat: List[Dict[str, Any]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            flat.append(entry)
+            nested = entry.get("contents")
+            if isinstance(nested, list) and nested:
+                flat.extend(OverdriveSource._flatten_toc(nested))
+        return flat
+
     def get_files(self, prefix: str, book_info) -> List[AudiobookFile]:
-        toc: List[str] = []
-        for part in book_info["nav"]["toc"]:
-            if "contents" in part:
-                toc = []
-                for _ in range(len(book_info["spine"])):
-                    toc.append(book_info["nav"]["toc"][0]["title"])
-                break
-            toc.append(part["title"])
+        toc_entries = (book_info.get("nav") or {}).get("toc") or []
+        has_nested = any(isinstance(part, dict) and "contents" in part for part in toc_entries)
+        part_titles: Dict[str, str] = {}
+        flat_titles: List[str] = []
+        for entry in self._flatten_toc(toc_entries):
+            title = str(entry.get("title") or "").strip()
+            path = str(entry.get("path") or "").split("#", 1)[0].strip()
+            if path and title and path not in part_titles:
+                part_titles[path] = title
+            if title:
+                flat_titles.append(title)
+
         files = []
         for num, part in enumerate(book_info["spine"]):
-            title = toc[num] if num < len(toc) else f"Part {num + 1}"
+            part_path = str(part.get("path") or "")
+            if has_nested:
+                title = (
+                    part_titles.get(part_path)
+                    or part_titles.get(f"Part{num + 1}.mp3")
+                    or (
+                        flat_titles[num]
+                        if num < len(flat_titles) and len(flat_titles) == len(book_info["spine"])
+                        else f"Part {num + 1}"
+                    )
+                )
+            else:
+                title = flat_titles[num] if num < len(flat_titles) else f"Part {num + 1}"
             files.append(
                 AudiobookFile(
                     url=f"{prefix}/{part['path']}",

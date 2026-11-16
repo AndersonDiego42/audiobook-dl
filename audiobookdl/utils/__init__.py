@@ -6,7 +6,7 @@ import os
 import re
 import subprocess
 import sys
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 import shutil
 from urllib3.poolmanager import PoolManager
 from requests.adapters import HTTPAdapter
@@ -97,6 +97,63 @@ def resolve_ffmpeg_dir(directory: str) -> Optional[str]:
     return None
 
 
+def validate_executable(path: str, *, probe_args: Sequence[str] = ("-version",)) -> Optional[str]:
+    """
+    Verify that `path` can be executed on this host.
+
+    Returns `None` when runnable, or a concise diagnostic message if launching fails
+    (for example due to a CPU architecture mismatch, missing DLLs, or permissions).
+    """
+    try:
+        result = subprocess.run(
+            [path, *probe_args],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            **subprocess_kwargs(capture_output=True),
+        )
+    except OSError as exc:
+        return f"{os.path.basename(path)} failed to execute: {exc}"
+    except subprocess.SubprocessError as exc:
+        return f"{os.path.basename(path)} failed health check: {exc}"
+    if result.returncode != 0:
+        code = result.returncode
+        code_text = f"{code} (0x{code & 0xFFFFFFFF:08X})" if (code < -1 or code >= 0x80000000) else str(code)
+        detail = ""
+        for stream in (result.stderr, result.stdout):
+            if stream:
+                first_line = next((ln.strip() for ln in stream.splitlines() if ln.strip()), "")
+                if first_line:
+                    detail = first_line[:200]
+                    break
+        msg = f"{os.path.basename(path)} exited with code {code_text}"
+        return f"{msg}: {detail}" if detail else msg
+    return None
+
+
+def validate_ffmpeg_dir(directory: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Resolve `directory` (or its `bin/` child) and verify its `ffmpeg`/`ffprobe` binaries execute.
+
+    Returns `(resolved_dir, None)` on success, `(None, None)` if `ffmpeg` is not found,
+    or `(None, error_message)` if a binary exists there but cannot execute.
+    """
+    resolved = resolve_ffmpeg_dir(directory)
+    if resolved is None:
+        return None, None
+    exe_names = ["ffmpeg.exe", "ffmpeg"] if os.name == "nt" else ["ffmpeg"]
+    probe_names = ["ffprobe.exe", "ffprobe"] if os.name == "nt" else ["ffprobe"]
+    for candidates in (exe_names, probe_names):
+        for name in candidates:
+            candidate_path = os.path.join(resolved, name)
+            if os.path.isfile(candidate_path):
+                err = validate_executable(candidate_path)
+                if err is not None:
+                    return None, err
+                break
+    return resolved, None
+
+
 def find_executable(program: str) -> Optional[str]:
     """
     Locate an external executable (e.g. ffmpeg, ffprobe).
@@ -144,6 +201,7 @@ class AudioProbeInfo:
     format_name: str = ""
     sample_rate: Optional[int] = None
     channels: Optional[int] = None
+    probe_error: Optional[str] = None
 
 
 def _parse_positive_int(raw: Any) -> Optional[int]:
@@ -189,9 +247,14 @@ def probe_audio_info(path: str) -> AudioProbeInfo:
             text=True,
             **subprocess_kwargs(capture_output=True),
         )
-    except OSError:
+    except OSError as exc:
+        return AudioProbeInfo(probe_error=f"ffprobe failed to execute ({ffprobe}): {exc}")
+    if result.returncode != 0:
+        exec_err = validate_executable(ffprobe)
+        if exec_err is not None:
+            return AudioProbeInfo(probe_error=f"ffprobe failed to execute ({ffprobe}): {exec_err}")
         return AudioProbeInfo()
-    if result.returncode != 0 or not result.stdout.strip():
+    if not result.stdout.strip():
         return AudioProbeInfo()
     try:
         payload = json.loads(result.stdout)

@@ -2,6 +2,7 @@
 
 from collections import deque
 from dataclasses import dataclass
+import json
 import os
 import queue
 import threading
@@ -11,12 +12,14 @@ import uuid
 from audiobookdl import args, logging
 from audiobookdl.config import (
     Config,
+    config_dir,
     load_config,
     save_ffmpeg_dir,
     save_gui_preferences,
     save_output_preferences,
     save_source_credentials,
 )
+from audiobookdl.utils.fs import atomic_write_text
 from audiobookdl.exceptions import DownloadCancelled
 from audiobookdl.gui.formatting import format_failed_job_detail
 from audiobookdl.options_schema import PERSISTED_GUI_OPTION_SPECS
@@ -202,6 +205,8 @@ class GuiController:
         self.event_queue: "queue.Queue[tuple]" = queue.Queue()
         self.sink = GuiLogSink(self.event_queue)
         self.cancel_event = threading.Event()
+        self.pause_event = threading.Event()
+        self.pause_event.set()
         self.preview_cancel_event = threading.Event()
         self.interaction: Optional[GuiInteractionHandler] = None
         self.preview_interaction: Optional[GuiInteractionHandler] = None
@@ -248,7 +253,7 @@ class GuiController:
         with self.queue_lock:
             return self.config.clone()
 
-    def save_ffmpeg_dir(self, resolved_dir: str) -> Config:
+    def save_ffmpeg_dir(self, resolved_dir: Optional[str]) -> Config:
         set_ffmpeg_dir(resolved_dir)
         save_ffmpeg_dir(resolved_dir, overwrite=self.config_location)
         return self.reload_config()
@@ -322,6 +327,110 @@ class GuiController:
             self._http_session = requests.Session()
         return self._http_session
 
+    def queue_state_path(self) -> str:
+        """Return path to `gui_queue.json` beside `config_location` (or default config dir)."""
+        base_dir = (
+            os.path.dirname(os.path.abspath(self.config_location))
+            if self.config_location
+            else config_dir()
+        )
+        return os.path.join(base_dir, "db", "gui_queue.json")
+
+    def save_queue_state(self) -> None:
+        """Persist non-completed download queue entries to `gui_queue.json` atomically."""
+        persistable: List[Dict[str, str]] = []
+        with self.queue_lock:
+            records = list(self.queue_records.values())
+        for rec in records:
+            if rec.get("job_kind", "download") != "download":
+                continue
+            status = str(rec.get("status") or "")
+            if status == "Completed":
+                continue
+            saved_status = "Interrupted" if status in ("Queued", "Running", "Paused") else status
+            detail = (
+                "Interrupted when closed"
+                if saved_status == "Interrupted" and not rec.get("detail")
+                else str(rec.get("detail") or "")
+            )
+            persistable.append(
+                {
+                    "url": str(rec.get("url") or ""),
+                    "service": str(rec.get("service") or "Unknown"),
+                    "status": saved_status,
+                    "detail": detail,
+                }
+            )
+        target = self.queue_state_path()
+        try:
+            if not persistable:
+                if os.path.exists(target):
+                    os.remove(target)
+                return
+            atomic_write_text(
+                target,
+                json.dumps(persistable, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    def load_saved_queue_records(self) -> List[Dict[str, Any]]:
+        """Load persisted unresolved queue items from `gui_queue.json`."""
+        target = self.queue_state_path()
+        if not os.path.isfile(target):
+            return []
+        try:
+            with open(target, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except (OSError, ValueError):
+            return []
+        if not isinstance(raw, list):
+            return []
+        restored: List[Dict[str, Any]] = []
+        with self.queue_lock:
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                url = str(item.get("url") or "").strip()
+                if not url:
+                    continue
+                job_id = self.make_job_id()
+                rec = {
+                    "job_id": job_id,
+                    "run_id": 0,
+                    "url": url,
+                    "status": str(item.get("status") or "Interrupted"),
+                    "detail": str(item.get("detail") or ""),
+                    "service": str(item.get("service") or "Unknown"),
+                    "job_kind": "download",
+                }
+                self.queue_records[job_id] = rec
+                restored.append(rec)
+        return restored
+
+    def is_paused(self) -> bool:
+        """Return `True` when the queue worker is paused between jobs."""
+        return not self.pause_event.is_set()
+
+    def pause_queue(self) -> None:
+        """Pause the queue before starting the next queued job."""
+        self.pause_event.clear()
+
+    def resume_queue(self) -> None:
+        """Resume queue processing after a pause."""
+        self.pause_event.set()
+        with self.queue_cond:
+            self.queue_cond.notify_all()
+
+    def toggle_pause(self) -> bool:
+        """Toggle queue pause state and return the new `is_paused()` state."""
+        if self.is_paused():
+            self.resume_queue()
+            return False
+        self.pause_queue()
+        return True
+
     def register_queue_record(self, job: QueuedJob, service_label: str) -> Dict[str, Any]:
         rec = {
             "job_id": job.job_id,
@@ -332,15 +441,19 @@ class GuiController:
             "service": service_label,
             "job_kind": "pack" if job.pack_request is not None else "download",
         }
-        self.queue_records[job.job_id] = rec
+        with self.queue_lock:
+            self.queue_records[job.job_id] = rec
+        self.save_queue_state()
         return rec
 
     def update_queue_record(self, job_id: str, status: str, detail: str = "") -> Optional[Dict[str, Any]]:
-        rec = self.queue_records.get(job_id)
-        if rec is None:
-            return None
-        rec["status"] = status
-        rec["detail"] = detail
+        with self.queue_lock:
+            rec = self.queue_records.get(job_id)
+            if rec is None:
+                return None
+            rec["status"] = status
+            rec["detail"] = detail
+        self.save_queue_state()
         return rec
 
     def clear_seen_urls(self) -> None:
@@ -353,6 +466,7 @@ class GuiController:
     ) -> Tuple[int, List[QueuedJob]]:
         """Initialize queue state for a fresh download run and ensure the worker is running."""
         self.cancel_event.clear()
+        self.pause_event.set()
         self.interaction = GuiInteractionHandler(self.event_queue, self.cancel_event)
 
         queued_jobs: List[QueuedJob] = []
@@ -536,7 +650,9 @@ class GuiController:
                 return False, None, True
             else:
                 new_total = None
-        self.queue_records.pop(job_id, None)
+        with self.queue_lock:
+            self.queue_records.pop(job_id, None)
+        self.save_queue_state()
         return True, new_total, False
 
     def move_pending_job(self, job_id: str, direction: int) -> Optional[str]:
@@ -568,21 +684,25 @@ class GuiController:
             for rec in [self.queue_records.get(iid)]
             if rec is not None
             and rec.get("job_kind", "download") == "download"
-            and rec["status"] in ("Failed", "Cancelled")
+            and rec["status"] in ("Failed", "Cancelled", "Interrupted")
         ]
 
     def clear_completed_records(self, ordered_ids: Sequence[str]) -> List[str]:
-        removable = [
-            iid
-            for iid in ordered_ids
-            if self.queue_records.get(iid, {}).get("status") in ("Completed", "Failed", "Cancelled")
-        ]
-        for iid in removable:
-            self.queue_records.pop(iid, None)
+        with self.queue_lock:
+            removable = [
+                iid
+                for iid in ordered_ids
+                if self.queue_records.get(iid, {}).get("status")
+                in ("Completed", "Failed", "Cancelled", "Interrupted")
+            ]
+            for iid in removable:
+                self.queue_records.pop(iid, None)
+        self.save_queue_state()
         return removable
 
     def cancel_active_run(self) -> None:
         self.cancel_event.set()
+        self.pause_event.set()
         if self.interaction is not None:
             self.interaction.release_all()
 
@@ -627,6 +747,11 @@ class GuiController:
             current_job: Optional[QueuedJob] = first_job
 
             while current_job is not None:
+                if self.is_paused() and not self.cancel_event.is_set():
+                    self.event_queue.put(("job_status", current_job.job_id, "Paused", "Queue paused"))
+                    while not self.pause_event.wait(0.2):
+                        if self.cancel_event.is_set():
+                            break
                 item_index += 1
                 if self.cancel_event.is_set():
                     batch_summary.cancelled = True
@@ -934,7 +1059,9 @@ class GuiController:
         return processed
 
     def shutdown(self, *, is_running: bool, is_previewing: bool) -> None:
-        """Cancel active operations, stop the worker thread, and close HTTP sessions."""
+        """Cancel active operations, persist unresolved queue state, stop worker, and close HTTP."""
+        self.save_queue_state()
+        self.pause_event.set()
         if is_running:
             self.cancel_active_run()
         if is_previewing:

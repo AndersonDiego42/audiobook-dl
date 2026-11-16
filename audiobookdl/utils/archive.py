@@ -151,6 +151,11 @@ def make_catalog_book_key(source_name: str, book: CatalogBook) -> str:
     return f"{source_name.lower()}::{title}::{author}"
 
 
+def _sql_like_escape(value: str) -> str:
+    """Escape SQLite `LIKE` wildcards using `\\` as the escape character."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -265,6 +270,24 @@ class DownloadArchive:
                 "CREATE INDEX IF NOT EXISTS idx_downloads_status ON downloads(status)"
             )
             conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_downloads_book_key ON downloads(book_key)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_downloads_url ON downloads(url)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_downloads_asin ON downloads(asin)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_downloads_isbn ON downloads(isbn)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_downloads_output_path ON downloads(output_path)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_downloads_title_nocase ON downloads(title COLLATE NOCASE)"
+            )
+            conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_item_tags_tag ON item_tags(tag)"
             )
             conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
@@ -335,7 +358,6 @@ class DownloadArchive:
                     isbn = COALESCE(excluded.isbn, downloads.isbn),
                     asin = COALESCE(excluded.asin, downloads.asin),
                     last_seen_at = COALESCE(excluded.last_seen_at, downloads.last_seen_at)
-                RETURNING id
                 """,
                 (
                     source,
@@ -357,7 +379,10 @@ class DownloadArchive:
                     timestamp,
                 ),
             )
-            row = cur.fetchone()
+            row = conn.execute(
+                "SELECT id FROM downloads WHERE source = ? AND book_key = ? LIMIT 1",
+                (source, book_key),
+            ).fetchone()
             return int(row["id"])
 
     def upsert_catalog_items(
@@ -450,14 +475,17 @@ class DownloadArchive:
     def _fetch_tags_for_ids(self, conn: sqlite3.Connection, item_ids: Sequence[int]) -> Dict[int, Tuple[str, ...]]:
         if not item_ids:
             return {}
-        placeholders = ",".join("?" for _ in item_ids)
-        rows = conn.execute(
-            f"SELECT item_id, tag FROM item_tags WHERE item_id IN ({placeholders}) ORDER BY tag ASC",
-            tuple(int(i) for i in item_ids),
-        ).fetchall()
         grouped: Dict[int, List[str]] = {}
-        for row in rows:
-            grouped.setdefault(int(row["item_id"]), []).append(str(row["tag"]))
+        chunk_size = 500
+        for start in range(0, len(item_ids), chunk_size):
+            batch = [int(i) for i in item_ids[start : start + chunk_size]]
+            placeholders = ",".join("?" for _ in batch)
+            rows = conn.execute(
+                f"SELECT item_id, tag FROM item_tags WHERE item_id IN ({placeholders}) ORDER BY tag ASC",
+                tuple(batch),
+            ).fetchall()
+            for row in rows:
+                grouped.setdefault(int(row["item_id"]), []).append(str(row["tag"]))
         return {k: tuple(v) for k, v in grouped.items()}
 
     def get_tags(self, entry_id: int) -> Tuple[str, ...]:
@@ -587,38 +615,101 @@ class DownloadArchive:
         )
         effective_limit = max(1, int(limit))
 
-        with self._connection() as conn:
-            sql = """
-                SELECT id, source, book_key, url, title, author, output_path, format, downloaded_at,
-                       profile, status, series, series_order, narrator, duration_seconds, isbn, asin, last_seen_at
-                FROM downloads
-            """
-            clauses: List[str] = []
-            params: List[object] = []
-            if status is not None:
-                clauses.append("status = ?")
-                params.append(status)
-            elif not include_trashed and not explicit_status_query:
-                clauses.append("status != 'trashed'")
-            if clauses:
-                sql += " WHERE " + " AND ".join(clauses)
-            sql += " ORDER BY id DESC"
-            if not terms and include_hidden:
-                sql += " LIMIT ?"
-                params.append(effective_limit)
-            rows = conn.execute(sql, tuple(params)).fetchall()
-            tags_by_id = self._fetch_tags_for_ids(conn, [int(r["id"]) for r in rows])
+        sql = """
+            SELECT id, source, book_key, url, title, author, output_path, format, downloaded_at,
+                   profile, status, series, series_order, narrator, duration_seconds, isbn, asin, last_seen_at
+            FROM downloads
+        """
+        clauses: List[str] = []
+        params: List[object] = []
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        elif not include_trashed and not explicit_status_query:
+            clauses.append("status != 'trashed'")
+
+        if not include_hidden and not explicit_hidden_query:
+            clauses.append(
+                "NOT EXISTS (SELECT 1 FROM item_tags t WHERE t.item_id = downloads.id AND t.tag = 'hidden')"
+            )
+
+        _FIELD_COL_MAP = {
+            "author": "author",
+            "title": "title",
+            "narrator": "narrator",
+            "series": "series",
+            "source": "source",
+            "profile": "profile",
+            "isbn": "isbn",
+            "asin": "asin",
+        }
+        needs_python_filter = False
+        for term in terms:
+            val = term.value
+            # SQLite `LIKE` is ASCII case-insensitive only; push ASCII predicates to SQL
+            # and keep Python `_matches_term()` for full Unicode & negated edge cases.
+            if not term.negated and val.isascii():
+                pattern = f"%{_sql_like_escape(val)}%"
+                if term.field in _FIELD_COL_MAP:
+                    col = _FIELD_COL_MAP[term.field]
+                    clauses.append(f"COALESCE({col}, '') LIKE ? ESCAPE '\\'")
+                    params.append(pattern)
+                elif term.field == "tag":
+                    clauses.append(
+                        "EXISTS (SELECT 1 FROM item_tags t WHERE t.item_id = downloads.id AND t.tag LIKE ? ESCAPE '\\')"
+                    )
+                    params.append(pattern)
+                elif term.field == "status":
+                    if val == "hidden":
+                        clauses.append(
+                            "EXISTS (SELECT 1 FROM item_tags t WHERE t.item_id = downloads.id AND t.tag = 'hidden')"
+                        )
+                    else:
+                        clauses.append("LOWER(status) = ?")
+                        params.append(val)
+                else:
+                    clauses.append(
+                        "("
+                        "title LIKE ? ESCAPE '\\' OR "
+                        "author LIKE ? ESCAPE '\\' OR "
+                        "narrator LIKE ? ESCAPE '\\' OR "
+                        "COALESCE(series, '') LIKE ? ESCAPE '\\' OR "
+                        "source LIKE ? ESCAPE '\\' OR "
+                        "profile LIKE ? ESCAPE '\\' OR "
+                        "COALESCE(url, '') LIKE ? ESCAPE '\\' OR "
+                        "COALESCE(isbn, '') LIKE ? ESCAPE '\\' OR "
+                        "COALESCE(asin, '') LIKE ? ESCAPE '\\' OR "
+                        "EXISTS (SELECT 1 FROM item_tags t WHERE t.item_id = downloads.id AND t.tag LIKE ? ESCAPE '\\')"
+                        ")"
+                    )
+                    params.extend([pattern] * 10)
+            else:
+                needs_python_filter = True
+
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY id DESC"
+        if not needs_python_filter:
+            sql += " LIMIT ?"
+            params.append(effective_limit)
 
         results: List[ArchiveEntry] = []
-        for row in rows:
-            entry = self._build_entry(row, tags_by_id.get(int(row["id"]), ()))
-            if not include_hidden and not explicit_hidden_query and entry.is_hidden:
-                continue
-            if terms and not all(self._matches_term(entry, term) for term in terms):
-                continue
-            results.append(entry)
-            if len(results) >= effective_limit:
-                break
+        with self._connection() as conn:
+            cursor = conn.execute(sql, tuple(params))
+            while True:
+                batch = cursor.fetchmany(500)
+                if not batch:
+                    break
+                tags_by_id = self._fetch_tags_for_ids(conn, [int(r["id"]) for r in batch])
+                for row in batch:
+                    entry = self._build_entry(row, tags_by_id.get(int(row["id"]), ()))
+                    if not include_hidden and not explicit_hidden_query and entry.is_hidden:
+                        continue
+                    if terms and not all(self._matches_term(entry, term) for term in terms):
+                        continue
+                    results.append(entry)
+                    if len(results) >= effective_limit:
+                        return results
         return results
 
     def get_entry(self, entry_id: int) -> Optional[ArchiveEntry]:
@@ -668,46 +759,79 @@ class DownloadArchive:
         norm_url = (scrape_url or "").strip()
         norm_asin = (asin or "").strip().lower()
         norm_isbn = (isbn or "").strip().replace("-", "").lower()
-        norm_path = os.path.normcase(os.path.abspath(output_path)) if output_path else ""
+        abs_path = os.path.abspath(output_path) if output_path else ""
+        norm_path = os.path.normcase(abs_path) if abs_path else ""
         norm_title = " ".join((title or "").casefold().split())
         norm_author = " ".join((author or "").casefold().split())
 
         with self._connection() as conn:
-            rows = conn.execute(
-                "SELECT id, book_key, url, title, author, output_path, isbn, asin FROM downloads"
-            ).fetchall()
+            if norm_url:
+                row = conn.execute(
+                    "SELECT id FROM downloads WHERE book_key = ? OR url = ? LIMIT 1",
+                    (norm_url, norm_url),
+                ).fetchone()
+                if row is not None:
+                    return int(row["id"])
 
-        if norm_url:
-            for r in rows:
-                if str(r["book_key"] or "").strip() == norm_url or str(r["url"] or "").strip() == norm_url:
-                    return int(r["id"])
-        if norm_asin:
-            for r in rows:
-                if str(r["asin"] or "").strip().lower() == norm_asin:
-                    return int(r["id"])
-        if norm_isbn:
-            for r in rows:
-                row_isbn = str(r["isbn"] or "").strip().replace("-", "").lower()
-                if row_isbn and row_isbn == norm_isbn:
-                    return int(r["id"])
-        if norm_path:
-            for r in rows:
-                rp = str(r["output_path"] or "").strip()
-                if rp and os.path.normcase(os.path.abspath(rp)) == norm_path:
-                    return int(r["id"])
-        if norm_title:
-            title_matches = [
-                r
-                for r in rows
-                if " ".join(str(r["title"] or "").casefold().split()) == norm_title
-            ]
-            if norm_author:
-                for r in title_matches:
-                    row_author = " ".join(str(r["author"] or "").casefold().split())
-                    if row_author and (row_author == norm_author or norm_author in row_author or row_author in norm_author):
+            if norm_asin:
+                row = conn.execute(
+                    "SELECT id FROM downloads WHERE asin = ? COLLATE NOCASE OR TRIM(LOWER(asin)) = ? LIMIT 1",
+                    (norm_asin, norm_asin),
+                ).fetchone()
+                if row is not None:
+                    return int(row["id"])
+
+            if norm_isbn:
+                row = conn.execute(
+                    "SELECT id FROM downloads WHERE isbn = ? OR REPLACE(LOWER(TRIM(isbn)), '-', '') = ? LIMIT 1",
+                    (isbn.strip(), norm_isbn) if isbn else ("", norm_isbn),
+                ).fetchone()
+                if row is not None:
+                    return int(row["id"])
+
+            if norm_path:
+                row = conn.execute(
+                    "SELECT id FROM downloads WHERE output_path = ? OR output_path = ? LIMIT 1",
+                    (output_path, abs_path),
+                ).fetchone()
+                if row is not None:
+                    return int(row["id"])
+                path_rows = conn.execute(
+                    "SELECT id, output_path FROM downloads WHERE output_path IS NOT NULL AND output_path != ''"
+                ).fetchall()
+                for r in path_rows:
+                    rp = str(r["output_path"] or "").strip()
+                    if rp and os.path.normcase(os.path.abspath(rp)) == norm_path:
                         return int(r["id"])
-            if len(title_matches) == 1 and (not norm_author or not str(title_matches[0]["author"] or "").strip()):
-                return int(title_matches[0]["id"])
+
+            if norm_title:
+                title_rows = conn.execute(
+                    "SELECT id, title, author FROM downloads WHERE title = ? COLLATE NOCASE",
+                    (norm_title,),
+                ).fetchall()
+                if not title_rows and title:
+                    title_rows = conn.execute(
+                        "SELECT id, title, author FROM downloads WHERE title = ? COLLATE NOCASE",
+                        (title.strip(),),
+                    ).fetchall()
+                title_matches = [
+                    r
+                    for r in title_rows
+                    if " ".join(str(r["title"] or "").casefold().split()) == norm_title
+                ]
+                if norm_author:
+                    for r in title_matches:
+                        row_author = " ".join(str(r["author"] or "").casefold().split())
+                        if row_author and (
+                            row_author == norm_author
+                            or norm_author in row_author
+                            or row_author in norm_author
+                        ):
+                            return int(r["id"])
+                if len(title_matches) == 1 and (
+                    not norm_author or not str(title_matches[0]["author"] or "").strip()
+                ):
+                    return int(title_matches[0]["id"])
         return None
 
     def mark_local_match(

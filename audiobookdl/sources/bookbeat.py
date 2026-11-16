@@ -1,9 +1,10 @@
 from .source import CatalogBook, Source
-from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover
-from audiobookdl.exceptions import MissingBookAccess
+from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, Result, Series
+from audiobookdl.exceptions import BookHasNoAudiobook, BookHasNoEbook, MissingBookAccess
 from audiobookdl.utils.fs import atomic_write_text
 
 import base64
+from datetime import datetime
 import os
 import re
 from typing import Any, Dict, List, MutableMapping, Optional, Union
@@ -13,7 +14,7 @@ import uuid
 
 class BookBeatSource(Source):
     match = [
-        r"https?://(www.)?bookbeat.+",
+        r"https?://(?:www\.)?bookbeat\..+",
     ]
     names = ["BookBeat"]
     _authentication_methods = ["login"]
@@ -40,7 +41,8 @@ class BookBeatSource(Source):
         device_file = os.path.join(self.database_directory, "bookbeat_device_id.txt")
         if os.path.isfile(device_file):
             try:
-                existing = open(device_file, "r", encoding="utf-8").read().strip()
+                with open(device_file, "r", encoding="utf-8") as fh:
+                    existing = fh.read().strip()
                 if existing:
                     return existing
             except OSError:
@@ -90,36 +92,111 @@ class BookBeatSource(Source):
                 next_url = None
         return {"_embedded": {"savedBooks": all_saved}}
 
-    def download(self, url: str) -> Audiobook:
+    def _build_ebook(self, book_info: Dict[str, Any], dl_entry: Dict[str, Any], url: str) -> Audiobook:
+        license_url = (dl_entry.get("_links") or {}).get("license", {}).get("href")
+        if not license_url:
+            raise BookHasNoEbook
+        lic = self.get_json(license_url)
+        href = ((lic.get("_links") or {}).get("download") or {}).get("href")
+        if not href:
+            raise MissingBookAccess
+        ext = "pdf" if ".pdf" in href.lower() else "epub"
+        return Audiobook(
+            session=self._session,
+            files=[AudiobookFile(url=href, headers=dict(self._session.headers), ext=ext)],
+            metadata=self.get_metadata(book_info, url=url, is_ebook=True),
+            cover=self.get_cover(book_info),
+            chapters=[],
+        )
+
+    def download(self, url: str) -> Result:
         book_id_re = r"(\d+)(?:[/?#].*)?$"
         wanted_id_match = re.search(book_id_re, url)
         if not wanted_id_match:
             raise ValueError(f"Couldn't get bookid from url {url}")
         wanted_id = wanted_id_match.group(1)
         book_info = self.find_book_info(wanted_id)
-        return Audiobook(
-            session=self._session,
-            files=self.get_files(book_info),
-            metadata=self.get_metadata(book_info),
-            cover=self.get_cover(book_info),
-            chapters=self.get_chapters(book_info),
-        )
+        mode = getattr(self._options, "media_type", None) or "auto"
 
-    def download_license_url(self, book_info) -> str:
+        if mode == "audiobook":
+            return Audiobook(
+                session=self._session,
+                files=self.get_files(book_info),
+                metadata=self.get_metadata(book_info, url=url),
+                cover=self.get_cover(book_info),
+                chapters=self.get_chapters(book_info),
+            )
+
+        downloads = self._get_download_entries(book_info)
+        audio_entry = next((d for d in downloads if d.get("format") == "audioBook"), None)
+        ebook_entry = next((d for d in downloads if d.get("format") == "eBook"), None)
+
+        if mode == "ebook":
+            if ebook_entry is None:
+                raise BookHasNoEbook
+            return self._build_ebook(book_info, ebook_entry, url)
+
+        if mode == "both":
+            items: List[Audiobook] = []
+            if audio_entry is not None:
+                items.append(
+                    Audiobook(
+                        session=self._session,
+                        files=self.get_files(book_info),
+                        metadata=self.get_metadata(book_info, url=url),
+                        cover=self.get_cover(book_info),
+                        chapters=self.get_chapters(book_info),
+                    )
+                )
+            if ebook_entry is not None:
+                items.append(self._build_ebook(book_info, ebook_entry, url))
+            if not items:
+                raise MissingBookAccess
+            if len(items) == 1:
+                return items[0]
+            return Series(title=items[0].metadata.title, books=items)
+
+        # Default "auto": prefer audiobook when present, fall back to ebook
+        if audio_entry is not None:
+            return Audiobook(
+                session=self._session,
+                files=self.get_files(book_info),
+                metadata=self.get_metadata(book_info, url=url),
+                cover=self.get_cover(book_info),
+                chapters=self.get_chapters(book_info),
+            )
+        if ebook_entry is not None:
+            return self._build_ebook(book_info, ebook_entry, url)
+        raise BookHasNoAudiobook
+
+    def _get_download_entries(self, book_info: Dict[str, Any]) -> List[Dict[str, Any]]:
+        cached = book_info.get("_downloads")
+        if isinstance(cached, list):
+            return cached
         dl_info = self.get_json(
             "https://api.bookbeat.com/api/downloadinfo/" + str(book_info["bookid"])
         )
-        if "_embedded" in dl_info:
-            if "downloads" in dl_info["_embedded"]:
-                for dl in dl_info["_embedded"]["downloads"]:
-                    if dl["format"] == "audioBook":
-                        return dl["_links"]["license"]["href"]
+        entries = list((dl_info.get("_embedded") or {}).get("downloads") or [])
+        book_info["_downloads"] = entries
+        return entries
+
+    def download_license_url(self, book_info) -> str:
+        for dl in self._get_download_entries(book_info):
+            if dl.get("format") == "audioBook":
+                return dl["_links"]["license"]["href"]
         raise MissingBookAccess
 
-    def get_files(self, book_info: Dict) -> List[AudiobookFile]:
+    def _get_license(self, book_info: Dict[str, Any]) -> Dict[str, Any]:
+        cached = book_info.get("license")
+        if isinstance(cached, dict):
+            return cached
         license_url = self.download_license_url(book_info)
         lic = self.get_json(license_url)
         book_info["license"] = lic
+        return lic
+
+    def get_files(self, book_info: Dict) -> List[AudiobookFile]:
+        lic = self._get_license(book_info)
         if "_links" in lic:
             return [
                 AudiobookFile(
@@ -130,36 +207,79 @@ class BookBeatSource(Source):
             ]
         raise MissingBookAccess
 
-    def get_metadata(self, book_info: Dict) -> AudiobookMetadata:
+    def get_metadata(
+        self,
+        book_info: Dict,
+        *,
+        url: Optional[str] = None,
+        is_ebook: bool = False,
+    ) -> AudiobookMetadata:
         meta = book_info["metadata"]
         title = meta["title"]
+        scrape_url = (
+            ((meta.get("_links") or {}).get("web") or {}).get("href")
+            or url
+            or (f"https://www.bookbeat.com/book/{book_info['bookid']}" if book_info.get("bookid") is not None else None)
+        )
         metadata = AudiobookMetadata(
             title=title,
             description=meta.get("summary") or meta.get("description"),
             language=meta.get("language"),
             source="bookbeat",
+            scrape_url=scrape_url,
         )
-        try:
-            contributors = [
-                e["contributors"] for e in meta["editions"] if e["format"] == "audioBook"
-            ][0]
-            if not contributors:
-                return metadata
-            for contributor in contributors:
-                name = f"{contributor['firstname']} {contributor['lastname']}".strip()
-                if "author" in contributor["role"]:
-                    metadata.add_author(name)
-                if "narrator" in contributor["role"]:
-                    metadata.add_narrator(name)
-            return metadata
-        except (KeyError, IndexError, TypeError):
-            return metadata
+        series_raw = meta.get("series")
+        if isinstance(series_raw, dict):
+            metadata.series = str(series_raw.get("name") or series_raw.get("title") or "").strip() or None
+            part = series_raw.get("partnumber") or series_raw.get("partNumber") or series_raw.get("number")
+            if part is not None:
+                try:
+                    metadata.series_order = int(float(part))
+                except (TypeError, ValueError):
+                    pass
+        elif isinstance(series_raw, str) and series_raw.strip():
+            metadata.series = series_raw.strip()
 
-    @staticmethod
-    def get_chapters(book_info: Dict) -> List[Chapter]:
+        target_fmt = "eBook" if is_ebook else "audioBook"
+        editions = [
+            e for e in (meta.get("editions") or []) if isinstance(e, dict) and e.get("format") == target_fmt
+        ] or [e for e in (meta.get("editions") or []) if isinstance(e, dict)]
+        if editions:
+            ed = editions[0]
+            pub = ed.get("publisher")
+            if isinstance(pub, dict):
+                pub = pub.get("name")
+            if isinstance(pub, str) and pub.strip():
+                metadata.publisher = pub.strip()
+            isbn = ed.get("isbn") or ed.get("isbn13")
+            if isbn:
+                metadata.isbn = str(isbn).strip()
+            pub_date = ed.get("published") or ed.get("releaseDate") or meta.get("published")
+            if isinstance(pub_date, str) and pub_date.strip():
+                try:
+                    metadata.release_date = datetime.fromisoformat(pub_date.strip().replace("Z", "+00:00")).date()
+                except ValueError:
+                    pass
+            contributors = ed.get("contributors") or []
+            for contributor in contributors:
+                name = f"{contributor.get('firstname', '')} {contributor.get('lastname', '')}".strip()
+                if not name:
+                    continue
+                roles = contributor.get("role") or []
+                if "author" in roles:
+                    metadata.add_author(name)
+                if "narrator" in roles:
+                    metadata.add_narrator(name)
+        return metadata
+
+    def get_chapters(self, book_info: Dict) -> List[Chapter]:
+        lic = self._get_license(book_info)
         chapters = []
-        for chapter_number, track in enumerate(book_info["license"]["tracks"]):
-            chapters.append(Chapter(track["start"], f"Chapter {chapter_number + 1}"))
+        for chapter_number, track in enumerate(lic.get("tracks") or []):
+            ch_title = str(
+                track.get("title") or track.get("name") or f"Chapter {chapter_number + 1}"
+            ).strip()
+            chapters.append(Chapter(track["start"], ch_title))
         return chapters
 
     def get_cover(self, book_info: Dict) -> Cover:

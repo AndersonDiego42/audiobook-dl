@@ -384,3 +384,31 @@ def test_gui_series_and_podcast_grouping_in_catalog_and_archive(tmp_path):
             arch_dialog.destroy()
     finally:
         root.destroy()
+
+
+def test_archive_handles_over_1100_rows_without_sqlite_variable_limit(tmp_path):
+    db_path = tmp_path / "large.db"
+    archive = DownloadArchive(str(db_path), persistent=True)
+    try:
+        items = [
+            CatalogBook(
+                title=f"Book {idx:04d}",
+                url=f"https://example.com/book/{idx}",
+                author=f"Author {idx % 10}",
+                source="storytel",
+            )
+            for idx in range(1150)
+        ]
+        inserted, _ = archive.upsert_catalog_items("storytel", items)
+        assert inserted == 1150
+
+        # Hide first entry and verify include_hidden=False + large query do not raise
+        first = archive.list_entries(query="title:Book 0000", limit=10)
+        assert len(first) == 1
+        archive.add_tags(first[0].id, ["hidden"])
+
+        visible = archive.list_entries(include_hidden=False, limit=1200)
+        assert len(visible) == 1149
+        assert archive.find_matching_entry_id(scrape_url="https://example.com/book/999") is not None
+    finally:
+        archive.close()

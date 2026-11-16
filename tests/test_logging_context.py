@@ -104,3 +104,15 @@ def test_job_context_isolates_ffmpeg_output_flag():
     t2.join(timeout=3.0)
 
     assert observed == {"verbose": True, "quiet": False}
+
+
+def test_cli_progress_adapter_tracks_bytes_and_speed():
+    logging.set_ui_sink(None)
+    with logging.progress([]) as prog:
+        task = prog.add_task("Downloading", total=2.0)
+        assert prog.get_byte_metrics(task) is None
+        prog.record_bytes(task, 2048)
+        stats = prog.get_byte_metrics(task)
+        assert stats is not None
+        assert stats[0] == 2048
+        assert stats[1] > 0.0

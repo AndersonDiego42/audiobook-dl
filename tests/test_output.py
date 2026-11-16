@@ -1037,4 +1037,83 @@ def test_verify_audio_integrity_and_staged_convert_preserve_existing_on_failure(
     assert [p.name for p in tmp_path.iterdir()] == sorted(["book.m4b", "book.mp3"])
 
 
+def test_probe_audio_info_distinguishes_ffprobe_execution_failure_from_corrupt_media(tmp_path):
+    from unittest.mock import MagicMock
+    from audiobookdl.utils import probe_audio_info, validate_ffmpeg_dir
+
+    sample = tmp_path / "sample.mp3"
+    sample.write_bytes(b"not-valid-mp3")
+
+    # 1. OSError (e.g. WinError 216 wrong architecture) sets probe_error and raises GenericAudiobookDLException
+    with (
+        patch("audiobookdl.utils.find_executable", return_value="/bad/ffprobe"),
+        patch("audiobookdl.utils.subprocess.run", side_effect=OSError("Exec format error")),
+    ):
+        info = probe_audio_info(str(sample))
+        assert info.probe_error is not None
+        assert "Exec format error" in info.probe_error
+        with pytest.raises(GenericAudiobookDLException, match="ffprobe could not run"):
+            output.verify_audio_integrity(str(sample))
+
+    # 2. Non-zero ffprobe exit when `ffprobe -version` works -> normal corrupt-media check (FailedCombining)
+    probe_fail = MagicMock(returncode=1, stdout="", stderr="Invalid data found")
+    version_ok = MagicMock(returncode=0, stdout="ffprobe version 7.0", stderr="")
+    with (
+        patch("audiobookdl.utils.find_executable", return_value="/good/ffprobe"),
+        patch("audiobookdl.output.output.find_executable", return_value="/good/ffprobe"),
+        patch("audiobookdl.utils.subprocess.run", side_effect=[probe_fail, version_ok]),
+    ):
+        info_corrupt = probe_audio_info(str(sample))
+        assert info_corrupt.probe_error is None
+        with patch("audiobookdl.utils.subprocess.run", side_effect=[probe_fail, version_ok]):
+            with pytest.raises(FailedCombining, match="Invalid or corrupt"):
+                output.verify_audio_integrity(str(sample))
+
+    # 3. validate_ffmpeg_dir rejects stub/unrunnable binaries
+    ff_dir = tmp_path / "bad_ff" / "bin"
+    ff_dir.mkdir(parents=True)
+    exe_suffix = ".exe" if os.name == "nt" else ""
+    (ff_dir / f"ffmpeg{exe_suffix}").write_text("stub")
+    resolved, err = validate_ffmpeg_dir(str(ff_dir.parent))
+    assert resolved is None
+    assert err is not None
+
+
+def test_chapter_offset_loudnorm_mono_and_silence_detection():
+    from unittest.mock import MagicMock
+
+    chapters = [Chapter(start=0, title="Intro"), Chapter(start=10000, title="Ch 1")]
+    shifted = output.apply_chapter_offset(chapters, -2500)
+    assert [(c.start, c.title) for c in shifted] == [(0, "Intro"), (7500, "Ch 1")]
+
+    codec_args = output._build_mux_codec_args(
+        "m4b",
+        "m4b",
+        "book.m4b",
+        AudioProbeInfo(duration=60.0, bitrate=96000, codec_name="aac"),
+        None,
+        loudnorm=True,
+        mono=True,
+    )
+    assert "-af" in codec_args
+    assert any("loudnorm" in a for a in codec_args)
+    assert "-ac" in codec_args and codec_args[codec_args.index("-ac") + 1] == "1"
+
+    fake_res = MagicMock(
+        returncode=0,
+        stderr=b"[silencedetect] silence_end: 15.5 | silence_duration: 2.1\n[silencedetect] silence_end: 32.0 | silence_duration: 1.9\n",
+    )
+    with (
+        patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
+        patch("audiobookdl.output.output.run_cancellable_subprocess", return_value=fake_res),
+        patch("audiobookdl.output.output._probe_audio_info", return_value=AudioProbeInfo(duration=60.0)),
+    ):
+        detected = output.detect_silence_chapters("book.m4b")
+    assert [(c.start, c.title) for c in detected] == [
+        (0, "Chapter 1"),
+        (15500, "Chapter 2"),
+        (32000, "Chapter 3"),
+    ]
+
+
 

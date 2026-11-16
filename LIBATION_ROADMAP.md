@@ -168,16 +168,15 @@ Phase 4: Automation & Packaging
      - `upload_book(library_id, folder_id, file_paths, metadata)` (`POST /api/upload` multipart upload for audio files, cover image, and sidecars)
      - `trigger_library_scan(library_id)` (`POST /api/libraries/<id>/scan`) for setups where `audiobook-dl` writes directly into a local/NAS folder already mounted by ABS.
 3. **Config, Credentials & Pipeline Hook (`audiobookdl/config.py`, `audiobookdl/credentials.py`, `audiobookdl/pipeline.py`, `audiobookdl/pack.py`)**
-   - Add `[integrations.audiobookshelf]` section to `audiobook-dl.toml`:
+   - Add `[audiobookshelf]` section to `audiobook-dl.toml`:
      ```toml
-     [integrations.audiobookshelf]
-     enabled = false
+     [audiobookshelf]
      url = "https://abs.example.com"
      library_id = "..."
-     folder_id = "..."
-     mode = "upload" # "upload" (remote POST /api/upload) or "scan" (trigger library scan)
+     auto_upload = false # upload finished books automatically
+     auto_scan = true # trigger library scan after upload
      ```
-   - Store the ABS API token in `CredentialStore` (`service_key="audiobookshelf"`) rather than plaintext TOML.
+   - Store the ABS API token in `CredentialStore` (`service_key="integration:audiobookshelf"`) rather than plaintext TOML.
    - Invoke the ABS hook at the end of `process_audiobook()` in `pipeline.py` (and optionally `run_pack()` in `pack.py`) with retry/error reporting that logs clearly without losing the downloaded local files if ABS is unreachable.
 4. **GUI Configuration (`audiobookdl/gui/app.py`)**
    - Add an Audiobookshelf integration dialog/section (URL, API token stored securely, "Fetch Libraries" dropdowns for Library/Folder, Upload vs. Scan mode, and "Test Connection").

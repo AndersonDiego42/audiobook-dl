@@ -1027,6 +1027,22 @@ def test_section7_adapters_metadata_catalog_search_and_library(tmp_path):
     assert lv_book.metadata.narrators == ["Stewart Wills"]
     assert lv_book.metadata.description == "Call me Ishmael."
     assert [(c.start, c.title) for c in lv_book.chapters] == [(0, "Loomings")]
+    assert LibrivoxSource.supports_library is False
+    assert find_compatible_source("https://librivox.org/moby-dick") is LibrivoxSource
+    assert find_compatible_source("https://www.librivox.org/moby-dick") is LibrivoxSource
+    lv._session.get = MagicMock(
+        side_effect=[
+            _json_resp({"books": [{"title": "Title Hit", "url_librivox": "https://librivox.org/1", "authors": []}]}),
+            _json_resp({
+                "books": [
+                    {"title": "Title Hit", "url_librivox": "https://librivox.org/1", "authors": []},
+                    {"title": "Author Hit", "url_librivox": "https://librivox.org/2", "authors": [{"first_name": "Herman", "last_name": "Melville"}]},
+                ]
+            }),
+        ]
+    )
+    lv_search = lv.search("Melville")
+    assert [b.url for b in lv_search] == ["https://librivox.org/1", "https://librivox.org/2"]
 
     # 8. overdrive: Libby URLs + chip validation + rich metadata
     assert find_compatible_source("https://libbyapp.com/open/loan/999") is OverdriveSource
@@ -1082,3 +1098,113 @@ def test_section7_adapters_metadata_catalog_search_and_library(tmp_path):
     assert len(ycl_items) == 1
     assert ycl_items[0].title == "Cloud Book"
     assert ycl_items[0].url == "https://ebook.yourcloudlibrary.com/library/lib1/detail/bk-2"
+
+
+def test_p1_adapter_fixes_overdrive_bookbeat_ycl_ereolen_saxo(tmp_path):
+    from audiobookdl import Series
+
+    # 1. Overdrive shelf returns Series of loans + nested TOC part titles are distinct
+    od = OverdriveSource(_opts(tmp_path))
+    od._session.cookies.set("session", "valid", domain="libbyapp.com")
+    od._session.get = MagicMock(
+        return_value=_json_resp(
+            {
+                "loans": [
+                    {"id": "101", "title": "Loan One", "firstCreatorName": "A1"},
+                    {"id": "102", "title": "Loan Two", "firstCreatorName": "A2"},
+                ]
+            }
+        )
+    )
+    shelf_res = od.download("https://libbyapp.com/shelf/loans")
+    assert isinstance(shelf_res, Series)
+    assert [b.title for b in shelf_res.books] == ["Loan One", "Loan Two"]
+
+    nested_bdata = {
+        "spine": [{"path": "Part1.mp3"}, {"path": "Part2.mp3"}],
+        "nav": {
+            "toc": [
+                {
+                    "title": "Section 1",
+                    "contents": [
+                        {"title": "Chapter One", "path": "Part1.mp3#0"},
+                        {"title": "Chapter Two", "path": "Part2.mp3#0"},
+                    ],
+                }
+            ]
+        },
+    }
+    od_files = od.get_files("https://demo.listen.overdrive.com", nested_bdata)
+    assert [f.title for f in od_files] == ["Chapter One", "Chapter Two"]
+
+    # 2. BookBeat: get_chapters works before get_files, track titles + extended metadata
+    bb = BookBeatSource(_opts(tmp_path))
+    bb_info = {
+        "bookid": 77,
+        "metadata": {
+            "title": "BB Rich",
+            "series": {"name": "Saga", "partnumber": 4},
+            "editions": [
+                {
+                    "format": "audioBook",
+                    "isbn": "9789100000077",
+                    "publisher": {"name": "BB Pub"},
+                    "published": "2024-02-01",
+                    "contributors": [],
+                }
+            ],
+        },
+    }
+    bb._session.get = MagicMock(
+        side_effect=[
+            _json_resp({"_embedded": {"downloads": [{"format": "audioBook", "_links": {"license": {"href": "https://api.bookbeat.com/lic/77"}}}]}}),
+            _json_resp({"_links": {"download": {"href": "https://cdn.bookbeat.com/77.mp4"}}, "tracks": [{"start": 0, "title": "Prologue"}, {"start": 5000, "title": "Act I"}]}),
+        ]
+    )
+    chapters = bb.get_chapters(bb_info)
+    assert [(c.start, c.title) for c in chapters] == [(0, "Prologue"), (5000, "Act I")]
+    bb_meta = bb.get_metadata(bb_info)
+    assert (bb_meta.isbn, bb_meta.publisher, bb_meta.series, bb_meta.series_order) == ("9789100000077", "BB Pub", "Saga", 4)
+    assert bb_meta.scrape_url == "https://www.bookbeat.com/book/77"
+
+    # 3. YourCloudLibrary: real chapter titles, metadata fields, and JSON body
+    ycl = YourCloudLibrarySource(_opts(tmp_path))
+    ycl._session.post = MagicMock(return_value=_json_resp({"playlist": []}))
+    ycl.download_playlist("ful1", "lic1")
+    assert ycl._session.post.call_args.kwargs["json"] == {"license_id": "lic1"}
+    ycl_chapters = ycl.create_chapters({"chapters": [{"chapter_number": 1, "title": "Opening", "duration": 1000}]})
+    assert [(c.start, c.title) for c in ycl_chapters] == [(0, "Opening")]
+    ycl_meta = ycl.get_metadata(
+        {
+            "title": "Cloud Rich",
+            "authors": ["Auth"],
+            "narrators": ["Narr"],
+            "description": "<p>Summary</p>",
+            "isbn": "9780001",
+            "publisher": "YCL Pub",
+            "language": "en",
+        },
+        url="https://audio.yourcloudlibrary.com/listen/bk99",
+    )
+    assert (ycl_meta.description, ycl_meta.isbn, ycl_meta.publisher, ycl_meta.scrape_url) == (
+        "Summary",
+        "9780001",
+        "YCL Pub",
+        "https://audio.yourcloudlibrary.com/listen/bk99",
+    )
+
+    # 4. eReolen & Saxo: list_library() & search()
+    eo = EreolenSource(_opts(tmp_path))
+    assert EreolenSource.supports_library is True
+    eo._session.get = MagicMock(return_value=_json_resp({"loans": [{"libraryBook": {"workId": "work-of:42", "title": "Loaned DK", "author": "Auth DK"}}]}))
+    eo_lib = eo.list_library()
+    assert [(b.title, b.url) for b in eo_lib] == [("Loaned DK", "https://ereolen.dk/work/work-of:42")]
+
+    sx = SaxoSource(_opts(tmp_path))
+    sx.user_id = "u1"
+    sx.bearer_token = "tok"
+    assert SaxoSource.supports_search is True and SaxoSource.supports_library is True
+    sx._session.get = MagicMock(return_value=_json_resp({"items": [{"bookId": "s1", "bookMetadata": {"title": "Saxo Search", "isbn13": "9781111111111", "authors": ["S Auth"]}}]}))
+    sx_hits = sx.search("Saxo Search")
+    assert sx_hits[0].title == "Saxo Search"
+    assert sx_hits[0].author == "S Auth"

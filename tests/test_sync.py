@@ -18,24 +18,25 @@ def test_sync_once_downloads_pending_and_skips_hidden_trashed_and_downloaded(tmp
     archive = DownloadArchive(str(db_path))
 
     # Pre-seed book 2 as already downloaded, book 3 as trashed, book 4 as hidden
-    b1 = CatalogBook(title="New Book", url="https://librivox.org/b1", author="A")
-    b2 = CatalogBook(title="Already Done", url="https://librivox.org/b2", author="B")
-    b3 = CatalogBook(title="Trashed Book", url="https://librivox.org/b3", author="C")
-    b4 = CatalogBook(title="Hidden Book", url="https://librivox.org/b4", author="D")
+    b1 = CatalogBook(title="New Book", url="https://storytel.com/b1", author="A")
+    b2 = CatalogBook(title="Already Done", url="https://storytel.com/b2", author="B")
+    b3 = CatalogBook(title="Trashed Book", url="https://storytel.com/b3", author="C")
+    b4 = CatalogBook(title="Hidden Book", url="https://storytel.com/b4", author="D")
 
-    archive.record("librivox", make_catalog_book_key("librivox", b2), title=b2.title, url=b2.url, profile="us")
+    archive.record("storytel", make_catalog_book_key("storytel", b2), title=b2.title, url=b2.url, profile="us")
     id3 = archive.record(
-        "librivox", make_catalog_book_key("librivox", b3), title=b3.title, url=b3.url, status="trashed", profile="us"
+        "storytel", make_catalog_book_key("storytel", b3), title=b3.title, url=b3.url, status="trashed", profile="us"
     )
     id4 = archive.record(
-        "librivox", make_catalog_book_key("librivox", b4), title=b4.title, url=b4.url, status="pending", profile="us"
+        "storytel", make_catalog_book_key("storytel", b4), title=b4.title, url=b4.url, status="pending", profile="us"
     )
     archive.add_tags(id4, ["hidden"])
     assert id3 > 0
 
     cfg = Config(
         sources={
-            "librivox:us": SourceConfig(username="u1", password=None, library=None, cookie_file=None),
+            "storytel:us": SourceConfig(username="u1", password=None, library=None, cookie_file=None),
+            "librivox": SourceConfig(username="u2", password=None, library=None, cookie_file=None),
             "audible:uk": SourceConfig(username="u2", password=None, library=None, cookie_file=None),
         },
         output_template=str(tmp_path / "{title}"),
@@ -72,15 +73,15 @@ def test_sync_once_downloads_pending_and_skips_hidden_trashed_and_downloaded(tmp
     assert cycle.pending_count == 1
     assert cycle.skipped == 3
     assert cycle.downloaded == 1
-    assert downloaded_batches == [("us", ["https://librivox.org/b1"])]
+    assert downloaded_batches == [("us", ["https://storytel.com/b1"])]
 
 
 def test_sync_cli_scan_only_json_and_watch_loop(tmp_path, capsys):
     cfg_path = tmp_path / "audiobook-dl.toml"
     db_path = tmp_path / "downloads.db"
-    cfg_path.write_text('[sources.librivox]\nusername = "demo"\n', encoding="utf-8")
+    cfg_path.write_text('[sources.storytel]\nusername = "demo"\n', encoding="utf-8")
 
-    books = [CatalogBook(title="Sync Item", url="https://librivox.org/s1", author="Author")]
+    books = [CatalogBook(title="Sync Item", url="https://storytel.com/s1", author="Author")]
     with patch("audiobookdl.sync.list_service_library", return_value=books), patch(
         "audiobookdl.sync.Downloader"
     ) as mock_dl:

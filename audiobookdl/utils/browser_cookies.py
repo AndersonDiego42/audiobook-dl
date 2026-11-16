@@ -17,7 +17,7 @@ import tempfile
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
-from appdirs import user_data_dir
+from platformdirs import user_data_dir
 
 from audiobookdl.utils.fs import atomic_write_text
 

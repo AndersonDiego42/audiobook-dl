@@ -1,4 +1,4 @@
-from .source import Source
+from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, logging, utils
 from audiobookdl.exceptions import BookHasNoAudiobook, DataNotPresent, RequestError
 
@@ -44,6 +44,7 @@ class EreolenSource(Source):
     ]
     names = ["eReolen"]
     login_data = ["username", "password"]
+    supports_library = True
     library_domains = [
         line.strip()
         for line in utils.read_asset_file("assets/sources/ereolen/libraries.txt").splitlines()
@@ -335,3 +336,36 @@ class EreolenSource(Source):
             f"https://audio.api.streaming.pubhub.dk/v1/stream/hls/{order_id}/playlist.m3u8",
             extension="ts",
         )
+
+    def list_library(self) -> List[CatalogBook]:
+        """Return currently loaned audiobooks from PubHub openplatform loans API."""
+        payload = self.get_json("https://pubhub-openplatform.dbc.dk/v1/user/loans?")
+        results: List[CatalogBook] = []
+        for loan in (payload.get("loans") or []) if isinstance(payload, dict) else []:
+            if not isinstance(loan, dict):
+                continue
+            lib_book = loan.get("libraryBook") or {}
+            if not isinstance(lib_book, dict):
+                continue
+            work_id = lib_book.get("workId") or lib_book.get("identifier") or loan.get("orderId")
+            title = str(lib_book.get("title") or work_id or "").strip()
+            if not work_id or not title:
+                continue
+            author = str(lib_book.get("author") or "").strip()
+            if not author and isinstance(lib_book.get("authors"), list):
+                author = ", ".join(str(a).strip() for a in lib_book["authors"] if a)
+            wid_str = str(work_id).strip()
+            book_url = (
+                f"https://ereolen.dk/work/{wid_str}"
+                if wid_str.startswith("work-of:")
+                else f"https://ereolen.dk/work/work-of:{wid_str}"
+            )
+            results.append(
+                CatalogBook(
+                    title=title,
+                    author=author,
+                    url=book_url,
+                    source="ereolen",
+                )
+            )
+        return results

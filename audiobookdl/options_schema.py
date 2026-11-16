@@ -128,6 +128,17 @@ def parse_enrich_providers_arg(value: str) -> str:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+def parse_limit_rate_arg(value: str) -> str:
+    """Validate and normalize `--limit-rate` bandwidth specification."""
+    from audiobookdl.utils.http import parse_byte_rate
+
+    try:
+        parsed = parse_byte_rate(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return value.strip() if parsed else ""
+
+
 def _validate_enrich_providers(key: str, raw: Any) -> Tuple[Optional[str], Optional[str]]:
     val, warning = _validate_str(key, raw)
     if warning is not None or val is None:
@@ -152,6 +163,22 @@ def _validate_media_type(key: str, raw: Any) -> Tuple[Optional[str], Optional[st
     return None, f"Warning: invalid '{key}' in config ('{val}'); ignoring"
 
 
+def _validate_limit_rate(key: str, raw: Any) -> Tuple[Optional[str], Optional[str]]:
+    val, warning = _validate_str(key, raw)
+    if warning is not None or val is None:
+        return None, warning
+    cleaned = val.strip()
+    if not cleaned:
+        return None, None
+    from audiobookdl.utils.http import parse_byte_rate
+
+    try:
+        parse_byte_rate(cleaned)
+    except ValueError:
+        return None, f"Warning: invalid '{key}' in config ('{val}'); ignoring"
+    return cleaned, None
+
+
 _CONFIG_VALIDATORS: Mapping[str, Callable[[str, Any], Tuple[Any, Optional[str]]]] = {
     "str": _validate_str,
     "bool": _validate_bool,
@@ -161,6 +188,7 @@ _CONFIG_VALIDATORS: Mapping[str, Callable[[str, Any], Tuple[Any, Optional[str]]]
     "audio_bitrate": _validate_audio_bitrate,
     "media_type": _validate_media_type,
     "enrich_providers": _validate_enrich_providers,
+    "limit_rate": _validate_limit_rate,
 }
 
 
@@ -273,6 +301,16 @@ def _gui_read_enrich_providers(raw: Any) -> Optional[str]:
     from audiobookdl.utils.enrichment import parse_provider_list
 
     return ",".join(parse_provider_list(cleaned))
+
+
+def _gui_read_limit_rate(raw: Any) -> Optional[str]:
+    cleaned = str(raw).strip()
+    if not cleaned:
+        return None
+    from audiobookdl.utils.http import parse_byte_rate
+
+    parse_byte_rate(cleaned)
+    return cleaned
 
 
 def _gui_init_raw_str(cfg_val: Any) -> str:
@@ -1018,6 +1056,144 @@ OPTION_REGISTRY: Tuple[OptionSpec, ...] = (
             to_option=_gui_read_book_delay,
             persisted_in_output_prefs=True,
         ),
+    ),
+    OptionSpec(
+        name="limit_rate",
+        default=None,
+        cli_flags=(
+            CliFlag(
+                ("--limit-rate",),
+                arg_type=parse_limit_rate_arg,
+                help="Maximum aggregate download speed (e.g. 500K, 2M)",
+            ),
+        ),
+        config_key="limit_rate",
+        config_kind="limit_rate",
+        toml_serializer=_serialize_non_empty_str,
+        merge_from_config=True,
+        merge_only_if_default=True,
+        merge_require_truthy=True,
+        gui=GuiBinding(
+            var_attr="limit_rate_var",
+            var_type="str",
+            gui_default="",
+            from_config=_gui_init_optional_str,
+            to_option=_gui_read_limit_rate,
+            persisted_in_output_prefs=True,
+        ),
+    ),
+    OptionSpec(
+        name="json_output",
+        default=False,
+        cli_flags=(
+            CliFlag(
+                ("--json",),
+                action="store_true",
+                help="Emit machine-readable JSON summary on stdout",
+            ),
+        ),
+    ),
+    OptionSpec(
+        name="post_exec",
+        default=None,
+        cli_flags=(
+            CliFlag(
+                ("--post-exec",),
+                help="Shell command to execute after each completed audiobook (sets AUDIOBOOK_DL_* env vars)",
+            ),
+        ),
+        config_key="post_exec",
+        config_kind="str",
+        toml_serializer=_serialize_non_empty_str,
+        merge_from_config=True,
+        merge_only_if_default=True,
+        merge_require_truthy=True,
+    ),
+    OptionSpec(
+        name="loudnorm",
+        default=False,
+        cli_flags=(
+            CliFlag(
+                ("--loudnorm",),
+                action="store_true",
+                help="Apply EBU R128 loudness normalization during audio processing",
+            ),
+        ),
+        config_key="loudnorm",
+        config_kind="bool",
+        toml_serializer=_serialize_bool,
+        merge_from_config=True,
+        merge_only_if_default=True,
+    ),
+    OptionSpec(
+        name="mono",
+        default=False,
+        cli_flags=(
+            CliFlag(
+                ("--mono",),
+                action="store_true",
+                help="Downmix audio to mono (1 channel) for voice-optimized size",
+            ),
+        ),
+        config_key="mono",
+        config_kind="bool",
+        toml_serializer=_serialize_bool,
+        merge_from_config=True,
+        merge_only_if_default=True,
+    ),
+    OptionSpec(
+        name="chapters_from_silence",
+        default=False,
+        cli_flags=(
+            CliFlag(
+                ("--chapters-from-silence",),
+                action="store_true",
+                help="Detect long pauses via FFmpeg silencedetect when no chapter markers exist",
+            ),
+        ),
+    ),
+    OptionSpec(
+        name="chapter_offset_ms",
+        default=0,
+        cli_flags=(
+            CliFlag(
+                ("--chapter-offset",),
+                arg_type=int,
+                help="Shift non-initial chapter timestamps by N milliseconds",
+            ),
+        ),
+    ),
+    OptionSpec(
+        name="square_cover",
+        default=False,
+        cli_flags=(
+            CliFlag(
+                ("--square-cover",),
+                action="store_true",
+                help="Pad cover artwork to a 1:1 square aspect ratio",
+            ),
+        ),
+        config_key="square_cover",
+        config_kind="bool",
+        toml_serializer=_serialize_bool,
+        merge_from_config=True,
+        merge_only_if_default=True,
+    ),
+    OptionSpec(
+        name="max_cover_size",
+        default=None,
+        cli_flags=(
+            CliFlag(
+                ("--max-cover-size",),
+                arg_type=parse_positive_int_arg,
+                help="Downscale oversized cover artwork so width and height do not exceed N pixels",
+            ),
+        ),
+        config_key="max_cover_size",
+        config_kind="positive_int",
+        toml_serializer=_serialize_positive_int,
+        merge_from_config=True,
+        merge_only_if_default=True,
     ),
     OptionSpec(
         name="proxy",

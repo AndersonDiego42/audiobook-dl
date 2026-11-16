@@ -1,5 +1,4 @@
 from datetime import date
-import hashlib
 import json
 from unittest.mock import MagicMock
 
@@ -10,16 +9,13 @@ from audiobookdl.args import build_default_options
 from audiobookdl.exceptions import (
     AudiobookDLException,
     BookHasNoAudiobook,
+    BookNotFound,
     DataNotPresent,
     GenericAudiobookDLException,
     UserNotAuthorized,
 )
 from audiobookdl.sources import find_compatible_source
-from audiobookdl.sources.nextory import (
-    NextorySource,
-    calculate_checksum,
-    calculate_password_checksum,
-)
+from audiobookdl.sources.nextory import NextorySource
 
 
 def _make_source(tmp_path) -> NextorySource:
@@ -239,15 +235,6 @@ def test_metadata_and_series_edge_cases(tmp_path):
     assert meta_bad_date.release_date is None
 
 
-def test_checksum_helpers():
-    assert calculate_checksum("user", "pass", "salt") == (
-        hashlib.md5(b"usersaltpass").hexdigest().upper()
-    )
-    assert calculate_password_checksum("pass", "salt") == (
-        hashlib.md5(b"passsalt").hexdigest().upper()
-    )
-
-
 def test_wantlist_pagination_and_secret_redaction(tmp_path, monkeypatch):
     from audiobookdl import logging as adl_logging
 
@@ -332,3 +319,9 @@ def test_nextory_profile_selection_locale_search_and_chapters(tmp_path):
     assert hits[0].title == "Search Hit"
     assert hits[0].author == "A. Writer"
     assert hits[0].url == "https://www.nextory.com/book/77"
+
+    with pytest.raises(BookNotFound):
+        src.download("https://www.nextory.com/book/no-numeric-id")
+    meta = src.get_metadata(_book_entry(77))
+    assert meta.source == "nextory"
+    assert meta.scrape_url == "https://www.nextory.com/book/77"

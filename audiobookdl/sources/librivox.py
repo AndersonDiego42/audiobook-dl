@@ -38,10 +38,10 @@ class LibrivoxSource(Source):
 
     names = ["Librivox"]
     supports_search = True
-    supports_library = True
+    supports_library = False
 
     match = [
-        r"https?://librivox.org/.+",
+        r"https?://(?:www\.)?librivox\.org/.+",
     ]
 
     def _fetch_api_book(self, url: str) -> Optional[Dict[str, Any]]:
@@ -225,10 +225,25 @@ class LibrivoxSource(Source):
         return results
 
     def search(self, query: str) -> List[CatalogBook]:
-        encoded = quote(f"^{query.strip()}")
-        data = self.get_json(f"https://librivox.org/api/feed/audiobooks?title={encoded}&format=json")
-        return self._parse_feed_books(data)
+        cleaned = query.strip()
+        if not cleaned:
+            return []
+        encoded = quote(cleaned)
+        results: List[CatalogBook] = []
+        seen_urls = set()
+        for param in ("title", "author"):
+            try:
+                data = self.get_json(
+                    f"https://librivox.org/api/feed/audiobooks?{param}={encoded}&format=json"
+                )
+            except RequestError:
+                continue
+            for item in self._parse_feed_books(data):
+                if item.url not in seen_urls:
+                    seen_urls.add(item.url)
+                    results.append(item)
+        return results
 
     def list_library(self) -> List[CatalogBook]:
-        data = self.get_json("https://librivox.org/api/feed/audiobooks?limit=25&format=json")
-        return self._parse_feed_books(data)
+        """Raise NotImplementedError: LibriVox has no personal user library."""
+        raise NotImplementedError("LibriVox has no user accounts or personal library")

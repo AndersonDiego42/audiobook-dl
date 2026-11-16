@@ -11,6 +11,10 @@ from audiobookdl.utils.fs import atomic_write_text, file_lock
 
 
 PLAINTEXT_OPT_IN_ENV = "AUDIOBOOK_DL_ALLOW_PLAINTEXT_CREDENTIALS"
+_PLAINTEXT_OPT_IN_ENV_ALIASES = (
+    PLAINTEXT_OPT_IN_ENV,
+    "AUDIOBOOKDL_ALLOW_PLAINTEXT_CREDENTIALS",
+)
 _CRYPTPROTECT_UI_FORBIDDEN = 0x1
 
 
@@ -391,9 +395,8 @@ def get_credential_store(
             index_path=get_keyring_index_path(config_location),
         )
     if allow_plaintext is None:
-        allow_plaintext = os.environ.get(PLAINTEXT_OPT_IN_ENV, "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
+        allow_plaintext = any(
+            os.environ.get(env_name, "").strip().lower() in ("1", "true", "yes")
+            for env_name in _PLAINTEXT_OPT_IN_ENV_ALIASES
         )
     return PlaintextFallbackCredentialStore(allow_plaintext=allow_plaintext)

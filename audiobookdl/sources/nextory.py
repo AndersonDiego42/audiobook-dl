@@ -3,6 +3,7 @@ from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, BookId, Cha
 from audiobookdl.exceptions import (
     AudiobookDLException,
     BookHasNoAudiobook,
+    BookNotFound,
     DataNotPresent,
     GenericAudiobookDLException,
     RequestError,
@@ -12,7 +13,6 @@ from audiobookdl.utils.fs import atomic_write_text
 
 import calendar
 from datetime import date, datetime
-import hashlib
 import os
 import pycountry
 import re
@@ -34,18 +34,6 @@ _TLD_LOCALES: Dict[str, str] = {
     "at": "de_AT",
     "com": "en_GB",
 }
-
-
-def calculate_checksum(username: str, password: str, salt: str) -> str:
-    return get_checksum(username + salt + password)
-
-
-def calculate_password_checksum(password: str, salt: str) -> str:
-    return get_checksum(password + salt)
-
-
-def get_checksum(s: str) -> str:
-    return hashlib.md5(s.encode()).digest().hex().zfill(32).upper()
 
 
 class NextorySource(Source):
@@ -74,7 +62,8 @@ class NextorySource(Source):
         device_file = os.path.join(self.database_directory, "nextory_device_id.txt")
         if os.path.isfile(device_file):
             try:
-                existing = open(device_file, "r", encoding="utf-8").read().strip()
+                with open(device_file, "r", encoding="utf-8") as fh:
+                    existing = fh.read().strip()
                 if existing:
                     return existing
             except OSError:
@@ -190,7 +179,10 @@ class NextorySource(Source):
     def download(self, url) -> Result:
         if self._is_wantlist_url(url):
             return self._download_wantlist()
-        book_id = int(url.rstrip("/").split("?")[0].split("/")[-1].split("-")[-1])
+        id_match = re.search(r"(\d+)(?:[/?#].*)?$", url)
+        if id_match is None:
+            raise BookNotFound
+        book_id = int(id_match.group(1))
         return self.download_from_id(book_id)
 
     def download_from_id(self, book_id: int) -> Audiobook:
@@ -331,6 +323,8 @@ class NextorySource(Source):
 
     def get_metadata(self, book_info) -> AudiobookMetadata:
         series_name, series_order = self._extract_series_metadata(book_info)
+        prod_id = book_info.get("id")
+        scrape_url = f"https://www.nextory.com/book/{prod_id}" if prod_id is not None else None
         metadata = AudiobookMetadata(
             title=book_info["title"],
             authors=[author["name"] for author in book_info["authors"]],
@@ -338,6 +332,8 @@ class NextorySource(Source):
             description=book_info["description_full"],
             series=series_name,
             series_order=series_order,
+            source="nextory",
+            scrape_url=scrape_url,
         )
         lang_code = book_info.get("language")
         if lang_code:

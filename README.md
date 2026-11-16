@@ -96,22 +96,53 @@ audiobook-dl --combine -f m4b <url>
 | `-v`, `--version` | Show program version and exit |
 | `-c`, `--cookies` | Path to a Netscape cookie file |
 | `--combine` | Combine output files into a single file (requires `ffmpeg`) |
+| `--split-chapters` | Split a continuous book into separate per-chapter audio files |
 | `-o`, `--output` | Output path template (default: `{title}`) |
+| `--output-preset` | Layout preset (`default`, `plex`, `audiobookshelf`, `simple`) |
 | `--remove-chars` | List of characters to remove from metadata values in output paths |
 | `-f`, `--output-format` | Output file format (e.g. `m4b`, `mp3`, `m4a`, `flac`, `opus`) |
+| `--media-type` | Media format preference (`auto`, `audiobook`, `ebook`, `both`) |
 | `--audio-bitrate`, `--m4b-bitrate` | Target AAC bitrate when converting to `.m4b`/`.m4a` (`auto`, `64k`, `128k`, `192k`, etc.) |
+| `--loudnorm` | Apply EBU R128 loudness normalization (`loudnorm`) |
+| `--mono` | Downmix audio to mono (`-ac 1`) for compact voice encoding |
 | `--resume` | Resume interrupted downloads using existing parts and HTTP `Range` requests |
-| `--skip-downloaded` | Skip books whose output file or directory already exists |
+| `--skip-downloaded` | Skip books already downloaded on disk or in SQLite `downloads.db` |
+| `--download-archive` | Custom SQLite path for library ledger (`downloads.db`) |
+| `--no-download-archive` | Disable SQLite download archive tracking |
 | `--no-chapters` | Don't include chapters in output file |
+| `--chapters-from-silence` | Detect silence pauses to synthesize chapters when none exist |
+| `--chapter-offset` | Shift non-initial chapter timestamps by `N` milliseconds |
 | `--cover` | Download only the cover image |
-| `--write-json-metadata` | Write metadata to a separate `.json` file |
+| `--square-cover` | Pad cover artwork to a `1:1` square canvas |
+| `--max-cover-size` | Downscale cover artwork exceeding `N` pixels |
+| `--write-cover` | Save cover artwork as a sidecar image file |
+| `--write-json-metadata` | Write metadata to a `.json` sidecar file (`audiobook.json` when paired with ABS) |
+| `--write-abs-metadata` | Write Audiobookshelf-compatible `metadata.json` sidecar |
+| `--write-opf` | Write OPF sidecar metadata |
+| `--write-cue` | Write CUE chapter sheet sidecar |
+| `--upload-to-abs` | Upload completed book to configured Audiobookshelf server |
+| `-y`, `--yes`, `--overwrite` / `--no-overwrite` | Non-interactive file replacement policy |
+| `--enrich`, `--enrich-metadata` | Fill missing metadata/cover/chapters via Audnexus, iTunes, Google Books, and OpenLibrary |
+| `--enrich-providers` | Ordered enrichment provider list (`audnexus,itunes,google,openlibrary`) |
+| `--enrich-interactive` | Choose interactively from ranked enrichment matches |
+| `--no-enrich-cache` | Bypass enrichment SQLite cache |
+| `--max-workers` | Maximum concurrent download threads (`1–20`) |
+| `--limit-rate` | Aggregate bandwidth limit (e.g. `500K`, `2M`) |
+| `--rate-limit`, `--book-delay` | Delay in seconds between consecutive books |
+| `--proxy` | HTTP/HTTPS proxy URL |
+| `--timeout` | HTTP read timeout in seconds |
+| `--service`, `--profile` | Target service key and named account profile |
+| `--search`, `--library-list`, `--verify-auth` | Catalog search, library listing, or credential verification |
+| `--list-sources` | List supported audiobook services |
+| `--info`, `--dry-run` | Inspect metadata and output path without downloading |
+| `--series-items` | Select 1-based range/indices in a series (e.g. `1,3-5`) |
+| `--post-exec` | Shell command run after each book completes (`AUDIOBOOK_DL_*` env vars) |
+| `--json` | Emit structured JSON output on stdout |
 | `--print-output` | Print resolved output locations instead of downloading |
 | `--input-file` | File containing one URL per line |
-| `--username` | Username for source (when using login) |
-| `--password` | Password for source (when using login) |
-| `--library` | Specific library on service (when required by login) |
-| `--database_directory` | Directory for sources to store database state |
-| `--config` | Alternative location of `audiobook-dl.toml` |
+| `--username`, `--password`, `--library` | Account credentials for login-based sources |
+| `--database_directory` | Directory for SQLite databases and per-source state |
+| `--config` | Alternative location of `audiobook-dl.toml` (`AUDIOBOOK_DL_CONFIG`) |
 | `-d`, `--debug` | Enable debug logging |
 | `-q`, `--quiet` | Suppress non-essential output |
 | `--verbose-ffmpeg` | Show `ffmpeg` output in terminal |
@@ -159,10 +190,19 @@ username = "yourusername"
 library = "hometown"
 ```
 
-Cookie files can be specified per source (relative paths are resolved against the configuration directory):
+Cookie files can be specified per source (relative paths are resolved against the configuration directory), alongside optional named multi-account profiles and `[audiobookshelf]` integration:
 ```toml
 [sources.everand]
 cookie_file = "./everand_cookies.txt"
+
+[sources.storytel.profiles.family]
+username = "family@example.com"
+
+[audiobookshelf]
+url = "https://abs.example.com"
+library_id = "lib-1"
+auto_upload = false
+auto_scan = true
 ```
 
 Passwords saved from the GUI are stored in the OS credential store (Windows DPAPI / system keyring) rather than plaintext in `audiobook-dl.toml`. Legacy `password = "..."` entries in `audiobook-dl.toml` are automatically migrated to the OS keystore and scrubbed from the file on load.
@@ -211,7 +251,8 @@ services:
 ```
 
 Additional CLI subcommands:
+- `audiobook-dl pack <paths...> [--recursive] [--delete-source] [--dry-run] [--json]`: Repackage local audio folders/tracks offline into chaptered `.m4b` audiobooks.
 - `audiobook-dl library list|tag|hide|unhide|trash|restore`: Query and manage persistent library items, tags, hidden items, and trash in `downloads.db`.
 - `audiobook-dl scan <paths...> [--verify-missing] [--json]`: Discover existing local audiobooks and reconcile `downloads.db`.
 - `audiobook-dl export <output.{csv,json,xlsx}> [--query ...]`: Export the library catalog/ledger.
-- `audiobook-dl sync [--service ...] [--profile ...] [--watch] [--interval 3600] [--scan-only]`: Poll configured accounts and download new pending titles.
+- `audiobook-dl sync [--service ...] [--profile ...] [--watch] [--interval 3600] [--scan-only] [--json]`: Poll configured accounts and download new pending titles.

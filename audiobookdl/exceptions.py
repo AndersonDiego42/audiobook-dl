@@ -65,6 +65,7 @@ class GenericAudiobookDLException(AudiobookDLException):
     error_description: str = "generic"
 
     def __init__(self, heading: str, body: Optional[str] = None) -> None:
+        super().__init__(message=f"{heading}: {body}" if body else heading)
         self.data = {'heading': heading, 'body': body if body else ""}
 
 class DownloadError(AudiobookDLException):

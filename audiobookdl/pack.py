@@ -21,6 +21,7 @@ from audiobookdl.config import Config, load_config
 from audiobookdl.exceptions import AudiobookDLException, DownloadCancelled, GenericAudiobookDLException
 from audiobookdl.output import download as output_download
 from audiobookdl.output import output
+from audiobookdl.output.metadata._cover import apply_cover_postprocessing
 from audiobookdl.output.metadata.reader import (
     TrackTagInfo,
     infer_metadata_from_path,
@@ -29,7 +30,11 @@ from audiobookdl.output.metadata.reader import (
     read_sidecar_metadata,
     read_track_tags,
 )
-from audiobookdl.pipeline import apply_runtime_options, enrich_audiobook_with_options
+from audiobookdl.pipeline import (
+    apply_runtime_options,
+    enrich_audiobook_with_options,
+    run_post_exec_hook,
+)
 from audiobookdl.utils import (
     AudioProbeInfo,
     find_executable,
@@ -85,6 +90,17 @@ class PackSummary:
     cancelled: bool = False
     book_errors: List[Tuple[str, str]] = field(default_factory=list)
     output_paths: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize summary to a JSON-compatible dictionary."""
+        return {
+            "books_completed": self.books_completed,
+            "books_skipped": self.books_skipped,
+            "books_failed": self.books_failed,
+            "cancelled": self.cancelled,
+            "output_paths": list(self.output_paths),
+            "errors": [{"source": s, "error": e} for s, e in self.book_errors],
+        }
 
 
 def natural_sort_key(text: str) -> Tuple[Any, ...]:
@@ -529,15 +545,22 @@ def _pack_single_track(
     src_ext = os.path.splitext(src_path)[1].lstrip(".").lower()
     target_ext = spec.output_format.lstrip(".").lower()
     chapters = None if options.no_chapters else (spec.audiobook.chapters or None)
+    use_loudnorm = bool(getattr(options, "loudnorm", False))
+    use_mono = bool(getattr(options, "mono", False))
     needs_mp4_mux = (
         src_ext == target_ext
         and target_ext in output.MP4_CONTAINERS
         and (chapters is not None or spec.audiobook.cover is not None)
     )
-    if src_ext == target_ext and not needs_mp4_mux:
+    if src_ext == target_ext and not needs_mp4_mux and not use_loudnorm and not use_mono:
         shutil.copy2(src_path, staged_path)
         return False, False
 
+    extra_filter_kwargs: Dict[str, Any] = {}
+    if use_loudnorm:
+        extra_filter_kwargs["loudnorm"] = True
+    if use_mono:
+        extra_filter_kwargs["mono"] = True
     _converted_path, chapters_embedded = output.convert_single_file(
         src_path,
         target_ext,
@@ -549,7 +572,8 @@ def _pack_single_track(
         cover=spec.audiobook.cover,
         probe_cache=probe_cache,
         output_path=staged_path,
-        faststart=False,
+        faststart=True,
+        **extra_filter_kwargs,
     )
     cover_embedded = spec.audiobook.cover is not None and target_ext in output.MP4_CONTAINERS
     return chapters_embedded, cover_embedded
@@ -613,6 +637,29 @@ def pack_book(
     work_tmp_dir: Optional[str] = None
     cache = probe_cache if probe_cache is not None else {}
 
+    if spec.audiobook.cover is not None and (
+        getattr(options, "square_cover", False)
+        or getattr(options, "max_cover_size", None)
+    ):
+        spec.audiobook.cover = apply_cover_postprocessing(
+            spec.audiobook.cover,
+            square=bool(getattr(options, "square_cover", False)),
+            max_size=getattr(options, "max_cover_size", None),
+        )
+    chapter_offset_ms = int(getattr(options, "chapter_offset_ms", 0) or 0)
+    if spec.audiobook.chapters and chapter_offset_ms != 0:
+        spec.audiobook.chapters = output.apply_chapter_offset(
+            spec.audiobook.chapters, chapter_offset_ms
+        )
+
+    use_loudnorm = bool(getattr(options, "loudnorm", False))
+    use_mono = bool(getattr(options, "mono", False))
+    extra_filter_kwargs: Dict[str, Any] = {}
+    if use_loudnorm:
+        extra_filter_kwargs["loudnorm"] = True
+    if use_mono:
+        extra_filter_kwargs["mono"] = True
+
     try:
         chapters = None if options.no_chapters else (spec.audiobook.chapters or None)
         if len(spec.track_paths) == 1:
@@ -637,7 +684,8 @@ def pack_book(
                 metadata=spec.audiobook.metadata,
                 cover=spec.audiobook.cover,
                 probe_cache=cache,
-                faststart=False,
+                faststart=True,
+                **extra_filter_kwargs,
             )
             cover_embedded = spec.audiobook.cover is not None and spec.output_format in output.MP4_CONTAINERS
 
@@ -654,6 +702,7 @@ def pack_book(
             cancel_event=cancel_event,
             chapters_embedded=chapters_embedded,
             cover_embedded=cover_embedded,
+            probe_cache=cache,
         )
     except Exception:
         if os.path.exists(staged_path):
@@ -671,6 +720,12 @@ def pack_book(
         if os.path.normcase(os.path.abspath(output_path)) not in src_norm:
             _remove_source_tracks(spec.track_paths, spec.source_root)
 
+    run_post_exec_hook(
+        getattr(options, "post_exec", None),
+        output_path=output_path,
+        metadata=spec.audiobook.metadata,
+        audio_format=spec.output_format,
+    )
     return output_path
 
 

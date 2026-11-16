@@ -94,8 +94,17 @@ class DownloadOptions:
     series_items: Optional[str] = None
     max_workers: Optional[int] = None
     book_delay: float = 0.0
+    limit_rate: Optional[str] = None
     proxy: Optional[str] = None
     timeout: Optional[float] = None
+    json_output: bool = False
+    post_exec: Optional[str] = None
+    loudnorm: bool = False
+    mono: bool = False
+    chapters_from_silence: bool = False
+    chapter_offset_ms: int = 0
+    square_cover: bool = False
+    max_cover_size: Optional[int] = None
     service: Optional[str] = None
     search_query: Optional[str] = None
     library_list: bool = False
@@ -171,6 +180,13 @@ _PACK_SHARED_OPTION_NAMES: FrozenSet[str] = frozenset(
         "debug",
         "quiet",
         "ffmpeg_output",
+        "post_exec",
+        "loudnorm",
+        "mono",
+        "chapters_from_silence",
+        "chapter_offset_ms",
+        "square_cover",
+        "max_cover_size",
     }
 )
 
@@ -193,6 +209,7 @@ class PackOptions:
     recursive: bool = False
     delete_source: bool = False
     dry_run: bool = False
+    json_output: bool = False
     output_dir: Optional[str] = None
     title: Optional[str] = None
     authors: List[str] = field(default_factory=list)
@@ -231,6 +248,12 @@ def build_pack_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Preview discovered books, chapters, metadata, and output paths without writing files",
+    )
+    parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="Emit machine-readable JSON report to stdout",
     )
     parser.add_argument(
         "--output-dir",
@@ -283,6 +306,7 @@ def parse_pack_arguments(
         recursive=bool(raw.pop("recursive", False)),
         delete_source=bool(raw.pop("delete_source", False)),
         dry_run=bool(raw.pop("dry_run", False)),
+        json_output=bool(raw.pop("json_output", False)),
         output_dir=raw.pop("pack_output_dir", None),
         title=raw.pop("pack_title", None),
         authors=list(raw.pop("pack_authors", [])),
@@ -309,6 +333,7 @@ class LibraryOptions:
     tags: List[str] = field(default_factory=list)
     archive_path: Optional[str] = None
     config_location: Optional[str] = None
+    json_output: bool = False
 
 
 def parse_library_arguments(argv: Optional[Sequence[str]] = None) -> LibraryOptions:
@@ -336,6 +361,7 @@ def parse_library_arguments(argv: Optional[Sequence[str]] = None) -> LibraryOpti
     list_p.add_argument("--limit", type=int, default=100, help="Maximum entries to print")
     list_p.add_argument("--include-trashed", action="store_true", help="Include trashed entries")
     list_p.add_argument("--no-hidden", action="store_true", help="Exclude entries tagged 'hidden'")
+    list_p.add_argument("--json", dest="json_output", action="store_true", help="Emit JSON array to stdout")
 
     tag_p = sub.add_parser("tag", help="Add or remove tags on library entries")
     tag_p.add_argument("entry_ids", nargs="+", type=int, help="Entry ID(s)")
@@ -365,6 +391,7 @@ def parse_library_arguments(argv: Optional[Sequence[str]] = None) -> LibraryOpti
         tags=tags,
         archive_path=ns.archive_path,
         config_location=ns.config_location,
+        json_output=bool(getattr(ns, "json_output", False)),
     )
 
 

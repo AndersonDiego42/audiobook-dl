@@ -27,7 +27,7 @@ try:
 except ModuleNotFoundError:  # Python < 3.11
     import tomli as tomllib  # type: ignore[no-redef]
 
-import appdirs
+import platformdirs
 
 
 @define
@@ -76,8 +76,14 @@ class Config:
     overwrite: Optional[bool] = None
     max_workers: Optional[int] = None
     book_delay: Optional[float] = None
+    limit_rate: Optional[str] = None
     proxy: Optional[str] = None
     timeout: Optional[float] = None
+    post_exec: Optional[str] = None
+    loudnorm: Optional[bool] = None
+    mono: Optional[bool] = None
+    square_cover: Optional[bool] = None
+    max_cover_size: Optional[int] = None
     download_archive: Optional[str] = None
     check_updates: Optional[bool] = None
     remove_chars: Optional[str] = None
@@ -274,6 +280,15 @@ def is_portable_mode() -> bool:
     )
 
 
+def _env_config_path() -> Optional[str]:
+    """Return configured path override from `AUDIOBOOK_DL_CONFIG` (or `AUDIOBOOKDL_CONFIG`), if set."""
+    raw = os.environ.get("AUDIOBOOK_DL_CONFIG") or os.environ.get("AUDIOBOOKDL_CONFIG")
+    if not raw:
+        return None
+    cleaned = raw.strip()
+    return os.path.abspath(os.path.expanduser(cleaned)) if cleaned else None
+
+
 def config_dir() -> str:
     """
     Get path of configuration directory
@@ -284,7 +299,10 @@ def config_dir() -> str:
         exe_dir = _frozen_executable_dir()
         if exe_dir is not None:
             return exe_dir
-    return appdirs.user_config_dir("audiobook-dl", "jo1gi")
+    env_cfg = _env_config_path()
+    if env_cfg is not None:
+        return os.path.dirname(env_cfg)
+    return platformdirs.user_config_dir("audiobook-dl", "jo1gi")
 
 
 def get_config_location(overwrite: Optional[str]) -> str:
@@ -298,6 +316,9 @@ def get_config_location(overwrite: Optional[str]) -> str:
         if not os.path.exists(overwrite):
             raise ConfigNotFound
         return overwrite
+    env_cfg = _env_config_path()
+    if env_cfg is not None:
+        return env_cfg
     return os.path.join(config_dir(), "audiobook-dl.toml")
 
 
@@ -665,69 +686,190 @@ def _format_toml_value(value: Any) -> str:
     return f'"{"".join(escaped)}"'
 
 
-def _dump_toml(data: Dict[str, Any]) -> str:
-    """Serialize config dictionary (top-level scalars + [gui] + [sources.*] tables) to TOML."""
-    lines = []
-    for key, value in data.items():
-        if isinstance(value, dict) or value is None:
+def _split_toml_section_header(header: str) -> Optional[Tuple[str, ...]]:
+    """Parse a dotted TOML `[section.sub]` header into key segments."""
+    text = header.strip()
+    if not text:
+        return None
+    parts: List[str] = []
+    idx = 0
+    while idx < len(text):
+        while idx < len(text) and text[idx].isspace():
+            idx += 1
+        if idx >= len(text):
+            break
+        if text[idx] in ('"', "'"):
+            quote_ch = text[idx]
+            idx += 1
+            buf = []
+            while idx < len(text) and text[idx] != quote_ch:
+                if text[idx] == "\\" and quote_ch == '"' and idx + 1 < len(text):
+                    idx += 1
+                buf.append(text[idx])
+                idx += 1
+            if idx >= len(text):
+                return None
+            idx += 1
+            parts.append("".join(buf))
+            while idx < len(text) and text[idx].isspace():
+                idx += 1
+            if idx < len(text):
+                if text[idx] != ".":
+                    return None
+                idx += 1
+        else:
+            start = idx
+            while idx < len(text) and text[idx] != ".":
+                idx += 1
+            seg = text[start:idx].strip()
+            if not seg:
+                return None
+            parts.append(seg)
+            if idx < len(text) and text[idx] == ".":
+                idx += 1
+    return tuple(parts) if parts else None
+
+
+def _strip_toml_assignment_key(line: str) -> Optional[Tuple[str, str]]:
+    """Return `(key_name, trailing_comment)` if `line` is a single-line TOML assignment."""
+    stripped = line.lstrip()
+    if not stripped or stripped.startswith("#") or stripped.startswith("["):
+        return None
+    eq_idx = stripped.find("=")
+    if eq_idx <= 0:
+        return None
+    raw_key = stripped[:eq_idx].strip()
+    if len(raw_key) >= 2 and raw_key[0] in ('"', "'") and raw_key[-1] == raw_key[0]:
+        key_name = raw_key[1:-1]
+    elif re.fullmatch(r"[A-Za-z0-9_-]+", raw_key):
+        key_name = raw_key
+    else:
+        return None
+    rhs = stripped[eq_idx + 1 :]
+    in_quote: Optional[str] = None
+    escaped = False
+    trailing = ""
+    for pos, ch in enumerate(rhs):
+        if escaped:
+            escaped = False
             continue
-        lines.append(f"{_format_toml_key(key)} = {_format_toml_value(value)}")
+        if in_quote == '"' and ch == "\\":
+            escaped = True
+            continue
+        if ch in ('"', "'"):
+            if in_quote == ch:
+                in_quote = None
+            elif in_quote is None:
+                in_quote = ch
+        elif ch == "#" and in_quote is None:
+            trailing = "  " + rhs[pos:].rstrip()
+            break
+    if in_quote is not None:
+        return None
+    return key_name, trailing
 
-    gui = data.get("gui")
-    if isinstance(gui, dict):
-        entries = [(k, v) for k, v in gui.items() if v is not None and v != ""]
-        if entries:
+
+def _iter_toml_sections(data: Dict[str, Any], prefix: Tuple[str, ...] = ()) -> List[Tuple[Tuple[str, ...], List[Tuple[str, Any]]]]:
+    """Collect `(section_path, scalar_items)` pairs in deterministic order for all nested dicts."""
+    scalars: List[Tuple[str, Any]] = []
+    sub_sections: List[Tuple[Tuple[str, ...], List[Tuple[str, Any]]]] = []
+    for k, v in data.items():
+        if isinstance(v, dict):
+            sub_sections.extend(_iter_toml_sections(v, prefix + (str(k),)))
+        elif v is not None and v != "":
+            scalars.append((str(k), v))
+    sections: List[Tuple[Tuple[str, ...], List[Tuple[str, Any]]]] = []
+    if prefix:
+        if scalars:
+            sections.append((prefix, scalars))
+    elif scalars:
+        sections.append(((), scalars))
+    sections.extend(sub_sections)
+    return sections
+
+
+def _merge_toml_preserving_comments(existing_text: str, data: Dict[str, Any]) -> str:
+    """
+    Update TOML `existing_text` with `data` while preserving `#` comments, blank lines,
+    key order, inline comments, and unknown user sections.
+    """
+    target_sections = dict(_iter_toml_sections(data))
+    emitted_keys: Dict[Tuple[str, ...], set[str]] = {sec: set() for sec in target_sections}
+    out_lines: List[str] = []
+    current_section: Tuple[str, ...] = ()
+
+    def _flush_missing_for_section(sec: Tuple[str, ...]) -> None:
+        if sec not in target_sections:
+            return
+        seen = emitted_keys.setdefault(sec, set())
+        missing = [(k, v) for k, v in target_sections[sec] if k not in seen]
+        if not missing:
+            return
+        # Insert new keys before any trailing blank lines at the end of the section.
+        trailing_blanks: List[str] = []
+        while out_lines and out_lines[-1].strip() == "":
+            trailing_blanks.append(out_lines.pop())
+        for k, v in missing:
+            out_lines.append(f"{_format_toml_key(k)} = {_format_toml_value(v)}")
+            seen.add(k)
+        out_lines.extend(reversed(trailing_blanks))
+
+    for raw_line in existing_text.splitlines():
+        sec_match = re.match(r"^\s*\[([^\[\]]+)\]\s*(?:#.*)?$", raw_line)
+        if sec_match:
+            _flush_missing_for_section(current_section)
+            parsed_sec = _split_toml_section_header(sec_match.group(1))
+            if parsed_sec is not None:
+                current_section = parsed_sec
+            out_lines.append(raw_line)
+            continue
+
+        parsed_assign = _strip_toml_assignment_key(raw_line)
+        if parsed_assign is not None:
+            key_name, trailing_comment = parsed_assign
+            sec_entries = dict(target_sections.get(current_section, []))
+            if key_name in sec_entries:
+                val = sec_entries[key_name]
+                indent = raw_line[: len(raw_line) - len(raw_line.lstrip())]
+                out_lines.append(
+                    f"{indent}{_format_toml_key(key_name)} = {_format_toml_value(val)}{trailing_comment}"
+                )
+                emitted_keys.setdefault(current_section, set()).add(key_name)
+            # Keys removed from target_sections are intentionally dropped cleanly.
+            continue
+
+        out_lines.append(raw_line)
+
+    _flush_missing_for_section(current_section)
+
+    for sec, entries in _iter_toml_sections(data):
+        if sec == ():
+            continue
+        seen = emitted_keys.get(sec, set())
+        remaining = [(k, v) for k, v in entries if k not in seen]
+        if not remaining:
+            continue
+        if out_lines and out_lines[-1].strip() != "":
+            out_lines.append("")
+        out_lines.append(f"[{'.'.join(_format_toml_key(part) for part in sec)}]")
+        for k, v in remaining:
+            out_lines.append(f"{_format_toml_key(k)} = {_format_toml_value(v)}")
+
+    return "\n".join(out_lines) + ("\n" if out_lines else "")
+
+
+def _dump_toml(data: Dict[str, Any]) -> str:
+    """Serialize config dictionary (top-level scalars + all nested tables) to TOML."""
+    lines: List[str] = []
+    for sec, entries in _iter_toml_sections(data):
+        if not entries:
+            continue
+        if sec:
             if lines:
                 lines.append("")
-            lines.append("[gui]")
-            for k, v in entries:
-                lines.append(f"{_format_toml_key(k)} = {_format_toml_value(v)}")
-
-    abs_tbl = data.get("audiobookshelf")
-    if isinstance(abs_tbl, dict):
-        entries = [(k, v) for k, v in abs_tbl.items() if v is not None and v != ""]
-        if entries:
-            if lines:
-                lines.append("")
-            lines.append("[audiobookshelf]")
-            for k, v in entries:
-                lines.append(f"{_format_toml_key(k)} = {_format_toml_value(v)}")
-
-    sources = data.get("sources")
-    if isinstance(sources, dict):
-        for source_name, values in sources.items():
-            if not isinstance(values, dict):
-                continue
-            entries = [
-                (k, v)
-                for k, v in values.items()
-                if k != "profiles" and not isinstance(v, dict) and v is not None and v != ""
-            ]
-            if entries:
-                if lines:
-                    lines.append("")
-                lines.append(f"[sources.{_format_toml_key(source_name)}]")
-                for k, v in entries:
-                    lines.append(f"{_format_toml_key(k)} = {_format_toml_value(v)}")
-            profiles = values.get("profiles")
-            if isinstance(profiles, dict):
-                for profile_name, prof_values in profiles.items():
-                    if not isinstance(prof_values, dict):
-                        continue
-                    prof_entries = [
-                        (k, v)
-                        for k, v in prof_values.items()
-                        if not isinstance(v, dict) and v is not None and v != ""
-                    ]
-                    if not prof_entries:
-                        continue
-                    if lines:
-                        lines.append("")
-                    lines.append(
-                        f"[sources.{_format_toml_key(source_name)}.profiles.{_format_toml_key(str(profile_name))}]"
-                    )
-                    for k, v in prof_entries:
-                        lines.append(f"{_format_toml_key(k)} = {_format_toml_value(v)}")
+            lines.append(f"[{'.'.join(_format_toml_key(part) for part in sec)}]")
+        for k, v in entries:
+            lines.append(f"{_format_toml_key(k)} = {_format_toml_value(v)}")
     return "\n".join(lines) + ("\n" if lines else "")
 
 
@@ -750,9 +892,18 @@ def _has_plaintext_password(config_dict: Dict[str, Any]) -> bool:
 
 
 def _write_config_dict(config_location: str, config_dict: Dict[str, Any]) -> str:
+    if os.path.isfile(config_location):
+        try:
+            with open(config_location, "r", encoding="utf-8") as fh:
+                existing_text = fh.read()
+            rendered = _merge_toml_preserving_comments(existing_text, config_dict)
+        except OSError:
+            rendered = _dump_toml(config_dict)
+    else:
+        rendered = _dump_toml(config_dict)
     return atomic_write_text(
         config_location,
-        _dump_toml(config_dict),
+        rendered,
         private=_has_plaintext_password(config_dict),
     )
 
@@ -877,6 +1028,7 @@ def save_output_preferences(
     overwrite: Any = _UNSET,
     max_workers: Any = _UNSET,
     book_delay: Any = _UNSET,
+    limit_rate: Any = _UNSET,
     proxy: Any = _UNSET,
     timeout: Any = _UNSET,
 ) -> str:
@@ -905,6 +1057,7 @@ def save_output_preferences(
         "overwrite": overwrite,
         "max_workers": max_workers,
         "book_delay": book_delay,
+        "limit_rate": limit_rate,
         "proxy": proxy,
         "timeout": timeout,
     }

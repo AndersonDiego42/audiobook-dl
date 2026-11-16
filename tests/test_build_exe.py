@@ -90,3 +90,22 @@ def test_build_exe_copy_ffmpeg_targets_exe_directory(tmp_path, monkeypatch):
 
     assert (exe_path.parent / "ffmpeg.exe").is_file()
     assert (exe_path.parent / "ffprobe.exe").is_file()
+
+
+def test_gui_launcher_dispatches_cli_subcommands_and_flags():
+    from audiobookdl.gui.app import _is_gui_invocation, main as gui_main
+
+    assert _is_gui_invocation([]) is True
+    assert _is_gui_invocation(["--self-test"]) is True
+    assert _is_gui_invocation(["--config", "foo.toml"]) is True
+    assert _is_gui_invocation(["--gui", "-cfoo.toml"]) is True
+
+    assert _is_gui_invocation(["--version"]) is False
+    assert _is_gui_invocation(["--help"]) is False
+    assert _is_gui_invocation(["pack", "C:/Books"]) is False
+    assert _is_gui_invocation(["https://librivox.org/book"]) is False
+    assert _is_gui_invocation(["--config", "foo.toml", "sync"]) is False
+
+    with patch("audiobookdl.__main__.main") as mock_cli_main:
+        gui_main(["--version"])
+        mock_cli_main.assert_called_once_with(["--version"])

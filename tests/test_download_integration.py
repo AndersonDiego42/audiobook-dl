@@ -475,7 +475,9 @@ def test_downloader_multipart_convert_output_m4b_integration(tmp_path):
         out_dir.mkdir()
         db_dir.mkdir()
 
-        cfg = load_config(None)
+        cfg_path = tmp_path / "audiobook-dl.toml"
+        cfg_path.write_text("", encoding="utf-8")
+        cfg = load_config(str(cfg_path))
         opts = args.build_default_options(
             urls=[f"{base}/mp/1"],
             combine=True,

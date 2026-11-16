@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -53,6 +54,55 @@ class DownloadSummary:
     books_skipped: int = field(default=0, compare=False)
     books_failed: int = field(default=0, compare=False)
     book_errors: List[Tuple[str, str]] = field(default_factory=list, compare=False)
+    outputs: List[Dict[str, Any]] = field(default_factory=list, compare=False)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize summary fields into a JSON-compatible dictionary."""
+        return {
+            "completed": self.completed,
+            "failed": self.failed,
+            "cancelled": self.cancelled,
+            "books_completed": self.books_completed,
+            "books_skipped": self.books_skipped,
+            "books_failed": self.books_failed,
+            "outputs": list(self.outputs),
+            "errors": [{"target": t, "error": e} for t, e in self.book_errors],
+        }
+
+
+def run_post_exec_hook(
+    command: Optional[str],
+    *,
+    output_path: str,
+    metadata: Any,
+    audio_format: Optional[str],
+) -> Optional[int]:
+    """
+    Execute user-configured `--post-exec` command with `AUDIOBOOK_DL_*` environment variables.
+
+    Logs warnings on failure without failing an already-completed audiobook download.
+    """
+    if not command or not str(command).strip():
+        return None
+    cmd = str(command).strip()
+    env = os.environ.copy()
+    env.update(
+        {
+            "AUDIOBOOK_DL_PATH": str(output_path or ""),
+            "AUDIOBOOK_DL_TITLE": str(getattr(metadata, "title", "") or ""),
+            "AUDIOBOOK_DL_AUTHOR": str(getattr(metadata, "author", "") or ""),
+            "AUDIOBOOK_DL_SOURCE": str(getattr(metadata, "source", "") or ""),
+            "AUDIOBOOK_DL_FORMAT": str(audio_format or ""),
+        }
+    )
+    try:
+        completed = subprocess.run(cmd, shell=True, env=env, check=False)
+    except OSError as exc:
+        logging.error(f"--post-exec hook failed to start ({cmd}): {exc}")
+        return None
+    if completed.returncode != 0:
+        logging.error(f"--post-exec hook exited with code {completed.returncode}: {cmd}")
+    return completed.returncode
 
 
 @dataclass(frozen=True)
@@ -316,7 +366,8 @@ class Downloader:
                     break
                 except AudiobookDLException as e:
                     summary.failed += 1
-                    summary.book_errors.append((url, e.error_description))
+                    detail = str(e).strip() or e.error_description
+                    summary.book_errors.append((url, detail))
                     e.print()
                     if logging.is_debug_mode():
                         logging.print_traceback()
@@ -377,14 +428,18 @@ def prepare_source_result(
         url = resolved_url
         source_class = find_compatible_source(url)
     source = source_class(options)
-    handler = interaction or logging.CliInteractionHandler()
-    if source.requires_authentication and not source.authenticated:
-        authenticate(url, source, options, config, interaction=handler)
-    if cancel_event is not None and cancel_event.is_set():
-        raise DownloadCancelled
-    logging.debug(f"Downloading result of [underline]{url}")
-    result = source.download(url)
-    return source, result
+    try:
+        handler = interaction or logging.CliInteractionHandler()
+        if source.requires_authentication and not source.authenticated:
+            authenticate(url, source, options, config, interaction=handler)
+        if cancel_event is not None and cancel_event.is_set():
+            raise DownloadCancelled
+        logging.debug(f"Downloading result of [underline]{url}")
+        result = source.download(url)
+        return source, result
+    except BaseException:
+        _close_source(source)
+        raise
 
 
 def fetch_metadata(
@@ -395,14 +450,71 @@ def fetch_metadata(
     cancel_event: Optional[threading.Event] = None,
 ) -> Result:
     """Fetch `Audiobook` or `Series` metadata for `url` without downloading audio files."""
-    _, result = prepare_source_result(
+    source, result = prepare_source_result(
         url,
         options,
         config,
         interaction=interaction,
         cancel_event=cancel_event,
     )
+    _close_source(source)
     return result
+
+
+def _audiobook_output_entry(audiobook: Audiobook, options: DownloadOptions) -> Dict[str, Any]:
+    location = output.gen_output_location(
+        options.output_template,
+        audiobook.metadata,
+        options.remove_chars,
+    )
+    raw_ext = audiobook.files[0].ext if audiobook.files else None
+    fmt = raw_ext if is_ebook(audiobook) else (options.output_format or raw_ext)
+    candidate_file = f"{location}.{fmt}" if fmt else ""
+    resolved_path = candidate_file if (candidate_file and os.path.isfile(candidate_file)) else location
+    return {
+        "title": audiobook.title,
+        "authors": list(audiobook.metadata.authors),
+        "source": audiobook.metadata.source,
+        "format": fmt,
+        "output_path": resolved_path,
+        "parts": len(audiobook.files),
+        "chapters": len(audiobook.chapters),
+    }
+
+
+def _result_to_info_dict(
+    source: Source,
+    result: Result,
+    options: DownloadOptions,
+    *,
+    selected_indices: Optional[Sequence[int]] = None,
+) -> Dict[str, Any]:
+    if isinstance(result, Audiobook):
+        if not result.metadata.source:
+            result.metadata.source = source.name
+        info = _audiobook_output_entry(result, options)
+        info["series"] = result.metadata.series
+        info["series_order"] = result.metadata.series_order
+        info["isbn"] = result.metadata.isbn
+        info["asin"] = result.metadata.asin
+        return info
+    indices = (
+        list(selected_indices)
+        if selected_indices is not None
+        else list(range(len(result.books)))
+    )
+    return {
+        "title": result.title,
+        "source": source.name,
+        "kind": "series",
+        "total_books": len(result.books),
+        "selected_indices": [i + 1 for i in indices if 0 <= i < len(result.books)],
+        "books": [
+            entry.title if isinstance(entry, Audiobook) else str(entry)
+            for idx, entry in enumerate(result.books)
+            if idx in indices
+        ],
+    }
 
 
 def print_result_info(
@@ -481,7 +593,13 @@ def download_result(
     if getattr(options, "info_only", False):
         if isinstance(result, Audiobook) and getattr(options, "enrich_metadata", False):
             enrich_audiobook_with_options(result, options, source=source, interaction=handler)
-        print_result_info(source, result, options, selected_indices=selected_indices)
+        if getattr(options, "json_output", False):
+            if summary is not None:
+                summary.outputs.append(
+                    _result_to_info_dict(source, result, options, selected_indices=selected_indices)
+                )
+        else:
+            print_result_info(source, result, options, selected_indices=selected_indices)
         return
 
     logging.log("")  # Empty line
@@ -501,6 +619,7 @@ def download_result(
                 summary.books_skipped += 1
             else:
                 summary.books_completed += 1
+                summary.outputs.append(_audiobook_output_entry(result, options))
     elif isinstance(result, Series):
         if selected_indices is None:
             books_to_process: List[Union[BookId[Any], Audiobook]] = list(result.books)
@@ -546,6 +665,8 @@ def download_result(
                         skip_count += 1
                     else:
                         done_count += 1
+                        if summary is not None:
+                            summary.outputs.append(_audiobook_output_entry(audiobook, options))
             except BookNotReleased:
                 skip_count += 1
                 logging.log(f"Skipped [blue]{book}[/] (not released)")
@@ -596,6 +717,7 @@ def process_url(
     Process `url` based on `options` and `config`.
     Will by default download the audiobook the URL is pointing to.
     """
+    owns_source = prefetched is None
     if prefetched is not None:
         source, result = prefetched
     else:
@@ -607,16 +729,20 @@ def process_url(
             cancel_event=cancel_event,
             session=session,
         )
-    download_result(
-        source,
-        result,
-        options,
-        interaction=interaction,
-        cancel_event=cancel_event,
-        selected_indices=selected_indices,
-        summary=summary,
-        config=config,
-    )
+    try:
+        download_result(
+            source,
+            result,
+            options,
+            interaction=interaction,
+            cancel_event=cancel_event,
+            selected_indices=selected_indices,
+            summary=summary,
+            config=config,
+        )
+    finally:
+        if owns_source:
+            _close_source(source)
 
 
 def get_cookie_path(options: DownloadOptions, config: Optional[SourceConfig]) -> Optional[str]:
@@ -1002,6 +1128,12 @@ def process_audiobook(
                 logging.log(f"Synced [blue]{audiobook.title}[/] to Audiobookshelf")
         except Exception as exc:
             logging.error(f"Audiobookshelf sync failed for '{audiobook.title}': {exc}")
+    run_post_exec_hook(
+        getattr(options, "post_exec", None),
+        output_path=resolved_output,
+        metadata=audiobook.metadata,
+        audio_format=fmt,
+    )
     return True
 
 

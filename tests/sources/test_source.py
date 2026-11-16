@@ -254,3 +254,59 @@ def test_source_retries_transient_429_and_connection_errors_with_proxy_and_timeo
         with pytest.raises(DownloadCancelled):
             source.get("https://example.com/cancelled")
 
+
+def test_source_close_closes_child_sessions_and_save_cookie_file_is_atomic(tmp_path):
+    source = _make_source(tmp_path)
+    primary_close = MagicMock()
+    child_close = MagicMock()
+    source._session.close = primary_close
+    cdn_session = source.create_unauthenticated_session()
+    cdn_session.close = child_close
+    source._session.cookies.set("tok", "secret", domain="example.com")
+
+    cookie_dest = tmp_path / "cookies" / "session.txt"
+    written = source.save_cookie_file(str(cookie_dest))
+    assert written == str(cookie_dest)
+    assert "tok\tsecret" in cookie_dest.read_text(encoding="utf-8")
+
+    source.close()
+    primary_close.assert_called_once()
+    child_close.assert_called_once()
+    # Calling close() twice is idempotent
+    source.close()
+    assert child_close.call_count == 1
+
+
+def test_get_source_classes_discovers_valid_plugin_entry_points(tmp_path, monkeypatch):
+    from audiobookdl.sources import Source, get_source_classes
+
+    class _PluginSource(Source):
+        names = ["CustomPlugin"]
+        match = [r"https?://plugin\.example\.com/.+"]
+
+    class _InvalidPlugin:
+        pass
+
+    class _FakeEP:
+        def __init__(self, name, obj=None, error=None):
+            self.name = name
+            self._obj = obj
+            self._error = error
+
+        def load(self):
+            if self._error:
+                raise self._error
+            return self._obj
+
+    monkeypatch.setattr(
+        "audiobookdl.sources.importlib.metadata.entry_points",
+        lambda group="": [
+            _FakeEP("good", obj=_PluginSource),
+            _FakeEP("bad_type", obj=_InvalidPlugin),
+            _FakeEP("broken", error=ImportError("missing dep")),
+        ] if group == "audiobookdl.sources" else [],
+    )
+    classes = get_source_classes()
+    assert _PluginSource in classes
+    assert _InvalidPlugin not in classes
+

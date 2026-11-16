@@ -734,7 +734,7 @@ def test_pack_single_track_direct_staging_and_cached_chapter_probing(tmp_path: P
     assert len(convert_calls) == 1
     assert convert_calls[0]["old_path"] == str(src_mp3.resolve())
     assert convert_calls[0]["remove_source"] is False
-    assert convert_calls[0]["faststart"] is False
+    assert convert_calls[0]["faststart"] is True
     assert convert_calls[0]["output_path"] is not None
 
 

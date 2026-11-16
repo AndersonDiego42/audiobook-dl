@@ -59,6 +59,12 @@ def _run_library_command(lib_opts: args.LibraryOptions) -> int:
             include_trashed=lib_opts.include_trashed,
             include_hidden=lib_opts.include_hidden,
         )
+        if getattr(lib_opts, "json_output", False):
+            import json
+            from dataclasses import asdict
+
+            print(json.dumps([asdict(entry) for entry in entries], indent=2, ensure_ascii=False))
+            return 0
         for entry in entries:
             tags_str = f" [{' '.join(entry.tags)}]" if entry.tags else ""
             author_str = f" — {entry.author}" if entry.author else ""
@@ -166,6 +172,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             dry_run=pack_options.dry_run,
             overrides=_build_pack_overrides(pack_options),
         )
+        if getattr(pack_options, "json_output", False):
+            import json
+
+            print(json.dumps(summary.to_dict(), indent=2, ensure_ascii=False))
         if summary.cancelled:
             sys.exit(130)
         if summary.books_failed > 0:
@@ -174,7 +184,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     options = args.parse_arguments(raw_argv)
     if getattr(options, "list_sources", False):
-        for service in get_available_services():
+        services = get_available_services()
+        if getattr(options, "json_output", False):
+            import json
+            from dataclasses import asdict
+
+            print(json.dumps([asdict(s) for s in services], indent=2, ensure_ascii=False))
+            return
+        for service in services:
             methods = ", ".join(service.auth_methods) if service.auth_methods else "none"
             print(f"{service.key:<20} {service.label} (auth: {methods})")
         return
@@ -205,12 +222,23 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 print("Error: --verify-auth requires --service <name>", file=sys.stderr)
                 sys.exit(2)
             ok = verify_service_auth(target_service, options, config)
-            print(f"Authentication for '{target_service}': {'OK' if ok else 'FAILED'}")
+            if getattr(options, "json_output", False):
+                import json
+
+                print(json.dumps({"service": target_service, "authenticated": bool(ok)}, indent=2))
+            else:
+                print(f"Authentication for '{target_service}': {'OK' if ok else 'FAILED'}")
             sys.exit(0 if ok else 1)
 
         if getattr(options, "search_query", None):
             target_service = getattr(options, "service", None) or "librivox"
             items = search_service(target_service, options.search_query, options, config)
+            if getattr(options, "json_output", False):
+                import json
+                from dataclasses import asdict
+
+                print(json.dumps([asdict(item) for item in items], indent=2, ensure_ascii=False))
+                return
             for item in items:
                 author = f" — {item.author}" if item.author else ""
                 print(f"{item.title}{author}\n  {item.url}")
@@ -222,6 +250,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 print("Error: --library-list requires --service <name>", file=sys.stderr)
                 sys.exit(2)
             items = list_service_library(target_service, options, config)
+            if getattr(options, "json_output", False):
+                import json
+                from dataclasses import asdict
+
+                print(json.dumps([asdict(item) for item in items], indent=2, ensure_ascii=False))
+                return
             for item in items:
                 author = f" — {item.author}" if item.author else ""
                 print(f"{item.title}{author}\n  {item.url}")
@@ -232,6 +266,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             logging.simple_help()
             sys.exit()
         summary = Downloader(config, options).download(urls)
+        if getattr(options, "json_output", False):
+            import json
+
+            print(json.dumps(summary.to_dict(), indent=2, ensure_ascii=False))
         if summary.cancelled:
             sys.exit(130)
         if summary.failed > 0:

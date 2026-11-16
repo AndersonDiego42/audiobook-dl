@@ -2,6 +2,7 @@ from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, logging
 from audiobookdl.exceptions import RequestError, UserNotAuthorized
 
+from datetime import datetime
 import json
 import lxml.html
 import re
@@ -38,7 +39,7 @@ class YourCloudLibrarySource(Source):
         return Audiobook(
             session=self._session,
             files=self.get_files(playlist),
-            metadata=self.get_metadata(book_info),
+            metadata=self.get_metadata(book_info, url=url),
             cover=self.download_cover(book_info),
             chapters=self.create_chapters(book_info),
         )
@@ -84,15 +85,39 @@ class YourCloudLibrarySource(Source):
         return files
 
     @staticmethod
-    def get_metadata(book_info: dict) -> AudiobookMetadata:
+    def get_metadata(book_info: dict, *, url: Optional[str] = None) -> AudiobookMetadata:
+        publisher_raw = book_info.get("publisher")
+        publisher = (
+            publisher_raw.get("name")
+            if isinstance(publisher_raw, dict)
+            else (str(publisher_raw).strip() if isinstance(publisher_raw, str) and publisher_raw.strip() else None)
+        )
+        desc_raw = book_info.get("description") or book_info.get("synopsis")
+        description = (
+            " ".join(re.sub(r"<[^>]+>", " ", desc_raw).split()) or None
+            if isinstance(desc_raw, str) and desc_raw.strip()
+            else None
+        )
+        isbn_raw = book_info.get("isbn") or book_info.get("isbn13")
         metadata = AudiobookMetadata(
             title=book_info["title"],
             authors=book_info["authors"],
             narrators=book_info["narrators"],
+            description=description,
+            publisher=publisher,
+            isbn=str(isbn_raw).strip() if isbn_raw else None,
+            language=book_info.get("language"),
             source="yourcloudlibrary",
+            scrape_url=url,
         )
         if book_info.get("series") is not None and len(book_info["series"]) >= 1:
             metadata.series = book_info["series"][0]
+        pub_date = book_info.get("publish_date") or book_info.get("release_date")
+        if isinstance(pub_date, str) and pub_date.strip():
+            try:
+                metadata.release_date = datetime.fromisoformat(pub_date.strip().replace("Z", "+00:00")).date()
+            except ValueError:
+                pass
         return metadata
 
     def download_cover(self, meta) -> Cover:
@@ -105,10 +130,13 @@ class YourCloudLibrarySource(Source):
         chapters = []
         elapsed = 0
         for chapter in book_info["chapters"]:
+            ch_title = str(
+                chapter.get("title") or f"Chapter {chapter['chapter_number']}"
+            ).strip()
             chapters.append(
                 Chapter(
                     start=elapsed,
-                    title=f"Chapter {chapter['chapter_number']}",
+                    title=ch_title,
                 )
             )
             elapsed += chapter["duration"]
@@ -129,10 +157,9 @@ class YourCloudLibrarySource(Source):
 
     def download_playlist(self, fulfillment_id: str, license_id: str) -> dict:
         """Download list of audio files."""
-        license_str = f'{{"license_id":"{license_id}"}}'
         return self.post_json(
             f"https://api.findawayworld.com/v4/audiobooks/{fulfillment_id}/playlists",
-            data=license_str,
+            json={"license_id": license_id},
         )
 
     @staticmethod
