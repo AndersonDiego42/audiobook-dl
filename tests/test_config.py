@@ -4,7 +4,7 @@ import sys
 
 import pytest
 
-from audiobookdl import args, utils
+from audiobookdl import args, logging, utils
 from audiobookdl.config import (
     config_dir,
     get_config_location,
@@ -164,13 +164,11 @@ def test_save_ffmpeg_dir_and_resolve_executable(tmp_path):
     loaded = load_config(str(cfg_path))
     assert loaded.ffmpeg_dir == resolved
 
-    prev = utils.get_ffmpeg_dir()
-    utils.set_ffmpeg_dir(loaded.ffmpeg_dir)
-    try:
+    assert utils.get_ffmpeg_dir() is None
+    with logging.job_context(logging.JobContext(ffmpeg_dir=loaded.ffmpeg_dir)):
         assert utils.find_executable("ffmpeg") == os.path.join(str(resolved), f"ffmpeg{exe_suffix}")
         assert utils.find_executable("ffprobe") == os.path.join(str(resolved), f"ffprobe{exe_suffix}")
-    finally:
-        utils.set_ffmpeg_dir(prev)
+    assert utils.get_ffmpeg_dir() is None
 
 
 class _RecordingSink:

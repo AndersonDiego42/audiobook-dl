@@ -107,7 +107,6 @@ def test_job_context_isolates_ffmpeg_output_flag():
 
 
 def test_cli_progress_adapter_tracks_bytes_and_speed():
-    logging.set_ui_sink(None)
     with logging.progress([]) as prog:
         task = prog.add_task("Downloading", total=2.0)
         assert prog.get_byte_metrics(task) is None

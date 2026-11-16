@@ -57,18 +57,8 @@ def read_asset_file(path: str) -> str:
         .read_text(encoding="utf8")
 
 
-_custom_ffmpeg_dir: Optional[str] = None
-
-
-def set_ffmpeg_dir(directory: Optional[str]) -> None:
-    """Configure an optional directory searched for `ffmpeg` and `ffprobe`."""
-    global _custom_ffmpeg_dir
-    cleaned = directory.strip() if directory else ""
-    _custom_ffmpeg_dir = cleaned or None
-
-
 def get_ffmpeg_dir() -> Optional[str]:
-    """Return the configured custom FFmpeg directory from the active job or global setting."""
+    """Return the configured custom FFmpeg directory from the active `JobContext`."""
     from audiobookdl import logging
 
     ctx = logging.get_job_context()
@@ -76,7 +66,7 @@ def get_ffmpeg_dir() -> Optional[str]:
         cleaned = ctx.ffmpeg_dir.strip()
         if cleaned:
             return cleaned
-    return _custom_ffmpeg_dir
+    return None
 
 
 def resolve_ffmpeg_dir(directory: str) -> Optional[str]:

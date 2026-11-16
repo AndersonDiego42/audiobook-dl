@@ -13,8 +13,9 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import pytest
 
+from audiobookdl import logging
 from audiobookdl.gui.app import AudiobookDLApp
-from audiobookdl.utils import find_executable, set_ffmpeg_dir
+from audiobookdl.utils import find_executable
 from tests.e2e.config import E2EConfig
 from tests.e2e.diagnostics import E2EDiagnosticRecorder
 
@@ -35,10 +36,10 @@ _PROXY_ENV_KEYS = (
 
 def require_ffmpeg(config: E2EConfig) -> Tuple[str, str]:
     """Verify `ffmpeg` and `ffprobe` readiness, skipping or failing per `config`."""
-    if config.ffmpeg_dir is not None:
-        set_ffmpeg_dir(str(config.ffmpeg_dir))
-    ffmpeg = find_executable("ffmpeg")
-    ffprobe = find_executable("ffprobe")
+    ffmpeg_dir = str(config.ffmpeg_dir) if config.ffmpeg_dir is not None else None
+    with logging.job_context(logging.JobContext(ffmpeg_dir=ffmpeg_dir)):
+        ffmpeg = find_executable("ffmpeg")
+        ffprobe = find_executable("ffprobe")
     if not ffmpeg or not ffprobe:
         msg = f"ffmpeg/ffprobe unavailable (ffmpeg={ffmpeg!r}, ffprobe={ffprobe!r})"
         if config.require_ffmpeg:

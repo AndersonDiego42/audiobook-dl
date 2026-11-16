@@ -28,35 +28,20 @@ def media_factory(
     e2e_config: E2EConfig,
 ) -> MediaFixtureFactory:
     """Session-cached generator for deterministic audio and cover fixtures."""
-    if e2e_config.ffmpeg_dir is not None:
-        utils.set_ffmpeg_dir(str(e2e_config.ffmpeg_dir))
-    ffmpeg = utils.find_executable("ffmpeg")
+    ffmpeg_dir = str(e2e_config.ffmpeg_dir) if e2e_config.ffmpeg_dir is not None else None
+    with logging.job_context(logging.JobContext(ffmpeg_dir=ffmpeg_dir)):
+        ffmpeg = utils.find_executable("ffmpeg")
     cache_dir = tmp_path_factory.mktemp("e2e_media_cache")
     return MediaFixtureFactory(cache_dir=cache_dir, ffmpeg_path=ffmpeg)
 
 
 @pytest.fixture(autouse=True)
 def isolated_runtime_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Snapshot and restore global runtime flags and environment across every E2E test."""
-    prev_debug = logging.debug_mode
-    prev_quiet = logging.quiet_mode
-    prev_ffmpeg_out = logging.ffmpeg_output
-    prev_sink = logging.get_ui_sink()
-    prev_ffmpeg_dir = utils.get_ffmpeg_dir()
+    """Snapshot and restore environment variables across every E2E test."""
     prev_env = dict(os.environ)
-
-    logging.debug_mode = False
-    logging.quiet_mode = False
-    logging.ffmpeg_output = False
-    logging.set_ui_sink(None)
     try:
         yield
     finally:
-        logging.debug_mode = prev_debug
-        logging.quiet_mode = prev_quiet
-        logging.ffmpeg_output = prev_ffmpeg_out
-        logging.set_ui_sink(prev_sink)
-        utils.set_ffmpeg_dir(prev_ffmpeg_dir)
         for key in list(os.environ.keys()):
             if key not in prev_env:
                 monkeypatch.delenv(key, raising=False)

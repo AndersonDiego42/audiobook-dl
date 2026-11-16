@@ -1,12 +1,13 @@
 """FFmpeg / FFprobe probing, folder selection, winget installation, and guidance UI."""
 
+from dataclasses import replace
 import os
 import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable, Optional, Tuple
 
-from audiobookdl import args
+from audiobookdl import args, logging
 from audiobookdl.gui.controller import GuiController
 from audiobookdl.utils import find_executable, validate_executable, validate_ffmpeg_dir
 from audiobookdl.utils.updater import winget_available
@@ -55,7 +56,15 @@ class FFmpegAssistant:
 
     def check_tool(self, program: str) -> Tuple[Optional[str], Optional[str]]:
         """Return `(resolved_path, validation_error)` for `ffmpeg` or `ffprobe`."""
-        path = find_executable(program)
+        configured_dir = self._controller.config.ffmpeg_dir
+        current_ctx = logging.get_job_context()
+        ctx = (
+            replace(current_ctx, ffmpeg_dir=configured_dir)
+            if current_ctx is not None
+            else logging.JobContext(ffmpeg_dir=configured_dir)
+        )
+        with logging.job_context(ctx):
+            path = find_executable(program)
         if path is None:
             return None, None
         if os.path.isfile(path):

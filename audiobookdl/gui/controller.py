@@ -40,7 +40,6 @@ from audiobookdl.pipeline import (
     verify_service_auth,
 )
 from audiobookdl.sources.source import Source
-from audiobookdl.utils import set_ffmpeg_dir
 from audiobookdl.utils.audiobook import Audiobook, Result
 from audiobookdl.utils.enrichment import (
     EnrichmentCandidate,
@@ -229,18 +228,15 @@ class GuiController:
         return uuid.uuid4().hex[:12]
 
     def load_saved_config(self) -> Config:
-        """Load configuration from `config_location` (or default) and apply `ffmpeg_dir`."""
+        """Load configuration from `config_location` (or default)."""
         if self.config_location and not os.path.exists(self.config_location):
-            cfg = Config(
+            return Config(
                 sources={},
                 output_template=None,
                 database_directory=None,
                 skip_downloaded=None,
             )
-        else:
-            cfg = load_config(self.config_location)
-        set_ffmpeg_dir(cfg.ffmpeg_dir)
-        return cfg
+        return load_config(self.config_location)
 
     def reload_config(self) -> Config:
         loaded = self.load_saved_config()
@@ -254,7 +250,6 @@ class GuiController:
             return self.config.clone()
 
     def save_ffmpeg_dir(self, resolved_dir: Optional[str]) -> Config:
-        set_ffmpeg_dir(resolved_dir)
         save_ffmpeg_dir(resolved_dir, overwrite=self.config_location)
         return self.reload_config()
 

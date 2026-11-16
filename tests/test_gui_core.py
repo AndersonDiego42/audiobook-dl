@@ -88,12 +88,7 @@ def test_build_default_options_matches_cli_defaults(monkeypatch):
 
 def test_logging_ui_sink_and_progress():
     sink = _RecordingSink()
-    logging.set_ui_sink(sink)
-    prev_quiet = logging.quiet_mode
-    prev_debug = logging.debug_mode
-    logging.quiet_mode = False
-    logging.debug_mode = True
-    try:
+    with logging.job_context(logging.JobContext(debug=True, quiet=False, sink=sink)):
         logging.log("Downloading [blue]Example Book[/]")
         logging.debug("Debug [bold]line[/]")
         with logging.progress([]) as progress:
@@ -102,10 +97,6 @@ def test_logging_ui_sink_and_progress():
             assert progress.tasks[task_id].remaining == pytest.approx(2.5)
             progress.advance(task_id, 2.5)
             assert progress.tasks[task_id].remaining == pytest.approx(0.0)
-    finally:
-        logging.set_ui_sink(None)
-        logging.quiet_mode = prev_quiet
-        logging.debug_mode = prev_debug
 
     assert ("INFO", "Downloading Example Book") in sink.logs
     assert ("DEBUG", "Debug line") in sink.logs
@@ -420,8 +411,7 @@ def test_sink_progress_adapter_throttles_by_delta_time_and_completion(monkeypatc
     monkeypatch.setattr("audiobookdl.logging.time.monotonic", lambda: clock[0])
 
     sink = _RecordingSink()
-    logging.set_ui_sink(sink)
-    try:
+    with logging.job_context(logging.JobContext(sink=sink)):
         with logging.progress([]) as progress:
             task_id = progress.add_task("Downloading", total=1000.0)
             # Four tiny advances (0.1% each = 0.4% total, 0s elapsed) -> throttled
@@ -447,8 +437,6 @@ def test_sink_progress_adapter_throttles_by_delta_time_and_completion(monkeypatc
             count_at_completion = len(sink.advances)
             progress.advance(task_id, 0.0)
             assert len(sink.advances) == count_at_completion
-    finally:
-        logging.set_ui_sink(None)
 
 
 def test_gui_poll_queue_bounds_batch_and_coalesces_progress(tmp_path):
@@ -702,8 +690,7 @@ def test_sink_progress_adapter_emits_speed_and_eta_metrics(monkeypatch):
             ))
 
     sink = _MetricsSink()
-    logging.set_ui_sink(sink)
-    try:
+    with logging.job_context(logging.JobContext(sink=sink)):
         with logging.progress([]) as progress:
             task_id = progress.add_task("Downloading", total=4.0)
             clock[0] += 1.0
@@ -718,8 +705,6 @@ def test_sink_progress_adapter_emits_speed_and_eta_metrics(monkeypatch):
             assert speed_bps > 0
             assert elapsed == pytest.approx(1.0)
             assert eta == pytest.approx(3.0)
-    finally:
-        logging.set_ui_sink(None)
 
 
 def _make_sample_png_bytes() -> bytes:
@@ -997,7 +982,6 @@ def test_gui_ffmpeg_locate_persists_and_updates_status(tmp_path, monkeypatch):
         assert load_config(str(cfg_path)).ffmpeg_dir == os.path.abspath(str(bin_dir))
     finally:
         root.destroy()
-        utils.set_ffmpeg_dir(None)
 
     # Re-opening app restores ffmpeg_dir from audiobook-dl.toml
     root2 = tk.Tk()
@@ -1007,7 +991,6 @@ def test_gui_ffmpeg_locate_persists_and_updates_status(tmp_path, monkeypatch):
         assert app2.ffmpeg_status_var.get() == "FFmpeg: Ready"
     finally:
         root2.destroy()
-        utils.set_ffmpeg_dir(None)
 
 
 def test_gui_start_download_validates_ffmpeg_upfront(tmp_path, monkeypatch):
@@ -1073,7 +1056,6 @@ def test_gui_start_download_validates_ffmpeg_upfront(tmp_path, monkeypatch):
         assert app.status_var.get() == "Completed"
     finally:
         root.destroy()
-        utils.set_ffmpeg_dir(None)
 
 
 def test_gui_rejects_unrunnable_ffmpeg_and_resets_to_path(tmp_path, monkeypatch):
@@ -1121,7 +1103,6 @@ def test_gui_rejects_unrunnable_ffmpeg_and_resets_to_path(tmp_path, monkeypatch)
         assert "Not found" in app.ffmpeg_status_var.get()
     finally:
         root.destroy()
-        utils.set_ffmpeg_dir(None)
 
 
 def test_gui_resume_and_m4b_bitrate_sync_and_persistence(tmp_path):

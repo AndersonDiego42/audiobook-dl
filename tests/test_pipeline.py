@@ -104,9 +104,9 @@ def test_downloader_events_isolation_and_selective_workflow(monkeypatch):
     monkeypatch.setattr("audiobookdl.pipeline.find_compatible_source", lambda _url: _FakeAuthSource)
     monkeypatch.setattr("audiobookdl.pipeline.process_audiobook", fake_process_audiobook)
 
-    logging.debug_mode = False
-    logging.quiet_mode = False
-    logging.ffmpeg_output = False
+    assert not logging.is_debug_mode()
+    assert not logging.is_quiet_mode()
+    assert not logging.is_ffmpeg_output()
     assert logging.get_ui_sink() is None
 
     config = Config(sources={}, output_template=None, database_directory=None, skip_downloaded=None)
@@ -135,10 +135,10 @@ def test_downloader_events_isolation_and_selective_workflow(monkeypatch):
     assert summary == DownloadSummary(completed=1, failed=0, cancelled=False)
     assert downloaded_titles == ["Second Title"]
 
-    # Global logging flags and sink remained isolated/untouched
-    assert not logging.debug_mode
-    assert not logging.quiet_mode
-    assert not logging.ffmpeg_output
+    # JobContext flags and sink remained isolated/untouched
+    assert not logging.is_debug_mode()
+    assert not logging.is_quiet_mode()
+    assert not logging.is_ffmpeg_output()
     assert logging.get_ui_sink() is None
     assert logging.get_job_context() is None
 
@@ -207,10 +207,6 @@ def test_cli_main_delegates_to_downloader(monkeypatch):
     assert captured["urls"] == ["https://example.com/one"]
     assert captured["options"].database_directory is not None
     assert logging.get_job_context() is None
-    # Restore module defaults after CLI test
-    logging.debug_mode = False
-    logging.quiet_mode = False
-    logging.ffmpeg_output = False
 
 
 def test_apply_runtime_options_merges_resume_and_audio_bitrate():
@@ -274,14 +270,10 @@ def test_cli_main_exit_codes(monkeypatch, summary, expected_code):
 
     from audiobookdl.__main__ import main
 
-    try:
-        with pytest.raises(SystemExit) as exc_info:
-            main()
-        assert exc_info.value.code == expected_code
-    finally:
-        logging.debug_mode = False
-        logging.quiet_mode = False
-        logging.ffmpeg_output = False
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+    assert exc_info.value.code == expected_code
+    assert logging.get_job_context() is None
 
 
 def test_download_cover_respects_output_template_and_creates_parents(tmp_path, monkeypatch):
@@ -995,26 +987,20 @@ def test_apply_runtime_options_isolates_ffmpeg_dir_per_job_context(tmp_path):
     (bin_a / exe_name).write_bytes(b"a")
     (bin_b / exe_name).write_bytes(b"b")
 
-    prev_global = utils.get_ffmpeg_dir()
-    try:
-        utils.set_ffmpeg_dir(None)
-        cfg_a = Config(sources={}, output_template=None, database_directory=None, skip_downloaded=None, ffmpeg_dir=str(bin_a))
-        cfg_b = Config(sources={}, output_template=None, database_directory=None, skip_downloaded=None, ffmpeg_dir=str(bin_b))
-        ctx_a = apply_runtime_options(args.build_default_options(), cfg_a)
-        ctx_b = apply_runtime_options(args.build_default_options(), cfg_b)
+    cfg_a = Config(sources={}, output_template=None, database_directory=None, skip_downloaded=None, ffmpeg_dir=str(bin_a))
+    cfg_b = Config(sources={}, output_template=None, database_directory=None, skip_downloaded=None, ffmpeg_dir=str(bin_b))
+    ctx_a = apply_runtime_options(args.build_default_options(), cfg_a)
+    ctx_b = apply_runtime_options(args.build_default_options(), cfg_b)
 
-        # Global singleton was NOT mutated
-        assert utils.get_ffmpeg_dir() is None
+    assert utils.get_ffmpeg_dir() is None
 
-        with logging.job_context(ctx_a):
-            assert utils.get_ffmpeg_dir() == str(bin_a)
-            assert utils.find_executable("ffmpeg") == str(bin_a / exe_name)
-        with logging.job_context(ctx_b):
-            assert utils.get_ffmpeg_dir() == str(bin_b)
-            assert utils.find_executable("ffmpeg") == str(bin_b / exe_name)
-        assert utils.get_ffmpeg_dir() is None
-    finally:
-        utils.set_ffmpeg_dir(prev_global)
+    with logging.job_context(ctx_a):
+        assert utils.get_ffmpeg_dir() == str(bin_a)
+        assert utils.find_executable("ffmpeg") == str(bin_a / exe_name)
+    with logging.job_context(ctx_b):
+        assert utils.get_ffmpeg_dir() == str(bin_b)
+        assert utils.find_executable("ffmpeg") == str(bin_b / exe_name)
+    assert utils.get_ffmpeg_dir() is None
 
 
 def test_fetch_metadata_and_process_url_close_owned_source_sessions(tmp_path, monkeypatch):

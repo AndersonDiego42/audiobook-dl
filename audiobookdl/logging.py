@@ -16,9 +16,6 @@ import threading
 import time
 import traceback
 
-debug_mode = False
-quiet_mode = False
-ffmpeg_output = False
 console = Console(stderr=True) if sys.stderr is not None else Console(file=io.StringIO())
 DEBUG_PREFIX = render("[yellow bold]DEBUG[/]")
 INFO_PREFIX = render("[cyan bold] INFO[/]")
@@ -79,9 +76,6 @@ class CliInteractionHandler:
             console.print(f"[red]Please enter a number between 0 and {len(choices)}.[/]")
 
 
-_ui_sink: Optional[LogSink] = None
-
-
 @dataclass
 class JobContext:
     """Per-job logging, UI sink, interaction, and cancellation context."""
@@ -129,35 +123,27 @@ def job_context(ctx: JobContext) -> Iterator[JobContext]:
 
 
 def is_debug_mode() -> bool:
-    """Return whether debug logging is enabled in the active job or globally."""
+    """Return whether debug logging is enabled in the active `JobContext`."""
     ctx = _job_context.get()
-    return ctx.debug if ctx is not None else debug_mode
+    return bool(ctx.debug) if ctx is not None else False
 
 
 def is_quiet_mode() -> bool:
-    """Return whether quiet mode is enabled in the active job or globally."""
+    """Return whether quiet mode is enabled in the active `JobContext`."""
     ctx = _job_context.get()
-    return ctx.quiet if ctx is not None else quiet_mode
+    return bool(ctx.quiet) if ctx is not None else False
 
 
 def is_ffmpeg_output() -> bool:
-    """Return whether verbose FFmpeg output is enabled in the active job or globally."""
+    """Return whether verbose FFmpeg output is enabled in the active `JobContext`."""
     ctx = _job_context.get()
-    return ctx.ffmpeg_output if ctx is not None else ffmpeg_output
+    return bool(ctx.ffmpeg_output) if ctx is not None else False
 
 
 def get_ui_sink() -> Optional[LogSink]:
-    """Return the active `LogSink` for the current job, or the global sink."""
+    """Return the active `LogSink` for the current `JobContext`, if any."""
     ctx = _job_context.get()
-    if ctx is not None and ctx.sink is not None:
-        return ctx.sink
-    return _ui_sink
-
-
-def set_ui_sink(sink: Optional[LogSink]) -> None:
-    """Register or clear the global fallback UI sink for logs and progress."""
-    global _ui_sink
-    _ui_sink = sink
+    return ctx.sink if ctx is not None else None
 
 
 def strip_markup(msg: str) -> str:
