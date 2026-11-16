@@ -98,6 +98,17 @@ def _probe_audio_info(path: str) -> AudioProbeInfo:
 _PROBE_CACHE_LOCK = threading.Lock()
 
 
+def get_cached_probe(
+    probe_cache: dict[str, AudioProbeInfo] | None,
+    path: str,
+) -> AudioProbeInfo | None:
+    """Thread-safely return the cached `AudioProbeInfo` for `path`, or `None` on miss."""
+    if probe_cache is None:
+        return None
+    with _PROBE_CACHE_LOCK:
+        return probe_cache.get(path)
+
+
 def store_cached_probe(
     probe_cache: dict[str, AudioProbeInfo] | None,
     path: str,
@@ -108,6 +119,20 @@ def store_cached_probe(
         return
     with _PROBE_CACHE_LOCK:
         probe_cache[path] = info
+
+
+def move_cached_probe(
+    probe_cache: dict[str, AudioProbeInfo] | None,
+    old_path: str,
+    new_path: str,
+) -> None:
+    """Thread-safely move a cached `AudioProbeInfo` entry from `old_path` to `new_path`."""
+    if probe_cache is None or old_path == new_path:
+        return
+    with _PROBE_CACHE_LOCK:
+        info = probe_cache.pop(old_path, None)
+        if info is not None:
+            probe_cache[new_path] = info
 
 
 def _get_cached_probe(
@@ -1133,7 +1158,6 @@ def convert_single_file(
         verified_info = verify_audio_integrity(
             staged_path,
             expected_duration=info.duration,
-            probe_cache=probe_cache,
         )
     except FailedCombining:
         if os.path.exists(staged_path):
@@ -1146,8 +1170,7 @@ def convert_single_file(
             os.remove(staged_path)
         raise
     os.replace(staged_path, new_path)
-    if probe_cache is not None:
-        probe_cache[new_path] = verified_info
+    store_cached_probe(probe_cache, new_path, verified_info)
     if remove_source and os.path.exists(old_path) and os.path.abspath(old_path) != os.path.abspath(new_path):
         os.remove(old_path)
     return new_path, chapters_embedded
@@ -1488,6 +1511,7 @@ def convert_output(
     audio_bitrate: str | None = None,
     loudnorm: bool = False,
     mono: bool = False,
+    probe_cache: dict[str, AudioProbeInfo] | None = None,
 ):
     """Converts a list of audio files into another format and return new
     files"""
@@ -1503,6 +1527,7 @@ def convert_output(
             cancel_event=cancel_event,
             audio_bitrate=explicit_bitrate,
             remove_source=True,
+            probe_cache=probe_cache,
             loudnorm=loudnorm,
             mono=mono,
         )
@@ -1529,6 +1554,7 @@ def convert_output(
                 cancel_event=effective_cancel,
                 audio_bitrate=explicit_bitrate,
                 remove_source=False,
+                probe_cache=probe_cache,
                 loudnorm=loudnorm,
                 mono=mono,
             )

@@ -343,6 +343,7 @@ def download_audiobook(
                         # Silence detection yielded <= 1 chapter: promote combined master as single file
                         fallback_path = os.path.join(work_output_dir, f"01 - {os.path.basename(output_dir)}.{output_format}")
                         shutil.move(master_path, fallback_path)
+                        output.move_cached_probe(probe_cache, master_path, fallback_path)
                         filepaths = [fallback_path]
             elif len(filepaths) == 1:
                 src_single = filepaths[0]
@@ -390,8 +391,7 @@ def download_audiobook(
                 staged_key = staged_combined_path
                 os.replace(staged_combined_path, output_path)
                 staged_combined_path = None
-                if staged_key in probe_cache:
-                    output.store_cached_probe(probe_cache, output_path, probe_cache.pop(staged_key))
+                output.move_cached_probe(probe_cache, staged_key, output_path)
                 if not use_staging_dir and os.path.isdir(work_output_dir):
                     shutil.rmtree(work_output_dir, ignore_errors=True)
                 cover_embedded = combine_cover is not None
@@ -454,6 +454,7 @@ def download_audiobook(
                     output_format,
                     cancel_event=cancel_event,
                     audio_bitrate=options.audio_bitrate,
+                    probe_cache=probe_cache,
                     **audio_filter_kwargs,
                 )
         if cancel_event is not None and cancel_event.is_set():
@@ -462,7 +463,9 @@ def download_audiobook(
         if wants_split and may_silence_chapters and not splitting and stage_dir is not None and len(filepaths) == 1:
             final_single_path = f"{output_dir}.{output_format}"
             os.makedirs(os.path.dirname(os.path.abspath(final_single_path)) or os.getcwd(), exist_ok=True)
-            os.replace(filepaths[0], final_single_path)
+            old_single_path = filepaths[0]
+            os.replace(old_single_path, final_single_path)
+            output.move_cached_probe(probe_cache, old_single_path, final_single_path)
             filepaths = [final_single_path]
             is_single_file = True
         # Add metadata & commit staged directory atomically
@@ -520,8 +523,8 @@ def _resolve_total_duration_seconds(
     for path in paths:
         if is_ebook_extension(os.path.splitext(path)[1]):
             continue
-        if probe_cache is not None and path in probe_cache:
-            cached = probe_cache[path]
+        cached = output.get_cached_probe(probe_cache, path)
+        if cached is not None:
             dur = getattr(cached, "duration", 0.0)
             if isinstance(dur, (int, float)) and dur > 0:
                 total_sec += float(dur)

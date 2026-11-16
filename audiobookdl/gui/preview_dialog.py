@@ -15,7 +15,13 @@ from audiobookdl.gui.formatting import (
     load_cover_from_file,
     render_cover_thumbnail,
 )
-from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, apply_theme_to_window, scale_px
+from audiobookdl.gui.theme import (
+    LIGHT_PALETTE,
+    ThemePalette,
+    apply_theme_to_window,
+    make_bold_font,
+    scale_px,
+)
 from audiobookdl.gui.widgets import MainThreadCallbackQueue, ScrolledTreeview, TreeColumnSpec
 from audiobookdl.sources.source import Source
 from audiobookdl.utils.audiobook import Audiobook, BookId, Cover, Result, Series
@@ -55,7 +61,7 @@ class ChoiceDialog(tk.Toplevel):
         body.columnconfigure(0, weight=1)
         body.rowconfigure(1, weight=1)
 
-        ttk.Label(body, text=title, font=("Segoe UI", 10, "bold")).grid(
+        ttk.Label(body, text=title, font=make_bold_font(self, 10)).grid(
             row=0, column=0, sticky="w", pady=(0, 8)
         )
 
@@ -409,7 +415,7 @@ class PreviewDialog(tk.Toplevel):
             ttk.Label(
                 meta_frame,
                 text=f"{label}:",
-                font=("Segoe UI", 9, "bold"),
+                font=make_bold_font(self, 9),
             ).grid(row=row_idx, column=0, sticky="w", padx=(0, 8), pady=3)
             if entry_width is not None:
                 entry = ttk.Entry(meta_frame, textvariable=var, width=entry_width)
@@ -474,7 +480,7 @@ class PreviewDialog(tk.Toplevel):
             ttk.Label(
                 self._readonly_frame,
                 text=f"{label}:",
-                font=("Segoe UI", 9, "bold"),
+                font=make_bold_font(self, 9),
             ).grid(row=row_idx, column=0, sticky="nw", padx=(0, 8), pady=2)
             ttk.Label(
                 self._readonly_frame,
@@ -488,7 +494,7 @@ class PreviewDialog(tk.Toplevel):
             ttk.Label(
                 self._readonly_frame,
                 text="Description:",
-                font=("Segoe UI", 9, "bold"),
+                font=make_bold_font(self, 9),
             ).grid(row=row_idx, column=0, sticky="nw", padx=(0, 8), pady=(6, 2))
             desc_box = ScrolledText(self._readonly_frame, height=4, width=40, wrap="word")
             desc_box.grid(row=row_idx, column=1, sticky="nsew", pady=(6, 2))
@@ -630,7 +636,7 @@ class PreviewDialog(tk.Toplevel):
         header = ttk.Frame(body)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         header.columnconfigure(0, weight=1)
-        ttk.Label(header, text=series.title, font=("Segoe UI", 11, "bold")).grid(
+        ttk.Label(header, text=series.title, font=make_bold_font(self, 11)).grid(
             row=0, column=0, sticky="w"
         )
         book_count = len(series.books)

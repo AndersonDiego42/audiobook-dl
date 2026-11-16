@@ -743,9 +743,11 @@ def test_pack_book_runs_silence_detection_when_chapters_from_silence_enabled(tmp
 
     detected = [Chapter(start=0, title="Part 1"), Chapter(start=12000, title="Part 2")]
 
-    def fake_convert(old_path, output_format, *, output_path=None, **kwargs):
+    def fake_convert(old_path, output_format, *, output_path=None, probe_cache=None, **kwargs):
         assert output_path is not None
         Path(output_path).write_bytes(b"m4b")
+        if probe_cache is not None:
+            probe_cache[output_path] = cached_info
         return output_path, True
 
     opts = args.build_default_options(
@@ -759,7 +761,7 @@ def test_pack_book_runs_silence_detection_when_chapters_from_silence_enabled(tmp
     meta_calls = []
 
     def fake_add_meta(audiobook, filepath, options, **kwargs):
-        meta_calls.append(list(audiobook.chapters))
+        meta_calls.append((list(audiobook.chapters), kwargs.get("probe_cache")))
 
     with (
         patch("audiobookdl.pack.output.detect_silence_chapters", return_value=detected) as silence_mock,
@@ -777,7 +779,9 @@ def test_pack_book_runs_silence_detection_when_chapters_from_silence_enabled(tmp
 
     assert final_path == str((out_dir / "Solo Track.m4b").resolve())
     silence_mock.assert_called_once()
-    assert meta_calls == [detected]
+    assert silence_mock.call_args.kwargs.get("probe_cache") is probe_cache
+    assert final_path in probe_cache
+    assert meta_calls == [(detected, probe_cache)]
 
 
 def test_pack_dialog_preserves_explicit_fields_passes_output_dir_and_keeps_global_format(

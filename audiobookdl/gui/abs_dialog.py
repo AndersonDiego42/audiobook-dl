@@ -31,7 +31,9 @@ class AudiobookshelfDialog(tk.Toplevel):
 
         self.title("Audiobookshelf Integration")
         self.transient(parent)  # type: ignore[arg-type]
+        self.grab_set()
         self.resizable(False, False)
+        self.bind("<Escape>", lambda _e: self.destroy())
 
         body = ttk.Frame(self, padding=scale_px(self, 14))
         body.pack(fill=tk.BOTH, expand=True)

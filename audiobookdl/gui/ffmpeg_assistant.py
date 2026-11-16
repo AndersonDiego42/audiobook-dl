@@ -56,7 +56,7 @@ class FFmpegAssistant:
 
     def check_tool(self, program: str) -> tuple[str | None, str | None]:
         """Return `(resolved_path, validation_error)` for `ffmpeg` or `ffprobe`."""
-        configured_dir = self._controller.config.ffmpeg_dir
+        configured_dir = self._controller.config_snapshot().ffmpeg_dir
         current_ctx = logging.get_job_context()
         ctx = (
             replace(current_ctx, ffmpeg_dir=configured_dir)
@@ -266,7 +266,7 @@ class FFmpegAssistant:
             if ffprobe_err:
                 details.append(f"ffprobe ({ffprobe_path}):\n  {ffprobe_err}")
             detail_text = "\n\n".join(details)
-            custom_dir = self._controller.config.ffmpeg_dir
+            custom_dir = self._controller.config_snapshot().ffmpeg_dir
             if custom_dir:
                 if messagebox.askyesno(
                     "FFmpeg Binary Error",

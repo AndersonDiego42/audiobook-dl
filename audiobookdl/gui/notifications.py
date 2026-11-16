@@ -52,25 +52,54 @@ def format_completion_notification(
     )
 
 
+def _resolve_windows_powershell() -> tuple[str | None, bool]:
+    """Return `(executable_path, supports_winrt)` preferring Windows PowerShell 5.1."""
+    ps5 = shutil.which("powershell.exe") or shutil.which("powershell")
+    if ps5:
+        return ps5, True
+    system_root = os.environ.get("SystemRoot") or r"C:\Windows"
+    winps_path = os.path.join(system_root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    if os.path.isfile(winps_path):
+        return winps_path, True
+    pwsh = shutil.which("pwsh.exe") or shutil.which("pwsh")
+    if pwsh:
+        return pwsh, False
+    return None, False
+
+
 def _send_windows_toast(title: str, message: str, *, app_name: str, timeout: float) -> bool:
-    """Display a Windows 10/11 toast notification via WinRT PowerShell without flashing a window."""
-    exe = shutil.which("powershell") or shutil.which("pwsh")
+    """Display a Windows 10/11 toast notification via WinRT PowerShell 5.1 or `pwsh` NotifyIcon fallback."""
+    exe, supports_winrt = _resolve_windows_powershell()
     if not exe:
         return False
 
-    script = (
-        "$ErrorActionPreference = 'Stop'\n"
-        "$null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]\n"
-        "$null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]\n"
-        "$template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent("
-        "[Windows.UI.Notifications.ToastTemplateType]::ToastText02)\n"
-        "$texts = $template.GetElementsByTagName('text')\n"
-        "$texts.Item(0).AppendChild($template.CreateTextNode($env:ABDL_NOTIFY_TITLE)) | Out-Null\n"
-        "$texts.Item(1).AppendChild($template.CreateTextNode($env:ABDL_NOTIFY_MSG)) | Out-Null\n"
-        "$toast = [Windows.UI.Notifications.ToastNotification]::new($template)\n"
-        "$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($env:ABDL_NOTIFY_APP)\n"
-        "$notifier.Show($toast)\n"
-    )
+    if supports_winrt:
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            "$null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]\n"
+            "$null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]\n"
+            "$template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent("
+            "[Windows.UI.Notifications.ToastTemplateType]::ToastText02)\n"
+            "$texts = $template.GetElementsByTagName('text')\n"
+            "$texts.Item(0).AppendChild($template.CreateTextNode($env:ABDL_NOTIFY_TITLE)) | Out-Null\n"
+            "$texts.Item(1).AppendChild($template.CreateTextNode($env:ABDL_NOTIFY_MSG)) | Out-Null\n"
+            "$toast = [Windows.UI.Notifications.ToastNotification]::new($template)\n"
+            "$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($env:ABDL_NOTIFY_APP)\n"
+            "$notifier.Show($toast)\n"
+        )
+    else:
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            "Add-Type -AssemblyName System.Windows.Forms\n"
+            "Add-Type -AssemblyName System.Drawing\n"
+            "$notify = New-Object System.Windows.Forms.NotifyIcon\n"
+            "$notify.Icon = [System.Drawing.SystemIcons]::Information\n"
+            "$notify.Visible = $true\n"
+            "$notify.ShowBalloonTip(5000, $env:ABDL_NOTIFY_TITLE, $env:ABDL_NOTIFY_MSG, "
+            "[System.Windows.Forms.ToolTipIcon]::Info)\n"
+            "Start-Sleep -Milliseconds 200\n"
+            "$notify.Dispose()\n"
+        )
     env = os.environ.copy()
     env["ABDL_NOTIFY_TITLE"] = title
     env["ABDL_NOTIFY_MSG"] = message

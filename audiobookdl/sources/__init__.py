@@ -23,7 +23,7 @@ import functools
 import importlib.metadata
 import re
 import threading
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 
 @dataclass(frozen=True)
@@ -78,6 +78,17 @@ def detect_service_key(url: str) -> str | None:
     except NoSourceFound:
         return None
     return source_cls.names[0].lower() if source_cls.names else None
+
+
+def resolve_service_label(
+    url: str,
+    services_by_key: Mapping[str, ServiceInfo] | None = None,
+) -> str:
+    """Return a human-readable service label for `url`, or `'Unknown'`."""
+    key = detect_service_key(url)
+    if key and services_by_key and key in services_by_key:
+        return services_by_key[key].label
+    return key or "Unknown"
 
 _EREOLEN_REFRESH_LOCK = threading.Lock()
 _EREOLEN_REFRESHED = False

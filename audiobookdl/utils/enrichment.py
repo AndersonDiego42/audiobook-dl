@@ -2,7 +2,6 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import date
 from difflib import SequenceMatcher
-import html
 from io import BytesIO
 import re
 from typing import Any
@@ -17,8 +16,10 @@ from audiobookdl.utils.audiobook import (
     AudiobookMetadata,
     Chapter,
     Cover,
+    clean_html_description,
     parse_language,
     parse_release_date,
+    parse_series_order,
 )
 from audiobookdl.utils.enrichment_cache import (
     DEFAULT_CACHE_TTL_SECONDS,
@@ -51,11 +52,8 @@ _EDITION_MARKER_RE = re.compile(
 _SUBTITLE_NOVEL_RE = re.compile(r"\s*[:\-]\s*a\s+novel\b.*$", re.IGNORECASE)
 _NON_ALNUM_RE = re.compile(r"[^\w\s]+", re.UNICODE)
 _WHITESPACE_RE = re.compile(r"\s+")
-_HTML_BREAK_RE = re.compile(r"<(?:br\s*/?|/p|/div|/li)\s*>", re.IGNORECASE)
-_HTML_TAG_RE = re.compile(r"<[^>]+>")
 _ISBN_CLEAN_RE = re.compile(r"[^0-9Xx]")
 _ASIN_RE = re.compile(r"^[A-Za-z0-9]{10}$")
-_SERIES_INT_RE = re.compile(r"^\s*(\d+)(?:\.0+)?\s*$")
 _ITUNES_ARTWORK_SIZE_RE = re.compile(r"/\d+x\d+bb[^/]*$")
 
 
@@ -177,28 +175,6 @@ def _clean_asin(raw: Any) -> str | None:
     if _ASIN_RE.match(candidate):
         return candidate
     return None
-
-
-def _strip_html(raw: Any) -> str | None:
-    if not isinstance(raw, str):
-        return None
-    text = _HTML_BREAK_RE.sub("\n", raw)
-    text = _HTML_TAG_RE.sub("", text)
-    text = html.unescape(text)
-    lines = [line.strip() for line in text.splitlines()]
-    cleaned = "\n".join(line for line in lines if line)
-    return cleaned.strip() or None
-
-
-def _parse_series_order(raw: Any) -> int | None:
-    if raw is None or isinstance(raw, bool):
-        return None
-    if isinstance(raw, int):
-        return raw
-    if isinstance(raw, float):
-        return int(raw) if raw.is_integer() else None
-    m = _SERIES_INT_RE.match(str(raw))
-    return int(m.group(1)) if m else None
 
 
 def _extract_names(items: Any) -> list[str]:
@@ -356,9 +332,12 @@ def _parse_audnexus_book(payload: Mapping[str, Any]) -> EnrichmentCandidate | No
     if isinstance(series_primary, dict):
         raw_series = str(series_primary.get("name") or "").strip()
         series_name = raw_series or None
-        series_order = _parse_series_order(series_primary.get("position"))
+        series_order = parse_series_order(series_primary.get("position"))
 
-    description = _strip_html(payload.get("summary") or payload.get("description"))
+    description = clean_html_description(
+        payload.get("summary") or payload.get("description"),
+        preserve_newlines=True,
+    )
     cover_url = str(payload.get("image") or "").strip() or None
     publisher = str(payload.get("publisherName") or "").strip() or None
     release_date = parse_release_date(payload.get("releaseDate"))
@@ -398,7 +377,7 @@ def _parse_audible_product(product: Mapping[str, Any]) -> EnrichmentCandidate | 
     series_list = product.get("series")
     if isinstance(series_list, list) and series_list and isinstance(series_list[0], dict):
         series_name = str(series_list[0].get("title") or "").strip() or None
-        series_order = _parse_series_order(series_list[0].get("sequence"))
+        series_order = parse_series_order(series_list[0].get("sequence"))
 
     cover_url: str | None = None
     images = product.get("product_images")
@@ -412,7 +391,10 @@ def _parse_audible_product(product: Mapping[str, Any]) -> EnrichmentCandidate | 
             if first_val:
                 cover_url = str(first_val).strip()
 
-    description = _strip_html(product.get("publisher_summary") or product.get("merchandising_summary"))
+    description = clean_html_description(
+        product.get("publisher_summary") or product.get("merchandising_summary"),
+        preserve_newlines=True,
+    )
     publisher = str(product.get("publisher_name") or "").strip() or None
     release_date = parse_release_date(product.get("release_date"))
     language = parse_language(product.get("language"))
@@ -624,7 +606,7 @@ def _query_itunes(
         authors = [artist] if artist else []
         genre = str(item.get("primaryGenreName") or "").strip()
         genres = [genre] if genre else []
-        description = _strip_html(item.get("description"))
+        description = clean_html_description(item.get("description"), preserve_newlines=True)
         release_date = parse_release_date(item.get("releaseDate"))
         artwork_raw = item.get("artworkUrl100") or item.get("artworkUrl60") or item.get("artworkUrl30")
         cover_url = _upgrade_itunes_artwork(str(artwork_raw)) if artwork_raw else None
@@ -734,7 +716,7 @@ def _query_google(
             authors=authors,
             genres=categories,
             language=parse_language(info.get("language")),
-            description=_strip_html(info.get("description")),
+            description=clean_html_description(info.get("description"), preserve_newlines=True),
             isbn=_extract_google_isbn(info.get("industryIdentifiers")),
             publisher=str(info.get("publisher") or "").strip() or None,
             release_date=parse_release_date(info.get("publishedDate")),

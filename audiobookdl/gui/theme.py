@@ -233,12 +233,44 @@ def _apply_windows_titlebar_theme(window: tk.Misc, *, is_dark: bool) -> None:
         pass
 
 
+def default_font_family(widget: tk.Misc | None = None) -> str:
+    """Return the platform's default UI font family from `TkDefaultFont`."""
+    try:
+        return str(tkfont.nametofont("TkDefaultFont", root=widget).cget("family"))
+    except (tk.TclError, ValueError, TypeError):
+        return "TkDefaultFont"
+
+
+def make_bold_font(widget: tk.Misc | None, size: int) -> tuple[str, int, str]:
+    """Return a portable `(family, size, 'bold')` font tuple based on `TkDefaultFont`."""
+    return (default_font_family(widget), size, "bold")
+
+
 def _configure_semantic_labels(style: ttk.Style, palette: ThemePalette) -> None:
     style.configure("Muted.TLabel", foreground=palette.fg_muted)
     style.configure("Secondary.TLabel", foreground=palette.fg_secondary)
     style.configure("Success.TLabel", foreground=palette.success)
     style.configure("Warning.TLabel", foreground=palette.warning)
     style.configure("Error.TLabel", foreground=palette.error)
+
+
+def _configure_accent_button(style: ttk.Style, palette: ThemePalette) -> None:
+    style.configure(
+        "Accent.TButton",
+        background=palette.accent,
+        foreground=palette.select_fg,
+        bordercolor=palette.accent,
+        padding=(8, 3),
+    )
+    style.map(
+        "Accent.TButton",
+        background=[
+            ("disabled", palette.bg),
+            ("pressed", palette.accent),
+            ("active", palette.accent),
+        ],
+        foreground=[("disabled", palette.fg_disabled)],
+    )
 
 
 def _configure_clam_palette(style: ttk.Style, palette: ThemePalette) -> None:
@@ -285,6 +317,7 @@ def _configure_clam_palette(style: ttk.Style, palette: ThemePalette) -> None:
         ],
         foreground=[("disabled", palette.fg_disabled)],
     )
+    _configure_accent_button(style, palette)
 
     style.configure("TCheckbutton", background=palette.bg, foreground=palette.fg)
     style.map(
@@ -439,6 +472,18 @@ def apply_theme_to_widget_tree(widget: tk.Misc, palette: ThemePalette) -> None:
             )
         except tk.TclError:
             pass
+    elif isinstance(widget, tk.Listbox):
+        try:
+            widget.configure(
+                background=palette.surface,
+                foreground=palette.fg,
+                selectbackground=palette.select_bg,
+                selectforeground=palette.select_fg,
+                highlightbackground=palette.border,
+                highlightcolor=palette.accent,
+            )
+        except tk.TclError:
+            pass
     elif isinstance(widget, tk.Menu):
         _configure_menu(widget, palette)
     elif isinstance(widget, tk.Canvas):
@@ -476,6 +521,7 @@ def apply_theme(root: tk.Misc, style: ttk.Style, theme_mode: str | None) -> Them
         if "vista" in available:
             style.theme_use("vista")
             _configure_semantic_labels(style, palette)
+            _configure_accent_button(style, palette)
         else:
             if "clam" in available:
                 style.theme_use("clam")

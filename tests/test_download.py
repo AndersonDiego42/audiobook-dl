@@ -1619,4 +1619,129 @@ def test_download_reuses_probe_cache_from_download_file_for_combine(tmp_path, mo
     assert len(tmp_part_probes) == 2
 
 
+def test_download_reuses_probe_cache_for_multipart_convert_output(tmp_path, monkeypatch):
+    import json
+    import os
+    from types import SimpleNamespace
+    from audiobookdl import Chapter
+    from audiobookdl.output import download as dl_mod
+    from audiobookdl.output import output as out_mod
+    from audiobookdl.utils import AudioProbeInfo
+
+    probed_paths: list[str] = []
+
+    def counting_probe(path: str) -> AudioProbeInfo:
+        probed_paths.append(path)
+        if path.endswith(".mp3.tmp"):
+            return AudioProbeInfo(duration=12.5, codec_name="mp3", bitrate=128000, sample_rate=44100, channels=2)
+        return AudioProbeInfo(duration=12.5, codec_name="aac", bitrate=128000, sample_rate=44100, channels=2)
+
+    monkeypatch.setattr(out_mod, "_probe_audio_info", counting_probe)
+    monkeypatch.setattr(out_mod, "find_executable", lambda _name: "ffprobe")
+    monkeypatch.setattr(out_mod, "_require_executable", lambda name: name)
+    monkeypatch.setattr(dl_mod.metadata, "add_metadata", lambda *a, **kw: False)
+    monkeypatch.setattr(
+        dl_mod,
+        "resolve_audio_duration_ms",
+        lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("should use probe_cache")),
+    )
+
+    def fake_run(cmd, **_kwargs):
+        Path(cmd[-1]).write_bytes(b"m4b")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(out_mod, "run_cancellable_subprocess", fake_run)
+
+    session = MagicMock()
+    session.get.side_effect = [
+        _mock_response(headers={"Content-Length": "4"}, chunks=[b"mp3a"]),
+        _mock_response(headers={"Content-Length": "4"}, chunks=[b"mp3b"]),
+    ]
+    ab = Audiobook(
+        session=session,
+        metadata=AudiobookMetadata(title="Convert Cached Book"),
+        files=[
+            AudiobookFile(url="https://example.com/1.mp3", ext="mp3"),
+            AudiobookFile(url="https://example.com/2.mp3", ext="mp3"),
+        ],
+        chapters=[Chapter(start=0, title="Part 1")],
+    )
+    opts = DownloadOptions(combine=False, output_format="m4b", write_abs_metadata=True)
+    out_dir = tmp_path / "Convert Cached Book"
+    download_audiobook(ab, str(out_dir), opts)
+
+    # 2 probes on .mp3.tmp during download + 2 probes on staged .m4b during convert_output;
+    # zero duplicate probes on Part *.mp3 or final Part *.m4b.
+    assert [p for p in probed_paths if p.endswith(".mp3")] == []
+    assert [p for p in probed_paths if p.endswith(".m4b") and ".tmp." not in os.path.basename(p)] == []
+    assert len([p for p in probed_paths if p.endswith(".mp3.tmp")]) == 2
+    assert len([p for p in probed_paths if ".tmp." in os.path.basename(p) and p.endswith(".m4b")]) == 2
+    abs_meta = json.loads((out_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert abs_meta["chapters"][-1]["end"] == 25.0
+
+
+def test_download_split_silence_fallback_preserves_probe_cache(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from audiobookdl.output import download as dl_mod
+    from audiobookdl.output import output as out_mod
+    from audiobookdl.utils import AudioProbeInfo
+
+    probed_paths: list[str] = []
+
+    def counting_probe(path: str) -> AudioProbeInfo:
+        probed_paths.append(path)
+        if path.endswith(".mp3.tmp"):
+            return AudioProbeInfo(duration=10.0, codec_name="mp3", bitrate=128000, sample_rate=44100, channels=2)
+        return AudioProbeInfo(duration=20.0, codec_name="mp3", bitrate=128000, sample_rate=44100, channels=2)
+
+    monkeypatch.setattr(out_mod, "_probe_audio_info", counting_probe)
+    monkeypatch.setattr(out_mod, "find_executable", lambda _name: "ffprobe")
+    monkeypatch.setattr(out_mod, "_require_executable", lambda name: name)
+    monkeypatch.setattr(out_mod, "_remux_to_mpegts", lambda _src, dst, **_kw: open(dst, "wb").write(b"ts") > 0)
+    monkeypatch.setattr(dl_mod.metadata, "add_metadata", lambda *a, **kw: False)
+    monkeypatch.setattr(
+        dl_mod,
+        "resolve_audio_duration_ms",
+        lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("should use probe_cache")),
+    )
+
+    def fake_run(cmd, **_kwargs):
+        if "-af" in cmd and any("silencedetect" in str(arg) for arg in cmd):
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"[silencedetect] silence_end: 2.0\n")
+        Path(cmd[-1]).write_bytes(b"master")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(out_mod, "run_cancellable_subprocess", fake_run)
+
+    session = MagicMock()
+    session.get.side_effect = [
+        _mock_response(headers={"Content-Length": "4"}, chunks=[b"mp3a"]),
+        _mock_response(headers={"Content-Length": "4"}, chunks=[b"mp3b"]),
+    ]
+    ab = Audiobook(
+        session=session,
+        metadata=AudiobookMetadata(title="Silence Fallback"),
+        files=[
+            AudiobookFile(url="https://example.com/1.mp3", ext="mp3"),
+            AudiobookFile(url="https://example.com/2.mp3", ext="mp3"),
+        ],
+    )
+    opts = DownloadOptions(
+        split_chapters=True,
+        chapters_from_silence=True,
+        output_format="mp3",
+        write_abs_metadata=True,
+    )
+    out_base = tmp_path / "Silence Fallback"
+    download_audiobook(ab, str(out_base), opts)
+
+    final_mp3 = tmp_path / "Silence Fallback.mp3"
+    assert final_mp3.is_file()
+    assert str(final_mp3) not in probed_paths
+    abs_meta = json.loads((tmp_path / "metadata.json").read_text(encoding="utf-8"))
+    assert abs_meta["chapters"][-1]["end"] == 20.0
+
+
+
 

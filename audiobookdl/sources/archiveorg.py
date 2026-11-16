@@ -10,7 +10,12 @@ from urllib.parse import quote
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover
 from audiobookdl.exceptions import BookNotFound, RequestError
-from audiobookdl.utils.audiobook import parse_language, parse_release_date
+from audiobookdl.utils.audiobook import (
+    clean_html_description,
+    parse_duration_ms,
+    parse_language,
+    parse_release_date,
+)
 
 # Higher value = preferred container/encoding when Archive.org stores derived variants for one stem.
 _FORMAT_PRIORITY: dict[str, int] = {
@@ -26,33 +31,9 @@ _FORMAT_PRIORITY: dict[str, int] = {
 }
 
 
-def _parse_ia_length_ms(raw: Any) -> int | None:
-    if raw is None or raw == "":
-        return None
-    if isinstance(raw, (int, float)):
-        return max(0, round(float(raw) * 1000))
-    text = str(raw).strip()
-    if re.fullmatch(r"\d+(?:\.\d+)?", text):
-        return max(0, round(float(text) * 1000))
-    parts = text.split(":")
-    if len(parts) in (2, 3) and all(re.fullmatch(r"\d+(?:\.\d+)?", p) for p in parts):
-        seconds = 0.0
-        for part in parts:
-            seconds = seconds * 60.0 + float(part)
-        return max(0, round(seconds * 1000))
-    return None
-
-
 def _natural_sort_key(text: str) -> tuple[Any, ...]:
     parts = re.split(r"(\d+)", text.lower())
     return tuple(int(p) if p.isdigit() else p for p in parts)
-
-
-def _strip_html(raw: str | None) -> str | None:
-    if not raw:
-        return None
-    cleaned = " ".join(re.sub(r"<[^>]+>", " ", str(raw)).split())
-    return cleaned or None
 
 
 class ArchiveOrgSource(Source):
@@ -243,7 +224,7 @@ class ArchiveOrgSource(Source):
         desc = md.get("description")
         if isinstance(desc, list):
             desc = "\n".join(str(d) for d in desc if d)
-        cleaned_desc = _strip_html(desc)
+        cleaned_desc = clean_html_description(desc)
         if cleaned_desc:
             meta.description = cleaned_desc
 
@@ -270,7 +251,7 @@ class ArchiveOrgSource(Source):
         files: list[AudiobookFile] = []
         chapters: list[Chapter] = []
         running_ms = 0
-        lengths: list[int | None] = [_parse_ia_length_ms(entry.get("length")) for entry in selected]
+        lengths: list[int | None] = [parse_duration_ms(entry.get("length")) for entry in selected]
         all_have_lengths = all(dur is not None and dur > 0 for dur in lengths)
 
         for entry, dur_ms in zip(selected, lengths, strict=True):

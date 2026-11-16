@@ -9,7 +9,7 @@ from audiobookdl.options_schema import (
     CONFIG_OPTION_SPECS,
     GUI_CONFIG_KEYS,
     KNOWN_TOP_LEVEL_CONFIG_KEYS,
-    OPTIONS_BY_NAME,
+    PERSISTED_GUI_OPTION_SPECS,
     SOURCE_CONFIG_KEYS,
     validate_config_value,
 )
@@ -1003,74 +1003,35 @@ def save_source_credentials(
 
 
 _UNSET: Any = object()
+_PERSISTED_GUI_SPEC_BY_NAME = {spec.name: spec for spec in PERSISTED_GUI_OPTION_SPECS}
 
 
 def save_output_preferences(
     output_format: Any = _UNSET,
     combine: Any = _UNSET,
     config_location: str | None = None,
-    *,
-    audio_bitrate: Any = _UNSET,
-    resume: Any = _UNSET,
-    media_type: Any = _UNSET,
-    skip_downloaded: Any = _UNSET,
-    write_json_metadata: Any = _UNSET,
-    enrich_metadata: Any = _UNSET,
-    enrich_providers: Any = _UNSET,
-    enrich_interactive: Any = _UNSET,
-    no_chapters: Any = _UNSET,
-    debug: Any = _UNSET,
-    split_chapters: Any = _UNSET,
-    write_opf: Any = _UNSET,
-    write_abs_metadata: Any = _UNSET,
-    write_cue: Any = _UNSET,
-    write_cover: Any = _UNSET,
-    remove_chars: Any = _UNSET,
-    cover: Any = _UNSET,
-    overwrite: Any = _UNSET,
-    max_workers: Any = _UNSET,
-    book_delay: Any = _UNSET,
-    limit_rate: Any = _UNSET,
-    proxy: Any = _UNSET,
-    timeout: Any = _UNSET,
-    impersonate: Any = _UNSET,
+    **preferences: Any,
 ) -> str:
     """Persist GUI output and toggle preferences in `audiobook-dl.toml`."""
+    updates: dict[str, Any] = {}
+    if output_format is not _UNSET:
+        updates["output_format"] = output_format
+    if combine is not _UNSET:
+        updates["combine"] = combine
+    for key, raw_value in preferences.items():
+        if key not in _PERSISTED_GUI_SPEC_BY_NAME:
+            raise TypeError(f"save_output_preferences() got an unexpected keyword argument {key!r}")
+        if key in updates:
+            raise TypeError(f"save_output_preferences() got multiple values for argument {key!r}")
+        updates[key] = raw_value
+
     resolved_location = config_location or get_config_location(None)
-    updates = {
-        "output_format": output_format,
-        "combine": combine,
-        "audio_bitrate": audio_bitrate,
-        "resume": resume,
-        "media_type": media_type,
-        "skip_downloaded": skip_downloaded,
-        "write_json_metadata": write_json_metadata,
-        "enrich_metadata": enrich_metadata,
-        "enrich_providers": enrich_providers,
-        "enrich_interactive": enrich_interactive,
-        "no_chapters": no_chapters,
-        "debug": debug,
-        "split_chapters": split_chapters,
-        "write_opf": write_opf,
-        "write_abs_metadata": write_abs_metadata,
-        "write_cue": write_cue,
-        "write_cover": write_cover,
-        "remove_chars": remove_chars,
-        "cover": cover,
-        "overwrite": overwrite,
-        "max_workers": max_workers,
-        "book_delay": book_delay,
-        "limit_rate": limit_rate,
-        "proxy": proxy,
-        "timeout": timeout,
-        "impersonate": impersonate,
-    }
     with file_lock(resolved_location):
         config_dict = read_config(resolved_location)
         for key, raw_value in updates.items():
             if raw_value is _UNSET:
                 continue
-            spec = OPTIONS_BY_NAME[key]
+            spec = _PERSISTED_GUI_SPEC_BY_NAME[key]
             if spec.toml_serializer is None:
                 continue
             should_set, serialized = spec.toml_serializer(raw_value)

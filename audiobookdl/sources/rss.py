@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from email.utils import parsedate_to_datetime
 import os
-import re
 from urllib.parse import urljoin, urlparse
 
 from lxml import etree
@@ -12,7 +11,7 @@ from lxml import etree
 from .source import Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover
 from audiobookdl.exceptions import BookNotFound
-from audiobookdl.utils.audiobook import parse_language
+from audiobookdl.utils.audiobook import clean_html_description, parse_duration_ms, parse_language
 
 _AUDIO_MIME_TO_EXT = {
     "audio/mpeg": "mp3",
@@ -31,31 +30,6 @@ _AUDIO_MIME_TO_EXT = {
     "audio/x-wav": "wav",
 }
 _AUDIO_EXTENSIONS = frozenset({"mp3", "m4a", "m4b", "ogg", "opus", "flac", "aac", "wav"})
-
-
-def _parse_duration_ms(raw: str | None) -> int | None:
-    """Parse `<itunes:duration>` (`HH:MM:SS`, `MM:SS`, or seconds) into milliseconds."""
-    if not raw:
-        return None
-    text = raw.strip()
-    if not text:
-        return None
-    if re.fullmatch(r"\d+(?:\.\d+)?", text):
-        return max(0, round(float(text) * 1000))
-    parts = text.split(":")
-    if len(parts) in (2, 3) and all(re.fullmatch(r"\d+(?:\.\d+)?", p) for p in parts):
-        seconds = 0.0
-        for part in parts:
-            seconds = seconds * 60.0 + float(part)
-        return max(0, round(seconds * 1000))
-    return None
-
-
-def _strip_html(raw: str | None) -> str | None:
-    if not raw:
-        return None
-    cleaned = " ".join(re.sub(r"<[^>]+>", " ", raw).split())
-    return cleaned or None
 
 
 def _local_tag(elem: etree._Element) -> str:
@@ -161,7 +135,7 @@ class RssSource(Source):
 
             ext = _guess_extension(abs_url, enclosure_type)
             ep_title = _find_child_text(item, ("title",)) or f"Episode {idx}"
-            duration_ms = _parse_duration_ms(_find_child_text(item, ("duration",)))
+            duration_ms = parse_duration_ms(_find_child_text(item, ("duration",)))
             raw_ep = _find_child_text(item, ("episode",))
             ep_num = int(raw_ep) if (raw_ep and raw_ep.isdigit()) else None
             pub_raw = _find_child_text(item, ("pubdate", "published", "updated"))
@@ -211,7 +185,7 @@ class RssSource(Source):
         author = _find_child_text(container, ("author", "creator", "managingeditor"))
         if author:
             meta.add_author(author)
-        desc = _strip_html(_find_child_text(container, ("summary", "description", "subtitle")))
+        desc = clean_html_description(_find_child_text(container, ("summary", "description", "subtitle")))
         if desc:
             meta.description = desc
         lang = _find_child_text(container, ("language",))

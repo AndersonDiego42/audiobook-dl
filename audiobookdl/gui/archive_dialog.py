@@ -52,8 +52,10 @@ class ArchiveLedgerDialog(tk.Toplevel):
 
         self.title("Library & Download Ledger")
         self.transient(parent)  # type: ignore[arg-type]
+        self.grab_set()
         self.geometry(f"{scale_px(self, 960)}x{scale_px(self, 480)}")
         self.minsize(scale_px(self, 680), scale_px(self, 340))
+        self.bind("<Escape>", lambda _e: self.destroy())
 
         body = ttk.Frame(self, padding=scale_px(self, 12))
         body.pack(fill=tk.BOTH, expand=True)

@@ -1,4 +1,6 @@
 from datetime import date, datetime
+from html import unescape
+import math
 import re
 import requests
 from typing import Generic, Optional, TypeVar, Any
@@ -165,6 +167,77 @@ def parse_release_date(raw: Any) -> date | None:
         return _dateutil_parse(cleaned, default=datetime(1900, 1, 1)).date()
     except (ValueError, OverflowError, TypeError):
         return None
+
+
+_DURATION_ISO_RE = re.compile(
+    r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?",
+    re.IGNORECASE,
+)
+_HTML_BREAK_NEWLINE_RE = re.compile(r"<(?:br\s*/?|/p|/div|/li)\s*>", re.IGNORECASE)
+_HTML_BLOCK_SPACE_RE = re.compile(r"</?(?:p|div|br|li|ul|ol|h[1-6])\b[^>]*>", re.IGNORECASE)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def parse_duration_ms(raw: Any) -> int | None:
+    """Parse ISO-8601 (`PT12M34S`), numeric seconds, or `HH:MM:SS` / `MM:SS` into milliseconds."""
+    if raw is None or isinstance(raw, bool) or raw == "":
+        return None
+    if isinstance(raw, (int, float)):
+        val = float(raw)
+        return max(0, round(val * 1000)) if math.isfinite(val) else None
+    text = str(raw).strip()
+    if not text:
+        return None
+    iso_match = _DURATION_ISO_RE.fullmatch(text)
+    if iso_match and any(iso_match.groups()):
+        hours = float(iso_match.group(1) or 0)
+        minutes = float(iso_match.group(2) or 0)
+        seconds = float(iso_match.group(3) or 0)
+        return max(0, round((hours * 3600.0 + minutes * 60.0 + seconds) * 1000))
+    if re.fullmatch(r"\d+(?:\.\d+)?", text):
+        return max(0, round(float(text) * 1000))
+    parts = text.split(":")
+    if len(parts) in (2, 3) and all(re.fullmatch(r"\d+(?:\.\d+)?", p) for p in parts):
+        seconds = 0.0
+        for part in parts:
+            seconds = seconds * 60.0 + float(part)
+        return max(0, round(seconds * 1000))
+    return None
+
+
+def clean_html_description(raw: Any, *, preserve_newlines: bool = False) -> str | None:
+    """Strip HTML tags, unescape entities, and normalize whitespace in text/descriptions."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    if preserve_newlines:
+        text = _HTML_BREAK_NEWLINE_RE.sub("\n", raw)
+        text = _HTML_TAG_RE.sub("", text)
+        text = unescape(text)
+        lines = [line.strip() for line in text.splitlines()]
+        cleaned = "\n".join(line for line in lines if line)
+        return cleaned.strip() or None
+    text = _HTML_BLOCK_SPACE_RE.sub(" ", raw)
+    text = _HTML_TAG_RE.sub("", text)
+    cleaned = " ".join(unescape(text).split())
+    return cleaned or None
+
+
+def parse_series_order(raw: Any) -> int | None:
+    """Parse an integer series index from an `int`, integer-valued `float`, or numeric string."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, float):
+        return int(raw) if math.isfinite(raw) and raw.is_integer() else None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        num = float(text)
+    except ValueError:
+        return None
+    return int(num) if math.isfinite(num) and num.is_integer() else None
 
 
 @define

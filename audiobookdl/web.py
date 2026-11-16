@@ -18,9 +18,9 @@ from audiobookdl import __version__, args
 from audiobookdl.config import DEFAULT_PROFILE
 from audiobookdl.gui.controller import GuiController
 from audiobookdl.pipeline import list_service_library, search_service
-from audiobookdl.sources import detect_service_key, get_available_services
+from audiobookdl.sources import get_available_services, resolve_service_label
 from audiobookdl.sync import run_sync_once
-from audiobookdl.utils.archive import DownloadArchive, default_archive_path
+from audiobookdl.utils.archive import DownloadArchive, resolve_archive_path
 
 MAX_REQUEST_BODY_BYTES = 1_048_576
 MAX_WEB_LOG_LINES = 400
@@ -124,11 +124,7 @@ class WebDashboardState:
             self._pump_thread.join(timeout=2.0)
 
     def archive_path(self) -> str:
-        cfg = self.controller.config_snapshot()
-        if cfg.download_archive:
-            return cfg.download_archive
-        db_dir = cfg.database_directory or args.default_database_directory()
-        return default_archive_path(db_dir)
+        return resolve_archive_path(self.controller.config_snapshot())
 
     def build_download_options(
         self,
@@ -168,10 +164,7 @@ class WebDashboardState:
         )
 
     def service_label_for_url(self, url: str) -> str:
-        key = detect_service_key(url)
-        if key and key in self._services_by_key:
-            return self._services_by_key[key].label
-        return key or "Unknown"
+        return resolve_service_label(url, self._services_by_key)
 
     def queue_urls(self, urls: Sequence[str], payload: dict[str, Any]) -> tuple[int, int]:
         unique_urls = [u.strip() for u in urls if isinstance(u, str) and u.strip()]

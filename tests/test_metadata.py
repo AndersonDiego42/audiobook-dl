@@ -891,3 +891,38 @@ def test_add_id3_metadata_writes_tags_chapters_and_cover_in_single_save(tmp_path
     assert tags.getall("CHAP")
     assert tags.getall("CTOC")
 
+
+def test_shared_audiobook_parsers_duration_html_and_series_order():
+    from audiobookdl.utils.audiobook import (
+        clean_html_description,
+        parse_duration_ms,
+        parse_series_order,
+    )
+
+    assert parse_duration_ms(None) is None
+    assert parse_duration_ms(True) is None
+    assert parse_duration_ms("") is None
+    assert parse_duration_ms(12.5) == 12500
+    assert parse_duration_ms("45") == 45000
+    assert parse_duration_ms("02:30") == 150000
+    assert parse_duration_ms("01:02:03.5") == 3723500
+    assert parse_duration_ms("PT1H2M3.5S") == 3723500
+    assert parse_duration_ms("PT") is None
+
+    assert clean_html_description(None) is None
+    assert clean_html_description("  ") is None
+    assert clean_html_description("<p>Hello <b>world</b> &amp; friends</p><p>Next</p>") == "Hello world & friends Next"
+    assert (
+        clean_html_description("<p>Line 1<br/>Line 2</p><p>Line 3</p>", preserve_newlines=True)
+        == "Line 1\nLine 2\nLine 3"
+    )
+
+    assert parse_series_order(None) is None
+    assert parse_series_order(True) is None
+    assert parse_series_order(0) == 0
+    assert parse_series_order(2.0) == 2
+    assert parse_series_order(1.5) is None
+    assert parse_series_order(" 3.0 ") == 3
+    assert parse_series_order("bad") is None
+
+

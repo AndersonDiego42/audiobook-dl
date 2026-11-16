@@ -61,3 +61,13 @@ def test_ereolen_refreshes_library_domains_once_on_unknown_dk_url(monkeypatch):
         sources_mod._EREOLEN_REFRESHED = orig_refreshed
         EreolenSource.library_domains = orig_domains
         EreolenSource.match = orig_match
+
+
+def test_resolve_service_label_uses_registry_and_fallbacks():
+    from audiobookdl.sources import get_available_services, resolve_service_label
+
+    by_key = {svc.key: svc for svc in get_available_services()}
+    assert resolve_service_label("https://www.storytel.com/en/books/1", by_key) == by_key["storytel"].label
+    assert resolve_service_label("https://librivox.org/book") == "librivox"
+    assert resolve_service_label("https://unknown.example.invalid/book", by_key) == "Unknown"
+

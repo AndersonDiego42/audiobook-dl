@@ -1,7 +1,12 @@
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, logging
 from audiobookdl.exceptions import BookNotFound, NoSourceFound
-from audiobookdl.utils.audiobook import AESEncryption, parse_language, parse_release_date
+from audiobookdl.utils.audiobook import (
+    AESEncryption,
+    clean_html_description,
+    parse_language,
+    parse_release_date,
+)
 
 import os
 import re
@@ -154,8 +159,9 @@ class SaxoSource(Source):
             result.isbn = str(resolved_isbn).strip()
 
         raw_desc = metadata.get("description") or metadata.get("summary")
-        if isinstance(raw_desc, str) and raw_desc.strip():
-            result.description = " ".join(re.sub(r"<[^>]+>", " ", raw_desc).split()) or None
+        cleaned_desc = clean_html_description(raw_desc)
+        if cleaned_desc:
+            result.description = cleaned_desc
 
         publisher = metadata.get("publisherName") or metadata.get("publisher")
         if isinstance(publisher, dict):

@@ -13,7 +13,7 @@ from audiobookdl.pipeline import (
     verify_service_auth,
 )
 from audiobookdl.sources import get_available_services
-from audiobookdl.utils.archive import DownloadArchive, default_archive_path
+from audiobookdl.utils.archive import DownloadArchive, resolve_archive_path
 from audiobookdl.utils.updater import check_for_updates
 
 
@@ -42,9 +42,7 @@ def _build_pack_overrides(pack_opts: args.PackOptions) -> PackOverrides | None:
 
 
 def _resolve_archive_path(config_location: str | None, archive_path: str | None) -> str:
-    cfg = load_config(config_location)
-    db_dir = cfg.database_directory or args.default_database_directory()
-    return archive_path or cfg.download_archive or default_archive_path(db_dir)
+    return resolve_archive_path(load_config(config_location), archive_path)
 
 
 def _run_library_command(lib_opts: args.LibraryOptions) -> int:

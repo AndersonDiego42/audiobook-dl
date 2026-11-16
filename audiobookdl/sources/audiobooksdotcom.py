@@ -11,6 +11,7 @@ from audiobookdl import (
     logging,
 )
 from audiobookdl.exceptions import DataNotPresent, GenericAudiobookDLException, NoSourceFound
+from audiobookdl.utils.audiobook import parse_duration_ms
 from audiobookdl.utils.http import DEFAULT_USER_AGENT, extract_session_cookies
 from rich.markup import escape
 
@@ -22,27 +23,6 @@ from urllib.parse import unquote, urljoin
 from urllib3.util import parse_url
 
 BASEURL = "https://www.audiobooks.com/book/stream/"
-
-
-def _parse_timestamp_ms(raw: Any) -> int | None:
-    """Parse numeric seconds or `HH:MM:SS` / `MM:SS` strings into milliseconds."""
-    if raw is None or raw == "":
-        return None
-    if isinstance(raw, (int, float)):
-        val = float(raw)
-        return max(0, round(val * 1000))
-    text = str(raw).strip()
-    if not text:
-        return None
-    if re.fullmatch(r"\d+(?:\.\d+)?", text):
-        return max(0, round(float(text) * 1000))
-    parts = text.split(":")
-    if len(parts) in (2, 3) and all(re.fullmatch(r"\d+(?:\.\d+)?", p) for p in parts):
-        seconds = 0.0
-        for part in parts:
-            seconds = seconds * 60.0 + float(part)
-        return max(0, round(seconds * 1000))
-    return None
 
 
 def _split_series_order(raw_series: str) -> tuple[str, int | None]:
@@ -295,7 +275,7 @@ class AudiobooksdotcomSource(Source):
                 for idx, entry in enumerate(parsed, start=1):
                     if not isinstance(entry, dict):
                         continue
-                    start_ms = _parse_timestamp_ms(
+                    start_ms = parse_duration_ms(
                         entry.get("start")
                         if entry.get("start") is not None
                         else entry.get("start_time", entry.get("offset"))
@@ -313,7 +293,7 @@ class AudiobooksdotcomSource(Source):
             start=1,
         ):
             start_raw = elem.get("data-start") or elem.get("data-time") or elem.get("value")
-            start_ms = _parse_timestamp_ms(start_raw)
+            start_ms = parse_duration_ms(start_raw)
             if start_ms is None:
                 continue
             ch_title = " ".join(elem.text_content().split()) or f"Chapter {idx}"

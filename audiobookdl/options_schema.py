@@ -343,6 +343,33 @@ def _gui_init_max_workers(cfg_val: Any) -> str:
     return "" if cfg_val is None else str(cfg_val)
 
 
+def _gui_init_int_str(cfg_val: Any) -> str:
+    return "0" if cfg_val is None else str(int(cfg_val))
+
+
+def _gui_read_int(raw: Any) -> int:
+    cleaned = str(raw).strip()
+    if not cleaned:
+        return 0
+    try:
+        return int(cleaned)
+    except ValueError as exc:
+        raise ValueError(f"Expected whole number, got '{cleaned}'") from exc
+
+
+def _gui_read_optional_positive_int(raw: Any) -> int | None:
+    cleaned = str(raw).strip()
+    if not cleaned:
+        return None
+    try:
+        parsed = int(cleaned)
+    except ValueError as exc:
+        raise ValueError(f"Expected positive integer, got '{cleaned}'") from exc
+    if parsed < 1:
+        raise ValueError("Expected integer >= 1")
+    return parsed
+
+
 def _gui_read_max_workers(raw: Any) -> int | None:
     cleaned = str(raw).strip()
     if not cleaned or cleaned.lower() in ("auto", "default"):
@@ -879,6 +906,11 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
                 help="Upload completed audiobooks to the configured Audiobookshelf server",
             ),
         ),
+        gui=GuiBinding(
+            var_attr="upload_to_abs_var",
+            var_type="bool",
+            gui_default=False,
+        ),
     ),
     OptionSpec(
         name="write_cue",
@@ -1113,6 +1145,14 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         merge_from_config=True,
         merge_only_if_default=True,
         merge_require_truthy=True,
+        gui=GuiBinding(
+            var_attr="post_exec_var",
+            var_type="str",
+            gui_default="",
+            from_config=_gui_init_optional_str,
+            to_option=_gui_read_optional_str,
+            persisted_in_output_prefs=True,
+        ),
     ),
     OptionSpec(
         name="loudnorm",
@@ -1129,6 +1169,12 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_bool,
         merge_from_config=True,
         merge_only_if_default=True,
+        gui=GuiBinding(
+            var_attr="loudnorm_var",
+            var_type="bool",
+            gui_default=False,
+            persisted_in_output_prefs=True,
+        ),
     ),
     OptionSpec(
         name="mono",
@@ -1145,6 +1191,12 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_bool,
         merge_from_config=True,
         merge_only_if_default=True,
+        gui=GuiBinding(
+            var_attr="mono_var",
+            var_type="bool",
+            gui_default=False,
+            persisted_in_output_prefs=True,
+        ),
     ),
     OptionSpec(
         name="chapters_from_silence",
@@ -1156,6 +1208,11 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
                 help="Detect long pauses via FFmpeg silencedetect when no chapter markers exist",
             ),
         ),
+        gui=GuiBinding(
+            var_attr="chapters_from_silence_var",
+            var_type="bool",
+            gui_default=False,
+        ),
     ),
     OptionSpec(
         name="chapter_offset_ms",
@@ -1166,6 +1223,13 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
                 arg_type=int,
                 help="Shift non-initial chapter timestamps by N milliseconds",
             ),
+        ),
+        gui=GuiBinding(
+            var_attr="chapter_offset_ms_var",
+            var_type="str",
+            gui_default="0",
+            from_config=_gui_init_int_str,
+            to_option=_gui_read_int,
         ),
     ),
     OptionSpec(
@@ -1183,6 +1247,12 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_bool,
         merge_from_config=True,
         merge_only_if_default=True,
+        gui=GuiBinding(
+            var_attr="square_cover_var",
+            var_type="bool",
+            gui_default=False,
+            persisted_in_output_prefs=True,
+        ),
     ),
     OptionSpec(
         name="max_cover_size",
@@ -1199,6 +1269,14 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_positive_int,
         merge_from_config=True,
         merge_only_if_default=True,
+        gui=GuiBinding(
+            var_attr="max_cover_size_var",
+            var_type="str",
+            gui_default="",
+            from_config=_gui_init_optional_str,
+            to_option=_gui_read_optional_positive_int,
+            persisted_in_output_prefs=True,
+        ),
     ),
     OptionSpec(
         name="proxy",

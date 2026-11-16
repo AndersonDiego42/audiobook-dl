@@ -54,6 +54,7 @@ class PackDialog(tk.Toplevel):
 
         self.title("Pack Local Audiobooks")
         self.transient(parent)  # type: ignore[arg-type]
+        self.grab_set()
         self.geometry(f"{scale_px(self, 820)}x{scale_px(self, 620)}")
         self.minsize(scale_px(self, 640), scale_px(self, 480))
 

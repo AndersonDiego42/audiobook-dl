@@ -16,7 +16,7 @@ from audiobookdl.config import (
 from audiobookdl.gui.controller import GuiController
 from audiobookdl.gui.cookie_dialog import CookieImportDialog
 from audiobookdl.gui.theme import ThemePalette
-from audiobookdl.sources import ServiceInfo, detect_service_key
+from audiobookdl.sources import ServiceInfo, detect_service_key, resolve_service_label
 
 
 class ServiceAuthPanel(ttk.LabelFrame):
@@ -187,10 +187,7 @@ class ServiceAuthPanel(ttk.LabelFrame):
         return self._services_by_label.get(self.service_label_var.get())
 
     def service_label_for_url(self, url: str) -> str:
-        detected = detect_service_key(url)
-        if detected and detected in self._services_by_key:
-            return self._services_by_key[detected].label
-        return detected or "Unknown"
+        return resolve_service_label(url, self._services_by_key)
 
     def on_service_selected(self, _event: tk.Event | None = None) -> None:
         self.profile_var.set(DEFAULT_PROFILE)

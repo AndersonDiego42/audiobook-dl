@@ -660,7 +660,9 @@ def pack_book(
     )
     if may_silence_chapters and len(spec.track_paths) == 1:
         detected = output.detect_silence_chapters(
-            spec.track_paths[0], cancel_event=cancel_event
+            spec.track_paths[0],
+            cancel_event=cancel_event,
+            probe_cache=cache,
         )
         if detected:
             if chapter_offset_ms != 0:
@@ -710,6 +712,7 @@ def pack_book(
             )
 
         os.replace(staged_path, output_path)
+        output.move_cached_probe(cache, staged_path, output_path)
         output_download.add_metadata_to_file(
             spec.audiobook,
             output_path,

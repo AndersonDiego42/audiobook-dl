@@ -118,6 +118,7 @@ class CookieImportDialog(tk.Toplevel):
 
         self.title("Import Browser Cookies")
         self.transient(parent)  # type: ignore[arg-type]
+        self.grab_set()
         self.minsize(scale_px(self, 620), scale_px(self, 440))
         self.bind("<Escape>", lambda _e: self.destroy())
 

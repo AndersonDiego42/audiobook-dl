@@ -1370,5 +1370,46 @@ def test_run_cancellable_pool_bounds_in_flight_futures():
     assert 1 <= peak_active <= 3
 
 
+def test_convert_output_reuses_and_updates_probe_cache_without_stale_staged_keys(tmp_path, monkeypatch):
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    src0 = tmp_path / "01.mp3"
+    src1 = tmp_path / "02.mp3"
+    src0.write_bytes(b"mp3-0")
+    src1.write_bytes(b"mp3-1")
+    out0 = tmp_path / "01.m4b"
+    out1 = tmp_path / "02.m4b"
+
+    probed: list[str] = []
+
+    def fake_probe(path: str) -> AudioProbeInfo:
+        probed.append(path)
+        return AudioProbeInfo(duration=15.0, bitrate=128000, codec_name="aac", format_name="mov,mp4,m4a")
+
+    def fake_run(cmd, **_kwargs):
+        Path(cmd[-1]).write_bytes(b"m4b")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(output, "_require_executable", lambda _n: "ffmpeg")
+    monkeypatch.setattr(output, "find_executable", lambda _n: "ffprobe")
+    monkeypatch.setattr(output, "_probe_audio_info", fake_probe)
+    monkeypatch.setattr(output, "run_cancellable_subprocess", fake_run)
+
+    cache: dict[str, AudioProbeInfo] = {
+        str(src0): AudioProbeInfo(duration=15.0, bitrate=128000, codec_name="mp3", format_name="mp3"),
+        str(src1): AudioProbeInfo(duration=15.0, bitrate=128000, codec_name="mp3", format_name="mp3"),
+    }
+    converted = convert_output([str(src0), str(src1)], "m4b", probe_cache=cache)
+
+    assert converted == [str(out0), str(out1)]
+    # Sources hit cache (0 probes); only the 2 staged output files are verified via ffprobe.
+    assert str(src0) not in probed and str(src1) not in probed
+    assert len(probed) == 2
+    assert str(out0) in cache and str(out1) in cache
+    assert not any(".tmp." in k for k in cache)
+
+
+
 
 

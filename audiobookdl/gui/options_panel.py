@@ -172,7 +172,22 @@ class OptionsPanel(ttk.LabelFrame):
             text="Split chapters",
             variable=self._vars.split_chapters_var,
         )
-        cb_split_chapters.grid(row=0, column=1, columnspan=2, sticky="w")
+        cb_split_chapters.grid(row=0, column=1, sticky="w", padx=(0, 14))
+
+        cb_silence_chapters = ttk.Checkbutton(
+            sidecars_tab,
+            text="Silence chapters",
+            variable=self._vars.chapters_from_silence_var,
+        )
+        cb_silence_chapters.grid(row=0, column=2, sticky="w", padx=(0, 14))
+
+        offset_box = ttk.Frame(sidecars_tab)
+        offset_box.grid(row=0, column=3, sticky="w")
+        ttk.Label(offset_box, text="Offset (ms):").pack(side=tk.LEFT, padx=(0, 4))
+        chapter_offset_entry = ttk.Entry(
+            offset_box, textvariable=self._vars.chapter_offset_ms_var, width=7
+        )
+        chapter_offset_entry.pack(side=tk.LEFT)
 
         cb_json = ttk.Checkbutton(
             sidecars_tab, text="Write JSON metadata", variable=self._vars.write_json_var
@@ -193,10 +208,37 @@ class OptionsPanel(ttk.LabelFrame):
         cb_abs_meta = ttk.Checkbutton(
             sidecars_tab, text="Write ABS metadata.json", variable=self._vars.write_abs_metadata_var
         )
-        cb_abs_meta.grid(row=2, column=0, columnspan=2, sticky="w", padx=(0, 14), pady=(4, 0))
+        cb_abs_meta.grid(row=2, column=0, sticky="w", padx=(0, 14), pady=(4, 0))
+
+        cb_upload_abs = ttk.Checkbutton(
+            sidecars_tab, text="Upload to ABS", variable=self._vars.upload_to_abs_var
+        )
+        cb_upload_abs.grid(row=2, column=1, sticky="w", padx=(0, 14), pady=(4, 0))
+
+        cb_square_cover = ttk.Checkbutton(
+            sidecars_tab, text="Square cover", variable=self._vars.square_cover_var
+        )
+        cb_square_cover.grid(row=2, column=2, sticky="w", padx=(0, 14), pady=(4, 0))
+
+        max_cover_box = ttk.Frame(sidecars_tab)
+        max_cover_box.grid(row=2, column=3, sticky="w", pady=(4, 0))
+        ttk.Label(max_cover_box, text="Max cover:").pack(side=tk.LEFT, padx=(0, 4))
+        max_cover_entry = ttk.Entry(
+            max_cover_box, textvariable=self._vars.max_cover_size_var, width=6
+        )
+        max_cover_entry.pack(side=tk.LEFT)
+
+        audio_row = ttk.Frame(sidecars_tab)
+        audio_row.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(4, 0))
+        cb_loudnorm = ttk.Checkbutton(
+            audio_row, text="Loudnorm", variable=self._vars.loudnorm_var
+        )
+        cb_loudnorm.pack(side=tk.LEFT, padx=(0, 14))
+        cb_mono = ttk.Checkbutton(audio_row, text="Mono audio", variable=self._vars.mono_var)
+        cb_mono.pack(side=tk.LEFT, padx=(0, 14))
 
         remove_row = ttk.Frame(sidecars_tab)
-        remove_row.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        remove_row.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(6, 0))
         ttk.Label(remove_row, text="Remove chars:").pack(side=tk.LEFT, padx=(0, 6))
         remove_chars_entry = ttk.Entry(remove_row, textvariable=self._vars.remove_chars_var, width=18)
         remove_chars_entry.pack(side=tk.LEFT, padx=(0, 8))
@@ -266,11 +308,17 @@ class OptionsPanel(ttk.LabelFrame):
         proxy_entry = ttk.Entry(network_tab, textvariable=self._vars.proxy_var)
         proxy_entry.grid(row=1, column=5, sticky="ew", pady=(6, 0))
 
+        ttk.Label(network_tab, text="Post-exec:").grid(
+            row=2, column=0, sticky="w", padx=(0, 4), pady=(6, 0)
+        )
+        post_exec_entry = ttk.Entry(network_tab, textvariable=self._vars.post_exec_var)
+        post_exec_entry.grid(row=2, column=1, columnspan=5, sticky="ew", pady=(6, 0))
+
         ttk.Label(
             network_tab,
             text="Defaults: 6 workers, unlimited bandwidth (e.g. 2M), TLS impersonate via curl_cffi (e.g. chrome)",
             style="Muted.TLabel",
-        ).grid(row=2, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        ).grid(row=3, column=0, columnspan=6, sticky="w", pady=(4, 0))
 
         self._widgets = [
             cb_m4b,
@@ -285,11 +333,18 @@ class OptionsPanel(ttk.LabelFrame):
             cb_cover_only,
             cb_no_chapters,
             cb_split_chapters,
+            cb_silence_chapters,
+            chapter_offset_entry,
             cb_json,
             cb_opf,
             cb_cue,
             cb_write_cover,
             cb_abs_meta,
+            cb_upload_abs,
+            cb_square_cover,
+            max_cover_entry,
+            cb_loudnorm,
+            cb_mono,
             remove_chars_entry,
             max_workers_spin,
             book_delay_spin,
@@ -297,6 +352,7 @@ class OptionsPanel(ttk.LabelFrame):
             limit_rate_entry,
             self._impersonate_combo,
             proxy_entry,
+            post_exec_entry,
             cb_enrich,
             cb_enrich_interactive,
             enrich_providers_entry,

@@ -6,6 +6,7 @@ import re
 import shlex
 import sqlite3
 import threading
+from typing import Any
 from collections.abc import Iterable, Iterator, Sequence
 
 from audiobookdl.sources.source import CatalogBook
@@ -123,6 +124,19 @@ def parse_library_query(query: str) -> list[SearchTerm]:
 def default_archive_path(database_directory: str) -> str:
     """Return the default SQLite download ledger path inside `database_directory`."""
     return os.path.join(database_directory, "downloads.db")
+
+
+def resolve_archive_path(config: Any, explicit_path: str | None = None) -> str:
+    """Resolve the SQLite ledger path from an explicit override, `config`, or default db dir."""
+    if explicit_path:
+        return explicit_path
+    configured = getattr(config, "download_archive", None)
+    if configured:
+        return str(configured)
+    from audiobookdl.options_schema import default_database_directory
+
+    db_dir = getattr(config, "database_directory", None) or default_database_directory()
+    return default_archive_path(db_dir)
 
 
 class ArchiveMatchIndex:

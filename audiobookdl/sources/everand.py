@@ -1,7 +1,11 @@
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, BookId, Chapter, Cover, Result, Series, logging
 from audiobookdl.exceptions import BookNotFound, RequestError
-from audiobookdl.utils.audiobook import parse_language, parse_release_date
+from audiobookdl.utils.audiobook import (
+    clean_html_description,
+    parse_language,
+    parse_release_date,
+)
 
 import json
 import lxml.html
@@ -224,15 +228,11 @@ class EverandSource(Source[str]):
         else:
             publisher = (str(book_info.get("publisher_name") or "").strip() or None)
 
-        description = (
+        description = clean_html_description(
             book_info.get("description")
             or book_info.get("short_description")
             or book_info.get("blurb")
         )
-        if isinstance(description, str):
-            description = " ".join(re.sub(r"<[^>]+>", " ", description).split()) or None
-        else:
-            description = None
 
         isbn = str(book_info.get("isbn") or "").strip() or None
         language = parse_language(book_info.get("language") or book_info.get("lang"))

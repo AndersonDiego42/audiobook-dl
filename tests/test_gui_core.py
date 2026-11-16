@@ -2754,9 +2754,240 @@ def test_gui_debounces_save_queue_state_and_hoists_series_build_options(tmp_path
         finally:
             if dlg.winfo_exists():
                 dlg.destroy()
+
+        # Series preview caches os.listdir stems per directory across books
+        listdir_calls: list[str] = []
+        orig_listdir = os.listdir
+
+        def spy_listdir(path="."):
+            listdir_calls.append(str(path))
+            return orig_listdir(path)
+
+        monkeypatch.setattr(os, "listdir", spy_listdir)
+        app.output_dir_var.set(str(tmp_path))
+        app.template_var.set("{title}")
+        dlg2 = app._show_preview_dialog("https://example.com/series", SimpleNamespace(name="Fake"), series)  # type: ignore[arg-type]
+        try:
+            assert len(listdir_calls) == 1
+        finally:
+            if dlg2.winfo_exists():
+                dlg2.destroy()
+
+        # Coalescing save_queue_state inside drain_events prevents N writes on N job_status updates
+        save_calls.clear()
+        for i in range(5):
+            job_id = app.controller.pending_jobs[i].job_id  # type: ignore[union-attr]
+            app.controller.event_queue.put(("job_status", job_id, "Cancelled", "Cancelled"))
+        app.controller.drain_events(app._handle_event)
+        assert len(save_calls) == 1
     finally:
         app.controller.shutdown(is_running=False, is_previewing=False)
         root.destroy()
+
+
+def test_gui_set_theme_reuses_cached_ffmpeg_validation(tmp_path, monkeypatch):
+    from audiobookdl.utils import clear_executable_validation_cache
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+
+    clear_executable_validation_cache()
+    bin_dir = tmp_path / "ffmpeg_bin"
+    bin_dir.mkdir()
+    exe_suffix = ".exe" if os.name == "nt" else ""
+    ff_path = bin_dir / f"ffmpeg{exe_suffix}"
+    fp_path = bin_dir / f"ffprobe{exe_suffix}"
+    ff_path.write_text("stub", encoding="utf-8")
+    fp_path.write_text("stub", encoding="utf-8")
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    cfg_path.write_text(
+        f'ffmpeg_dir = "{str(bin_dir).replace(os.sep, "/")}"\n',
+        encoding="utf-8",
+    )
+
+    spawn_calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        spawn_calls.append(list(cmd))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("audiobookdl.utils.shutil.which", lambda _name: None)
+    monkeypatch.setattr("audiobookdl.utils.subprocess.run", fake_run)
+
+    try:
+        app = AudiobookDLApp(root, config_location=str(cfg_path))
+        assert app.ffmpeg_status_var.get() == "FFmpeg: Ready"
+        assert len(spawn_calls) == 2  # initial ffmpeg + ffprobe probe
+
+        app.set_theme("dark")
+        app.set_theme("light")
+        assert len(spawn_calls) == 2  # cached by (abspath, mtime_ns, size)
+    finally:
+        clear_executable_validation_cache()
+        app.controller.shutdown(is_running=False, is_previewing=False)
+        root.destroy()
+
+
+def test_gui_options_panel_exposes_new_pipeline_options_and_roundtrips(tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+        app.loudnorm_var.set(True)
+        app.mono_var.set(True)
+        app.chapters_from_silence_var.set(True)
+        app.chapter_offset_ms_var.set("-250")
+        app.square_cover_var.set(True)
+        app.max_cover_size_var.set("1200")
+        app.post_exec_var.set("echo done")
+        app.upload_to_abs_var.set(True)
+
+        opts = app.build_options(urls_override=["https://librivox.org/book-1"])
+        assert opts.loudnorm is True
+        assert opts.mono is True
+        assert opts.chapters_from_silence is True
+        assert opts.chapter_offset_ms == -250
+        assert opts.square_cover is True
+        assert opts.max_cover_size == 1200
+        assert opts.post_exec == "echo done"
+        assert opts.upload_to_abs is True
+    finally:
+        app.controller.shutdown(is_running=False, is_previewing=False)
+        root.destroy()
+
+
+def test_gui_dark_mode_listbox_accent_button_fonts_modality_and_scrollable_frame(tmp_path, monkeypatch):
+    from audiobookdl.gui.theme import DARK_PALETTE, LIGHT_PALETTE
+    from audiobookdl.sources.source import CatalogBook
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        pre_bound: list[int] = []
+        root.bind("<MouseWheel>", lambda _e: pre_bound.append(1))
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+
+        # ScrollableFrame preserves existing bindings via add="+" and ignores child Toplevel wheel events
+        root.event_generate("<MouseWheel>", delta=-120)
+        assert len(pre_bound) == 1
+
+        app.set_theme("dark")
+        assert app._style.lookup("Accent.TButton", "background") == DARK_PALETTE.accent
+        app.set_theme("light")
+        assert app._style.lookup("Accent.TButton", "background") == LIGHT_PALETTE.accent
+
+        # PackDialog is single-instance, has grab_set / Escape, and styles tk.Listbox in dark mode
+        app.set_theme("dark")
+        monkeypatch.setattr(app._ffmpeg_assistant, "ensure_available", lambda _opts: True)
+        dlg1 = app._show_pack_dialog()
+        dlg2 = app._show_pack_dialog()
+        assert dlg1 is not None and dlg1 is dlg2
+        assert dlg1.grab_current() is dlg1
+        assert dlg1._paths_listbox.cget("background") == DARK_PALETTE.surface
+        assert dlg1._paths_listbox.cget("foreground") == DARK_PALETTE.fg
+        # Wheel event originating from child Toplevel does not scroll main canvas
+        app._scroll_frame.on_mousewheel(SimpleNamespace(widget=dlg1._paths_listbox, delta=-120))
+        dlg1.destroy()
+
+        # Archive, ABS, and Catalog dialogs guard against duplicate instances and support empty selection
+        arch1 = app._show_archive_ledger_dialog()
+        arch2 = app._show_archive_ledger_dialog()
+        assert arch1 is arch2
+        assert arch1.grab_current() is arch1
+        arch1.destroy()
+
+        abs1 = app._show_audiobookshelf_dialog()
+        abs2 = app._show_audiobookshelf_dialog()
+        assert abs1 is abs2
+        assert abs1.grab_current() is abs1
+        abs1.destroy()
+
+        cat1 = app._show_catalog_browser_dialog()
+        cat2 = app._show_catalog_browser_dialog()
+        assert cat1 is cat2
+        assert cat1.grab_current() is cat1
+        cat1.populate_items(
+            [
+                CatalogBook(title="One", url="https://librivox.org/1", author="A", source="librivox"),
+            ]
+        )
+        cat1._tree.selection_set(())
+        cat1.add_selected()
+        assert "https://librivox.org/1" not in app.urls_text.get("1.0", tk.END)
+        assert "Select one or more" in cat1._status_var.get()
+        cat1.destroy()
+    finally:
+        app.controller.shutdown(is_running=False, is_previewing=False)
+        root.destroy()
+
+
+def test_gui_sync_libraries_and_windows_toast_powershell_preference(tmp_path, monkeypatch):
+    from audiobookdl.gui import notifications
+    from audiobookdl.sync import SyncCycleResult
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+        started: list[Any] = []
+        shown: list[str] = []
+        monkeypatch.setattr(app.controller, "start_library_sync", lambda opts: started.append(opts))
+        monkeypatch.setattr("audiobookdl.gui.app.messagebox.showinfo", lambda t, _m, parent=None: shown.append(t))
+
+        app._sync_libraries(services=["librivox"])
+        assert len(started) == 1
+        assert started[0].services == ["librivox"]
+        assert app._is_syncing is True
+
+        app._handle_event(("sync_done", SyncCycleResult(books_discovered=3, newly_added=1, downloaded=1), None))
+        assert app._is_syncing is False
+        assert "Sync complete" in app.status_var.get()
+        assert shown == ["Library Sync Complete"]
+    finally:
+        app.controller.shutdown(is_running=False, is_previewing=False)
+        root.destroy()
+
+    # Windows toast prefers powershell.exe (WinRT) and falls back to NotifyIcon on pwsh-only systems
+    cmds_run: list[list[str]] = []
+
+    def fake_which(name: str) -> str | None:
+        if name in ("pwsh.exe", "pwsh"):
+            return "C:/Program Files/PowerShell/7/pwsh.exe"
+        return None
+
+    monkeypatch.setattr(notifications.shutil, "which", fake_which)
+    monkeypatch.setattr(notifications.os.path, "isfile", lambda _p: False)
+    monkeypatch.setattr(
+        notifications.subprocess,
+        "run",
+        lambda cmd, **_kw: cmds_run.append(list(cmd)) or SimpleNamespace(returncode=0),
+    )
+    assert notifications._send_windows_toast("Title", "Body", app_name="audiobook-dl", timeout=2.0) is True
+    assert "NotifyIcon" in cmds_run[0][-1]
+    assert "WindowsRuntime" not in cmds_run[0][-1]
+
+    cmds_run.clear()
+    monkeypatch.setattr(
+        notifications.shutil,
+        "which",
+        lambda name: "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe" if "powershell" in name else None,
+    )
+    assert notifications._send_windows_toast("Title", "Body", app_name="audiobook-dl", timeout=2.0) is True
+    assert "WindowsRuntime" in cmds_run[0][-1]
+
 
 
 

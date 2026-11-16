@@ -34,6 +34,7 @@ class CatalogBrowserDialog(tk.Toplevel):
         on_fetch: Callable[[str, ServiceInfo, str, "CatalogBrowserDialog"], None],
         on_add_urls: Callable[[list[str]], None],
         on_save_to_library: Callable[[str, str, Sequence[CatalogBook]], tuple[int, int]] | None = None,
+        on_sync_libraries: Callable[[str], None] | None = None,
         profile_resolver: Callable[[str], Sequence[str]] | None = None,
         selected_profile: str = "default",
         palette: ThemePalette | None = None,
@@ -44,6 +45,7 @@ class CatalogBrowserDialog(tk.Toplevel):
         self._on_fetch = on_fetch
         self._on_add_urls = on_add_urls
         self._on_save_to_library = on_save_to_library
+        self._on_sync_libraries = on_sync_libraries
         self._profile_resolver = profile_resolver
         self._loaded_books: list[CatalogBook] = []
         self._loaded_service_key: str = ""
@@ -52,8 +54,10 @@ class CatalogBrowserDialog(tk.Toplevel):
 
         self.title("Browse Library / Search")
         self.transient(parent)  # type: ignore[arg-type]
+        self.grab_set()
         self.geometry(f"{scale_px(self, 760)}x{scale_px(self, 460)}")
         self.minsize(scale_px(self, 560), scale_px(self, 340))
+        self.bind("<Escape>", lambda _e: self.destroy())
 
         body = ttk.Frame(self, padding=scale_px(self, 12))
         body.pack(fill=tk.BOTH, expand=True)
@@ -134,6 +138,12 @@ class CatalogBrowserDialog(tk.Toplevel):
                 state="disabled",
             )
             self._save_lib_btn.pack(side=tk.RIGHT, padx=(0, 6))
+        if self._on_sync_libraries is not None:
+            ttk.Button(
+                btn_bar,
+                text="Sync Libraries",
+                command=self._trigger_sync,
+            ).pack(side=tk.RIGHT, padx=(0, 6))
 
         self._query_entry.bind("<Return>", lambda _e: self.run_fetch("search"))
         svc_combo.bind("<<ComboboxSelected>>", self.sync_buttons)
@@ -225,10 +235,17 @@ class CatalogBrowserDialog(tk.Toplevel):
         inserted, updated = self._on_save_to_library(service_key, profile, chosen)
         self._status_var.set(f"Saved to Library DB: +{inserted} new, {updated} updated.")
 
+    def _trigger_sync(self) -> None:
+        if self._on_sync_libraries is None:
+            return
+        svc = self._services_by_label.get(self._service_var.get())
+        self._on_sync_libraries(svc.key if svc is not None else "")
+
     def add_selected(self) -> None:
         selected_iids = resolve_selected_leaf_iids(self._tree)
         if not selected_iids:
-            selected_iids = [f"book-{idx}" for idx in range(len(self._loaded_books))]
+            self._status_var.set("Select one or more books first.")
+            return
         urls_to_add: list[str] = []
         for iid in selected_iids:
             values = self._tree.item(iid, "values")

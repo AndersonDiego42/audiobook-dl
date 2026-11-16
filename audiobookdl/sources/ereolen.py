@@ -1,41 +1,12 @@
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, logging, utils
 from audiobookdl.exceptions import BookHasNoAudiobook, DataNotPresent, RequestError, UserNotAuthorized
-from audiobookdl.utils.audiobook import parse_language
+from audiobookdl.utils.audiobook import parse_duration_ms, parse_language
 
 import re
 from typing import Any
 from urllib.parse import urlparse
 import requests
-
-
-def _parse_playing_time_ms(raw: Any) -> int | None:
-    """Parse ISO-8601 durations (`PT12M34S`), numeric seconds, or `HH:MM:SS` into milliseconds."""
-    if raw is None or raw == "":
-        return None
-    if isinstance(raw, (int, float)):
-        return max(0, round(float(raw) * 1000))
-    text = str(raw).strip()
-    if not text:
-        return None
-    iso_match = re.fullmatch(
-        r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if iso_match:
-        h = float(iso_match.group(1) or 0)
-        m = float(iso_match.group(2) or 0)
-        s = float(iso_match.group(3) or 0)
-        total = h * 3600.0 + m * 60.0 + s
-        return max(0, round(total * 1000))
-    parts = text.split(":")
-    if len(parts) in (2, 3) and all(re.fullmatch(r"\d+(?:\.\d+)?", p) for p in parts):
-        seconds = 0.0
-        for part in parts:
-            seconds = seconds * 60.0 + float(part)
-        return max(0, round(seconds * 1000))
-    return None
 
 
 class EreolenSource(Source):
@@ -163,7 +134,7 @@ class EreolenSource(Source):
             )
             ch_title = str(title or f"Chapter {idx}").strip()
             chapters.append(Chapter(start=offset_ms, title=ch_title))
-            dur_ms = _parse_playing_time_ms(entry.get("playingTime"))
+            dur_ms = parse_duration_ms(entry.get("playingTime"))
             if dur_ms:
                 offset_ms += dur_ms
         return chapters

@@ -1,7 +1,12 @@
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover
 from audiobookdl.exceptions import RequestError
-from audiobookdl.utils.audiobook import parse_language, parse_release_date
+from audiobookdl.utils.audiobook import (
+    clean_html_description,
+    parse_duration_ms,
+    parse_language,
+    parse_release_date,
+)
 
 from datetime import date
 
@@ -9,31 +14,6 @@ import lxml.html
 import re
 from typing import Any
 from urllib.parse import quote
-
-
-def _strip_html(raw: str | None) -> str | None:
-    if not raw or not isinstance(raw, str):
-        return None
-    cleaned = " ".join(re.sub(r"<[^>]+>", " ", raw).split())
-    return cleaned or None
-
-
-def _parse_playtime_ms(raw: Any) -> int | None:
-    """Parse LibriVox `playtime` (`HH:MM:SS`, `MM:SS`, or seconds) into milliseconds."""
-    if raw is None or raw == "":
-        return None
-    if isinstance(raw, (int, float)):
-        return max(0, round(float(raw) * 1000))
-    text = str(raw).strip()
-    if re.fullmatch(r"\d+(?:\.\d+)?", text):
-        return max(0, round(float(text) * 1000))
-    parts = text.split(":")
-    if len(parts) in (2, 3) and all(re.fullmatch(r"\d+(?:\.\d+)?", p) for p in parts):
-        sec = 0.0
-        for p in parts:
-            sec = sec * 60.0 + float(p)
-        return max(0, round(sec * 1000))
-    return None
 
 
 class LibrivoxSource(Source):
@@ -120,7 +100,7 @@ class LibrivoxSource(Source):
                         genres.append(g_name)
             if api_book.get("language"):
                 language = parse_language(api_book["language"])
-            description = _strip_html(api_book.get("description"))
+            description = clean_html_description(api_book.get("description"))
             if api_book.get("copyright_year"):
                 release_date = parse_release_date(api_book["copyright_year"])
 
@@ -169,7 +149,7 @@ class LibrivoxSource(Source):
                 continue
             ch_title = str(section.get("title") or f"Section {idx}").strip()
             chapters.append(Chapter(start=offset_ms, title=ch_title))
-            dur_ms = _parse_playtime_ms(section.get("playtime"))
+            dur_ms = parse_duration_ms(section.get("playtime"))
             if dur_ms:
                 offset_ms += dur_ms
         return chapters

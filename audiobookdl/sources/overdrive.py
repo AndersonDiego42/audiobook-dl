@@ -1,6 +1,7 @@
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, BookId, Chapter, Cover, Result, Series
 from audiobookdl.exceptions import DataNotPresent, RequestError, UserNotAuthorized
+from audiobookdl.utils.audiobook import clean_html_description
 
 import json
 import re
@@ -123,13 +124,9 @@ class OverdriveSource(Source):
 
         desc_raw = book_info.get("description")
         if isinstance(desc_raw, dict):
-            description = str(desc_raw.get("full") or desc_raw.get("short") or "").strip() or None
-        elif isinstance(desc_raw, str):
-            description = desc_raw.strip() or None
+            description = clean_html_description(desc_raw.get("full") or desc_raw.get("short"))
         else:
-            description = None
-        if description:
-            description = " ".join(re.sub(r"<[^>]+>", " ", description).split()) or None
+            description = clean_html_description(desc_raw)
 
         pub_raw = book_info.get("publisher")
         if isinstance(pub_raw, dict):

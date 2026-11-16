@@ -21,11 +21,10 @@ from audiobookdl.exceptions import NoSourceFound
 from audiobookdl.pipeline import (
     Downloader,
     apply_runtime_options,
-    default_archive_path,
     list_service_library,
 )
 from audiobookdl.sources import find_source_by_name
-from audiobookdl.utils.archive import DownloadArchive, make_catalog_book_key
+from audiobookdl.utils.archive import DownloadArchive, make_catalog_book_key, resolve_archive_path
 
 
 @dataclass
@@ -167,8 +166,7 @@ def run_sync_once(
 ) -> SyncCycleResult:
     """Perform one sync cycle: poll account libraries, update ledger, download new pending items."""
     resolved_config = config if config is not None else load_config(sync_opts.config_location)
-    db_dir = resolved_config.database_directory or args.default_database_directory()
-    archive_path = sync_opts.archive_path or resolved_config.download_archive or default_archive_path(db_dir)
+    archive_path = resolve_archive_path(resolved_config, sync_opts.archive_path)
 
     targets, target_errors = _resolve_sync_targets(
         resolved_config,

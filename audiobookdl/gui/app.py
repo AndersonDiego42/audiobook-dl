@@ -47,6 +47,7 @@ from audiobookdl.gui.theme import (
     apply_theme_to_widget_tree,
     apply_theme_to_window,
     enable_high_dpi_awareness,
+    make_bold_font,
     normalize_theme_mode,
     scale_px,
 )
@@ -60,7 +61,7 @@ from audiobookdl.pipeline import DownloadSummary
 from audiobookdl.sources import ServiceInfo, get_available_services
 from audiobookdl.sources.source import Source
 from audiobookdl.utils import read_asset_file
-from audiobookdl.utils.archive import default_archive_path
+from audiobookdl.utils.archive import resolve_archive_path
 from audiobookdl.utils.audiobook import Audiobook, BookId, Result, Series
 from audiobookdl.utils.updater import UpdateInfo
 
@@ -98,6 +99,14 @@ class AudiobookDLApp:
     enrich_metadata_var: tk.BooleanVar
     enrich_providers_var: tk.StringVar
     enrich_interactive_var: tk.BooleanVar
+    loudnorm_var: tk.BooleanVar
+    mono_var: tk.BooleanVar
+    chapters_from_silence_var: tk.BooleanVar
+    chapter_offset_ms_var: tk.StringVar
+    square_cover_var: tk.BooleanVar
+    max_cover_size_var: tk.StringVar
+    post_exec_var: tk.StringVar
+    upload_to_abs_var: tk.BooleanVar
 
     def __init__(self, root: tk.Tk, config_location: str | None = None) -> None:
         self.root = root
@@ -126,7 +135,12 @@ class AudiobookDLApp:
         self._services: list[ServiceInfo] = get_available_services()
         self._is_running = False
         self._is_previewing = False
+        self._is_syncing = False
         self._preview_dialog: PreviewDialog | None = None
+        self._archive_dialog: ArchiveLedgerDialog | None = None
+        self._abs_dialog: Any | None = None
+        self._catalog_dialog: CatalogBrowserDialog | None = None
+        self._pack_dialog: PackDialog | None = None
         self._output_widgets: list[ttk.Entry | ttk.Button | ttk.Combobox] = []
 
         self._init_variables()
@@ -245,7 +259,7 @@ class AudiobookDLApp:
         title_text = f"audiobook-dl  v{__version__}"
         if is_portable_mode():
             title_text += "  [Portable]"
-        ttk.Label(header, text=title_text, font=("Segoe UI", 13, "bold")).grid(
+        ttk.Label(header, text=title_text, font=make_bold_font(self.root, 13)).grid(
             row=0, column=0, sticky="w"
         )
         ffmpeg_box = self._ffmpeg_assistant.build_controls(header)
@@ -446,6 +460,9 @@ class AudiobookDLApp:
         tools_menu.add_command(
             label="Browse Library / Search...", command=self._show_catalog_browser_dialog
         )
+        tools_menu.add_command(
+            label="Sync Libraries...", command=self._sync_libraries
+        )
         tools_menu.add_command(label="Pack Local Audiobooks...", command=self._show_pack_dialog)
         tools_menu.add_command(label="Locate FFmpeg Folder...", command=self.browse_ffmpeg_dir)
         tools_menu.add_command(
@@ -551,7 +568,6 @@ class AudiobookDLApp:
             self.m4b_var.set(self.output_format_var.get() == "m4b")
             self._auth_panel.load_service_into_form()
             self._auth_panel.update_field_states()
-            self._ffmpeg_assistant.update_status()
             self.status_var.set("Config reloaded")
             self._queue_panel.append_log("Reloaded configuration.")
         except Exception as exc:
@@ -567,29 +583,48 @@ class AudiobookDLApp:
         )
 
     def _archive_ledger_path(self) -> str:
-        cfg = self._controller.config_snapshot()
-        if cfg.download_archive:
-            return cfg.download_archive
-        db_dir = cfg.database_directory or args.default_database_directory()
-        return default_archive_path(db_dir)
+        return resolve_archive_path(self._controller.config_snapshot())
+
+    @staticmethod
+    def _raise_existing_dialog(dialog: tk.Toplevel | None) -> Any | None:
+        """Raise and focus `dialog` if it still exists, returning it; otherwise `None`."""
+        if dialog is None:
+            return None
+        try:
+            if dialog.winfo_exists():
+                dialog.lift()
+                dialog.focus_set()
+                return dialog
+        except tk.TclError:
+            return None
+        return None
 
     def _show_archive_ledger_dialog(self) -> ArchiveLedgerDialog:
+        existing = self._raise_existing_dialog(self._archive_dialog)
+        if existing is not None:
+            return existing
+
         def _on_queue_urls(urls_to_add: list[str]) -> None:
             added = self._append_urls_to_input(urls_to_add)
             self.status_var.set(
                 f"Queued {len(added)} URL{'s' if len(added) != 1 else ''} from library"
             )
 
-        return ArchiveLedgerDialog(
+        self._archive_dialog = ArchiveLedgerDialog(
             self.root,
             self._archive_ledger_path(),
             on_queue_urls=_on_queue_urls,
             palette=self._palette,
         )
+        return self._archive_dialog
 
     def _show_audiobookshelf_dialog(self):
         from audiobookdl.config import load_config
         from audiobookdl.gui.abs_dialog import AudiobookshelfDialog
+
+        existing = self._raise_existing_dialog(self._abs_dialog)
+        if existing is not None:
+            return existing
 
         cfg = self._controller.config_snapshot()
         config_loc = self._controller.config_location
@@ -598,15 +633,20 @@ class AudiobookDLApp:
             self._controller.config = load_config(config_loc)
             self.status_var.set("Saved Audiobookshelf configuration.")
 
-        return AudiobookshelfDialog(
+        self._abs_dialog = AudiobookshelfDialog(
             self.root,
             cfg.audiobookshelf,
             config_location=config_loc,
             on_saved=_on_saved,
             palette=self._palette,
         )
+        return self._abs_dialog
 
     def _show_catalog_browser_dialog(self) -> CatalogBrowserDialog:
+        existing = self._raise_existing_dialog(self._catalog_dialog)
+        if existing is not None:
+            return existing
+
         def _on_fetch(mode: str, svc: ServiceInfo, query_text: str, dialog: CatalogBrowserDialog) -> None:
             options = self._try_build_options(urls_override=[], parent=dialog)
             if options is None:
@@ -637,17 +677,22 @@ class AudiobookDLApp:
             self.status_var.set(f"Library DB: +{inserted} new, {updated} refreshed")
             return inserted, updated
 
-        return CatalogBrowserDialog(
+        def _on_sync_from_dialog(svc_key: str) -> None:
+            self._sync_libraries(services=[svc_key] if svc_key else ())
+
+        self._catalog_dialog = CatalogBrowserDialog(
             self.root,
             self._services,
             self._auth_panel.selected_service(),
             on_fetch=_on_fetch,
             on_add_urls=_on_add_urls,
             on_save_to_library=_on_save_to_library,
+            on_sync_libraries=_on_sync_from_dialog,
             profile_resolver=_profile_resolver,
             selected_profile=normalize_profile_name(self.profile_var.get()),
             palette=self._palette,
         )
+        return self._catalog_dialog
 
     def _apply_window_icon(self) -> None:
         try:
@@ -950,15 +995,18 @@ class AudiobookDLApp:
         ]
         self._start_new_run(job_specs)
 
-    def _show_pack_dialog(self) -> None:
+    def _show_pack_dialog(self) -> PackDialog | None:
         """Open the modal Local Audiobook Repackager dialog."""
+        existing = self._raise_existing_dialog(self._pack_dialog)
+        if existing is not None:
+            return existing
         options = self._try_build_options(urls_override=[])
         if options is None:
-            return
+            return None
         if not self._ffmpeg_assistant.ensure_available(options):
-            return
+            return None
         output_dir = self.output_dir_var.get().strip() or default_output_dir()
-        PackDialog(
+        self._pack_dialog = PackDialog(
             self.root,
             self._controller,
             options,
@@ -966,6 +1014,51 @@ class AudiobookDLApp:
             on_submit=self._on_pack_submitted,
             palette=self._palette,
         )
+        return self._pack_dialog
+
+    def _sync_libraries(self, *, services: Sequence[str] = (), scan_only: bool = False) -> None:
+        """Run one library synchronization cycle in the background."""
+        if self._is_syncing:
+            self.status_var.set("Library sync already in progress")
+            return
+        options = self._try_build_options(urls_override=[])
+        if options is None:
+            return
+        self._is_syncing = True
+        self.status_var.set("Syncing libraries...")
+        self._queue_panel.append_log("--- Starting library sync ---")
+        sync_opts = args.SyncOptions(
+            services=list(services),
+            scan_only=scan_only,
+            output_template=options.output_template,
+            output_format=options.output_format,
+            archive_path=self._archive_ledger_path(),
+            config_location=self._controller.config_location,
+        )
+        self._controller.start_library_sync(sync_opts)
+
+    def _handle_sync_done(self, cycle: Any, exc: Exception | None) -> None:
+        self._is_syncing = False
+        if exc is not None:
+            self.status_var.set("Library sync failed")
+            self._queue_panel.append_log(f"[ERROR] Library sync failed: {exc}")
+            messagebox.showerror("Library Sync Failed", str(exc), parent=self.root)
+            return
+        if cycle is None:
+            self.status_var.set("Library sync finished")
+            return
+        msg = (
+            f"Discovered {cycle.books_discovered}, new {cycle.newly_added}, "
+            f"downloaded {cycle.downloaded}, skipped {cycle.skipped}, failed {cycle.failed}"
+        )
+        self.status_var.set(f"Sync complete: {msg}")
+        self._queue_panel.append_log(f"--- Library sync finished: {msg} ---")
+        for err in getattr(cycle, "errors", ()):
+            self._queue_panel.append_log(f"[WARN] {err}")
+        if cycle.failed > 0 or getattr(cycle, "errors", ()):
+            messagebox.showwarning("Library Sync Finished with Warnings", msg, parent=self.root)
+        else:
+            messagebox.showinfo("Library Sync Complete", msg, parent=self.root)
 
     def _on_pack_submitted(self, requests_list: list[PackJobRequest], output_format: str) -> None:
         """Queue one or more local repackaging requests onto `GuiController`."""
@@ -1147,6 +1240,7 @@ class AudiobookDLApp:
             return self._controller.apply_enrichment_candidate(book, candidate, opts)
 
         cached_series_opts = self.build_options() if isinstance(result, Series) else None
+        dir_stems_cache: dict[str, set[str]] = {}
         dialog = PreviewDialog(
             self.root,
             url,
@@ -1154,7 +1248,11 @@ class AudiobookDLApp:
             result,
             is_running=self._is_running,
             skip_downloaded=self.skip_downloaded_var.get(),
-            series_book_exists=lambda book: self._series_book_exists(book, options=cached_series_opts),
+            series_book_exists=lambda book: self._series_book_exists(
+                book,
+                options=cached_series_opts,
+                dir_stems_cache=dir_stems_cache,
+            ),
             on_confirm=self._enqueue_from_preview,
             palette=self._palette,
             on_search_enrichment=_search_enrichment,
@@ -1168,6 +1266,7 @@ class AudiobookDLApp:
         book: BookId[Any] | Audiobook,
         *,
         options: args.DownloadOptions | None = None,
+        dir_stems_cache: dict[str, set[str]] | None = None,
     ) -> bool:
         """Return True when `book` already appears on disk at the configured output path."""
         if not isinstance(book, Audiobook):
@@ -1182,11 +1281,13 @@ class AudiobookDLApp:
                 return True
             parent = os.path.dirname(target) or "."
             base = os.path.basename(target)
+            if dir_stems_cache is not None and parent in dir_stems_cache:
+                return base in dir_stems_cache[parent]
             if os.path.isdir(parent):
-                for entry in os.listdir(parent):
-                    stem, _ext = os.path.splitext(entry)
-                    if stem == base:
-                        return True
+                stems = {os.path.splitext(entry)[0] for entry in os.listdir(parent)}
+                if dir_stems_cache is not None:
+                    dir_stems_cache[parent] = stems
+                return base in stems
         except (OSError, ValueError, KeyError):
             return False
         return False
@@ -1343,6 +1444,9 @@ class AudiobookDLApp:
         elif kind == "update_checked":
             _, info, interactive = item
             self._handle_update_checked(info, interactive)
+        elif kind == "sync_done":
+            _, cycle, sync_exc = item
+            self._handle_sync_done(cycle, sync_exc)
         elif kind == "done":
             _, run_id, summary, exc = item
             if run_id == self._queue_panel.current_ui_run_id:

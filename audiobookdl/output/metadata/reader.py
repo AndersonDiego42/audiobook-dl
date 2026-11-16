@@ -18,7 +18,7 @@ from mutagen.id3 import ID3
 from mutagen.mp4 import MP4, MP4Cover
 
 from audiobookdl import AudiobookMetadata, Chapter, Cover
-from audiobookdl.utils.audiobook import parse_language, parse_release_date
+from audiobookdl.utils.audiobook import parse_language, parse_release_date, parse_series_order
 
 
 _AUDIO_COVER_CANDIDATES = (
@@ -74,21 +74,6 @@ def _parse_int_prefix(raw: Any) -> int | None:
         return int(match.group(1))
     except ValueError:
         return None
-
-
-def _parse_series_order(raw: Any) -> int | None:
-    if raw is None or isinstance(raw, bool):
-        return None
-    if isinstance(raw, int):
-        return raw
-    text = str(raw).strip()
-    if not text:
-        return None
-    try:
-        num = float(text)
-    except ValueError:
-        return None
-    return int(num) if num.is_integer() else None
 
 
 def _clean_text_list(values: Any, *, split_semicolons: bool = True) -> list[str]:
@@ -179,7 +164,7 @@ def _read_id3_tags(filepath: str) -> TrackTagInfo:
         meta.series = series_vals[0]
     series_order_raw = _first_text(txxx_map.get("series-part") or txxx_map.get("series_order"))
     if series_order_raw is not None:
-        meta.series_order = _parse_series_order(series_order_raw)
+        meta.series_order = parse_series_order(series_order_raw)
 
     meta.isbn = _first_text(txxx_map.get("isbn"))
     meta.asin = _first_text(txxx_map.get("asin"))
@@ -257,7 +242,7 @@ def _read_mp4_tags(filepath: str) -> TrackTagInfo:
         meta.series = series_val
     series_part = _decode_mp4_freeform(freeform_ci.get("series-part") or freeform_ci.get("series_order"))
     if series_part is not None:
-        meta.series_order = _parse_series_order(series_part)
+        meta.series_order = parse_series_order(series_part)
 
     meta.isbn = _decode_mp4_freeform(freeform_ci.get("isbn"))
     meta.asin = _decode_mp4_freeform(freeform_ci.get("asin"))
@@ -309,7 +294,7 @@ def _read_vorbis_tags(filepath: str) -> TrackTagInfo:
     meta.publisher = _first_text(tag_ci.get("publisher") or tag_ci.get("organization"))
     meta.description = _first_text(tag_ci.get("description") or tag_ci.get("comment"))
     meta.series = _first_text(tag_ci.get("series"))
-    meta.series_order = _parse_series_order(_first_text(tag_ci.get("series-part") or tag_ci.get("series_order")))
+    meta.series_order = parse_series_order(_first_text(tag_ci.get("series-part") or tag_ci.get("series_order")))
     meta.isbn = _first_text(tag_ci.get("isbn"))
     meta.asin = _first_text(tag_ci.get("asin"))
     meta.source = _first_text(tag_ci.get("source"))
@@ -412,24 +397,24 @@ def _parse_metadata_json(path: str) -> tuple[AudiobookMetadata | None, list[Chap
         if isinstance(first_series, dict):
             series_text = str(first_series.get("name") or "").strip()
             if first_series.get("sequence") is not None and meta.series_order is None:
-                meta.series_order = _parse_series_order(first_series.get("sequence"))
+                meta.series_order = parse_series_order(first_series.get("sequence"))
         else:
             series_text = str(first_series or "").strip()
     elif isinstance(raw_series, dict):
         series_text = str(raw_series.get("name") or "").strip()
         if raw_series.get("sequence") is not None and meta.series_order is None:
-            meta.series_order = _parse_series_order(raw_series.get("sequence"))
+            meta.series_order = parse_series_order(raw_series.get("sequence"))
     elif isinstance(raw_series, str):
         series_text = raw_series.strip()
     if series_text:
         m = _SERIES_HASH_RE.match(series_text)
         if m and m.group(1).strip():
             meta.series = m.group(1).strip()
-            meta.series_order = _parse_series_order(m.group(2))
+            meta.series_order = parse_series_order(m.group(2))
         else:
             meta.series = series_text
     if payload.get("series_order") is not None and meta.series_order is None:
-        meta.series_order = _parse_series_order(payload.get("series_order"))
+        meta.series_order = parse_series_order(payload.get("series_order"))
 
     rel_date_raw = payload.get("release_date") or payload.get("publishedDate") or payload.get("publishedYear")
     if rel_date_raw:
@@ -523,7 +508,7 @@ def _parse_opf_file(path: str, base_dir: str) -> tuple[AudiobookMetadata | None,
             if name == "calibre:series" and content:
                 meta.series = content
             elif name == "calibre:series_index" and content:
-                meta.series_order = _parse_series_order(content)
+                meta.series_order = parse_series_order(content)
             elif name == "cover" and content:
                 cover_id = content
         elif lname == "item":

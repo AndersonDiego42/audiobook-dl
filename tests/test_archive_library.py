@@ -411,3 +411,22 @@ def test_archive_handles_over_1100_rows_without_sqlite_variable_limit(tmp_path):
         assert archive.find_matching_entry_id(scrape_url="https://example.com/book/999") is not None
     finally:
         archive.close()
+
+
+def test_resolve_archive_path_precedence(tmp_path):
+    from audiobookdl.config import Config
+    from audiobookdl.utils.archive import default_archive_path, resolve_archive_path
+
+    db_dir = str(tmp_path / "db")
+    cfg = Config(
+        sources={},
+        output_template=None,
+        database_directory=db_dir,
+        skip_downloaded=None,
+        download_archive=str(tmp_path / "configured.db"),
+    )
+    assert resolve_archive_path(cfg, str(tmp_path / "explicit.db")) == str(tmp_path / "explicit.db")
+    assert resolve_archive_path(cfg) == str(tmp_path / "configured.db")
+    cfg.download_archive = None
+    assert resolve_archive_path(cfg) == default_archive_path(db_dir)
+

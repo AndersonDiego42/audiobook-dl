@@ -1,7 +1,6 @@
 """Schema completeness and parity tests for `audiobookdl.options_schema`."""
 
 from dataclasses import fields as dataclass_fields
-import inspect
 
 from attrs import fields as attrs_fields
 import pytest
@@ -105,12 +104,19 @@ def test_config_clone_copies_all_fields_independently():
     assert original.check_updates is True
 
 
-def test_persisted_gui_options_match_save_output_preferences():
-    sig_params = set(inspect.signature(save_output_preferences).parameters.keys())
+def test_persisted_gui_options_match_save_output_preferences(tmp_path):
+    cfg_path = tmp_path / "prefs.toml"
+    all_persisted = {}
     for spec in PERSISTED_GUI_OPTION_SPECS:
         assert spec.toml_serializer is not None
         assert spec.config_key is not None
-        assert spec.name in sig_params
+        assert spec.gui is not None
+        all_persisted[spec.name] = spec.gui.read_option(spec.gui.init_value(None))
+    save_output_preferences(config_location=str(cfg_path), **all_persisted)
+    assert cfg_path.is_file()
+
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        save_output_preferences(config_location=str(cfg_path), unknown_pref_key=True)
 
 
 def test_gui_option_bindings_roundtrip():

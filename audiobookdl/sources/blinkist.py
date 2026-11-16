@@ -1,21 +1,10 @@
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover
 from audiobookdl.exceptions import RequestError, UserNotAuthorized
-from audiobookdl.utils.audiobook import parse_language
+from audiobookdl.utils.audiobook import clean_html_description, parse_language
 
-from html import unescape
-import re
 from typing import Any
 from urllib.parse import quote_plus, urlsplit
-
-
-def _clean_html_text(raw: str | None) -> str | None:
-    if not raw or not isinstance(raw, str):
-        return None
-    text = re.sub(r"</?(?:p|div|br|li|ul|ol|h[1-6])\b[^>]*>", " ", raw, flags=re.IGNORECASE)
-    text = re.sub(r"<[^>]+>", "", text)
-    cleaned = " ".join(unescape(text).split())
-    return cleaned or None
 
 
 def _duration_seconds(chapter: dict[str, Any]) -> float:
@@ -83,10 +72,10 @@ class BlinkistSource(Source):
             narrators = [raw_narrators.strip()]
 
         description = (
-            _clean_html_text(book.get("about_the_book"))
-            or _clean_html_text(book.get("description"))
-            or _clean_html_text(book.get("subtitle"))
-            or _clean_html_text(book.get("summary"))
+            clean_html_description(book.get("about_the_book"))
+            or clean_html_description(book.get("description"))
+            or clean_html_description(book.get("subtitle"))
+            or clean_html_description(book.get("summary"))
         )
 
         genres: list[str] = []

@@ -202,9 +202,9 @@ class ScrollableFrame(ttk.Frame):
         self.canvas.bind("<Configure>", self.sync_layout)
 
         toplevel = self.winfo_toplevel()
-        toplevel.bind("<FocusIn>", self.ensure_focus_visible)
+        toplevel.bind("<FocusIn>", self.ensure_focus_visible, add="+")
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            toplevel.bind(seq, self.on_mousewheel)
+            toplevel.bind(seq, self.on_mousewheel, add="+")
 
     def apply_theme(self, background: str) -> None:
         """Update the underlying canvas background to match the active theme."""
@@ -281,6 +281,11 @@ class ScrollableFrame(ttk.Frame):
         """Scroll the main canvas unless an inner scrollable widget handles the wheel."""
         widget = getattr(event, "widget", None)
         if widget is not None:
+            try:
+                if widget.winfo_toplevel() is not self.winfo_toplevel():
+                    return
+            except tk.TclError:
+                return
             if "popdown" in str(widget):
                 return
             if self._inner_scrollables is not None:
