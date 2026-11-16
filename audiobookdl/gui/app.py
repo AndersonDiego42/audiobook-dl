@@ -402,6 +402,10 @@ class AudiobookDLApp:
             on_open_folder=self._open_output_folder,
             on_retry_failed=self._retry_failed_queue_items,
             service_label_for_url=self._auth_panel.service_label_for_url,
+            on_retry_selected=self._retry_failed_queue_items,
+            on_preview_url=lambda u: self.preview_metadata(url_override=u),
+            on_send_to_urls=self._send_urls_to_input,
+            on_open_path=self._open_path_in_os,
         )
         self._queue_panel.grid(row=5, column=0, sticky="nsew")
         self.download_btn = self._queue_panel.download_btn
@@ -815,6 +819,43 @@ class AudiobookDLApp:
         if chosen:
             self.output_dir_var.set(chosen)
 
+    def _open_path_in_os(self, target_path: str, reveal_in_folder: bool = False) -> None:
+        """Open `target_path` or reveal it in the system file manager."""
+        cleaned = (target_path or "").strip()
+        if not cleaned or not os.path.exists(cleaned):
+            messagebox.showinfo(
+                "Path Missing",
+                f"Path does not exist:\n{cleaned}",
+                parent=self.root,
+            )
+            return
+        try:
+            if reveal_in_folder and os.path.isfile(cleaned):
+                if sys.platform.startswith("win"):
+                    subprocess.Popen(["explorer", "/select,", os.path.abspath(cleaned)])
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", "-R", cleaned])
+                else:
+                    subprocess.Popen(["xdg-open", os.path.dirname(os.path.abspath(cleaned)) or "."])
+                return
+            open_target = (
+                os.path.dirname(os.path.abspath(cleaned)) or "."
+                if reveal_in_folder and not os.path.isdir(cleaned)
+                else cleaned
+            )
+            if sys.platform.startswith("win") and hasattr(os, "startfile"):
+                os.startfile(open_target)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", open_target])
+            else:
+                subprocess.Popen(["xdg-open", open_target])
+        except OSError as exc:
+            messagebox.showerror(
+                "Open Path Failed",
+                f"Could not open:\n{cleaned}\n\n{exc}",
+                parent=self.root,
+            )
+
     def _open_output_folder(self) -> None:
         folder = self.output_dir_var.get().strip() or default_output_dir()
         if not os.path.isdir(folder):
@@ -822,19 +863,16 @@ class AudiobookDLApp:
                 "Folder Missing", f"Folder does not exist yet:\n{folder}", parent=self.root
             )
             return
-        try:
-            if sys.platform.startswith("win") and hasattr(os, "startfile"):
-                os.startfile(folder)  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", folder])
-            else:
-                subprocess.Popen(["xdg-open", folder])
-        except OSError as exc:
-            messagebox.showerror(
-                "Open Folder Failed",
-                f"Could not open folder:\n{folder}\n\n{exc}",
-                parent=self.root,
+        self._open_path_in_os(folder, reveal_in_folder=False)
+
+    def _send_urls_to_input(self, urls: Sequence[str]) -> None:
+        added = self._append_urls_to_input(urls)
+        if added:
+            self.status_var.set(
+                f"Added {len(added)} URL{'s' if len(added) != 1 else ''} to input"
             )
+        else:
+            self.status_var.set("URL(s) already in input")
 
     def _set_running_state(self, running: bool) -> None:
         self._is_running = running
@@ -973,27 +1011,141 @@ class AudiobookDLApp:
         )
         return True
 
-    def _retry_failed_queue_items(self) -> None:
-        failed_urls = self._controller.retryable_urls(self.queue_tree.get_children())
-        if not failed_urls:
+    def _register_enqueued_batch(
+        self,
+        *,
+        was_appended: bool,
+        run_id: int,
+        queued_jobs: Sequence[Any],
+        new_total: int,
+        start_header: str,
+        append_status: str,
+        append_log_msg: str,
+    ) -> None:
+        if was_appended:
+            for job in queued_jobs:
+                self._queue_panel.register_queue_job(job, persist=False)
+            if queued_jobs:
+                self._controller.save_queue_state()
+            self._queue_panel.ui_item_total = new_total
+            self._queue_panel.refresh_batch_label()
+            self.status_var.set(append_status)
+            self._queue_panel.append_log(append_log_msg)
+            return
+
+        self._set_running_state(True)
+        self._queue_panel.prepare_run_ui_state(
+            run_id,
+            len(queued_jobs),
+            start_header,
+        )
+        for job in queued_jobs:
+            self._queue_panel.register_queue_job(job, persist=False)
+        if queued_jobs:
+            self._controller.save_queue_state()
+
+    def _retry_failed_queue_items(self, job_ids: Sequence[str] | None = None) -> None:
+        target_ids = list(job_ids) if job_ids is not None else list(self.queue_tree.get_children())
+        retry_records = self._controller.retryable_jobs(target_ids)
+        if not retry_records:
             self.status_var.set("No failed or cancelled jobs to retry")
             return
+
+        download_urls: list[str] = []
+        pack_requests: list[PackJobRequest] = []
+        for rec in retry_records:
+            if rec.get("job_kind", "download") == "pack":
+                parsed = PackJobRequest.from_dict(rec.get("pack_request"))
+                if parsed is not None:
+                    pack_requests.append(parsed)
+            else:
+                url = str(rec.get("url") or "").strip()
+                if url and url not in download_urls:
+                    download_urls.append(url)
+
+        if not download_urls and not pack_requests:
+            self.status_var.set("No failed or cancelled jobs to retry")
+            return
+
         if self._is_running:
-            if not self._controller.cancel_event.is_set():
-                self._enqueue_additional_urls(failed_urls, allow_existing=True)
+            if self._controller.cancel_event.is_set():
+                return
+            if download_urls and not pack_requests:
+                self._enqueue_additional_urls(download_urls, allow_existing=True)
+                return
+            base_opts = self._try_build_options(urls_override=[])
+            if base_opts is None:
+                return
+            dl_specs = [
+                (u, self.build_options(urls_override=[u]), None, None)
+                for u in download_urls
+            ]
+            pack_pairs = []
+            for req in pack_requests:
+                fmt = req.output_format or base_opts.output_format or "m4b"
+                opts = dataclasses.replace(base_opts, output_format=fmt)
+                opts._explicit_fields = frozenset(base_opts._explicit_fields | {"output_format"})
+                pack_pairs.append((req, opts))
+            was_appended, run_id, queued_jobs, new_total = self._controller.start_or_enqueue_jobs(
+                download_specs=dl_specs,
+                pack_requests=pack_pairs,
+            )
+            self._register_enqueued_batch(
+                was_appended=was_appended,
+                run_id=run_id,
+                queued_jobs=queued_jobs,
+                new_total=new_total,
+                start_header=f"--- Retrying {len(queued_jobs)} job(s) ---",
+                append_status=f"Queued +{len(queued_jobs)} retry job(s) (total {new_total})",
+                append_log_msg=f"--- Added {len(queued_jobs)} retry job(s) to queue (total {new_total}) ---",
+            )
             return
-        options = self._try_build_options()
-        if options is None:
+
+        if download_urls and not pack_requests:
+            options = self._try_build_options()
+            if options is None:
+                return
+            if not self._ffmpeg_assistant.ensure_available(options):
+                return
+            self._save_run_preferences(options)
+            job_specs = [
+                (u, self.build_options(urls_override=[u]), None, None)
+                for u in download_urls
+            ]
+            self._start_new_run(job_specs)
             return
-        if not self._ffmpeg_assistant.ensure_available(options):
+
+        base_opts = self._try_build_options(urls_override=[])
+        if base_opts is None:
             return
-        self._save_run_preferences(options)
-        unique_urls = list(dict.fromkeys(failed_urls))
-        job_specs = [
+        pack_pairs = []
+        for req in pack_requests:
+            fmt = req.output_format or base_opts.output_format or "m4b"
+            opts = dataclasses.replace(base_opts, output_format=fmt)
+            opts._explicit_fields = frozenset(base_opts._explicit_fields | {"output_format"})
+            if not self._ffmpeg_assistant.ensure_available(opts):
+                return
+            pack_pairs.append((req, opts))
+        if download_urls and not self._ffmpeg_assistant.ensure_available(base_opts):
+            return
+        self._save_run_preferences(base_opts)
+        dl_specs = [
             (u, self.build_options(urls_override=[u]), None, None)
-            for u in unique_urls
+            for u in download_urls
         ]
-        self._start_new_run(job_specs)
+        was_appended, run_id, queued_jobs, new_total = self._controller.start_or_enqueue_jobs(
+            download_specs=dl_specs,
+            pack_requests=pack_pairs,
+        )
+        self._register_enqueued_batch(
+            was_appended=was_appended,
+            run_id=run_id,
+            queued_jobs=queued_jobs,
+            new_total=new_total,
+            start_header=f"--- Retrying {len(queued_jobs)} job(s) ---",
+            append_status=f"Queued +{len(queued_jobs)} retry job(s) (total {new_total})",
+            append_log_msg=f"--- Added {len(queued_jobs)} retry job(s) to queue (total {new_total}) ---",
+        )
 
     def _show_pack_dialog(self) -> PackDialog | None:
         """Open the modal Local Audiobook Repackager dialog."""
@@ -1070,36 +1222,23 @@ class AudiobookDLApp:
         self._save_run_preferences(base_opts)
         pairs: list[tuple[PackJobRequest, args.DownloadOptions]] = []
         for req in requests_list:
-            opts = dataclasses.replace(base_opts, output_format=output_format)
+            fmt = output_format or req.output_format or "m4b"
+            opts = dataclasses.replace(base_opts, output_format=fmt)
             opts._explicit_fields = frozenset(base_opts._explicit_fields | {"output_format"})
             pairs.append((req, opts))
 
         was_appended, run_id, queued_jobs, new_total = self._controller.start_or_enqueue_pack_jobs(
             pairs
         )
-        if was_appended:
-            for job in queued_jobs:
-                self._queue_panel.register_queue_job(job, persist=False)
-            if queued_jobs:
-                self._controller.save_queue_state()
-            self._queue_panel.ui_item_total = new_total
-            self._queue_panel.refresh_batch_label()
-            self.status_var.set(f"Queued +{len(queued_jobs)} pack job(s) (total {new_total})")
-            self._queue_panel.append_log(
-                f"--- Added {len(queued_jobs)} local pack job(s) to queue ---"
-            )
-            return
-
-        self._set_running_state(True)
-        self._queue_panel.prepare_run_ui_state(
-            run_id,
-            len(queued_jobs),
-            f"--- Starting local pack ({len(queued_jobs)} book{'s' if len(queued_jobs) != 1 else ''}) ---",
+        self._register_enqueued_batch(
+            was_appended=was_appended,
+            run_id=run_id,
+            queued_jobs=queued_jobs,
+            new_total=new_total,
+            start_header=f"--- Starting local pack ({len(queued_jobs)} book{'s' if len(queued_jobs) != 1 else ''}) ---",
+            append_status=f"Queued +{len(queued_jobs)} pack job(s) (total {new_total})",
+            append_log_msg=f"--- Added {len(queued_jobs)} local pack job(s) to queue ---",
         )
-        for job in queued_jobs:
-            self._queue_panel.register_queue_job(job, persist=False)
-        if queued_jobs:
-            self._controller.save_queue_state()
 
     def start_download(self) -> None:
         if self._is_previewing:
@@ -1146,11 +1285,13 @@ class AudiobookDLApp:
         self._is_previewing = previewing
         self._queue_panel.set_previewing_state(previewing, is_running=self._is_running)
 
-    def preview_metadata(self) -> None:
-        """Fetch book or series metadata for the first entered URL without downloading audio."""
+    def preview_metadata(self, url_override: str | None = None) -> None:
+        """Fetch book or series metadata for `url_override` or the first entered URL."""
         if self._is_running or self._is_previewing:
             return
-        urls = parse_url_text(self.urls_text.get("1.0", tk.END))
+        urls = [url_override.strip()] if (url_override and url_override.strip()) else parse_url_text(
+            self.urls_text.get("1.0", tk.END)
+        )
         if not urls:
             self.status_var.set("Enter a URL to preview")
             messagebox.showwarning(

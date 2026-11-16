@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
 import json
 import os
+from pathlib import PurePosixPath
 import threading
 from typing import Any
 from collections.abc import Sequence
@@ -24,6 +25,10 @@ from audiobookdl.utils.archive import DownloadArchive, resolve_archive_path
 
 MAX_REQUEST_BODY_BYTES = 1_048_576
 MAX_WEB_LOG_LINES = 400
+
+
+class _PayloadTooLargeError(ValueError):
+    """Raised when an HTTP request body exceeds `MAX_REQUEST_BODY_BYTES`."""
 
 
 class WebDashboardState:
@@ -71,6 +76,13 @@ class WebDashboardState:
             elif kind == "job_status":
                 _, job_id, status_val, detail = item
                 self.controller.update_queue_record(job_id, status_val, detail)
+            elif kind == "job_meta":
+                _, job_id, title_val, output_path_val = item
+                self.controller.update_queue_metadata(
+                    job_id,
+                    title=title_val or None,
+                    output_path=output_path_val or None,
+                )
             elif kind == "progress_start":
                 _, description, _total = item
                 self.progress_pct = 0.0
@@ -133,19 +145,45 @@ class WebDashboardState:
     ) -> args.DownloadOptions:
         cfg = self.controller.config_snapshot()
         raw_ov = overrides or {}
-        base_dir = str(
-            raw_ov.get("output_dir")
-            or self.options.output_dir
-            or cfg.gui.output_dir
-            or os.getcwd()
-        ).strip()
-        tpl = str(
-            raw_ov.get("output_template")
-            or self.options.output_template
-            or cfg.gui.output_template
-            or cfg.output_template
-            or "{title}"
-        ).strip()
+        configured_base = os.path.realpath(
+            self.options.output_dir or cfg.gui.output_dir or os.getcwd()
+        )
+        raw_dir = raw_ov.get("output_dir")
+        if raw_dir is not None and str(raw_dir).strip():
+            requested_dir = str(raw_dir).strip()
+            candidate_dir = os.path.realpath(
+                requested_dir
+                if os.path.isabs(requested_dir)
+                else os.path.join(configured_base, requested_dir)
+            )
+            try:
+                inside = os.path.commonpath([configured_base, candidate_dir]) == configured_base
+            except ValueError:
+                inside = False
+            if not inside:
+                raise ValueError("output_dir must stay within the configured output directory")
+            base_dir = candidate_dir
+        else:
+            base_dir = configured_base
+
+        raw_tpl = raw_ov.get("output_template")
+        if raw_tpl is not None and str(raw_tpl).strip():
+            tpl = str(raw_tpl).strip()
+            if (
+                os.path.isabs(tpl)
+                or tpl.startswith(("/", "\\"))
+                or (len(tpl) >= 2 and tpl[1] == ":")
+            ):
+                raise ValueError("output_template override must be relative")
+            if ".." in PurePosixPath(tpl.replace("\\", "/")).parts:
+                raise ValueError("output_template must not contain '..' path segments")
+        else:
+            tpl = str(
+                self.options.output_template
+                or cfg.gui.output_template
+                or cfg.output_template
+                or "{title}"
+            ).strip()
         output_template = os.path.join(base_dir, tpl) if base_dir else tpl
         fmt = raw_ov.get("output_format") or self.options.output_format or cfg.output_format
         combine = (
@@ -427,6 +465,9 @@ class _WebRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("Cache-Control", "no-store")
+        if status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE:
+            self.close_connection = True
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(raw)
 
@@ -450,13 +491,34 @@ class _WebRequestHandler(BaseHTTPRequestHandler):
         alt = (self.headers.get("X-API-Token") or "").strip()
         return bool(alt and hmac.compare_digest(alt, expected))
 
+    def _validate_csrf(self) -> tuple[HTTPStatus, str] | None:
+        host_hdr = (self.headers.get("Host") or "").strip().lower()
+        raw_origin = self.headers.get("Origin")
+        if raw_origin is not None:
+            origin = raw_origin.strip()
+            if not origin or origin.lower() == "null":
+                return (HTTPStatus.FORBIDDEN, "Cross-origin request rejected")
+            origin_netloc = urlparse(origin).netloc.lower()
+            if not host_hdr or origin_netloc != host_hdr:
+                return (HTTPStatus.FORBIDDEN, "Cross-origin request rejected")
+        else:
+            raw_referer = self.headers.get("Referer")
+            if raw_referer is not None:
+                ref_netloc = urlparse(raw_referer.strip()).netloc.lower()
+                if not host_hdr or ref_netloc != host_hdr:
+                    return (HTTPStatus.FORBIDDEN, "Cross-origin request rejected")
+        content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            return (HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "Content-Type must be application/json")
+        return None
+
     def _read_json_body(self) -> dict[str, Any]:
         raw_len = self.headers.get("Content-Length") or "0"
         if not raw_len.strip().isdigit():
             raise ValueError("Invalid Content-Length header")
         length = int(raw_len.strip())
         if length > MAX_REQUEST_BODY_BYTES:
-            raise ValueError("Request payload too large")
+            raise _PayloadTooLargeError("Request payload too large")
         if length <= 0:
             return {}
         data = self.rfile.read(length)
@@ -502,8 +564,16 @@ class _WebRequestHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "Unauthorized"})
             return
+        csrf_err = self._validate_csrf()
+        if csrf_err is not None:
+            status_code, message = csrf_err
+            self._send_json(status_code, {"error": message})
+            return
         try:
             body = self._read_json_body()
+        except _PayloadTooLargeError as exc:
+            self._send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": str(exc)})
+            return
         except ValueError as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return

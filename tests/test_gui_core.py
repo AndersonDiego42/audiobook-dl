@@ -2896,7 +2896,7 @@ def test_gui_dark_mode_listbox_accent_button_fonts_modality_and_scrollable_frame
         assert dlg1._paths_listbox.cget("background") == DARK_PALETTE.surface
         assert dlg1._paths_listbox.cget("foreground") == DARK_PALETTE.fg
         # Wheel event originating from child Toplevel does not scroll main canvas
-        app._scroll_frame.on_mousewheel(SimpleNamespace(widget=dlg1._paths_listbox, delta=-120))
+        app._scroll_frame.on_mousewheel(SimpleNamespace(widget=dlg1._paths_listbox, delta=-120))  # type: ignore[arg-type]
         dlg1.destroy()
 
         # Archive, ABS, and Catalog dialogs guard against duplicate instances and support empty selection
@@ -2953,7 +2953,7 @@ def test_gui_sync_libraries_and_windows_toast_powershell_preference(tmp_path, mo
         assert app._is_syncing is True
 
         app._handle_event(("sync_done", SyncCycleResult(books_discovered=3, newly_added=1, downloaded=1), None))
-        assert app._is_syncing is False
+        assert not app._is_syncing
         assert "Sync complete" in app.status_var.get()
         assert shown == ["Library Sync Complete"]
     finally:
@@ -2987,6 +2987,189 @@ def test_gui_sync_libraries_and_windows_toast_powershell_preference(tmp_path, mo
     )
     assert notifications._send_windows_toast("Title", "Body", app_name="audiobook-dl", timeout=2.0) is True
     assert "WindowsRuntime" in cmds_run[0][-1]
+
+
+def test_gui_queue_title_resolution_and_output_path(tmp_path, monkeypatch):
+    from audiobookdl.gui.controller import GuiLogSink
+    import queue as pyqueue
+
+    q: pyqueue.Queue[tuple] = pyqueue.Queue()
+    sink = GuiLogSink(q)
+    sink.set_active_run_id(4)
+    sink.set_active_job_id("job_series")
+    sink.on_item_progress(0, 3, "Chronicles")
+    sink.on_item_progress(2, 3, "Book Two")
+    drained: list[tuple] = []
+    while not q.empty():
+        drained.append(q.get_nowait())
+    meta_events = [ev for ev in drained if ev[0] == "job_meta"]
+    assert meta_events == [
+        ("job_meta", "job_series", "Chronicles", ""),
+        ("job_meta", "job_series", "Chronicles (2/3)", ""),
+    ]
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+        out_file = tmp_path / "Resolved Title.m4b"
+        out_file.write_bytes(b"audio")
+        app.output_dir_var.set(str(tmp_path))
+        app.urls_text.insert("1.0", "https://librivox.org/book\n")
+
+        def fake_run_downloads(urls, options, config, interaction=None, cancel_event=None, sink=None):
+            logging.emit_item_progress(1, 1, "Resolved Title")
+            return DownloadSummary(
+                completed=1,
+                failed=0,
+                cancelled=False,
+                books_completed=1,
+                outputs=[{"title": "Resolved Title", "output_path": str(out_file)}],
+            )
+
+        monkeypatch.setattr("audiobookdl.gui.ffmpeg_assistant.find_executable", lambda name: name)
+        monkeypatch.setattr("audiobookdl.gui.controller.run_downloads", fake_run_downloads)
+
+        app.start_download()
+        for _ in range(100):
+            root.update()
+            if not app.is_running:
+                break
+            threading.Event().wait(0.02)
+
+        assert not app.is_running
+        children = app.queue_tree.get_children()
+        assert len(children) == 1
+        job_id = children[0]
+        rec = app.controller.queue_records[job_id]
+        assert rec["title"] == "Resolved Title"
+        assert rec["output_path"] == str(out_file)
+        values = app.queue_tree.item(job_id, "values")
+        assert isinstance(values, (tuple, list))
+        assert values[1] == "Resolved Title \u2014 https://librivox.org/book"
+        assert values[2] == "Completed"
+        assert out_file.name in values[3]
+    finally:
+        app.controller.shutdown(is_running=False, is_previewing=False)
+        root.destroy()
+
+
+def test_gui_queue_row_actions_context_menu_double_click_and_multiselect(tmp_path, monkeypatch):
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+        ctrl = app.controller
+        panel = app._queue_panel
+        interaction = GuiInteractionHandler(ctrl.event_queue, ctrl.cancel_event)
+
+        out_file = tmp_path / "Finished Book.m4b"
+        out_file.write_bytes(b"m4b")
+        j_done = QueuedJob(
+            job_id="j_done",
+            run_id=1,
+            url="https://librivox.org/done",
+            options=app.build_options(urls_override=["https://librivox.org/done"]),
+            interaction=interaction,
+        )
+        j_fail = QueuedJob(
+            job_id="j_fail",
+            run_id=1,
+            url="https://librivox.org/failed",
+            options=app.build_options(urls_override=["https://librivox.org/failed"]),
+            interaction=interaction,
+        )
+        j_pend = QueuedJob(
+            job_id="j_pend",
+            run_id=1,
+            url="https://librivox.org/pending",
+            options=app.build_options(urls_override=["https://librivox.org/pending"]),
+            interaction=interaction,
+        )
+        panel.register_queue_job(j_done, persist=False)
+        panel.register_queue_job(j_fail, persist=False)
+        panel.register_queue_job(j_pend, persist=False)
+        panel.update_queue_row_metadata("j_done", title="Finished Book", output_path=str(out_file))
+        panel.update_queue_row("j_done", "Completed", f"1 ok \u2014 {out_file.name}")
+        panel.update_queue_row("j_fail", "Failed", "Network timeout")
+
+        # Verify context menu item enablement for completed vs failed row
+        app.queue_tree.selection_set("j_done")
+        monkeypatch.setattr(panel._queue_menu, "tk_popup", lambda _x, _y: None)
+        monkeypatch.setattr(panel._queue_menu, "grab_release", lambda: None)
+        monkeypatch.setattr(app.queue_tree, "identify_row", lambda _y: "j_done")
+        panel._show_queue_context_menu(SimpleNamespace(y=0, x_root=10, y_root=10))  # type: ignore[arg-type]
+        assert str(panel._queue_menu.entrycget("Open Output", "state")) == "normal"
+        assert str(panel._queue_menu.entrycget("Retry Selected", "state")) == "disabled"
+
+        app.queue_tree.selection_set("j_fail")
+        monkeypatch.setattr(app.queue_tree, "identify_row", lambda _y: "j_fail")
+        panel._show_queue_context_menu(SimpleNamespace(y=0, x_root=10, y_root=10))  # type: ignore[arg-type]
+        assert str(panel._queue_menu.entrycget("Open Output", "state")) == "disabled"
+        assert str(panel._queue_menu.entrycget("Retry Selected", "state")) == "normal"
+        assert str(panel._queue_menu.entrycget("Preview Metadata...", "state")) == "normal"
+        assert str(panel._queue_menu.entrycget("Copy Detail / Error", "state")) == "normal"
+
+        # Double-click completed row opens output path; double-click failed row opens details
+        opened: list[tuple[str, bool]] = []
+        shown_details: list[tuple[str, str]] = []
+        monkeypatch.setattr(panel, "_on_open_path", lambda p, rev=False: opened.append((p, rev)))
+        monkeypatch.setattr(
+            "audiobookdl.gui.queue_panel.messagebox.showinfo",
+            lambda title, msg, parent=None: shown_details.append((title, msg)),
+        )
+        monkeypatch.setattr(app.queue_tree, "identify_row", lambda _y: "j_done")
+        panel._on_queue_double_click(SimpleNamespace(y=0))  # type: ignore[arg-type]
+        assert opened == [(str(out_file), False)]
+
+        # Verify app._open_path_in_os handles direct open and reveal-in-folder
+        popen_calls: list[list[str]] = []
+        monkeypatch.setattr("audiobookdl.gui.app.subprocess.Popen", lambda cmd: popen_calls.append(list(cmd)))
+        if hasattr(os, "startfile"):
+            startfile_calls: list[str] = []
+            monkeypatch.setattr(os, "startfile", lambda p: startfile_calls.append(p))
+            app._open_path_in_os(str(out_file), reveal_in_folder=False)
+            assert startfile_calls == [str(out_file)]
+        else:
+            app._open_path_in_os(str(out_file), reveal_in_folder=False)
+            assert len(popen_calls) == 1
+        app._open_path_in_os(str(out_file), reveal_in_folder=True)
+        assert len(popen_calls) >= 1
+
+        monkeypatch.setattr(app.queue_tree, "identify_row", lambda _y: "j_fail")
+        panel._on_queue_double_click(SimpleNamespace(y=0))  # type: ignore[arg-type]
+        assert len(shown_details) == 1
+        assert "Network timeout" in shown_details[0][1]
+        assert "https://librivox.org/failed" in shown_details[0][1]
+
+        # Copy URL, Copy Detail, Send URL to Input, Preview Metadata
+        app.queue_tree.selection_set("j_fail")
+        panel._copy_selected_urls()
+        assert root.clipboard_get() == "https://librivox.org/failed"
+        panel._copy_selected_detail()
+        assert root.clipboard_get() == "Network timeout"
+        panel._send_selected_to_urls()
+        assert "https://librivox.org/failed" in app.urls_text.get("1.0", tk.END)
+
+        previewed: list[str | None] = []
+        monkeypatch.setattr(app, "preview_metadata", lambda url_override=None: previewed.append(url_override))
+        panel._preview_selected_item()
+        assert previewed == ["https://librivox.org/failed"]
+
+        # Multi-select removal removes multiple selected rows at once
+        app.queue_tree.selection_set(("j_done", "j_fail"))
+        panel.remove_selected_item()
+        assert list(app.queue_tree.get_children()) == ["j_pend"]
+    finally:
+        app.controller.shutdown(is_running=False, is_previewing=False)
+        root.destroy()
+
 
 
 

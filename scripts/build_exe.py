@@ -40,8 +40,8 @@ EXCLUDED_MODULES = (
     # On Python 3.12+, `distutils` is aliased from `setuptools._distutils` by PyInstaller's
     # pre-safe-import hook; excluding `distutils` directly triggers an alias conflict.
     *(("distutils",) if sys.version_info < (3, 12) else ()),
-    # Python 3.11+ uses stdlib `tomllib`, so `tomli` (and its mypyc binary) is unneeded.
-    *(("tomli",) if sys.version_info >= (3, 11) else ()),
+    # Modern `setuptools` also vendors `tomli` (`setuptools._vendor.tomli`), which PyInstaller's
+    # pre-safe-import hook aliases to `tomli`; excluding `tomli` triggers the same alias conflict.
     "setuptools",
     "_distutils_hack",
     "pkg_resources",

@@ -62,6 +62,86 @@ class PackJobRequest:
     output_dir: str | None = None
     overrides: PackOverrides | None = None
     label: str = ""
+    output_format: str | None = None
+
+    def to_dict(self, *, output_format: str | None = None) -> dict[str, Any]:
+        """Serialize this pack request into a JSON-compatible dictionary."""
+        ov_dict: dict[str, Any] | None = None
+        if self.overrides is not None:
+            ov = self.overrides
+            ov_dict = {
+                "title": ov.title,
+                "authors": list(ov.authors),
+                "narrators": list(ov.narrators),
+                "series": ov.series,
+                "series_order": ov.series_order,
+                "isbn": ov.isbn,
+                "asin": ov.asin,
+                "cover_path": ov.cover_path,
+            }
+        fmt = output_format if output_format is not None else self.output_format
+        return {
+            "paths": list(self.paths),
+            "recursive": bool(self.recursive),
+            "delete_source": bool(self.delete_source),
+            "output_dir": self.output_dir,
+            "label": self.label,
+            "output_format": fmt,
+            "overrides": ov_dict,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> "PackJobRequest | None":
+        """Reconstruct a `PackJobRequest` from a persisted dictionary, or return `None`."""
+        if not isinstance(raw, Mapping):
+            return None
+        raw_paths = raw.get("paths")
+        if not isinstance(raw_paths, list):
+            return None
+        paths = [str(p).strip() for p in raw_paths if isinstance(p, str) and p.strip()]
+        if not paths:
+            return None
+        overrides: PackOverrides | None = None
+        raw_ov = raw.get("overrides")
+        if isinstance(raw_ov, Mapping):
+            authors = [str(a).strip() for a in (raw_ov.get("authors") or []) if str(a).strip()]
+            narrators = [str(n).strip() for n in (raw_ov.get("narrators") or []) if str(n).strip()]
+            raw_order = raw_ov.get("series_order")
+            series_order = raw_order if isinstance(raw_order, int) and not isinstance(raw_order, bool) else None
+            cand = PackOverrides(
+                title=str(raw_ov["title"]).strip() if raw_ov.get("title") else None,
+                authors=authors,
+                narrators=narrators,
+                series=str(raw_ov["series"]).strip() if raw_ov.get("series") else None,
+                series_order=series_order,
+                isbn=str(raw_ov["isbn"]).strip() if raw_ov.get("isbn") else None,
+                asin=str(raw_ov["asin"]).strip() if raw_ov.get("asin") else None,
+                cover_path=str(raw_ov["cover_path"]).strip() if raw_ov.get("cover_path") else None,
+            )
+            if any((
+                cand.title,
+                cand.authors,
+                cand.narrators,
+                cand.series is not None,
+                cand.series_order is not None,
+                cand.isbn is not None,
+                cand.asin is not None,
+                cand.cover_path,
+            )):
+                overrides = cand
+        raw_out_dir = raw.get("output_dir")
+        output_dir = str(raw_out_dir).strip() if isinstance(raw_out_dir, str) and raw_out_dir.strip() else None
+        raw_fmt = raw.get("output_format")
+        output_format = str(raw_fmt).strip().lower() if isinstance(raw_fmt, str) and raw_fmt.strip() else None
+        return cls(
+            paths=paths,
+            recursive=bool(raw.get("recursive", False)),
+            delete_source=bool(raw.get("delete_source", False)),
+            output_dir=output_dir,
+            overrides=overrides,
+            label=str(raw.get("label") or ""),
+            output_format=output_format,
+        )
 
 
 @dataclass
@@ -84,9 +164,18 @@ class GuiLogSink:
     def __init__(self, event_queue: "queue.Queue[tuple]") -> None:
         self._queue = event_queue
         self._active_run_id = 0
+        self._active_job_id: str | None = None
+        self._active_series_title: str = ""
+        self._last_emitted_title: str = ""
 
     def set_active_run_id(self, run_id: int) -> None:
         self._active_run_id = run_id
+
+    def set_active_job_id(self, job_id: str | None) -> None:
+        """Bind `job_id` so `item_progress` updates also resolve the active queue row title."""
+        self._active_job_id = job_id
+        self._active_series_title = ""
+        self._last_emitted_title = ""
 
     def on_log(self, level: str, message: str) -> None:
         self._queue.put(("log", level, message))
@@ -118,6 +207,22 @@ class GuiLogSink:
 
     def on_item_progress(self, current: int, total: int, title: str) -> None:
         self._queue.put(("item_progress", self._active_run_id, current, total, title))
+        cleaned = str(title or "").strip()
+        if not self._active_job_id or not cleaned:
+            return
+        if total > 1 and current == 0:
+            self._active_series_title = cleaned
+            display_title = cleaned
+        elif total > 1 and current > 0:
+            if self._active_series_title and self._active_series_title != cleaned:
+                display_title = f"{self._active_series_title} ({current}/{total})"
+            else:
+                display_title = f"{cleaned} ({current}/{total})"
+        else:
+            display_title = cleaned
+        if display_title != self._last_emitted_title:
+            self._last_emitted_title = display_title
+            self._queue.put(("job_meta", self._active_job_id, display_title, ""))
 
     def on_progress_finish(self) -> None:
         self._queue.put(("progress_finish",))
@@ -358,12 +463,13 @@ class GuiController:
         return os.path.join(base_dir, "db", "gui_queue.json")
 
     def save_queue_state(self) -> None:
-        """Persist non-completed download queue entries to `gui_queue.json` atomically."""
-        persistable: list[dict[str, str]] = []
+        """Persist non-completed download and pack queue entries to `gui_queue.json` atomically."""
+        persistable: list[dict[str, Any]] = []
         with self.queue_lock:
             records = list(self.queue_records.values())
         for rec in records:
-            if rec.get("job_kind", "download") != "download":
+            job_kind = str(rec.get("job_kind") or "download")
+            if job_kind not in ("download", "pack"):
                 continue
             status = str(rec.get("status") or "")
             if status == "Completed":
@@ -374,14 +480,25 @@ class GuiController:
                 if saved_status == "Interrupted" and not rec.get("detail")
                 else str(rec.get("detail") or "")
             )
-            persistable.append(
-                {
-                    "url": str(rec.get("url") or ""),
-                    "service": str(rec.get("service") or "Unknown"),
-                    "status": saved_status,
-                    "detail": detail,
-                }
-            )
+            entry: dict[str, Any] = {
+                "job_kind": job_kind,
+                "url": str(rec.get("url") or ""),
+                "service": str(rec.get("service") or "Unknown"),
+                "status": saved_status,
+                "detail": detail,
+            }
+            title = str(rec.get("title") or "").strip()
+            if title:
+                entry["title"] = title
+            output_path = str(rec.get("output_path") or "").strip()
+            if output_path:
+                entry["output_path"] = output_path
+            if job_kind == "pack":
+                pack_payload = rec.get("pack_request")
+                if not isinstance(pack_payload, dict):
+                    continue
+                entry["pack_request"] = pack_payload
+            persistable.append(entry)
         target = self.queue_state_path()
         try:
             if not persistable:
@@ -397,7 +514,7 @@ class GuiController:
             pass
 
     def load_saved_queue_records(self) -> list[dict[str, Any]]:
-        """Load persisted unresolved queue items from `gui_queue.json`."""
+        """Load persisted unresolved download and pack queue items from `gui_queue.json`."""
         target = self.queue_state_path()
         if not os.path.isfile(target):
             return []
@@ -413,19 +530,38 @@ class GuiController:
             for item in raw:
                 if not isinstance(item, dict):
                     continue
-                url = str(item.get("url") or "").strip()
-                if not url:
+                job_kind = str(item.get("job_kind") or "download").strip().lower()
+                if job_kind not in ("download", "pack"):
                     continue
+                pack_dict: dict[str, Any] | None = None
+                if job_kind == "pack":
+                    parsed_pack = PackJobRequest.from_dict(item.get("pack_request"))
+                    if parsed_pack is None:
+                        continue
+                    pack_dict = parsed_pack.to_dict()
+                    url = str(item.get("url") or "").strip() or parsed_pack.label or parsed_pack.paths[0]
+                    service = str(item.get("service") or "Local Pack")
+                    title = str(item.get("title") or parsed_pack.label or "").strip()
+                else:
+                    url = str(item.get("url") or "").strip()
+                    if not url:
+                        continue
+                    service = str(item.get("service") or "Unknown")
+                    title = str(item.get("title") or "").strip()
                 job_id = self.make_job_id()
-                rec = {
+                rec: dict[str, Any] = {
                     "job_id": job_id,
                     "run_id": 0,
                     "url": url,
+                    "title": title,
+                    "output_path": str(item.get("output_path") or "").strip(),
                     "status": str(item.get("status") or "Interrupted"),
                     "detail": str(item.get("detail") or ""),
-                    "service": str(item.get("service") or "Unknown"),
-                    "job_kind": "download",
+                    "service": service,
+                    "job_kind": job_kind,
                 }
+                if pack_dict is not None:
+                    rec["pack_request"] = pack_dict
                 self.queue_records[job_id] = rec
                 restored.append(rec)
         return restored
@@ -466,20 +602,38 @@ class GuiController:
         *,
         persist: bool = True,
     ) -> dict[str, Any]:
-        rec = {
+        is_pack = job.pack_request is not None
+        initial_title = ""
+        if job.prefetched is not None:
+            initial_title = str(getattr(job.prefetched[1], "title", "") or "").strip()
+        elif job.pack_request is not None:
+            initial_title = str(job.pack_request.label or "").strip()
+        rec: dict[str, Any] = {
             "job_id": job.job_id,
             "run_id": job.run_id,
             "url": job.url,
+            "title": initial_title,
+            "output_path": "",
             "status": "Queued",
             "detail": "",
             "service": service_label,
-            "job_kind": "pack" if job.pack_request is not None else "download",
+            "job_kind": "pack" if is_pack else "download",
         }
+        if job.pack_request is not None:
+            rec["pack_request"] = job.pack_request.to_dict(
+                output_format=getattr(job.options, "output_format", None) or job.pack_request.output_format
+            )
         with self.queue_lock:
             self.queue_records[job.job_id] = rec
         if persist:
             self._request_save_queue_state()
         return rec
+
+    def get_queue_record(self, job_id: str) -> dict[str, Any] | None:
+        """Return a shallow copy of the queue record for `job_id`, if present."""
+        with self.queue_lock:
+            rec = self.queue_records.get(job_id)
+            return dict(rec) if rec is not None else None
 
     def update_queue_record(self, job_id: str, status: str, detail: str = "") -> dict[str, Any] | None:
         with self.queue_lock:
@@ -490,6 +644,33 @@ class GuiController:
             rec["detail"] = detail
         self._request_save_queue_state()
         return rec
+
+    def update_queue_metadata(
+        self,
+        job_id: str,
+        *,
+        title: str | None = None,
+        output_path: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Update resolved title and/or output path for `job_id` and persist if changed."""
+        changed = False
+        snapshot: dict[str, Any] | None = None
+        with self.queue_lock:
+            rec = self.queue_records.get(job_id)
+            if rec is None:
+                return None
+            cleaned_title = str(title or "").strip()
+            cleaned_path = str(output_path or "").strip()
+            if cleaned_title and rec.get("title") != cleaned_title:
+                rec["title"] = cleaned_title
+                changed = True
+            if cleaned_path and rec.get("output_path") != cleaned_path:
+                rec["output_path"] = cleaned_path
+                changed = True
+            snapshot = dict(rec)
+        if changed:
+            self._request_save_queue_state()
+        return snapshot
 
     def clear_seen_urls(self) -> None:
         with self.queue_lock:
@@ -598,32 +779,51 @@ class GuiController:
             self.queue_cond.notify_all()
             return added_job, new_total
 
-    def start_or_enqueue_pack_jobs(
+    def start_or_enqueue_jobs(
         self,
-        requests_with_options: Sequence[tuple[PackJobRequest, args.DownloadOptions]],
+        *,
+        download_specs: Sequence[
+            tuple[str, args.DownloadOptions, list[int] | None, tuple[Source, Result] | None]
+        ] = (),
+        pack_requests: Sequence[tuple[PackJobRequest, args.DownloadOptions]] = (),
     ) -> tuple[bool, int, list[QueuedJob], int]:
-        """Queue local pack jobs on the active run or start a new run when idle.
+        """Queue download and/or pack jobs onto the active run, or start a new run when idle.
 
         Returns `(was_appended, run_id, queued_jobs, batch_total)`.
         """
+        total_incoming = len(download_specs) + len(pack_requests)
         queued_jobs: list[QueuedJob] = []
         with self.queue_cond:
             was_appended = self.worker_has_active_run
             if not was_appended:
                 self.cancel_event.clear()
+                self.pause_event.set()
                 self.interaction = GuiInteractionHandler(self.event_queue, self.cancel_event)
                 self.worker_run_id += 1
                 self.worker_has_active_run = True
-                self.batch_total = len(requests_with_options)
-                self.run_seen_urls.clear()
+                self.batch_total = total_incoming
+                self.run_seen_urls = {url for url, _, _, _ in download_specs}
                 self.sink.set_active_run_id(self.worker_run_id)
             else:
                 if self.interaction is None:
                     self.interaction = GuiInteractionHandler(self.event_queue, self.cancel_event)
-                self.batch_total += len(requests_with_options)
+                self.batch_total += total_incoming
+                self.run_seen_urls.update(url for url, _, _, _ in download_specs)
             run_id = self.worker_run_id
             interaction = self.interaction
-            for req, opts in requests_with_options:
+            for url, job_opts, selected_indices, prefetched in download_specs:
+                job = QueuedJob(
+                    job_id=self.make_job_id(),
+                    run_id=run_id,
+                    url=url,
+                    options=job_opts,
+                    interaction=interaction,
+                    selected_indices=selected_indices,
+                    prefetched=prefetched,
+                )
+                self.pending_jobs.append(job)
+                queued_jobs.append(job)
+            for req, opts in pack_requests:
                 display = req.label or (req.paths[0] if req.paths else "Local folder")
                 job = QueuedJob(
                     job_id=self.make_job_id(),
@@ -640,6 +840,16 @@ class GuiController:
 
         self.ensure_worker_started()
         return was_appended, run_id, queued_jobs, new_total
+
+    def start_or_enqueue_pack_jobs(
+        self,
+        requests_with_options: Sequence[tuple[PackJobRequest, args.DownloadOptions]],
+    ) -> tuple[bool, int, list[QueuedJob], int]:
+        """Queue local pack jobs on the active run or start a new run when idle.
+
+        Returns `(was_appended, run_id, queued_jobs, batch_total)`.
+        """
+        return self.start_or_enqueue_jobs(pack_requests=requests_with_options)
 
     def inspect_local_pack_preview(
         self,
@@ -730,14 +940,32 @@ class GuiController:
             return neighbor_id
 
     def retryable_urls(self, ordered_ids: Sequence[str]) -> list[str]:
-        return [
-            rec["url"]
-            for iid in ordered_ids
-            for rec in [self.queue_records.get(iid)]
-            if rec is not None
-            and rec.get("job_kind", "download") == "download"
-            and rec["status"] in ("Failed", "Cancelled", "Interrupted")
-        ]
+        with self.queue_lock:
+            return [
+                rec["url"]
+                for iid in ordered_ids
+                for rec in [self.queue_records.get(iid)]
+                if rec is not None
+                and rec.get("job_kind", "download") == "download"
+                and rec["status"] in ("Failed", "Cancelled", "Interrupted")
+            ]
+
+    def retryable_jobs(self, ordered_ids: Sequence[str]) -> list[dict[str, Any]]:
+        """Return shallow copies of retryable download and pack queue records in order."""
+        out: list[dict[str, Any]] = []
+        with self.queue_lock:
+            for iid in ordered_ids:
+                rec = self.queue_records.get(iid)
+                if rec is None:
+                    continue
+                if rec.get("status") not in ("Failed", "Cancelled", "Interrupted"):
+                    continue
+                job_kind = rec.get("job_kind", "download")
+                if job_kind == "download" and rec.get("url"):
+                    out.append(dict(rec))
+                elif job_kind == "pack" and isinstance(rec.get("pack_request"), dict):
+                    out.append(dict(rec))
+        return out
 
     def clear_completed_records(self, ordered_ids: Sequence[str]) -> list[str]:
         with self.queue_lock:
@@ -867,10 +1095,13 @@ class GuiController:
                 item_index += 1
                 self.event_queue.put(("batch_item", run_id, item_index, item_total, active_job.url))
                 self.event_queue.put(("job_status", active_job.job_id, "Running", ""))
+                self.sink.set_active_job_id(active_job.job_id)
 
                 should_break = False
                 try:
                     config = self.config_snapshot()
+                    resolved_title = ""
+                    resolved_output_path = ""
                     if active_job.pack_request is not None:
                         req = active_job.pack_request
                         pack_summary = run_pack(
@@ -894,6 +1125,14 @@ class GuiController:
                             books_failed=pack_summary.books_failed,
                             book_errors=list(pack_summary.book_errors),
                         )
+                        if pack_summary.output_paths:
+                            if len(pack_summary.output_paths) == 1:
+                                resolved_output_path = pack_summary.output_paths[0]
+                            else:
+                                first_out = pack_summary.output_paths[0]
+                                resolved_output_path = os.path.dirname(first_out) or first_out
+                                base_label = req.label or os.path.basename(resolved_output_path) or "Local Pack"
+                                resolved_title = f"{base_label} ({len(pack_summary.output_paths)} books)"
                     else:
                         run_kwargs: dict[str, Any] = {
                             "interaction": active_job.interaction,
@@ -909,6 +1148,17 @@ class GuiController:
                             active_job.options,
                             config,
                             **run_kwargs,
+                        )
+                        if summary.outputs:
+                            if len(summary.outputs) == 1:
+                                resolved_title = str(summary.outputs[0].get("title") or "").strip()
+                                resolved_output_path = str(summary.outputs[0].get("output_path") or "").strip()
+                            else:
+                                first_out = str(summary.outputs[0].get("output_path") or "").strip()
+                                resolved_output_path = os.path.dirname(first_out) or first_out
+                    if resolved_title or resolved_output_path:
+                        self.event_queue.put(
+                            ("job_meta", active_job.job_id, resolved_title, resolved_output_path)
                         )
                     batch_summary.completed += summary.completed
                     batch_summary.failed += summary.failed
@@ -927,11 +1177,15 @@ class GuiController:
                         self._discard_seen_url_if_unpending(active_job.url)
                         self.event_queue.put(("job_status", active_job.job_id, "Failed", detail))
                     else:
-                        detail = (
-                            f"{summary.books_completed} ok"
-                            if summary.books_completed
-                            else ("Skipped" if summary.books_skipped else "Done")
-                        )
+                        if summary.books_completed:
+                            out_name = os.path.basename(resolved_output_path) if resolved_output_path else ""
+                            detail = (
+                                f"{summary.books_completed} ok \u2014 {out_name}"
+                                if out_name
+                                else f"{summary.books_completed} ok"
+                            )
+                        else:
+                            detail = "Skipped" if summary.books_skipped else "Done"
                         self.event_queue.put(("job_status", active_job.job_id, "Completed", detail))
                 except DownloadCancelled:
                     batch_summary.cancelled = True
@@ -955,6 +1209,7 @@ class GuiController:
                         self.event_queue.put(("log", "ERROR", f"{active_job.url}: {err_text}"))
                         self.event_queue.put(("job_status", active_job.job_id, "Failed", err_text[:120]))
                 finally:
+                    self.sink.set_active_job_id(None)
                     self._close_job_prefetched(active_job)
                     with self.queue_cond:
                         self.cancelled_job_ids.discard(active_job.job_id)

@@ -88,6 +88,8 @@ class E2EConfig:
 
     def gui_self_test_command(self) -> list[str]:
         """Return argv used to invoke the GUI `--self-test` readiness check."""
-        if self.target_mode == "executable" and self.gui_executable is not None:
-            return [str(self.gui_executable), "--self-test"]
+        if self.target_mode == "executable":
+            if self.gui_executable is not None:
+                return [str(self.gui_executable), "--self-test"]
+            return ["audiobook-dl-gui", "--self-test"]
         return [sys.executable, "-m", "audiobookdl.gui", "--self-test"]

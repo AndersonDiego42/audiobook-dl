@@ -25,8 +25,11 @@ from audiobookdl.utils.http import DEFAULT_HTTP_TIMEOUT
 
 @pytest.fixture(autouse=True)
 def _mock_probe_for_dummy_download_bytes(request, monkeypatch):
-    """Stub ffprobe in dummy-byte download unit tests unless marked `real_integrity`."""
-    if request.node.get_closest_marker("real_integrity") is not None:
+    """Stub ffprobe in dummy-byte download unit tests unless opted out."""
+    if (
+        request.node.get_closest_marker("real_integrity") is not None
+        or request.node.get_closest_marker("no_probe_stub") is not None
+    ):
         return
     from audiobookdl.output import output as output_mod
     from audiobookdl.utils import AudioProbeInfo
@@ -1138,7 +1141,7 @@ def test_download_audiobook_atomic_staging_preserves_existing_dir_on_cancel_or_e
     assert [p.name for p in tmp_path.iterdir()] == ["Atomic Book"]
 
 
-@pytest.mark.real_integrity
+@pytest.mark.no_probe_stub
 def test_download_file_rejects_corrupt_audio_before_replacing_existing_file(tmp_path):
     from audiobookdl.exceptions import GenericAudiobookDLException
     from audiobookdl.output import output as output_mod
@@ -1166,7 +1169,7 @@ def test_download_file_rejects_corrupt_audio_before_replacing_existing_file(tmp_
     assert not (tmp_path / "Existing.mp3.tmp").exists()
 
 
-@pytest.mark.real_integrity
+@pytest.mark.no_probe_stub
 def test_download_file_surfaces_ffprobe_execution_error_without_false_integrity_message(tmp_path):
     from audiobookdl.exceptions import GenericAudiobookDLException
 
@@ -1196,6 +1199,88 @@ def test_download_file_surfaces_ffprobe_execution_error_without_false_integrity_
     assert "not compatible" in body
     assert "failed media integrity verification" not in heading
     assert target.read_bytes() == b"valid-existing-audio"
+
+
+def _generate_real_mp3(tmp_path: Path, name: str = "valid.mp3") -> Path:
+    import shutil
+    import subprocess
+
+    ffmpeg_bin = shutil.which("ffmpeg")
+    ffprobe_bin = shutil.which("ffprobe")
+    if not ffmpeg_bin or not ffprobe_bin:
+        pytest.skip("ffmpeg/ffprobe unavailable for real_integrity test")
+    assert ffmpeg_bin is not None
+    out = tmp_path / name
+    subprocess.run(
+        [
+            ffmpeg_bin,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=44100:cl=mono",
+            "-t",
+            "1.0",
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "64k",
+            str(out),
+        ],
+        capture_output=True,
+        check=True,
+    )
+    return out
+
+
+@pytest.mark.real_integrity
+@pytest.mark.ffmpeg
+def test_real_ffprobe_integrity_accepts_valid_mp3_and_rejects_corrupt_bytes(tmp_path):
+    from audiobookdl.exceptions import GenericAudiobookDLException
+
+    valid_bytes = _generate_real_mp3(tmp_path, "source.mp3").read_bytes()
+    session = MagicMock()
+    session.get.return_value = _mock_response(
+        headers={"Content-Length": str(len(valid_bytes)), "Content-Type": "audio/mpeg"},
+        chunks=[valid_bytes],
+    )
+    book = _make_audiobook(session)
+    target = tmp_path / "Book.mp3"
+
+    committed = download_file((book, str(tmp_path / "Book"), 0, lambda _d: None, None))
+    assert committed == str(target)
+    assert target.read_bytes() == valid_bytes
+
+    corrupt = b"<html>403 Forbidden - not an audio stream</html>"
+    session.get.return_value = _mock_response(
+        headers={"Content-Length": str(len(corrupt)), "Content-Type": "audio/mpeg"},
+        chunks=[corrupt],
+    )
+    with pytest.raises(GenericAudiobookDLException) as exc_info:
+        download_file((book, str(tmp_path / "Book"), 0, lambda _d: None, None))
+
+    assert "failed media integrity verification" in exc_info.value.data["heading"]
+    assert target.read_bytes() == valid_bytes
+    assert not (tmp_path / "Book.mp3.tmp").exists()
+
+
+@pytest.mark.real_integrity
+@pytest.mark.ffmpeg
+def test_real_ffprobe_integrity_rejects_truncated_audio(tmp_path):
+    from audiobookdl.exceptions import FailedCombining
+    from audiobookdl.output import output as output_mod
+
+    valid_mp3 = _generate_real_mp3(tmp_path, "short.mp3")
+    info = output_mod.verify_audio_integrity(str(valid_mp3), require_ffprobe=True)
+    assert info.codec_name == "mp3"
+    assert 0.5 <= info.duration <= 2.0
+
+    with pytest.raises(FailedCombining, match="truncated"):
+        output_mod.verify_audio_integrity(
+            str(valid_mp3),
+            expected_duration=10.0,
+            require_ffprobe=True,
+        )
 
 
 def test_download_file_streams_inline_aes_on_multi_segment_hls_even_with_resume(tmp_path):

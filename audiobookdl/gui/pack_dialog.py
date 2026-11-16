@@ -379,6 +379,7 @@ class PackDialog(tk.Toplevel):
                     output_dir=self._output_dir,
                     overrides=batch_overrides,
                     label=spec.audiobook.title,
+                    output_format=fmt,
                 )
                 for spec in self._preview_specs
             ]
@@ -396,6 +397,7 @@ class PackDialog(tk.Toplevel):
                     output_dir=self._output_dir,
                     overrides=overrides,
                     label=label,
+                    output_format=fmt,
                 )
             ]
 

@@ -303,6 +303,11 @@ class GuiHarness:
 
     def start(self) -> AudiobookDLApp:
         """Create Tk root, launch `AudiobookDLApp`, and verify UI readiness."""
+        if self.config.target_mode == "executable":
+            pytest.skip(
+                "GuiHarness requires AUDIOBOOK_DL_E2E_TARGET=module (in-process Tkinter); "
+                "frozen GUI executable readiness is verified via gui_self_test_command()"
+            )
         try:
             root = tk.Tk()
         except tk.TclError as exc:

@@ -38,7 +38,7 @@ def test_build_exe_onedir_and_exclusions(tmp_path, monkeypatch):
         idx = cmd.index(excluded)
         assert cmd[idx - 1] == "--exclude-module"
     if sys.version_info >= (3, 11):
-        assert "tomli" in build_exe.EXCLUDED_MODULES
+        assert "tomli" not in build_exe.EXCLUDED_MODULES
         assert build_exe._collect_mypyc_binaries() == []
     if build_exe.ICON_PATH.is_file():
         assert "--icon" in cmd

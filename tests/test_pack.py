@@ -854,6 +854,141 @@ def test_pack_dialog_preserves_explicit_fields_passes_output_dir_and_keeps_globa
         root.destroy()
 
 
+def test_pack_job_persistence_and_retry_across_restart(tmp_path: Path, monkeypatch):
+    import gc
+    import time
+    import tkinter as tk
+    from audiobookdl.gui.app import AudiobookDLApp
+    from audiobookdl.gui.controller import GuiInteractionHandler, QueuedJob
+
+    # Verify PackJobRequest serialization round-trip with PackOverrides and output_format
+    req = PackJobRequest(
+        paths=[str(tmp_path / "book_src")],
+        recursive=True,
+        delete_source=False,
+        output_dir=str(tmp_path / "out"),
+        overrides=PackOverrides(
+            title="Persisted Title",
+            authors=["Author One", "Author Two"],
+            narrators=["Narrator One"],
+            series="My Series",
+            series_order=2,
+            isbn="9781234567890",
+            asin="B00TEST123",
+            cover_path=str(tmp_path / "cover.jpg"),
+        ),
+        label="Persisted Title",
+        output_format="mp3",
+    )
+    restored_req = PackJobRequest.from_dict(req.to_dict())
+    assert restored_req == req
+    assert PackJobRequest.from_dict({"paths": []}) is None
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    cfg_path.write_text("", encoding="utf-8")
+
+    src_dir = tmp_path / "Persist Author - Persist Book"
+    src_dir.mkdir()
+    _create_empty_id3_mp3(src_dir / "01.mp3")
+    _create_empty_id3_mp3(src_dir / "02.mp3")
+    out_dir = tmp_path / "pack_out"
+    out_dir.mkdir()
+
+    try:
+        app1 = AudiobookDLApp(root, config_location=str(cfg_path))
+        interaction = GuiInteractionHandler(app1.controller.event_queue, app1.controller.cancel_event)
+        pack_req = PackJobRequest(
+            paths=[str(src_dir)],
+            recursive=False,
+            delete_source=False,
+            output_dir=str(out_dir),
+            overrides=PackOverrides(title="Persisted Book", authors=["Persist Author"]),
+            label="Persisted Book",
+            output_format="m4b",
+        )
+        pack_opts = args.build_default_options(output_format="m4b")
+        j_pending = QueuedJob(
+            job_id="p_pend",
+            run_id=1,
+            url="Persisted Book",
+            options=pack_opts,
+            interaction=interaction,
+            pack_request=pack_req,
+        )
+        j_done = QueuedJob(
+            job_id="p_done",
+            run_id=1,
+            url="Completed Pack",
+            options=pack_opts,
+            interaction=interaction,
+            pack_request=PackJobRequest(paths=[str(src_dir)], label="Completed Pack", output_format="m4b"),
+        )
+        app1._queue_panel.register_queue_job(j_pending, persist=False)
+        app1._queue_panel.register_queue_job(j_done, persist=False)
+        app1._queue_panel.update_queue_row("p_done", "Completed", "1 ok")
+        app1.controller.shutdown(is_running=False, is_previewing=False)
+    finally:
+        gc.collect()
+        root.destroy()
+
+    root2 = tk.Tk()
+    root2.withdraw()
+    try:
+        app2 = AudiobookDLApp(root2, config_location=str(cfg_path))
+        children = app2.queue_tree.get_children()
+        assert len(children) == 1
+        restored_id = children[0]
+        row_values = app2.queue_tree.item(restored_id, "values")
+        assert row_values[0] == "Local Pack"
+        assert row_values[1] == "Persisted Book"
+        assert row_values[2] == "Interrupted"
+
+        retryable = app2.controller.retryable_jobs(children)
+        assert len(retryable) == 1
+        assert retryable[0]["job_kind"] == "pack"
+
+        fake_probe = AudioProbeInfo(duration=1.5, bitrate=128_000, codec_name="mp3", format_name="mp3")
+
+        def _fake_combine(_tracks, _tmp, out_path, **_kwargs):
+            Path(out_path).write_bytes(b"retried-pack")
+            return True
+
+        monkeypatch.setattr("audiobookdl.gui.ffmpeg_assistant.find_executable", lambda name: name)
+        app2.output_dir_var.set(str(out_dir))
+        app2.template_var.set("{author}/{title}")
+        with (
+            patch("audiobookdl.pack.probe_audio_info", return_value=fake_probe),
+            patch("audiobookdl.pack.output.combine_audiofiles", side_effect=_fake_combine),
+            patch("audiobookdl.pack.output_download.add_metadata_to_file"),
+        ):
+            app2._retry_failed_queue_items([restored_id])
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and app2._is_running:
+                root2.update()
+                time.sleep(0.02)
+            root2.update()
+
+        all_children = app2.queue_tree.get_children()
+        assert len(all_children) == 2
+        retried_id = all_children[-1]
+        retried_rec = app2.controller.queue_records[retried_id]
+        expected_out = out_dir / "Persist Author" / "Persisted Book.m4b"
+        assert expected_out.is_file()
+        assert retried_rec["status"] == "Completed"
+        assert retried_rec["output_path"] == str(expected_out)
+    finally:
+        app2.controller.shutdown(is_running=False, is_previewing=False)
+        gc.collect()
+        root2.destroy()
+
+
+
 
 
 

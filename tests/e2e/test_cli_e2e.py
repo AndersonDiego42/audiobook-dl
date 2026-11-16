@@ -330,7 +330,6 @@ def test_cli_mid_download_cancellation_leaves_no_final_output(
     ffmpeg_tools: tuple,
 ) -> None:
     import subprocess
-    import sys
     import threading
     import time
 
@@ -367,9 +366,7 @@ def test_cli_mid_download_cancellation_leaves_no_final_output(
     env, _ = e2e_workspace.build_env(proxy_url=cli_runner.proxy_url)
     proc = subprocess.Popen(
         [
-            sys.executable,
-            "-m",
-            "audiobookdl",
+            *cli_runner.config.cli_command(),
             "--config",
             str(cfg_path),
             "--database_directory",

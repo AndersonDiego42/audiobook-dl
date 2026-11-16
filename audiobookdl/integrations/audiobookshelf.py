@@ -38,9 +38,11 @@ _UPLOADABLE_EXTENSIONS = frozenset({
 class AudiobookshelfError(AudiobookDLException):
     """Raised when an Audiobookshelf API request fails."""
 
+    error_description: str = "generic"
+
     def __init__(self, message: str) -> None:
-        self.error_description = message
-        super().__init__(message)
+        super().__init__(message=message)
+        self.data = {"heading": "Audiobookshelf error", "body": message}
 
 
 def _normalize_base_url(url: str) -> str:

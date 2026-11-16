@@ -22,8 +22,16 @@ class EreolenSource(Source):
         for line in utils.read_asset_file("assets/sources/ereolen/libraries.txt").splitlines()
         if line.strip()
     ]
+    @classmethod
+    def _build_match_patterns(cls, domains: list[str]) -> list[str]:
+        return [
+            rf"https://(www\.)?({'|'.join(re.escape(d) for d in domains)})/work/work-of:.+",
+            r"https://(www\.)?ereolen\.dk/work/work-of:.+",
+        ]
+
     match = [
         rf"https://(www\.)?({'|'.join(re.escape(d) for d in library_domains)})/work/work-of:.+",
+        r"https://(www\.)?ereolen\.dk/work/work-of:.+",
     ]
 
     @classmethod
@@ -61,9 +69,7 @@ class EreolenSource(Source):
                 seen.add(host)
                 cleaned.append(host)
         cls.library_domains = cleaned
-        cls.match = [
-            rf"https://(www\.)?({'|'.join(re.escape(d) for d in cls.library_domains)})/work/work-of:.+",
-        ]
+        cls.match = cls._build_match_patterns(cls.library_domains)
         return list(cls.library_domains)
 
     def _login(self, url: str, username: str, password: str):

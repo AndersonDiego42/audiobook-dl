@@ -87,4 +87,5 @@ markers = [
     "gui: Tests requiring a Tkinter display",
     "ffmpeg: Tests requiring ffmpeg and ffprobe executables",
     "real_integrity: Tests exercising real ffprobe media integrity verification without stubbing",
+    "no_probe_stub: Unit tests that opt out of dummy ffprobe stubbing while mocking probe calls directly",
 ]
