@@ -1226,6 +1226,33 @@ def test_download_file_streams_inline_aes_on_multi_segment_hls_even_with_resume(
     assert open(out_path, "rb").read() == plaintext
 
 
+def test_download_file_streams_inline_aes_when_accept_ranges_none_with_resume(tmp_path):
+    from audiobookdl.utils.audiobook import AESEncryption
+
+    key = b"0123456789abcdef"
+    iv = b"fedcba9876543210"
+    plaintext = b"0123456789abcdef" * 8 + b"small-file"
+    ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(pad(plaintext, AES.block_size))
+
+    session = MagicMock()
+    session.get.return_value = _mock_response(
+        headers={"Content-Length": str(len(ciphertext)), "Accept-Ranges": "none"},
+        chunks=[ciphertext],
+    )
+    book = Audiobook(
+        session=session,
+        metadata=AudiobookMetadata(title="Single Resume Small"),
+        files=[AudiobookFile(url="https://example.com/single.ts", ext="ts", encryption_method=AESEncryption(key=key, iv=iv))],
+    )
+    out_dir = tmp_path / "single_small_dir"
+    out_dir.mkdir()
+    with patch("audiobookdl.output.download.encryption.decrypt_file") as mock_decrypt_file:
+        out_path = download_file((book, str(out_dir), 0, lambda _: None, None), resume=True)
+
+    mock_decrypt_file.assert_not_called()
+    assert open(out_path, "rb").read() == plaintext
+
+
 def test_download_audiobook_enables_faststart_on_combine_and_convert(tmp_path):
     session = MagicMock()
     session.get.return_value = _mock_response({"Content-Length": "3"}, [b"raw"])

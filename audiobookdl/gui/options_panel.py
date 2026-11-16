@@ -247,15 +247,27 @@ class OptionsPanel(ttk.LabelFrame):
         limit_rate_entry = ttk.Entry(network_tab, textvariable=self._vars.limit_rate_var, width=10)
         limit_rate_entry.grid(row=1, column=1, sticky="w", padx=(0, 14), pady=(6, 0))
 
-        ttk.Label(network_tab, text="Proxy URL:").grid(
+        ttk.Label(network_tab, text="Impersonate:").grid(
             row=1, column=2, sticky="w", padx=(0, 4), pady=(6, 0)
         )
+        self._impersonate_combo = ttk.Combobox(
+            network_tab,
+            textvariable=self._vars.impersonate_var,
+            values=("", "chrome", "chrome124", "edge", "safari", "firefox"),
+            state="normal",
+            width=10,
+        )
+        self._impersonate_combo.grid(row=1, column=3, sticky="w", padx=(0, 14), pady=(6, 0))
+
+        ttk.Label(network_tab, text="Proxy URL:").grid(
+            row=1, column=4, sticky="w", padx=(0, 4), pady=(6, 0)
+        )
         proxy_entry = ttk.Entry(network_tab, textvariable=self._vars.proxy_var)
-        proxy_entry.grid(row=1, column=3, columnspan=3, sticky="ew", pady=(6, 0))
+        proxy_entry.grid(row=1, column=5, sticky="ew", pady=(6, 0))
 
         ttk.Label(
             network_tab,
-            text="Leave blank for defaults (6 workers, unlimited bandwidth, e.g. 2M, http://127.0.0.1:8080)",
+            text="Defaults: 6 workers, unlimited bandwidth (e.g. 2M), TLS impersonate via curl_cffi (e.g. chrome)",
             style="Muted.TLabel",
         ).grid(row=2, column=0, columnspan=6, sticky="w", pady=(4, 0))
 
@@ -282,6 +294,7 @@ class OptionsPanel(ttk.LabelFrame):
             book_delay_spin,
             timeout_spin,
             limit_rate_entry,
+            self._impersonate_combo,
             proxy_entry,
             cb_enrich,
             cb_enrich_interactive,
@@ -292,7 +305,7 @@ class OptionsPanel(ttk.LabelFrame):
     def set_enabled(self, enabled: bool) -> None:
         """Enable or disable interactive option controls cleanly."""
         for widget in self._widgets:
-            if isinstance(widget, ttk.Combobox):
+            if isinstance(widget, ttk.Combobox) and widget is not self._impersonate_combo:
                 widget.configure(state="readonly" if enabled else "disabled")
             else:
                 widget.configure(state="normal" if enabled else "disabled")

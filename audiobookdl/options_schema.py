@@ -1238,6 +1238,30 @@ OPTION_REGISTRY: Tuple[OptionSpec, ...] = (
         ),
     ),
     OptionSpec(
+        name="impersonate",
+        default=None,
+        cli_flags=(
+            CliFlag(
+                ("--impersonate",),
+                help="TLS/HTTP2 browser fingerprint to impersonate via optional curl_cffi (e.g. chrome, edge, safari)",
+            ),
+        ),
+        config_key="impersonate",
+        config_kind="str",
+        toml_serializer=_serialize_non_empty_str,
+        merge_from_config=True,
+        merge_only_if_default=True,
+        merge_require_truthy=True,
+        gui=GuiBinding(
+            var_attr="impersonate_var",
+            var_type="str",
+            gui_default="",
+            from_config=_gui_init_optional_str,
+            to_option=_gui_read_optional_str,
+            persisted_in_output_prefs=True,
+        ),
+    ),
+    OptionSpec(
         name="service",
         default=None,
         cli_flags=(

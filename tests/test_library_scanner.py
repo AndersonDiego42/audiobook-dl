@@ -141,3 +141,28 @@ def test_cli_scan_subcommand_json_and_gui_scan_folder(tmp_path, capsys):
             dialog.destroy()
     finally:
         root.destroy()
+
+
+def test_scan_local_library_closes_batch_connection_and_dedupes_via_index(tmp_path):
+    from audiobookdl.utils.archive import DownloadArchive
+    from audiobookdl.utils.library_scanner import scan_local_library
+
+    lib_root = tmp_path / "lib"
+    book_dir = lib_root / "Author" / "Book One"
+    book_dir.mkdir(parents=True)
+    (book_dir / "01.mp3").write_bytes(b"mp3-1")
+    (book_dir / "metadata.json").write_text(
+        json.dumps({"title": "Book One", "authors": ["Author"]}),
+        encoding="utf-8",
+    )
+
+    archive = DownloadArchive(str(tmp_path / "downloads.db"))
+    assert archive._conn is None
+    with patch("audiobookdl.pack.read_track_tags", return_value=TrackTagInfo()):
+        res1 = scan_local_library([str(lib_root)], archive)
+        assert res1.registered == 1
+        assert archive._conn is None
+
+        res2 = scan_local_library([str(lib_root)], archive)
+        assert res2.matched == 1
+        assert archive._conn is None

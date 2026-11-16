@@ -161,98 +161,110 @@ def scan_local_library(
     units, errors = _discover_local_units(paths)
     result.errors.extend(errors)
 
-    for source_root, track_paths, unit_output_path in units:
-        try:
-            sorted_tracks, tag_map = sort_track_paths(track_paths)
-            sidecar_dir = source_root if os.path.isdir(source_root) else os.path.dirname(source_root)
-            audio_stem = os.path.splitext(os.path.basename(sorted_tracks[0]))[0] if len(sorted_tracks) == 1 else None
-            sidecar_meta, _cover, _chapters = read_sidecar_metadata(sidecar_dir, audio_stem=audio_stem)
-            meta = aggregate_book_metadata(source_root, sorted_tracks, tag_map, sidecar_meta, None)
-            audio_format = os.path.splitext(sorted_tracks[0])[1].lstrip(".").lower()
+    with archive.batch_connection():
+        match_index = archive.build_match_index()
+        for source_root, track_paths, unit_output_path in units:
+            try:
+                sorted_tracks, tag_map = sort_track_paths(track_paths)
+                sidecar_dir = source_root if os.path.isdir(source_root) else os.path.dirname(source_root)
+                audio_stem = os.path.splitext(os.path.basename(sorted_tracks[0]))[0] if len(sorted_tracks) == 1 else None
+                sidecar_meta, _cover, _chapters = read_sidecar_metadata(sidecar_dir, audio_stem=audio_stem)
+                meta = aggregate_book_metadata(source_root, sorted_tracks, tag_map, sidecar_meta, None)
+                audio_format = os.path.splitext(sorted_tracks[0])[1].lstrip(".").lower()
 
-            result.scanned_books += 1
-            if on_progress is not None:
-                on_progress(f"Scanning: {meta.title}")
+                result.scanned_books += 1
+                if on_progress is not None:
+                    on_progress(f"Scanning: {meta.title}")
 
-            match_id = archive.find_matching_entry_id(
-                title=meta.title,
-                author=meta.author,
-                isbn=meta.isbn,
-                asin=meta.asin,
-                scrape_url=meta.scrape_url,
-                output_path=unit_output_path,
-            )
-            if match_id is not None:
-                if not dry_run:
-                    archive.mark_local_match(
-                        match_id,
-                        output_path=unit_output_path,
-                        audio_format=audio_format,
-                        series=meta.series,
-                        series_order=meta.series_order,
-                        narrator=meta.narrator,
-                        isbn=meta.isbn,
-                        asin=meta.asin,
-                    )
-                result.matched += 1
-                result.items.append(
-                    ScannedLocalBook(
-                        action="matched",
-                        title=meta.title,
-                        author=meta.author,
-                        output_path=unit_output_path,
-                        audio_format=audio_format,
-                        entry_id=match_id,
-                        source=(meta.source or "local"),
-                    )
-                )
-            else:
-                src = (meta.source or "local").strip().lower() or "local"
-                book_key = _build_local_book_key(
-                    scrape_url=meta.scrape_url,
+                match_id = match_index.find(
+                    title=meta.title,
+                    author=meta.author,
                     isbn=meta.isbn,
                     asin=meta.asin,
+                    scrape_url=meta.scrape_url,
                     output_path=unit_output_path,
                 )
-                entry_id: Optional[int] = None
-                if not dry_run:
-                    entry_id = archive.record(
-                        src,
-                        book_key,
-                        title=meta.title,
-                        author=meta.author,
-                        url=meta.scrape_url,
-                        output_path=unit_output_path,
-                        audio_format=audio_format,
-                        profile=profile,
-                        status="downloaded",
-                        series=meta.series,
-                        series_order=meta.series_order,
-                        narrator=meta.narrator,
+                if match_id is not None:
+                    if not dry_run:
+                        archive.mark_local_match(
+                            match_id,
+                            output_path=unit_output_path,
+                            audio_format=audio_format,
+                            series=meta.series,
+                            series_order=meta.series_order,
+                            narrator=meta.narrator,
+                            isbn=meta.isbn,
+                            asin=meta.asin,
+                        )
+                    result.matched += 1
+                    result.items.append(
+                        ScannedLocalBook(
+                            action="matched",
+                            title=meta.title,
+                            author=meta.author,
+                            output_path=unit_output_path,
+                            audio_format=audio_format,
+                            entry_id=match_id,
+                            source=(meta.source or "local"),
+                        )
+                    )
+                else:
+                    src = (meta.source or "local").strip().lower() or "local"
+                    book_key = _build_local_book_key(
+                        scrape_url=meta.scrape_url,
                         isbn=meta.isbn,
                         asin=meta.asin,
-                    )
-                result.registered += 1
-                result.items.append(
-                    ScannedLocalBook(
-                        action="registered",
-                        title=meta.title,
-                        author=meta.author,
                         output_path=unit_output_path,
-                        audio_format=audio_format,
-                        entry_id=entry_id,
-                        source=src,
                     )
-                )
-        except Exception as exc:
-            result.errors.append(f"{unit_output_path}: {exc}")
+                    entry_id: Optional[int] = None
+                    if not dry_run:
+                        entry_id = archive.record(
+                            src,
+                            book_key,
+                            title=meta.title,
+                            author=meta.author,
+                            url=meta.scrape_url,
+                            output_path=unit_output_path,
+                            audio_format=audio_format,
+                            profile=profile,
+                            status="downloaded",
+                            series=meta.series,
+                            series_order=meta.series_order,
+                            narrator=meta.narrator,
+                            isbn=meta.isbn,
+                            asin=meta.asin,
+                        )
+                        match_index.add(
+                            entry_id,
+                            book_key=book_key,
+                            url=meta.scrape_url,
+                            title=meta.title,
+                            author=meta.author,
+                            output_path=unit_output_path,
+                            isbn=meta.isbn,
+                            asin=meta.asin,
+                        )
+                    result.registered += 1
+                    result.items.append(
+                        ScannedLocalBook(
+                            action="registered",
+                            title=meta.title,
+                            author=meta.author,
+                            output_path=unit_output_path,
+                            audio_format=audio_format,
+                            entry_id=entry_id,
+                            source=src,
+                        )
+                    )
+            except Exception as exc:
+                result.errors.append(f"{unit_output_path}: {exc}")
 
-    if verify_missing:
-        for entry in archive.list_entries(limit=100000, include_trashed=False, include_hidden=True):
-            if entry.status == "downloaded" and entry.output_path and not os.path.exists(entry.output_path):
-                result.missing += 1
-                result.missing_paths.append(entry.output_path)
-                if not dry_run:
-                    archive.set_status(entry.id, "pending")
+        if verify_missing:
+            for entry in archive.list_entries(limit=100000, include_trashed=False, include_hidden=True):
+                if entry.status == "downloaded" and entry.output_path and not os.path.exists(entry.output_path):
+                    result.missing += 1
+                    result.missing_paths.append(entry.output_path)
+                    if not dry_run:
+                        archive.set_status(entry.id, "pending")
 
     return result

@@ -1,14 +1,17 @@
 from .source import Source
 
+from .archiveorg import ArchiveOrgSource
 from .audiobooksdotcom import AudiobooksdotcomSource
 from .blinkist import BlinkistSource
 from .bookbeat import BookBeatSource
 from .chirp import ChirpSource
 from .ereolen import EreolenSource
+from .librofm import LibrofmSource
 from .librivox import LibrivoxSource
 from .nextory import NextorySource
 from .overdrive import OverdriveSource
 from .podimo import PodimoSource
+from .rss import RssSource
 from .saxo import SaxoSource
 from .everand import EverandSource
 from .storytel import StorytelSource
@@ -18,6 +21,7 @@ from ..exceptions import NoSourceFound
 from dataclasses import dataclass
 import importlib.metadata
 import re
+import threading
 from typing import Iterable, List, Optional, Tuple, Type
 
 
@@ -74,22 +78,47 @@ def detect_service_key(url: str) -> Optional[str]:
         return None
     return source_cls.names[0].lower() if source_cls.names else None
 
+_EREOLEN_REFRESH_LOCK = threading.Lock()
+_EREOLEN_REFRESHED = False
+_EREOLEN_WORK_URL_RE = re.compile(r"^https?://[^/]+\.(?:dk|fo|gl)/work/work-of:", re.IGNORECASE)
+
+
+def _refresh_ereolen_domains_once() -> None:
+    """Refresh dynamic Danish library domains on first unrecognized `.dk`/`.fo`/`.gl` work URL."""
+    global _EREOLEN_REFRESHED
+    with _EREOLEN_REFRESH_LOCK:
+        if _EREOLEN_REFRESHED:
+            return
+        _EREOLEN_REFRESHED = True
+        try:
+            EreolenSource.refresh_library_domains()
+        except Exception:
+            pass
+
+
 def find_compatible_source(url: str) -> Type[Source]:
     """Finds the first source that supports the given url"""
     sources = get_source_classes()
     for source in sources:
-        for n, m in enumerate(source.match):
-            if not re.match(m, url) is None:
+        for _n, m in enumerate(source.match):
+            if re.match(m, url) is not None:
                 return source
+    if _EREOLEN_WORK_URL_RE.match(url):
+        _refresh_ereolen_domains_once()
+        for m in EreolenSource.match:
+            if re.match(m, url) is not None:
+                return EreolenSource
     raise NoSourceFound
 
 
 _BUILTIN_SOURCES: Tuple[Type[Source], ...] = (
+    ArchiveOrgSource,
     AudiobooksdotcomSource,
     BlinkistSource,
     BookBeatSource,
     ChirpSource,
     EreolenSource,
+    LibrofmSource,
     LibrivoxSource,
     NextorySource,
     OverdriveSource,
@@ -98,6 +127,7 @@ _BUILTIN_SOURCES: Tuple[Type[Source], ...] = (
     EverandSource,
     StorytelSource,
     YourCloudLibrarySource,
+    RssSource,
 )
 
 

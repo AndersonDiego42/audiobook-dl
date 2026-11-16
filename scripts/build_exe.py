@@ -15,6 +15,7 @@ import tempfile
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ENTRY_POINT = REPO_ROOT / "audiobookdl" / "gui" / "app.py"
+CLI_ENTRY_POINT = REPO_ROOT / "audiobookdl" / "__main__.py"
 ASSETS_DIR = REPO_ROOT / "audiobookdl" / "assets"
 ICON_PATH = ASSETS_DIR / "icon.ico"
 BUILD_DIR = REPO_ROOT / "build"
@@ -176,6 +177,49 @@ def build(
 
     exe_name = "audiobook-dl.exe" if os.name == "nt" else "audiobook-dl"
     exe_path = (DIST_DIR / "audiobook-dl" / exe_name) if onedir else (DIST_DIR / exe_name)
+    if onedir:
+        cli_name = "audiobook-dl-cli"
+        cli_exe_name = f"{cli_name}.exe" if os.name == "nt" else cli_name
+        cli_cmd = [
+            sys.executable,
+            "-m",
+            "PyInstaller",
+            "--noconfirm",
+            "--clean",
+            "--onedir",
+            "--console",
+            "--name",
+            cli_name,
+            "--specpath",
+            str(BUILD_DIR),
+            "--workpath",
+            str(BUILD_DIR / "pyinstaller-cli"),
+            "--distpath",
+            str(DIST_DIR),
+            "--paths",
+            str(REPO_ROOT),
+            "--add-data",
+            f"{ASSETS_DIR}{sep}audiobookdl/assets",
+            "--collect-data",
+            "pycountry",
+        ]
+        for module in EXCLUDED_MODULES:
+            cli_cmd.extend(["--exclude-module", module])
+        for mypyc_bin in _collect_mypyc_binaries():
+            cli_cmd.extend(["--add-binary", f"{mypyc_bin}{sep}."])
+        if ICON_PATH.is_file():
+            cli_cmd.extend(["--icon", str(ICON_PATH)])
+        if os.name == "nt":
+            cli_cmd.extend(["--version-file", str(version_file)])
+        cli_cmd.append(str(CLI_ENTRY_POINT))
+        subprocess.run(cli_cmd, cwd=str(REPO_ROOT), check=True)
+        built_cli = DIST_DIR / cli_name / cli_exe_name
+        if built_cli.is_file():
+            exe_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(built_cli, exe_path.parent / cli_exe_name)
+        cli_dist_dir = DIST_DIR / cli_name
+        if cli_dist_dir.is_dir():
+            shutil.rmtree(cli_dist_dir, ignore_errors=True)
     if copy_ffmpeg and not bundle_ffmpeg:
         target_dir = exe_path.parent
         target_dir.mkdir(parents=True, exist_ok=True)

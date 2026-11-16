@@ -2389,5 +2389,35 @@ def test_gui_persistent_queue_and_pause_resume_toggle(tmp_path):
         root2.destroy()
 
 
+def test_gui_queue_panel_tracks_stage_subprogress(tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+        panel = app._queue_panel
+        panel.prepare_run_ui_state(1, 1, "--- Starting ---")
+        assert panel.stage_var.get() == "Stage: Preparing"
+
+        panel.handle_activity_event(("batch_item", 1, 1, 1, "https://librivox.org/book"))
+        assert panel.stage_var.get() == "Stage: Fetching metadata"
+
+        panel.handle_activity_event(("progress_start", "Downloading Book", 10.0))
+        assert panel.stage_var.get() == "Stage: Downloading"
+
+        panel.handle_activity_event(("log", "INFO", "Combining files"))
+        assert panel.stage_var.get() == "Stage: Combining & muxing"
+
+        panel.handle_activity_event(("log", "INFO", "Enriching metadata from providers"))
+        assert panel.stage_var.get() == "Stage: Enriching metadata"
+
+        app._finish_run(DownloadSummary(completed=1, failed=0, cancelled=False), None)
+        assert panel.stage_var.get() == ""
+    finally:
+        root.destroy()
+
+
 
 

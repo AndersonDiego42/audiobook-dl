@@ -159,6 +159,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
         sync_opts = args.parse_sync_arguments(raw_argv[1:])
         sys.exit(run_sync_loop(sync_opts))
+    if raw_argv and raw_argv[0] == "serve":
+        from .web import serve_web_ui
+
+        serve_opts = args.parse_serve_arguments(raw_argv[1:])
+        sys.exit(serve_web_ui(serve_opts))
     if raw_argv and raw_argv[0] == "pack":
         pack_dl_options, pack_options = args.parse_pack_arguments(raw_argv[1:])
         config = load_config(pack_dl_options.config_location)

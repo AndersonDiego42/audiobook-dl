@@ -1079,3 +1079,100 @@ def test_cli_json_outputs_and_post_exec_hook(tmp_path, capsys, monkeypatch):
     assert captured_env["env"]["AUDIOBOOK_DL_SOURCE"] == "librivox"
 
 
+def test_source_impersonate_session_and_cookie_bridge(tmp_path, monkeypatch):
+    from http.cookiejar import CookieJar
+    from types import SimpleNamespace
+    from audiobookdl.exceptions import GenericAudiobookDLException
+    from audiobookdl.sources.source import Source
+
+    class _DummySource(Source):
+        names = ["dummy_imp"]
+        match = [r"https://example\.com/.*"]
+
+        def download(self, url):  # pragma: no cover - not invoked
+            raise NotImplementedError
+
+    # 1. Helpful error when curl_cffi is not installed
+    def missing_import(name):
+        if name == "curl_cffi.requests":
+            raise ImportError("No module named 'curl_cffi'")
+        return __import__(name)
+
+    monkeypatch.setattr("audiobookdl.utils.http.importlib.import_module", missing_import)
+    opts = args.build_default_options(impersonate="chrome", database_directory=str(tmp_path))
+    with pytest.raises(GenericAudiobookDLException, match=r"audiobook-dl\[impersonate\]"):
+        _DummySource(opts)
+
+    # 2. Functional stub simulating curl_cffi.requests.Session and Cookies(jar=CookieJar)
+    class _StubCurlCookies:
+        def __init__(self) -> None:
+            self.jar = CookieJar()
+
+        def __iter__(self):
+            return iter(["token"])  # Deliberately yields names, not Cookie objects
+
+    class _StubTimeoutError(Exception):
+        __module__ = "curl_cffi.requests.exceptions"
+
+    class _StubCurlSession:
+        def __init__(self, *, impersonate: str) -> None:
+            self.impersonate = impersonate
+            self.proxies: dict[str, str] = {}
+            self.cookies = _StubCurlCookies()
+            self.closed = False
+            self.calls = 0
+
+        def get(self, url, timeout=None, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise _StubTimeoutError("timed out")
+            return SimpleNamespace(status_code=200, content=b'{"ok": true}', headers={})
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(
+        "audiobookdl.utils.http.importlib.import_module",
+        lambda name: SimpleNamespace(Session=_StubCurlSession) if name == "curl_cffi.requests" else __import__(name),
+    )
+
+    opts_imp = args.build_default_options(
+        impersonate="chrome124",
+        proxy="http://127.0.0.1:8888",
+        database_directory=str(tmp_path),
+    )
+    src = _DummySource(opts_imp)
+    try:
+        assert isinstance(src._session, _StubCurlSession)
+        assert src._session.impersonate == "chrome124"
+        assert src._session.proxies == {"http": "http://127.0.0.1:8888", "https": "http://127.0.0.1:8888"}
+
+        # Retry handles curl_cffi timeout cleanly and returns JSON
+        payload = src.get_json("https://example.com/api")
+        assert payload == {"ok": True}
+        assert src._session.calls == 2
+
+        # Cookie bridge supports load_cookie_file, _get_all_cookies, and save_cookie_file
+        cookie_file = tmp_path / "cookies.txt"
+        cookie_file.write_text(
+            "# Netscape HTTP Cookie File\n"
+            ".example.com\tTRUE\t/\tTRUE\t1999999999\tsession_id\tabc123\n",
+            encoding="utf-8",
+        )
+        src.load_cookie_file(str(cookie_file))
+        from audiobookdl.sources.source.networking import _get_all_cookies
+
+        assert _get_all_cookies(src._session) == {"session_id": "abc123"}
+        saved_path = src.save_cookie_file(str(tmp_path / "saved.txt"))
+        assert "session_id\tabc123" in (tmp_path / "saved.txt").read_text(encoding="utf-8")
+        assert saved_path == str(tmp_path / "saved.txt")
+
+        child = src.create_unauthenticated_session()
+        assert isinstance(child, _StubCurlSession)
+    finally:
+        src.close()
+    assert src._session.closed is True
+    assert child.closed is True
+
+
+

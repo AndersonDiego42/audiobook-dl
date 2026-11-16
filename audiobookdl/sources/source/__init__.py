@@ -5,6 +5,11 @@ from . import networking
 from audiobookdl import logging, AudiobookFile, Chapter, AudiobookMetadata, Cover, Result, Audiobook, BookId
 from audiobookdl.exceptions import DataNotPresent, GenericAudiobookDLException
 from audiobookdl.utils import CustomSSLContextHTTPAdapter
+from audiobookdl.utils.http import (
+    create_impersonated_session,
+    extract_session_cookies,
+    update_session_cookies,
+)
 
 # External imports
 import requests
@@ -15,7 +20,7 @@ import re
 import os
 import weakref
 from dataclasses import dataclass
-from http.cookiejar import CookieJar, MozillaCookieJar
+from http.cookiejar import MozillaCookieJar
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, TypeVar, Generic
 from ssl import SSLContext
 import urllib3
@@ -142,7 +147,7 @@ class Source(Generic[T]):
             logging.debug(f"Loading cookies from '{cookie_file}'")
             cookie_jar = MozillaCookieJar()
             cookie_jar.load(cookie_file, ignore_discard=True, ignore_expires=True)
-            self._session.cookies.update(cookie_jar)
+            update_session_cookies(self._session, cookie_jar)
             self.__authenticated = True
 
     def cached_cookie_path(self) -> str:
@@ -158,7 +163,7 @@ class Source(Generic[T]):
         from audiobookdl.utils.browser_cookies import export_cookies_netscape
 
         target = cookie_file or self.cached_cookie_path()
-        cookies = list(CookieJar.__iter__(self._session.cookies))
+        cookies = extract_session_cookies(self._session)
         return export_cookies_netscape(cookies, target)
 
     def search(self, query: str) -> List[CatalogBook]:
@@ -292,6 +297,10 @@ class Source(Generic[T]):
             raise GenericAudiobookDLException(f"Please update urllib3 to version >= 2 using the command 'pip install -U urllib3'")
 
     def create_session(self, options: Optional[DownloadOptions] = None) -> requests.Session:
+        proxy = getattr(options, "proxy", None) if options is not None else None
+        impersonate = (getattr(options, "impersonate", None) or "").strip() if options is not None else ""
+        if impersonate:
+            return create_impersonated_session(impersonate, proxy=proxy)
         session = requests.Session()
         ssl_context: SSLContext = self.create_ssl_context(options)
         session.mount(
@@ -302,7 +311,6 @@ class Source(Generic[T]):
             "http://",
             HTTPAdapter(pool_connections=20, pool_maxsize=20),
         )
-        proxy = getattr(options, "proxy", None) if options is not None else None
         if proxy:
             session.proxies.update({"http": proxy, "https": proxy})
         return session

@@ -468,4 +468,12 @@ def test_toml_save_preserves_comments_inline_notes_and_custom_sections(tmp_path)
     assert "combine = true" in updated
 
 
+def test_atomic_write_text_private_succeeds(tmp_path):
+    from audiobookdl.utils.fs import atomic_write_text
+
+    target = tmp_path / "secret.txt"
+    atomic_write_text(str(target), "secret-token\n", private=True)
+    assert target.read_text(encoding="utf-8") == "secret-token\n"
+
+
 

@@ -109,3 +109,30 @@ def test_gui_launcher_dispatches_cli_subcommands_and_flags():
     with patch("audiobookdl.__main__.main") as mock_cli_main:
         gui_main(["--version"])
         mock_cli_main.assert_called_once_with(["--version"])
+
+
+def test_build_exe_onedir_builds_console_cli_companion(tmp_path, monkeypatch):
+    build_exe = _load_build_exe()
+    dist_dir = tmp_path / "dist"
+    monkeypatch.setattr(build_exe, "DIST_DIR", dist_dir)
+    monkeypatch.setattr(build_exe, "BUILD_DIR", tmp_path / "build")
+
+    captured_cmds = []
+
+    def fake_run(cmd, cwd, check):
+        captured_cmds.append(cmd)
+        name = cmd[cmd.index("--name") + 1]
+        out_dir = dist_dir / name
+        out_dir.mkdir(parents=True, exist_ok=True)
+        suffix = ".exe" if os.name == "nt" else ""
+        (out_dir / f"{name}{suffix}").write_text("stub")
+
+    with patch.object(build_exe.subprocess, "run", side_effect=fake_run):
+        exe_path = build_exe.build(onedir=True)
+
+    assert len(captured_cmds) == 2
+    assert "--windowed" in captured_cmds[0]
+    assert "--console" in captured_cmds[1]
+    assert str(build_exe.CLI_ENTRY_POINT) == captured_cmds[1][-1]
+    cli_suffix = ".exe" if os.name == "nt" else ""
+    assert (exe_path.parent / f"audiobook-dl-cli{cli_suffix}").is_file()

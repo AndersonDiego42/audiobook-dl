@@ -1,12 +1,16 @@
 """Pure formatting, validation, and preview-building helpers for the desktop GUI."""
 
+from __future__ import annotations
+
 from datetime import date
 import io
 import os
 from pathlib import Path
 import re
-import tkinter as tk
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
+
+if TYPE_CHECKING:
+    import tkinter as tk
 
 from audiobookdl import output
 from audiobookdl.options_schema import (

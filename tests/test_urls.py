@@ -28,3 +28,36 @@ def test_ereolen_rejects_empty_domain_and_unlisted_host():
         find_compatible_source("https://www./work/work-of:870970-basis:53978223")
     with pytest.raises(NoSourceFound):
         find_compatible_source("https://evil-aakb.dk/work/work-of:870970-basis:53978223")
+
+
+def test_ereolen_refreshes_library_domains_once_on_unknown_dk_url(monkeypatch):
+    import re
+    import audiobookdl.sources as sources_mod
+    from audiobookdl.sources.ereolen import EreolenSource
+
+    orig_domains = list(EreolenSource.library_domains)
+    orig_match = list(EreolenSource.match)
+    orig_refreshed = sources_mod._EREOLEN_REFRESHED
+    calls = []
+
+    def fake_refresh():
+        calls.append(1)
+        EreolenSource.library_domains = [*orig_domains, "nybibliotek.dk"]
+        EreolenSource.match = [
+            rf"https://(www\.)?({'|'.join(re.escape(d) for d in EreolenSource.library_domains)})/work/work-of:.+"
+        ]
+        return list(EreolenSource.library_domains)
+
+    try:
+        sources_mod._EREOLEN_REFRESHED = False
+        monkeypatch.setattr(EreolenSource, "refresh_library_domains", staticmethod(fake_refresh))
+        src = find_compatible_source("https://nybibliotek.dk/work/work-of:870970-basis:123456")
+        assert src is EreolenSource
+        assert len(calls) == 1
+        with pytest.raises(NoSourceFound):
+            find_compatible_source("https://still-unknown.dk/work/work-of:1")
+        assert len(calls) == 1
+    finally:
+        sources_mod._EREOLEN_REFRESHED = orig_refreshed
+        EreolenSource.library_domains = orig_domains
+        EreolenSource.match = orig_match

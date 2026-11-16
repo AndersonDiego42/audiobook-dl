@@ -97,6 +97,7 @@ class DownloadOptions:
     limit_rate: Optional[str] = None
     proxy: Optional[str] = None
     timeout: Optional[float] = None
+    impersonate: Optional[str] = None
     json_output: bool = False
     post_exec: Optional[str] = None
     loudnorm: bool = False
@@ -136,7 +137,11 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> DownloadOptions:
         epilog=(
             "Subcommands:\n"
             "  audiobook-dl pack <paths...>      Repackage local folders/tracks offline into .m4b\n"
-            "  audiobook-dl library <action>     Manage unified library ledger, tags, and trash"
+            "  audiobook-dl library <action>     Manage unified library ledger, tags, and trash\n"
+            "  audiobook-dl scan <paths...>      Scan local folders into downloads.db\n"
+            "  audiobook-dl export <out>         Export library catalog (csv, json, xlsx, md)\n"
+            "  audiobook-dl sync                 Poll configured libraries and download new books\n"
+            "  audiobook-dl serve                Launch headless Web UI dashboard and JSON API"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         argument_default=argparse.SUPPRESS,
@@ -544,6 +549,52 @@ def parse_sync_arguments(argv: Optional[Sequence[str]] = None) -> SyncOptions:
         output_template=ns.output_template,
         output_format=ns.output_format,
         archive_path=ns.archive_path,
+        config_location=ns.config_location,
+    )
+
+
+@dataclass
+class ServeOptions:
+    """CLI options parsed by `audiobook-dl serve`."""
+
+    host: str = "127.0.0.1"
+    port: int = 8080
+    output_dir: Optional[str] = None
+    output_template: Optional[str] = None
+    output_format: Optional[str] = None
+    token: Optional[str] = None
+    config_location: Optional[str] = None
+
+
+def parse_serve_arguments(argv: Optional[Sequence[str]] = None) -> ServeOptions:
+    """Parse arguments for `audiobook-dl serve`."""
+    import os
+
+    parser = argparse.ArgumentParser(
+        prog="audiobook-dl serve",
+        description="Start a headless Web UI dashboard and JSON API server",
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1; use 0.0.0.0 in Docker)")
+    parser.add_argument("--port", type=int, default=8080, help="HTTP listen port (default: 8080)")
+    parser.add_argument("--output-dir", default=None, help="Default output base directory")
+    parser.add_argument("-o", "--output", dest="output_template", default=None, help="Default output template")
+    parser.add_argument("-f", "--output-format", dest="output_format", default=None, help="Default output format")
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("AUDIOBOOK_DL_WEB_TOKEN") or None,
+        help="Optional Bearer API token (defaults to $AUDIOBOOK_DL_WEB_TOKEN)",
+    )
+    parser.add_argument("--config", dest="config_location", default=None, help="Alternative location of config file")
+    ns = parser.parse_args(argv)
+    if ns.port < 0 or ns.port > 65535:
+        parser.error("--port must be between 0 and 65535")
+    return ServeOptions(
+        host=str(ns.host),
+        port=int(ns.port),
+        output_dir=ns.output_dir,
+        output_template=ns.output_template,
+        output_format=ns.output_format,
+        token=(str(ns.token).strip() or None) if ns.token else None,
         config_location=ns.config_location,
     )
 

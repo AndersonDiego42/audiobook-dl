@@ -37,6 +37,7 @@ dynamic = ["version"]
 
 [project.optional-dependencies]
 export = ["openpyxl>=3.1"]
+impersonate = ["curl_cffi>=0.7"]
 dev = [
     "pytest>=8",
     "mypy>=1.10",

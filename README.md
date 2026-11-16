@@ -86,6 +86,10 @@ To combine multi-part streams into a single chaptered `.m4b`:
 ```shell
 audiobook-dl --combine -f m4b <url>
 ```
+To launch the headless Web UI dashboard and JSON API (ideal for NAS/Docker setups):
+```shell
+audiobook-dl serve --host 0.0.0.0 --port 8080
+```
 **Most sites require you to provide the listening page, not just the book information page.**
 
 ## Arguments
@@ -131,6 +135,7 @@ audiobook-dl --combine -f m4b <url>
 | `--rate-limit`, `--book-delay` | Delay in seconds between consecutive books |
 | `--proxy` | HTTP/HTTPS proxy URL |
 | `--timeout` | HTTP read timeout in seconds |
+| `--impersonate` | Browser TLS/HTTP2 fingerprint to impersonate via optional `curl_cffi` (e.g. `chrome`; install `audiobook-dl[impersonate]`) |
 | `--service`, `--profile` | Target service key and named account profile |
 | `--search`, `--library-list`, `--verify-auth` | Catalog search, library listing, or credential verification |
 | `--list-sources` | List supported audiobook services |

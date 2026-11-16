@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     XDG_CONFIG_HOME=/config \
     XDG_DATA_HOME=/config \
-AUDIOBOOK_DL_CONFIG=/config/audiobook-dl.toml \
+    AUDIOBOOK_DL_CONFIG=/config/audiobook-dl.toml \
     AUDIOBOOK_DL_ALLOW_PLAINTEXT_CREDENTIALS=1
 
 RUN apt-get update && \
@@ -25,6 +25,7 @@ RUN pip install --no-cache-dir ".[export]"
 USER audiobookdl
 VOLUME ["/config", "/audiobooks"]
 WORKDIR /audiobooks
+EXPOSE 8080
 
 ENTRYPOINT ["audiobook-dl"]
 CMD ["sync", "--watch", "--interval", "3600"]

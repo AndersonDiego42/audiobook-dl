@@ -85,7 +85,7 @@ def add_mp4_metadata(
             audio[atom] = val
     if mp4_cover is not None:
         audio["covr"] = [mp4_cover]
-    audio.save()
+    audio.save(padding=lambda _info: 16384)
     return mp4_cover is not None
 
 
@@ -95,4 +95,4 @@ def embed_mp4_cover(filepath: str, cover: Cover) -> None:
         return
     audio = MP4(filepath)
     audio["covr"] = [mp4_cover]
-    audio.save()
+    audio.save(padding=lambda _info: 16384)

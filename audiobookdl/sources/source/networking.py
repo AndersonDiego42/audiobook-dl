@@ -1,8 +1,11 @@
 from audiobookdl import AudiobookFile, exceptions, logging
 from audiobookdl.utils.audiobook import AESEncryption
-from audiobookdl.utils.http import DEFAULT_HTTP_TIMEOUT
+from audiobookdl.utils.http import (
+    DEFAULT_HTTP_TIMEOUT,
+    extract_session_cookies,
+    is_transient_network_error,
+)
 
-from http.cookiejar import CookieJar
 from typing import Dict, List, Optional
 import json
 import os
@@ -71,7 +74,9 @@ def request(
     for attempt in range(max_retries + 1):
         try:
             resp = _send()
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+        except Exception as exc:
+            if not is_transient_network_error(exc):
+                raise
             last_exc = exc
             if attempt >= max_retries:
                 raise exceptions.RequestError from exc
@@ -197,7 +202,7 @@ def _get_all_cookies(session: requests.Session) -> Dict[str, str]:
 
     :returns: Dictionary of cookies
     """
-    cookies: Dict[str, str] = {}
-    for cookie in CookieJar.__iter__(session.cookies):
-        cookies[cookie.name] = str(cookie.value)
-    return cookies
+    return {
+        cookie.name: str(cookie.value)
+        for cookie in extract_session_cookies(session)
+    }

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -99,6 +101,29 @@ def _release_os_lock(fh) -> None:
             pass
 
 
+def _restrict_windows_private_file(path: str) -> None:
+    """Restrict NTFS permissions on `path` to the current user (best effort)."""
+    if os.name != "nt":
+        return
+    username = (os.environ.get("USERNAME") or "").strip()
+    if not username or not shutil.which("icacls"):
+        return
+    domain = (os.environ.get("USERDOMAIN") or "").strip()
+    principal = f"{domain}\\{username}" if domain else username
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        subprocess.run(
+            ["icacls", path, "/inheritance:r", "/grant:r", f"{principal}:F"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=creation_flags,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def atomic_write_text(
     target_path: str,
     content: str,
@@ -121,8 +146,11 @@ def atomic_write_text(
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        if private and os.name != "nt":
-            os.chmod(tmp_path, 0o600)
+        if private:
+            if os.name == "nt":
+                _restrict_windows_private_file(tmp_path)
+            else:
+                os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, abs_path)
     except Exception:
         try:

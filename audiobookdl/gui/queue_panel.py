@@ -40,6 +40,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
         self._controller = controller
         self.status_var = status_var
         self.batch_var = batch_var
+        self.stage_var = tk.StringVar(value="")
         self.metrics_var = metrics_var
         self._on_start_download = on_start_download
         self._on_cancel_download = on_cancel_download
@@ -100,12 +101,15 @@ class ActivityQueuePanel(ttk.LabelFrame):
         meta_bar.columnconfigure(1, weight=1)
 
         self.batch_label = ttk.Label(meta_bar, textvariable=self.batch_var, style="Secondary.TLabel")
-        self.batch_label.grid(row=0, column=0, sticky="w")
+        self.batch_label.grid(row=0, column=0, sticky="w", padx=(0, 10))
+
+        self.stage_label = ttk.Label(meta_bar, textvariable=self.stage_var, style="Muted.TLabel")
+        self.stage_label.grid(row=0, column=1, sticky="w")
 
         self.metrics_label = ttk.Label(
             meta_bar, textvariable=self.metrics_var, style="Muted.TLabel", anchor="e"
         )
-        self.metrics_label.grid(row=0, column=1, sticky="e")
+        self.metrics_label.grid(row=0, column=2, sticky="e")
 
         self.progressbar = ttk.Progressbar(self, mode="determinate", maximum=100)
         self.progressbar.grid(row=2, column=0, sticky="ew", pady=(0, 6))
@@ -239,11 +243,35 @@ class ActivityQueuePanel(ttk.LabelFrame):
             parts.append(f"ETA {format_duration(self._last_eta_seconds)}")
         self.metrics_var.set("  \u2022  ".join(parts))
 
+    def _update_stage_from_message(self, message: str) -> None:
+        lower = message.strip().lower()
+        if not lower:
+            return
+        if "combining" in lower or "packing" in lower:
+            self.stage_var.set("Stage: Combining & muxing")
+        elif "converting" in lower:
+            self.stage_var.set("Stage: Converting audio")
+        elif "splitting" in lower:
+            self.stage_var.set("Stage: Splitting chapters")
+        elif "enrich" in lower:
+            self.stage_var.set("Stage: Enriching metadata")
+        elif "adding chapters" in lower:
+            self.stage_var.set("Stage: Writing chapters")
+        elif "adding metadata" in lower:
+            self.stage_var.set("Stage: Writing tags")
+        elif "embedding cover" in lower or "adding cover" in lower:
+            self.stage_var.set("Stage: Embedding cover")
+        elif "uploading" in lower or "audiobookshelf" in lower:
+            self.stage_var.set("Stage: Syncing library")
+        elif "downloading" in lower:
+            self.stage_var.set("Stage: Downloading")
+
     def prepare_run_ui_state(self, run_id: int, item_total: int, log_header: str) -> None:
         """Initialize progress, timer, and batch counters for a fresh queue run."""
         self.progressbar.stop()
         self.progressbar.configure(mode="determinate", value=0)
         self.status_var.set("Starting...")
+        self.stage_var.set("Stage: Preparing")
         self._run_start_time = time.monotonic()
         self._last_pct = 0.0
         self._last_speed_bps = 0.0
@@ -340,6 +368,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
             self.append_log(f"{prefix}{message}")
             if level == "INFO" and message.strip():
                 self.status_var.set(message.strip().splitlines()[0][:80])
+                self._update_stage_from_message(message)
             return True
         if kind == "batch_item":
             _, run_id, item_index, item_total, _url = item
@@ -348,6 +377,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
                 self.ui_item_total = max(self.ui_item_total, item_total)
                 self.ui_book_index = 0
                 self.ui_book_total = 0
+                self.stage_var.set("Stage: Fetching metadata")
                 self.refresh_batch_label()
             return True
         if kind == "job_status":
@@ -368,6 +398,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
             self._last_pct = 0.0
             self._last_speed_bps = 0.0
             self._last_eta_seconds = None
+            self.stage_var.set("Stage: Downloading")
             self.update_metrics_display(is_running=True, force=True)
             self.status_var.set(description[:80])
             return True
@@ -412,6 +443,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
         )
         self._run_start_time = None
         self.batch_var.set("")
+        self.stage_var.set("")
         if exc is not None:
             self.progressbar.configure(value=0)
             self.metrics_var.set("")

@@ -125,6 +125,91 @@ def default_archive_path(database_directory: str) -> str:
     return os.path.join(database_directory, "downloads.db")
 
 
+class ArchiveMatchIndex:
+    """In-memory normalized identifier/path/title index for O(1) bulk ledger matching."""
+
+    def __init__(self) -> None:
+        self._by_url: Dict[str, int] = {}
+        self._by_asin: Dict[str, int] = {}
+        self._by_isbn: Dict[str, int] = {}
+        self._by_path: Dict[str, int] = {}
+        self._by_title: Dict[str, List[Tuple[int, str]]] = {}
+
+    @staticmethod
+    def _norm_text(raw: Optional[str]) -> str:
+        return " ".join((raw or "").casefold().split())
+
+    def add(
+        self,
+        entry_id: int,
+        *,
+        book_key: Optional[str] = None,
+        url: Optional[str] = None,
+        title: str = "",
+        author: str = "",
+        output_path: Optional[str] = None,
+        isbn: Optional[str] = None,
+        asin: Optional[str] = None,
+    ) -> None:
+        if book_key:
+            self._by_url.setdefault(book_key.strip(), entry_id)
+        if url:
+            self._by_url.setdefault(url.strip(), entry_id)
+        norm_asin = (asin or "").strip().lower()
+        if norm_asin:
+            self._by_asin.setdefault(norm_asin, entry_id)
+        norm_isbn = (isbn or "").strip().replace("-", "").lower()
+        if norm_isbn:
+            self._by_isbn.setdefault(norm_isbn, entry_id)
+        if output_path and output_path.strip():
+            norm_path = os.path.normcase(os.path.abspath(output_path))
+            self._by_path.setdefault(norm_path, entry_id)
+        norm_title = self._norm_text(title)
+        if norm_title:
+            self._by_title.setdefault(norm_title, []).append(
+                (entry_id, self._norm_text(author))
+            )
+
+    def find(
+        self,
+        *,
+        title: str = "",
+        author: str = "",
+        isbn: Optional[str] = None,
+        asin: Optional[str] = None,
+        scrape_url: Optional[str] = None,
+        output_path: Optional[str] = None,
+    ) -> Optional[int]:
+        norm_url = (scrape_url or "").strip()
+        if norm_url and norm_url in self._by_url:
+            return self._by_url[norm_url]
+        norm_asin = (asin or "").strip().lower()
+        if norm_asin and norm_asin in self._by_asin:
+            return self._by_asin[norm_asin]
+        norm_isbn = (isbn or "").strip().replace("-", "").lower()
+        if norm_isbn and norm_isbn in self._by_isbn:
+            return self._by_isbn[norm_isbn]
+        if output_path:
+            norm_path = os.path.normcase(os.path.abspath(output_path))
+            if norm_path in self._by_path:
+                return self._by_path[norm_path]
+        norm_title = self._norm_text(title)
+        norm_author = self._norm_text(author)
+        if norm_title:
+            matches = self._by_title.get(norm_title, [])
+            if norm_author:
+                for entry_id, row_author in matches:
+                    if row_author and (
+                        row_author == norm_author
+                        or norm_author in row_author
+                        or row_author in norm_author
+                    ):
+                        return entry_id
+            if len(matches) == 1 and (not norm_author or not matches[0][1]):
+                return matches[0][0]
+        return None
+
+
 def make_book_key(source_name: str, audiobook: Audiobook, fallback_url: Optional[str] = None) -> str:
     """Build a stable deduplication key for an `Audiobook`."""
     scrape_url = (audiobook.metadata.scrape_url or "").strip()
@@ -195,6 +280,20 @@ class DownloadArchive:
                     yield conn
             finally:
                 conn.close()
+
+    @contextmanager
+    def batch_connection(self) -> Iterator[None]:
+        """Keep a single SQLite connection open across bulk operations (such as library scanning)."""
+        with self._lock:
+            was_persistent = self._persistent
+            self._persistent = True
+            try:
+                yield
+            finally:
+                self._persistent = was_persistent
+                if not was_persistent and self._conn is not None:
+                    self._conn.close()
+                    self._conn = None
 
     def close(self) -> None:
         """Close the cached persistent SQLite connection, if open."""
@@ -833,6 +932,26 @@ class DownloadArchive:
                 ):
                     return int(title_matches[0]["id"])
         return None
+
+    def build_match_index(self) -> "ArchiveMatchIndex":
+        """Load an in-memory O(1) lookup index across all ledger rows for bulk matching."""
+        index = ArchiveMatchIndex()
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT id, book_key, url, title, author, output_path, isbn, asin FROM downloads"
+            ).fetchall()
+        for row in rows:
+            index.add(
+                int(row["id"]),
+                book_key=row["book_key"],
+                url=row["url"],
+                title=row["title"],
+                author=row["author"],
+                output_path=row["output_path"],
+                isbn=row["isbn"],
+                asin=row["asin"],
+            )
+        return index
 
     def mark_local_match(
         self,

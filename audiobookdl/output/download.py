@@ -1049,11 +1049,17 @@ def download_file(
                         update_progress(initial_progress)
                         advanced += initial_progress
 
-            # Stream AES-CBC decryption inline when writing from byte 0 without resume
-            # (or on multi-segment HLS streams where per-segment retry replaces byte-range resume).
+            # Stream AES-CBC decryption inline when writing from byte 0 without needing
+            # range-based ciphertext resume (no resume, multi-segment HLS streams, or Accept-Ranges: none).
             stream_decryptor: Optional[AESStreamDecryptor] = None
+            accept_ranges = (_get_header_ci(request.headers, "Accept-Ranges") or "").strip().lower()
+            can_inline_aes = (
+                not resume
+                or len(audiobook.files) > 1
+                or accept_ranges == "none"
+            )
             if (
-                (not resume or len(audiobook.files) > 1)
+                can_inline_aes
                 and open_mode == "wb"
                 and isinstance(file.encryption_method, AESEncryption)
             ):

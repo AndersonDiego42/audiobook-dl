@@ -79,6 +79,7 @@ class Config:
     limit_rate: Optional[str] = None
     proxy: Optional[str] = None
     timeout: Optional[float] = None
+    impersonate: Optional[str] = None
     post_exec: Optional[str] = None
     loudnorm: Optional[bool] = None
     mono: Optional[bool] = None
@@ -1031,6 +1032,7 @@ def save_output_preferences(
     limit_rate: Any = _UNSET,
     proxy: Any = _UNSET,
     timeout: Any = _UNSET,
+    impersonate: Any = _UNSET,
 ) -> str:
     """Persist GUI output and toggle preferences in `audiobook-dl.toml`."""
     resolved_location = config_location or get_config_location(None)
@@ -1060,6 +1062,7 @@ def save_output_preferences(
         "limit_rate": limit_rate,
         "proxy": proxy,
         "timeout": timeout,
+        "impersonate": impersonate,
     }
     with file_lock(resolved_location):
         config_dict = read_config(resolved_location)

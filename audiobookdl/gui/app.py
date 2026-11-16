@@ -91,6 +91,7 @@ class AudiobookDLApp:
     limit_rate_var: tk.StringVar
     proxy_var: tk.StringVar
     timeout_var: tk.StringVar
+    impersonate_var: tk.StringVar
     enrich_metadata_var: tk.BooleanVar
     enrich_providers_var: tk.StringVar
     enrich_interactive_var: tk.BooleanVar
@@ -141,8 +142,10 @@ class AudiobookDLApp:
         self._queue_panel.restore_saved_queue_history()
         self._set_running_state(False)
 
+        self._poll_after_id: Optional[str] = None
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.root.after(50, self._poll_queue)
+        self.root.bind("<Destroy>", self._on_root_destroy, add="+")
+        self._poll_after_id = self.root.after(50, self._poll_queue)
 
     @property
     def theme_mode(self) -> str:
@@ -1189,6 +1192,12 @@ class AudiobookDLApp:
         self._controller.cancel_active_run()
 
     def _poll_queue(self) -> None:
+        self._poll_after_id = None
+        try:
+            if not self.root.winfo_exists():
+                return
+        except tk.TclError:
+            return
         processed = self._controller.drain_events(
             self._handle_event,
             max_batch=self._controller.MAX_QUEUE_BATCH,
@@ -1196,7 +1205,24 @@ class AudiobookDLApp:
         if self._is_running:
             self._queue_panel.update_metrics_display(is_running=True)
         delay_ms = 10 if processed >= self._controller.MAX_QUEUE_BATCH else 50
-        self.root.after(delay_ms, self._poll_queue)
+        try:
+            if self.root.winfo_exists():
+                self._poll_after_id = self.root.after(delay_ms, self._poll_queue)
+        except tk.TclError:
+            self._poll_after_id = None
+
+    def _cancel_poll_timer(self) -> None:
+        after_id = getattr(self, "_poll_after_id", None)
+        self._poll_after_id = None
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except tk.TclError:
+                pass
+
+    def _on_root_destroy(self, event: tk.Event) -> None:
+        if getattr(event, "widget", None) is self.root:
+            self._cancel_poll_timer()
 
     def _handle_event(self, item: tuple) -> None:
         if self._queue_panel.handle_activity_event(item):
@@ -1312,6 +1338,7 @@ class AudiobookDLApp:
             )
         except OSError:
             pass
+        self._cancel_poll_timer()
         self._controller.shutdown(
             is_running=self._is_running,
             is_previewing=self._is_previewing,

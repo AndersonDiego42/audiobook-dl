@@ -257,3 +257,13 @@ def test_gui_cli_parity_bindings_converters():
     assert archive_binding is not None
     assert archive_binding.init_value(None) is False
     assert archive_binding.init_value("/tmp/downloads.db") is True
+
+    impersonate_binding = OPTIONS_BY_NAME["impersonate"].gui
+    assert impersonate_binding is not None
+    assert impersonate_binding.init_value(None) == ""
+    assert impersonate_binding.init_value("chrome") == "chrome"
+    assert impersonate_binding.read_option("  chrome  ") == "chrome"
+    assert impersonate_binding.read_option("   ") is None
+
+    parsed = args.parse_arguments(["--impersonate", "chrome", "https://example.com/book"])
+    assert parsed.impersonate == "chrome"
