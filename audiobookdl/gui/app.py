@@ -206,6 +206,7 @@ class AudiobookDLApp:
     mono_var: tk.BooleanVar
     chapters_from_silence_var: tk.BooleanVar
     chapter_offset_ms_var: tk.StringVar
+    intro_chapter_mode_var: tk.StringVar
     square_cover_var: tk.BooleanVar
     max_cover_size_var: tk.StringVar
     post_exec_var: tk.StringVar
@@ -611,6 +612,7 @@ class AudiobookDLApp:
             self.remove_chars_var,
             self.cover_only_var,
             self.split_chapters_var,
+            self.intro_chapter_mode_var,
         ):
             var.trace_add("write", lambda *_args: self._update_template_preview())
         self.template_var.trace_add("write", lambda *_args: self._sync_preset_from_template())
@@ -1379,7 +1381,9 @@ class AudiobookDLApp:
             if self.cover_only_var.get():
                 suffix = ".jpg"
             elif self.split_chapters_var.get() or not self.combine_var.get():
-                suffix = f"/01.{ext}"
+                intro_val = self.intro_chapter_mode_var.get().strip().lower()
+                first_num = "00" if intro_val.startswith("always") else "01"
+                suffix = f"/{first_num}.{ext}"
             else:
                 suffix = f".{ext}"
             self.template_preview_var.set(f"{rendered_series}{suffix}")

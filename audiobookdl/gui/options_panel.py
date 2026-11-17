@@ -8,7 +8,7 @@ from collections.abc import Callable
 from audiobookdl.gui.formatting import MEDIA_TYPE_OPTIONS, OUTPUT_FORMATS, OVERWRITE_OPTIONS
 from audiobookdl.gui.theme import ThemePalette
 from audiobookdl.gui.widgets import attach_tooltip
-from audiobookdl.options_schema import OPTIONS_BY_NAME
+from audiobookdl.options_schema import GUI_INTRO_CHAPTER_MODES, OPTIONS_BY_NAME
 from audiobookdl.utils import AUDIO_BITRATE_PRESETS
 from audiobookdl.utils.http import parse_byte_rate
 
@@ -262,6 +262,15 @@ class OptionsPanel(ttk.LabelFrame):
         cb_loudnorm.pack(side=tk.LEFT, padx=(0, 14))
         cb_mono = ttk.Checkbutton(audio_row, text="Mono audio", variable=self._vars.mono_var)
         cb_mono.pack(side=tk.LEFT, padx=(0, 14))
+        ttk.Label(audio_row, text="Intro numbering:").pack(side=tk.LEFT, padx=(0, 4))
+        intro_chapter_combo = ttk.Combobox(
+            audio_row,
+            textvariable=self._vars.intro_chapter_mode_var,
+            values=GUI_INTRO_CHAPTER_MODES,
+            state="readonly",
+            width=19,
+        )
+        intro_chapter_combo.pack(side=tk.LEFT)
 
         remove_row = ttk.Frame(sidecars_tab)
         remove_row.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(6, 0))
@@ -366,6 +375,7 @@ class OptionsPanel(ttk.LabelFrame):
         self._cb_split_chapters = cb_split_chapters
         self._cb_silence_chapters = cb_silence_chapters
         self._chapter_offset_entry = chapter_offset_entry
+        self._intro_chapter_combo = intro_chapter_combo
         self._cb_cue = cb_cue
         self._cb_loudnorm = cb_loudnorm
         self._cb_mono = cb_mono
@@ -392,6 +402,7 @@ class OptionsPanel(ttk.LabelFrame):
             (cb_split_chapters, _option_help("split_chapters")),
             (cb_silence_chapters, _option_help("chapters_from_silence")),
             (chapter_offset_entry, _option_help("chapter_offset_ms")),
+            (intro_chapter_combo, _option_help("intro_chapter_mode")),
             (cb_json, _option_help("write_json_metadata")),
             (cb_opf, _option_help("write_opf")),
             (cb_cue, _option_help("write_cue")),
@@ -427,6 +438,7 @@ class OptionsPanel(ttk.LabelFrame):
             cb_split_chapters,
             cb_silence_chapters,
             chapter_offset_entry,
+            intro_chapter_combo,
             cb_json,
             cb_opf,
             cb_cue,
@@ -559,6 +571,7 @@ class OptionsPanel(ttk.LabelFrame):
         _set_widget(self._cb_split_chapters, (not cover_only) and (not no_chapters))
         _set_widget(self._cb_silence_chapters, (not cover_only) and (not no_chapters))
         _set_widget(self._chapter_offset_entry, not no_chapters)
+        _set_widget(self._intro_chapter_combo, (not cover_only) and (not no_chapters), readonly_combo=True)
         _set_widget(self._cb_cue, not no_chapters)
 
     def set_enabled(self, enabled: bool) -> None:

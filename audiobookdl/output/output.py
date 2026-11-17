@@ -6,7 +6,10 @@ from audiobookdl.exceptions import (
     MissingDependency,
 )
 from audiobookdl.output.metadata import ffmpeg as ffmpeg_metadata
-from audiobookdl.output.metadata._chapters import normalize_chapters
+from audiobookdl.output.metadata._chapters import (
+    normalize_chapters,
+    resolve_split_chapter_entries,
+)
 from audiobookdl.output.metadata._cover import normalize_cover_image
 from audiobookdl.utils import (
     AudioProbeInfo,
@@ -1425,17 +1428,18 @@ def _split_single_chapter(
 
 def _chapter_output_filepath(
     output_dir: str,
-    chapter_index: int,
-    total_chapters: int,
+    file_number: int,
+    number_width: int,
     raw_title: str,
     target_format: str,
 ) -> str:
     """Build zero-padded, filename-safe chapter/lesson output path inside `output_dir`."""
-    width = max(2, len(str(total_chapters)))
-    safe_title = _truncate_utf8(_fix_output(raw_title or "") or f"Chapter {chapter_index + 1}", 160)
+    width = max(2, number_width)
+    fallback = "Introduction" if file_number == 0 else f"Chapter {file_number}"
+    safe_title = _truncate_utf8(_fix_output(raw_title or "") or fallback, 160)
     if platform.system() == "Windows":
-        safe_title = _sanitize_windows_reserved_name(safe_title.rstrip(". ") or f"Chapter {chapter_index + 1}")
-    out_name = f"{chapter_index + 1:0{width}d} - {safe_title}.{target_format}"
+        safe_title = _sanitize_windows_reserved_name(safe_title.rstrip(". ") or fallback)
+    out_name = f"{file_number:0{width}d} - {safe_title}.{target_format}"
     return os.path.join(output_dir, out_name)
 
 
@@ -1452,6 +1456,7 @@ def split_audio_by_chapters(
     mono: bool = False,
     preserve_video: bool = False,
     max_workers: int | None = None,
+    intro_chapter_mode: str = "auto",
 ) -> list[str]:
     """
     Split `master_path` into individual zero-padded chapter files inside `output_dir`.
@@ -1501,16 +1506,24 @@ def split_audio_by_chapters(
     if not spans:
         return [master_path]
 
+    resolved_entries = resolve_split_chapter_entries(
+        [raw_title for _s, _e, raw_title in spans],
+        intro_mode=intro_chapter_mode,
+    )
+    number_width = max(2, len(str(resolved_entries[-1][0])))
+
     tasks = []
-    for idx, (start_ms, end_ms, raw_title) in enumerate(spans):
+    for idx, ((start_ms, end_ms, _raw_title), (file_number, resolved_title)) in enumerate(
+        zip(spans, resolved_entries, strict=True)
+    ):
         start_sec = start_ms / 1000.0
         duration_sec: float | None = None
         if idx + 1 < len(spans) or (total_ms > 0 and end_ms < total_ms):
             duration_sec = max(0.05, (end_ms - start_ms) / 1000.0)
         out_path = _chapter_output_filepath(
-            output_dir, idx, len(spans), raw_title or f"Chapter {idx + 1}", target_format
+            output_dir, file_number, number_width, resolved_title, target_format
         )
-        tasks.append((idx, start_sec, duration_sec, out_path, raw_title or f"Chapter {idx + 1}"))
+        tasks.append((idx, start_sec, duration_sec, out_path, resolved_title))
 
     batch_abort = threading.Event()
     state_lock = threading.Lock()
@@ -1589,6 +1602,7 @@ def merge_segment_groups_into_chapters(
     mono: bool = False,
     preserve_video: bool = False,
     max_workers: int | None = None,
+    intro_chapter_mode: str = "auto",
 ) -> list[str]:
     """
     Merge pre-grouped segment lists directly into per-chapter/per-lesson files in `output_dir`.
@@ -1600,6 +1614,11 @@ def merge_segment_groups_into_chapters(
     cache: dict[str, AudioProbeInfo] = probe_cache if probe_cache is not None else {}
     target_format = (output_format or get_extension(non_empty[0][1][0])).lstrip(".").lower()
     total = len(non_empty)
+    resolved_entries = resolve_split_chapter_entries(
+        [title for title, _paths in non_empty],
+        intro_mode=intro_chapter_mode,
+    )
+    number_width = max(2, len(str(resolved_entries[-1][0])))
 
     batch_abort = threading.Event()
     state_lock = threading.Lock()
@@ -1617,11 +1636,11 @@ def merge_segment_groups_into_chapters(
             with logging.progress([]) as merge_prog:
                 merge_task = merge_prog.add_task(f"Merging ({total} chapters)", total=total)
 
-                def _merge_one(item: tuple[int, tuple[str, list[str]]]) -> str:
+                def _merge_one(item: tuple[int, tuple[tuple[str, list[str]], tuple[int, str]]]) -> str:
                     nonlocal first_error
-                    idx, (title, group_paths) = item
+                    idx, ((_raw_title, group_paths), (file_number, resolved_title)) = item
                     out_path = _chapter_output_filepath(
-                        output_dir, idx, total, title, target_format
+                        output_dir, file_number, number_width, resolved_title, target_format
                     )
                     try:
                         if len(group_paths) == 1:
@@ -1678,7 +1697,7 @@ def merge_segment_groups_into_chapters(
                 ordered = list(
                     run_cancellable_pool(
                         _merge_one,
-                        list(enumerate(non_empty)),
+                        list(enumerate(zip(non_empty, resolved_entries, strict=True))),
                         max_workers=resolve_ffmpeg_pool_workers(max_workers, cpu_bound=False),
                         cancel_event=effective_cancel,
                     )
@@ -1716,6 +1735,7 @@ def merge_hls_segments_into_chapters(
     mono: bool = False,
     preserve_video: bool = False,
     max_workers: int | None = None,
+    intro_chapter_mode: str = "auto",
 ) -> list[str]:
     """
     Combine fine-grained HLS segment files seamlessly and split cleanly by `chapters`.
@@ -1758,6 +1778,7 @@ def merge_hls_segments_into_chapters(
             probe_cache=cache,
             preserve_video=preserve_video,
             max_workers=max_workers,
+            intro_chapter_mode=intro_chapter_mode,
         )
     for part in filepaths:
         if part not in split_paths and os.path.exists(part):

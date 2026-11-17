@@ -107,6 +107,7 @@ class Config:
     mono: bool | None = None
     chapters_from_silence: bool | None = None
     chapter_offset_ms: int | None = None
+    intro_chapter_mode: str | None = None
     square_cover: bool | None = None
     max_cover_size: int | None = None
     download_archive: str | None = None

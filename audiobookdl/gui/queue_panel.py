@@ -30,7 +30,12 @@ from audiobookdl.gui.formatting import format_duration, format_speed, parse_url_
 from audiobookdl.gui.notifications import format_completion_notification, send_os_notification_async
 from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, make_bold_font, scale_px
 from audiobookdl.gui.widgets import ModalDialog, ScrolledTreeview, TreeColumnSpec
-from audiobookdl.options_schema import GUI_MEDIA_TYPE_OPTIONS, GUI_OUTPUT_FORMATS
+from audiobookdl.options_schema import (
+    GUI_INTRO_CHAPTER_MODES,
+    GUI_MEDIA_TYPE_OPTIONS,
+    GUI_OUTPUT_FORMATS,
+    OPTIONS_BY_NAME,
+)
 from audiobookdl.pipeline import DownloadSummary
 from audiobookdl.sources import detect_service_key
 
@@ -132,11 +137,16 @@ class _JobOptionsDialog(ModalDialog):
         raw_skip = ov_map.get("skip_downloaded")
         cur_skip = "On" if raw_skip is True else ("Off" if raw_skip is False else "Default")
 
+        intro_binding = OPTIONS_BY_NAME["intro_chapter_mode"].gui
+        assert intro_binding is not None
+        cur_intro_mode = intro_binding.init_value(ov_map.get("intro_chapter_mode"))
+
         self._profile_var = tk.StringVar(value=cur_prof)
         self._format_var = tk.StringVar(value=cur_fmt)
         self._media_var = tk.StringVar(value=cur_media)
         self._bitrate_var = tk.StringVar(value=cur_bitrate)
         self._skip_dl_var = tk.StringVar(value=cur_skip)
+        self._intro_mode_var = tk.StringVar(value=cur_intro_mode)
         self._combine_var = tk.BooleanVar(value=bool(ov_map.get("combine", False)))
         self._split_var = tk.BooleanVar(value=bool(ov_map.get("split_chapters", False)))
         self._overwrite_var = tk.BooleanVar(value=bool(ov_map.get("overwrite", False)))
@@ -189,8 +199,16 @@ class _JobOptionsDialog(ModalDialog):
             state="disabled" if is_pack else "readonly",
         ).grid(row=4, column=1, sticky="ew", pady=4)
 
+        ttk.Label(body, text="Intro Numbering:").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Combobox(
+            body,
+            textvariable=self._intro_mode_var,
+            values=GUI_INTRO_CHAPTER_MODES,
+            state="readonly",
+        ).grid(row=5, column=1, sticky="ew", pady=4)
+
         toggles = ttk.Frame(body)
-        toggles.grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 2))
+        toggles.grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 2))
         ttk.Checkbutton(
             toggles,
             text="Combine parts",
@@ -205,7 +223,7 @@ class _JobOptionsDialog(ModalDialog):
         ).pack(side=tk.LEFT)
 
         toggles2 = ttk.Frame(body)
-        toggles2.grid(row=6, column=0, columnspan=2, sticky="w", pady=(2, 4))
+        toggles2.grid(row=7, column=0, columnspan=2, sticky="w", pady=(2, 4))
         ttk.Checkbutton(toggles2, text="Overwrite", variable=self._overwrite_var).pack(
             side=tk.LEFT, padx=(0, 12)
         )
@@ -217,7 +235,7 @@ class _JobOptionsDialog(ModalDialog):
         )
 
         btns = ttk.Frame(body)
-        btns.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        btns.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         ttk.Button(btns, text="Save", command=self._save, style="Accent.TButton").pack(side=tk.RIGHT)
         ttk.Button(btns, text="Cancel", command=self.destroy).pack(side=tk.RIGHT, padx=(0, 6))
 
@@ -230,10 +248,14 @@ class _JobOptionsDialog(ModalDialog):
         media = (self._media_var.get() or "Auto").strip().lower()
         bitrate = (self._bitrate_var.get() or "").strip() or None
         skip_dl = {"On": True, "Off": False}.get(self._skip_dl_var.get(), None)
+        intro_binding = OPTIONS_BY_NAME["intro_chapter_mode"].gui
+        assert intro_binding is not None
+        intro_mode = intro_binding.read_option(self._intro_mode_var.get())
         overrides: dict[str, Any] = {
             "output_format": fmt,
             "combine": self._combine_var.get(),
             "split_chapters": self._split_var.get(),
+            "intro_chapter_mode": intro_mode,
             "media_type": media,
             "audio_bitrate": bitrate,
             "overwrite": self._overwrite_var.get(),

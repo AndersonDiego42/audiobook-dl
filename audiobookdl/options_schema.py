@@ -10,9 +10,15 @@ from audiobookdl.utils import normalize_audio_bitrate
 
 
 MEDIA_TYPE_CHOICES: tuple[str, ...] = ("auto", "audiobook", "ebook", "video", "both")
+INTRO_CHAPTER_MODE_CHOICES: tuple[str, ...] = ("auto", "always", "off")
 OUTPUT_PRESET_CHOICES: tuple[str, ...] = ("default", "audiobookshelf", "plex", "kavita")
 GUI_OUTPUT_FORMATS: tuple[str, ...] = ("Original", "m4b", "mp3", "m4a", "mp4", "mkv", "flac", "opus")
 GUI_MEDIA_TYPE_OPTIONS: tuple[str, ...] = ("Auto", "Audiobook", "Ebook", "Video", "Both")
+GUI_INTRO_CHAPTER_MODES: tuple[str, ...] = (
+    "Auto (detect intro)",
+    "Always (first is 00)",
+    "Off (start at 01)",
+)
 GUI_OVERWRITE_OPTIONS: tuple[str, ...] = ("Ask", "Overwrite", "Keep existing")
 
 GUI_CONFIG_KEYS: frozenset[str] = frozenset(
@@ -162,6 +168,16 @@ def _validate_media_type(key: str, raw: Any) -> tuple[str | None, str | None]:
     return None, f"Warning: invalid '{key}' in config ('{val}'); ignoring"
 
 
+def _validate_intro_chapter_mode(key: str, raw: Any) -> tuple[str | None, str | None]:
+    val, warning = _validate_str(key, raw)
+    if warning is not None or val is None:
+        return None, warning
+    normalized = val.strip().lower()
+    if normalized in INTRO_CHAPTER_MODE_CHOICES:
+        return normalized, None
+    return None, f"Warning: invalid '{key}' in config ('{val}'); ignoring"
+
+
 def _validate_limit_rate(key: str, raw: Any) -> tuple[str | None, str | None]:
     val, warning = _validate_str(key, raw)
     if warning is not None or val is None:
@@ -187,6 +203,7 @@ _CONFIG_VALIDATORS: Mapping[str, Callable[[str, Any], tuple[Any, str | None]]] =
     "positive_float": _validate_positive_float,
     "audio_bitrate": _validate_audio_bitrate,
     "media_type": _validate_media_type,
+    "intro_chapter_mode": _validate_intro_chapter_mode,
     "enrich_providers": _validate_enrich_providers,
     "limit_rate": _validate_limit_rate,
 }
@@ -226,6 +243,13 @@ def _serialize_audio_bitrate(val: Any) -> tuple[bool, Any]:
 def _serialize_media_type(val: Any) -> tuple[bool, Any]:
     normalized = str(val).strip().lower() if val else ""
     if normalized and normalized != "auto":
+        return True, normalized
+    return False, None
+
+
+def _serialize_intro_chapter_mode(val: Any) -> tuple[bool, Any]:
+    normalized = str(val).strip().lower() if val else ""
+    if normalized in ("always", "off"):
         return True, normalized
     return False, None
 
@@ -278,6 +302,24 @@ def _gui_init_media_type(cfg_val: Any) -> str:
 def _gui_read_media_type(raw: Any) -> str:
     cleaned = str(raw).strip().lower()
     return cleaned if cleaned in MEDIA_TYPE_CHOICES else "auto"
+
+
+def _gui_init_intro_chapter_mode(cfg_val: Any) -> str:
+    normalized = (cfg_val or "auto").strip().lower()
+    return {
+        "auto": "Auto (detect intro)",
+        "always": "Always (first is 00)",
+        "off": "Off (start at 01)",
+    }.get(normalized, "Auto (detect intro)")
+
+
+def _gui_read_intro_chapter_mode(raw: Any) -> str:
+    cleaned = str(raw).strip().lower()
+    if cleaned in ("always", "always (first is 00)", "force"):
+        return "always"
+    if cleaned in ("off", "off (start at 01)", "never"):
+        return "off"
+    return "auto"
 
 
 def _gui_init_audio_bitrate(cfg_val: Any) -> str:
@@ -1035,6 +1077,25 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         ),
     ),
     OptionSpec(
+        name="intro_chapter_mode",
+        default="auto",
+        help="Numbering mode when splitting chapters with an introduction/prologue first (auto, always, off)",
+        config_key="intro_chapter_mode",
+        config_kind="intro_chapter_mode",
+        toml_serializer=_serialize_intro_chapter_mode,
+        merge_from_config=True,
+        merge_only_if_default=True,
+        merge_require_truthy=True,
+        gui=GuiBinding(
+            var_attr="intro_chapter_mode_var",
+            var_type="str",
+            gui_default="Auto (detect intro)",
+            from_config=_gui_init_intro_chapter_mode,
+            to_option=_gui_read_intro_chapter_mode,
+            persisted_in_output_prefs=True,
+        ),
+    ),
+    OptionSpec(
         name="square_cover",
         default=False,
         help="Pad cover artwork to a 1:1 square aspect ratio",
@@ -1283,6 +1344,7 @@ class DownloadOptions:
     mono: bool = False
     chapters_from_silence: bool = False
     chapter_offset_ms: int = 0
+    intro_chapter_mode: str = "auto"
     square_cover: bool = False
     max_cover_size: int | None = None
     proxy: str | None = None

@@ -765,8 +765,8 @@ def test_real_ffmpeg_split_chapters_and_hls_smart_merge(tmp_path):
         output_format="m4b",
     )
     assert len(merged_files) == 2
-    assert os.path.basename(merged_files[0]) == "01 - Intro.m4b"
-    assert os.path.basename(merged_files[1]) == "02 - Act I.m4b"
+    assert os.path.basename(merged_files[0]) == "00 - Intro.m4b"
+    assert os.path.basename(merged_files[1]) == "01 - Act I.m4b"
     assert all(os.path.exists(p) and os.path.getsize(p) > 0 for p in merged_files)
 
     # Direct split_audio_by_chapters on single m4b
@@ -791,9 +791,18 @@ def test_real_ffmpeg_split_chapters_and_hls_smart_merge(tmp_path):
     split_dir = tmp_path / "split_mp3"
     split_paths = split_audio_by_chapters(str(master), str(split_dir), chapters)
     assert len(split_paths) == 2
-    assert os.path.basename(split_paths[0]) == "01 - Intro.mp3"
-    assert os.path.basename(split_paths[1]) == "02 - Act I.mp3"
+    assert os.path.basename(split_paths[0]) == "00 - Intro.mp3"
+    assert os.path.basename(split_paths[1]) == "01 - Act I.mp3"
     assert all(os.path.getsize(p) > 0 for p in split_paths)
+
+    split_off_dir = tmp_path / "split_mp3_off"
+    split_off_paths = split_audio_by_chapters(
+        str(master), str(split_off_dir), chapters, intro_chapter_mode="off"
+    )
+    assert [os.path.basename(p) for p in split_off_paths] == [
+        "01 - Intro.mp3",
+        "02 - Act I.mp3",
+    ]
 
 
 def test_combine_audiofiles_reuses_ffprobe_cache_and_skips_redundant_combined_probe(tmp_path):
@@ -1451,6 +1460,131 @@ def test_resolve_ffmpeg_pool_workers_cpu_and_explicit_caps(monkeypatch):
     assert resolve_ffmpeg_pool_workers(None, cpu_bound=False) == 4
     assert resolve_ffmpeg_pool_workers(None, cpu_bound=True) == 2
     assert resolve_ffmpeg_pool_workers(6, cpu_bound=True) == 2
+
+
+def test_intro_chapter_detection_and_split_resolution():
+    from audiobookdl.output.metadata._chapters import (
+        apply_intro_chapter_titles,
+        is_intro_chapter_title,
+        resolve_split_chapter_entries,
+    )
+
+    assert is_intro_chapter_title("Introduction") is True
+    assert is_intro_chapter_title("Intro") is True
+    assert is_intro_chapter_title("Prologue") is True
+    assert is_intro_chapter_title("Opening Credits") is True
+    assert is_intro_chapter_title("Opening") is True
+    assert is_intro_chapter_title("Foreword") is True
+    assert is_intro_chapter_title("Chapter 0") is True
+    assert is_intro_chapter_title("Chapter 00") is True
+    assert is_intro_chapter_title("01 - Introduction") is True
+    assert is_intro_chapter_title("Introduktion") is True
+
+    assert is_intro_chapter_title("Chapter 1") is False
+    assert is_intro_chapter_title("Chapter 1: Introduction") is False
+    assert is_intro_chapter_title("Opening the Gate") is False
+    assert is_intro_chapter_title("Introspection") is False
+    assert is_intro_chapter_title("") is False
+
+    # Auto mode: explicit intro starts at 00 and shifts off-by-one generic Chapter N titles
+    assert resolve_split_chapter_entries(
+        ["Introduction", "Chapter 2", "Chapter 3"],
+        intro_mode="auto",
+    ) == [(0, "Introduction"), (1, "Chapter 1"), (2, "Chapter 2")]
+
+    # Auto mode: explicit intro followed by already-1-based Chapter 1 keeps Chapter 1 intact
+    assert resolve_split_chapter_entries(
+        ["Introduction", "Chapter 1", "Chapter 2"],
+        intro_mode="auto",
+    ) == [(0, "Introduction"), (1, "Chapter 1"), (2, "Chapter 2")]
+
+    # Auto mode: untitled/generic Chapter 1..3 without explicit intro stays 01..03
+    assert resolve_split_chapter_entries(
+        ["Chapter 1", "Chapter 2", "Chapter 3"],
+        intro_mode="auto",
+    ) == [(1, "Chapter 1"), (2, "Chapter 2"), (3, "Chapter 3")]
+
+    # Always mode: forces first generic/untitled track to 00 - Introduction and shifts Chapter 2 -> Chapter 1
+    assert resolve_split_chapter_entries(
+        ["Chapter 01", "Chapter 02", "Chapter 03"],
+        intro_mode="always",
+    ) == [(0, "Introduction"), (1, "Chapter 01"), (2, "Chapter 02")]
+
+    # Always mode with real title keeps real title at 00
+    assert resolve_split_chapter_entries(
+        ["The Setup", "The Conflict", "The Resolution"],
+        intro_mode="always",
+    ) == [(0, "The Setup"), (1, "The Conflict"), (2, "The Resolution")]
+
+    # Off mode: never shifts to 00 even when titled Introduction
+    assert resolve_split_chapter_entries(
+        ["Introduction", "Chapter 1", "Chapter 2"],
+        intro_mode="off",
+    ) == [(1, "Introduction"), (2, "Chapter 1"), (3, "Chapter 2")]
+
+    # Multiple leading front-matter tracks
+    assert resolve_split_chapter_entries(
+        ["Opening Credits", "Prologue", "Chapter 3", "Chapter 4"],
+        intro_mode="auto",
+    ) == [(0, "Opening Credits"), (1, "Prologue"), (2, "Chapter 1"), (3, "Chapter 2")]
+
+    chapters = [Chapter(0, "Chapter 1"), Chapter(5000, "Chapter 2"), Chapter(10000, "Chapter 3")]
+    updated = apply_intro_chapter_titles(chapters, intro_mode="always")
+    assert [(c.start, c.title) for c in updated] == [
+        (0, "Introduction"),
+        (5000, "Chapter 1"),
+        (10000, "Chapter 2"),
+    ]
+
+
+def test_split_and_merge_segment_groups_respect_intro_chapter_mode(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from pathlib import Path
+
+    monkeypatch.setattr(output, "_require_executable", lambda _n: "ffmpeg")
+    monkeypatch.setattr(output, "find_executable", lambda _n: "ffprobe")
+    monkeypatch.setattr(
+        output,
+        "_probe_audio_info",
+        lambda _p: AudioProbeInfo(duration=30.0, codec_name="mp3", bitrate=128000, sample_rate=44100, channels=2),
+    )
+
+    def fake_run(cmd, **_kwargs):
+        Path(cmd[-1]).write_bytes(b"out")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(output, "run_cancellable_subprocess", fake_run)
+
+    master = tmp_path / "master.mp3"
+    master.write_bytes(b"master")
+    chapters = [Chapter(0, "Chapter 1"), Chapter(10000, "Chapter 2"), Chapter(20000, "Chapter 3")]
+
+    split_always = output.split_audio_by_chapters(
+        str(master), str(tmp_path / "split_always"), chapters, intro_chapter_mode="always"
+    )
+    assert [os.path.basename(p) for p in split_always] == [
+        "00 - Introduction.mp3",
+        "01 - Chapter 1.mp3",
+        "02 - Chapter 2.mp3",
+    ]
+
+    seg_dir = tmp_path / "segs"
+    seg_dir.mkdir()
+    s0, s1, s2 = seg_dir / "s0.mp3", seg_dir / "s1.mp3", seg_dir / "s2.mp3"
+    for s in (s0, s1, s2):
+        s.write_bytes(b"seg")
+
+    merged = output.merge_segment_groups_into_chapters(
+        [("Introduction", [str(s0)]), ("Chapter 2", [str(s1)]), ("Chapter 3", [str(s2)])],
+        str(tmp_path / "merged_auto"),
+        output_format="mp3",
+        intro_chapter_mode="auto",
+    )
+    assert [os.path.basename(p) for p in merged] == [
+        "00 - Introduction.mp3",
+        "01 - Chapter 1.mp3",
+        "02 - Chapter 2.mp3",
+    ]
 
 
 

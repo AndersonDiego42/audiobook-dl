@@ -174,11 +174,10 @@ class EverandSource(Source[str]):
         )
         files = []
         for i in response["playlist"]:
-            chapter = i["chapter_number"]
             files.append(
                 AudiobookFile(
                     url=i["url"],
-                    title=f"Chapter {chapter}",
+                    title=EverandSource.get_chapter_title(i),
                     ext="mp3",
                 )
             )

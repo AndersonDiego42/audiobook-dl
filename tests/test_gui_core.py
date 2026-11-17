@@ -1786,6 +1786,7 @@ def test_gui_persists_all_toggles_on_close_and_run_start(tmp_path):
     app.no_chapters_var.set(True)
     app.debug_var.set(True)
     app.split_chapters_var.set(True)
+    app.intro_chapter_mode_var.set("Always (first is 00)")
     app.write_opf_var.set(True)
     app.write_cue_var.set(True)
     app.write_cover_var.set(True)
@@ -1823,6 +1824,8 @@ def test_gui_persists_all_toggles_on_close_and_run_start(tmp_path):
         assert app2.no_chapters_var.get() is True
         assert app2.debug_var.get() is True
         assert app2.split_chapters_var.get() is True
+        assert app2.intro_chapter_mode_var.get() == "Always (first is 00)"
+        assert app2.build_options().intro_chapter_mode == "always"
         assert app2.write_opf_var.get() is True
         assert app2.write_cue_var.get() is True
         assert app2.write_cover_var.get() is True

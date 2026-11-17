@@ -957,6 +957,7 @@ class GuiController:
         "output_format",
         "combine",
         "split_chapters",
+        "intro_chapter_mode",
         "media_type",
         "output_template",
         "audio_bitrate",

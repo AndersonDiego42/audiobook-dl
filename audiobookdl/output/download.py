@@ -8,7 +8,10 @@ from audiobookdl.exceptions import (
 )
 from audiobookdl.output.encryption import AESStreamDecryptor
 from audiobookdl.output.metadata import id3
-from audiobookdl.output.metadata._chapters import resolve_audio_duration_ms
+from audiobookdl.output.metadata._chapters import (
+    apply_intro_chapter_titles,
+    resolve_audio_duration_ms,
+)
 from audiobookdl.output.metadata._cover import apply_cover_postprocessing
 from audiobookdl.utils.audiobook import (
     AESEncryption,
@@ -259,6 +262,7 @@ def download_audiobook(
         chapters_embedded = False
         cover_embedded = False
         chapter_offset_ms = int(getattr(options, "chapter_offset_ms", 0) or 0)
+        intro_chapter_mode = str(getattr(options, "intro_chapter_mode", "auto") or "auto")
         if not ebook:
             if audiobook.cover is not None and (
                 getattr(options, "square_cover", False)
@@ -283,6 +287,10 @@ def download_audiobook(
                     if chapter_offset_ms != 0:
                         detected = output.apply_chapter_offset(detected, chapter_offset_ms)
                     audiobook.chapters = detected
+            if audiobook.chapters and not options.no_chapters:
+                audiobook.chapters = apply_intro_chapter_titles(
+                    audiobook.chapters, intro_mode=intro_chapter_mode
+                )
 
         # Re-evaluate after silence chapter detection on single-file inputs
         splitting = wants_split and len(audiobook.chapters) > 1
@@ -331,6 +339,7 @@ def download_audiobook(
                 probe_cache=probe_cache,
                 preserve_video=video,
                 max_workers=max_workers,
+                intro_chapter_mode=intro_chapter_mode,
                 **audio_filter_kwargs,
             )
             current_format = output_format
@@ -368,7 +377,9 @@ def download_audiobook(
                         if detected:
                             if chapter_offset_ms != 0:
                                 detected = output.apply_chapter_offset(detected, chapter_offset_ms)
-                            audiobook.chapters = detected
+                            audiobook.chapters = apply_intro_chapter_titles(
+                                detected, intro_mode=intro_chapter_mode
+                            )
                     splitting = wants_split and len(audiobook.chapters) > 1
                     if splitting:
                         split_result = output.split_audio_by_chapters(
@@ -381,6 +392,7 @@ def download_audiobook(
                             probe_cache=probe_cache,
                             preserve_video=video,
                             max_workers=max_workers,
+                            intro_chapter_mode=intro_chapter_mode,
                         )
                         for src_part in filepaths:
                             if src_part not in split_result and os.path.exists(src_part):
@@ -407,6 +419,7 @@ def download_audiobook(
                     probe_cache=probe_cache,
                     preserve_video=video,
                     max_workers=max_workers,
+                    intro_chapter_mode=intro_chapter_mode,
                     **audio_filter_kwargs,
                 )
                 if src_single not in filepaths and os.path.exists(src_single):
@@ -458,7 +471,9 @@ def download_audiobook(
                     if detected:
                         if chapter_offset_ms != 0:
                             detected = output.apply_chapter_offset(detected, chapter_offset_ms)
-                        audiobook.chapters = detected
+                        audiobook.chapters = apply_intro_chapter_titles(
+                            detected, intro_mode=intro_chapter_mode
+                        )
             except DownloadCancelled:
                 if os.path.isdir(work_output_dir) and (use_staging_dir or not options.resume):
                     shutil.rmtree(work_output_dir, ignore_errors=True)
@@ -473,6 +488,7 @@ def download_audiobook(
                 probe_cache=probe_cache,
                 preserve_video=video,
                 max_workers=max_workers,
+                intro_chapter_mode=intro_chapter_mode,
                 **audio_filter_kwargs,
             )
             current_format = output_format
@@ -492,6 +508,7 @@ def download_audiobook(
                 probe_cache=probe_cache,
                 preserve_video=video,
                 max_workers=max_workers,
+                intro_chapter_mode=intro_chapter_mode,
                 **audio_filter_kwargs,
             )
             current_format = output_format

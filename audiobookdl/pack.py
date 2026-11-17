@@ -24,6 +24,7 @@ from audiobookdl.config import Config, load_config
 from audiobookdl.exceptions import AudiobookDLException, DownloadCancelled, GenericAudiobookDLException
 from audiobookdl.output import download as output_download
 from audiobookdl.output import output
+from audiobookdl.output.metadata._chapters import apply_intro_chapter_titles
 from audiobookdl.output.metadata._cover import apply_cover_postprocessing
 from audiobookdl.output.metadata.reader import (
     TrackTagInfo,
@@ -714,6 +715,12 @@ def pack_book(
             if chapter_offset_ms != 0:
                 detected = output.apply_chapter_offset(detected, chapter_offset_ms)
             spec.audiobook.chapters = detected
+
+    if not options.no_chapters and spec.audiobook.chapters:
+        intro_chapter_mode = str(getattr(options, "intro_chapter_mode", "auto") or "auto")
+        spec.audiobook.chapters = apply_intro_chapter_titles(
+            spec.audiobook.chapters, intro_mode=intro_chapter_mode
+        )
 
     use_loudnorm = bool(getattr(options, "loudnorm", False))
     use_mono = bool(getattr(options, "mono", False))

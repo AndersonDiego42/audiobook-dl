@@ -173,6 +173,11 @@ def test_validate_config_value_variants():
     val, warn = validate_config_value("media_type", "media_type", "vinyl")
     assert val is None and warn is not None
 
+    assert validate_config_value("intro_chapter_mode", "intro_chapter_mode", " ALWAYS ") == ("always", None)
+    assert validate_config_value("intro_chapter_mode", "intro_chapter_mode", "off") == ("off", None)
+    val, warn = validate_config_value("intro_chapter_mode", "intro_chapter_mode", "invalid")
+    assert val is None and warn is not None
+
     with pytest.raises(ValueError, match="Unknown config value kind"):
         validate_config_value("foo", "unknown_kind", "bar")
 
@@ -199,6 +204,7 @@ def test_schema_driven_merge_and_preset_precedence(tmp_path):
             "mono": True,
             "chapters_from_silence": True,
             "chapter_offset_ms": -250,
+            "intro_chapter_mode": "always",
             "square_cover": True,
             "max_cover_size": 1000,
             "download_archive": str(tmp_path / "arch.sqlite"),
@@ -306,10 +312,21 @@ def test_persisted_gui_roundtrip_silence_offset_and_abs(tmp_path):
         config_location=str(cfg_path),
         chapters_from_silence=True,
         chapter_offset_ms=-350,
+        intro_chapter_mode="always",
         upload_to_abs=True,
     )
     loaded = load_config(str(cfg_path))
     assert loaded.chapters_from_silence is True
     assert loaded.chapter_offset_ms == -350
+    assert loaded.intro_chapter_mode == "always"
     assert loaded.upload_to_abs is True
     assert validate_config_value("chapter_offset_ms", "int", True)[0] is None
+
+    intro_binding = OPTIONS_BY_NAME["intro_chapter_mode"].gui
+    assert intro_binding is not None
+    assert intro_binding.init_value(None) == "Auto (detect intro)"
+    assert intro_binding.init_value("always") == "Always (first is 00)"
+    assert intro_binding.init_value("off") == "Off (start at 01)"
+    assert intro_binding.read_option("Auto (detect intro)") == "auto"
+    assert intro_binding.read_option("Always (first is 00)") == "always"
+    assert intro_binding.read_option("Off (start at 01)") == "off"

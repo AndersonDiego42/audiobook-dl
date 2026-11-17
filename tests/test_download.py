@@ -1850,5 +1850,77 @@ def test_add_metadata_to_dir_respects_write_cover_false(tmp_path):
     assert (book_dir / "cover.jpg").read_bytes() == b"\xff\xd8\xff\xe0fake-jpeg"
 
 
+def test_download_audiobook_split_intro_chapter_mode_updates_filenames_tags_and_sidecars(tmp_path, monkeypatch):
+    import json
+    import os
+    from types import SimpleNamespace
+    from audiobookdl import Chapter
+    from audiobookdl.output import download as dl_mod
+    from audiobookdl.output import output as out_mod
+    from audiobookdl.utils import AudioProbeInfo
+
+    monkeypatch.setattr(out_mod, "_require_executable", lambda _n: "ffmpeg")
+    monkeypatch.setattr(out_mod, "find_executable", lambda _n: "ffprobe")
+    monkeypatch.setattr(
+        out_mod,
+        "_probe_audio_info",
+        lambda _p: AudioProbeInfo(duration=30.0, codec_name="mp3", bitrate=128000, sample_rate=44100, channels=2),
+    )
+
+    def fake_run(cmd, **_kwargs):
+        if "-af" in cmd and any("silencedetect" in str(arg) for arg in cmd):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=b"",
+                stderr=b"[silencedetect] silence_end: 10.0\n[silencedetect] silence_end: 20.0\n",
+            )
+        Path(cmd[-1]).write_bytes(b"mp3")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(out_mod, "run_cancellable_subprocess", fake_run)
+
+    tagged_calls: list[tuple[str, str]] = []
+
+    def fake_add_metadata(filepath, _meta, cover=None, track_context=None, **_kw):
+        tagged_calls.append((os.path.basename(filepath), track_context.title))
+        return True
+
+    monkeypatch.setattr(dl_mod.metadata, "add_metadata", fake_add_metadata)
+
+    session = MagicMock()
+    session.get.return_value = _mock_response(headers={"Content-Length": "4"}, chunks=[b"mp3a"])
+    ab = Audiobook(
+        session=session,
+        metadata=AudiobookMetadata(title="Intro Split Book"),
+        files=[AudiobookFile(url="https://example.com/single.mp3", ext="mp3")],
+    )
+    opts = DownloadOptions(
+        split_chapters=True,
+        chapters_from_silence=True,
+        intro_chapter_mode="always",
+        write_json_metadata=True,
+    )
+    out_dir = tmp_path / "Intro Split Book"
+    download_audiobook(ab, str(out_dir), opts)
+
+    produced_mp3s = sorted(p.name for p in out_dir.glob("*.mp3"))
+    assert produced_mp3s == [
+        "00 - Introduction.mp3",
+        "01 - Chapter 1.mp3",
+        "02 - Chapter 2.mp3",
+    ]
+    assert tagged_calls == [
+        ("00 - Introduction.mp3", "Introduction"),
+        ("01 - Chapter 1.mp3", "Chapter 1"),
+        ("02 - Chapter 2.mp3", "Chapter 2"),
+    ]
+    meta_json = json.loads((out_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert [c["title"] for c in meta_json["chapters"]] == [
+        "Introduction",
+        "Chapter 1",
+        "Chapter 2",
+    ]
+
+
 
 
