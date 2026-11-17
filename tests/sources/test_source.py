@@ -380,3 +380,85 @@ def test_get_stream_files_supports_ext_x_map_and_ext_x_byterange(tmp_path):
     assert source._session.get.call_count == 2
 
 
+def test_get_stream_files_selects_audio_rendition_decodes_data_key_and_rejects_unsupported_method(tmp_path):
+    import base64
+    from audiobookdl.exceptions import GenericAudiobookDLException
+
+    master_m3u8 = (
+        b"#EXTM3U\n"
+        b'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",DEFAULT=YES,URI="audio/index.m3u8"\n'
+        b'#EXT-X-STREAM-INF:BANDWIDTH=2000000,AUDIO="aud"\n'
+        b"video/index.m3u8\n"
+    )
+    raw_key = b"fedcba9876543210"
+    b64_key = base64.b64encode(raw_key).decode("ascii")
+    audio_m3u8 = (
+        b"#EXTM3U\n"
+        + f'#EXT-X-KEY:METHOD=AES-128,URI="data:application/octet-stream;base64,{b64_key}"\n'.encode("ascii")
+        + b"#EXTINF:10.0,\nseg0.aac\n#EXT-X-ENDLIST\n"
+    )
+
+    source = _make_source(tmp_path)
+    source._session.get = MagicMock(
+        side_effect=[
+            MagicMock(status_code=200, content=master_m3u8),
+            MagicMock(status_code=200, content=audio_m3u8),
+        ]
+    )
+    files = source.get_stream_files("https://cdn.example.com/master.m3u8")
+    assert len(files) == 1
+    assert files[0].url == "https://cdn.example.com/audio/seg0.aac"
+    assert files[0].encryption_method is not None
+    assert files[0].encryption_method.key == raw_key
+
+    unsupported_m3u8 = (
+        b"#EXTM3U\n"
+        b'#EXT-X-KEY:METHOD=SAMPLE-AES,URI="https://cdn.example.com/k.bin"\n'
+        b"#EXTINF:10.0,\nseg0.ts\n#EXT-X-ENDLIST\n"
+    )
+    source._session.get = MagicMock(return_value=MagicMock(status_code=200, content=unsupported_m3u8))
+    with pytest.raises(GenericAudiobookDLException, match="SAMPLE-AES"):
+        source.get_stream_files("https://cdn.example.com/sample.m3u8")
+
+
+def test_download_file_invokes_lazy_encryption_resolver(tmp_path):
+    from Crypto.Cipher import AES
+    from Crypto.Util.Padding import pad
+    from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata
+    from audiobookdl.output.download import download_file
+    from audiobookdl.utils.audiobook import AESEncryption
+
+    key = b"0123456789abcdef"
+    iv = b"abcdef9876543210"
+    plaintext = b"decrypted-ebook-payload"
+    ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(pad(plaintext, AES.block_size))
+
+    session = MagicMock()
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.headers = {"Content-Length": str(len(ciphertext))}
+    resp.iter_content.return_value = [ciphertext]
+    session.get.return_value = resp
+
+    resolved_calls = 0
+
+    def _resolve_enc():
+        nonlocal resolved_calls
+        resolved_calls += 1
+        return AESEncryption(key=key, iv=iv)
+
+    ab = Audiobook(
+        session=session,
+        files=[AudiobookFile(url="https://cdn.example.com/book.epub", ext="epub", encryption_resolver=_resolve_enc)],
+        metadata=AudiobookMetadata(title="Enc Book"),
+    )
+    out_path = download_file(
+        (ab, str(tmp_path / "Enc Book"), 0, lambda _d: None, None),
+    )
+    assert resolved_calls == 1
+    with open(out_path, "rb") as fh:
+        assert fh.read() == plaintext
+
+
+
+

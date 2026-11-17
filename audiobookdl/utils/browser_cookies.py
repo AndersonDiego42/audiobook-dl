@@ -37,6 +37,7 @@ SERVICE_COOKIE_DOMAINS: dict[str, tuple[str, ...]] = {
     "chirp": ("chirpbooks.com",),
     "ereolen": ("ereolen.dk",),
     "everand": ("everand.com", "scribd.com"),
+    "oreilly": ("oreilly.com", "learning.oreilly.com"),
     "overdrive": ("overdrive.com", "listen.overdrive.com", "libbyapp.com"),
     "yourcloudlibrary": ("yourcloudlibrary.com",),
 }

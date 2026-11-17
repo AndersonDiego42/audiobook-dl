@@ -52,6 +52,10 @@ class AudiobookFile:
     expected_status_code: int = 200
     # Optional lazy URL resolver invoked when downloading starts
     url_resolver: Callable[[], str] | None = None
+    # Optional lazy encryption resolver invoked when downloading starts
+    encryption_resolver: Callable[[], AudiobookFileEncryption] | None = None
+    # Optional lazy writer for multi-asset/assembled files (e.g. exploded EPUB packages)
+    file_writer: Callable[[str], None] | None = None
     # Optional HLS fMP4 initialization section (#EXT-X-MAP) prepended before segment frames
     init_section: bytes | None = None
 

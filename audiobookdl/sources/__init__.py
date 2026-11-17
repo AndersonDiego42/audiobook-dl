@@ -9,6 +9,7 @@ from .ereolen import EreolenSource
 from .librofm import LibrofmSource
 from .librivox import LibrivoxSource
 from .nextory import NextorySource
+from .oreilly import OReillySource
 from .overdrive import OverdriveSource
 from .podimo import PodimoSource
 from .rss import RssSource
@@ -133,6 +134,7 @@ _BUILTIN_SOURCES: tuple[type[Source], ...] = (
     LibrofmSource,
     LibrivoxSource,
     NextorySource,
+    OReillySource,
     OverdriveSource,
     PodimoSource,
     SaxoSource,

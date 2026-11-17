@@ -1,4 +1,4 @@
-"""Source-to-tagging round-trip contract tests covering all 16 built-in source adapters."""
+"""Source-to-tagging round-trip contract tests covering all 17 built-in source adapters."""
 
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ from audiobookdl.sources.everand import EverandSource
 from audiobookdl.sources.librivox import LibrivoxSource
 from audiobookdl.sources.librofm import LibrofmSource
 from audiobookdl.sources.nextory import NextorySource
+from audiobookdl.sources.oreilly import OReillySource
 from audiobookdl.sources.overdrive import OverdriveSource
 from audiobookdl.sources.podimo import PodimoSource
 from audiobookdl.sources.rss import RssSource
@@ -802,6 +803,129 @@ def _build_yourcloudlibrary() -> tuple[Source, str]:
     return src, "https://audio.yourcloudlibrary.com/listen/item123"
 
 
+def _build_oreilly() -> tuple[Source, str]:
+    src = _new_source(OReillySource)
+    src._session.cookies.set("orm-jwt", "contract-jwt", domain=".oreilly.com")
+    audio_info = {
+        "identifier": "9781000000009",
+        "ourn": "urn:orm:audiobook:9781000000009",
+        "name": "Fluent Systems",
+        "type": "audiobook",
+        "talent": {
+            "contributors": [
+                {"name": "Ada Coder", "contributor_type": "author"},
+                {"name": "Voice Reader", "contributor_type": "narrator"},
+            ]
+        },
+        "publishers": [{"name": "O'Reilly Media"}],
+        "publication_date": "2024-03-01",
+        "language": "en",
+        "description": {"text/html": "<p>Systems guide.</p>"},
+    }
+    toc_payload = {
+        "toc": [
+            {
+                "title": "Chapter 1",
+                "duration": 60,
+                "reference_id": "9781000000009-clip1",
+                "ourn": "urn:orm:audiobook:9781000000009:audio-clip:clip1",
+            }
+        ]
+    }
+    m3u8_bytes = b"#EXTM3U\n#EXTINF:60.0,\nhttps://cdn.example/seg0.aac\n#EXT-X-ENDLIST\n"
+
+    def _request(_method: str, url: str, **_kw: Any):
+        if "/api/v2/metadata/urn:orm:audiobook:9781000000009/" in url:
+            return SimpleNamespace(
+                status_code=200,
+                url=url,
+                headers={"Content-Type": "application/json"},
+                content=json.dumps(audio_info).encode("utf-8"),
+                json=lambda: audio_info,
+            )
+        if "/api/v1/videotocs/9781000000009/" in url:
+            return SimpleNamespace(
+                status_code=200,
+                url=url,
+                headers={"Content-Type": "application/json"},
+                content=json.dumps(toc_payload).encode("utf-8"),
+                json=lambda: toc_payload,
+            )
+        if "/api/v1/videoclips/9781000000009-clip1/" in url:
+            clip_payload = {"kaltura_entry_id": "1_abc123"}
+            return SimpleNamespace(
+                status_code=200,
+                url=url,
+                headers={"Content-Type": "application/json"},
+                content=json.dumps(clip_payload).encode("utf-8"),
+                json=lambda: clip_payload,
+            )
+        if "/api/v1/player/kaltura_session/" in url:
+            ks_payload = {"session": "ks-token", "partner_id": "1926081"}
+            return SimpleNamespace(
+                status_code=200,
+                url=url,
+                headers={"Content-Type": "application/json"},
+                content=json.dumps(ks_payload).encode("utf-8"),
+                json=lambda: ks_payload,
+            )
+        if url.endswith("/api/v3/collections/"):
+            col_payload = [
+                {
+                    "id": "pl1",
+                    "items": [
+                        {
+                            "ourn": "urn:orm:audiobook:9781000000009",
+                            "title": "Fluent Systems",
+                            "authors": [{"name": "Ada Coder"}],
+                            "format": "audiobook",
+                            "web_url": "https://learning.oreilly.com/audiobooks/-/9781000000009/",
+                        }
+                    ],
+                }
+            ]
+            return SimpleNamespace(
+                status_code=200,
+                url=url,
+                headers={"Content-Type": "application/json"},
+                content=json.dumps(col_payload).encode("utf-8"),
+                json=lambda: col_payload,
+            )
+        if "/bookmarks/" in url:
+            empty_bm = {"results": [], "next": None}
+            return SimpleNamespace(
+                status_code=200,
+                url=url,
+                headers={"Content-Type": "application/json"},
+                content=json.dumps(empty_bm).encode("utf-8"),
+                json=lambda: empty_bm,
+            )
+        if "/api/v2/search/" in url:
+            search_payload = {
+                "results": [
+                    {
+                        "ourn": "urn:orm:audiobook:9781000000009",
+                        "title": "Fluent Systems",
+                        "authors": ["Ada Coder"],
+                        "format": "audiobook",
+                        "web_url": "https://learning.oreilly.com/audiobooks/-/9781000000009/",
+                    }
+                ]
+            }
+            return SimpleNamespace(
+                status_code=200,
+                url=url,
+                headers={"Content-Type": "application/json"},
+                content=json.dumps(search_payload).encode("utf-8"),
+                json=lambda: search_payload,
+            )
+        return SimpleNamespace(status_code=404, url=url, headers={}, content=b"")
+
+    src.request = _request  # type: ignore[method-assign]
+    src.get = lambda url, **_kw: m3u8_bytes if ".m3u8" in url else _SAMPLE_COVER  # type: ignore[method-assign]
+    return src, "https://learning.oreilly.com/audiobooks/-/9781000000009/"
+
+
 _SOURCE_CONTRACT_BUILDERS: dict[type[Source], Callable[[], tuple[Source, str]]] = {
     ArchiveOrgSource: _build_archiveorg,
     AudiobooksdotcomSource: _build_audiobooksdotcom,
@@ -813,6 +937,7 @@ _SOURCE_CONTRACT_BUILDERS: dict[type[Source], Callable[[], tuple[Source, str]]] 
     LibrivoxSource: _build_librivox,
     LibrofmSource: _build_librofm,
     NextorySource: _build_nextory,
+    OReillySource: _build_oreilly,
     OverdriveSource: _build_overdrive,
     PodimoSource: _build_podimo,
     RssSource: _build_rss,
@@ -822,8 +947,8 @@ _SOURCE_CONTRACT_BUILDERS: dict[type[Source], Callable[[], tuple[Source, str]]] 
 }
 
 
-def test_source_contract_matrix_covers_all_16_builtin_sources():
-    assert len(_BUILTIN_SOURCES) == 16
+def test_source_contract_matrix_covers_all_17_builtin_sources():
+    assert len(_BUILTIN_SOURCES) == 17
     assert set(_SOURCE_CONTRACT_BUILDERS) == set(_BUILTIN_SOURCES)
 
 

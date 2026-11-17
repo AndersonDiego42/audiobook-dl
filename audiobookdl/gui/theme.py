@@ -206,8 +206,12 @@ def configure_hidpi_scaling(root: tk.Misc, style: ttk.Style) -> float:
         line_h = round(16 * scale)
     row_height = max(scale_px(root, 22), line_h + scale_px(root, 6))
     style.configure("Treeview", rowheight=row_height)
-    catalog_row_height = max(scale_px(root, 56), line_h + scale_px(root, 10))
-    style.configure("Catalog.Treeview", rowheight=catalog_row_height)
+    catalog_row_height = max(scale_px(root, 60), line_h + scale_px(root, 12))
+    style.configure(
+        "Catalog.Treeview",
+        rowheight=catalog_row_height,
+        indent=scale_px(root, 14),
+    )
     return scale
 
 

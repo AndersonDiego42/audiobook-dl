@@ -7,11 +7,13 @@ from audiobookdl.utils.http import (
     is_transient_network_error,
 )
 
+import base64
+from collections.abc import MutableMapping
 import json
 import os
 import random
 import time
-from urllib.parse import urlparse
+from urllib.parse import unquote_to_bytes, urlparse
 import m3u8
 import requests
 
@@ -175,6 +177,46 @@ def _parse_hls_byterange(raw: str, default_offset: int | None = None) -> tuple[i
     return start, start + length - 1
 
 
+def _decode_key_data_uri(uri: str) -> bytes | None:
+    """Decode an inline `data:` HLS key URI into raw key bytes, or return `None` for non-data URIs."""
+    if not uri.lower().startswith("data:"):
+        return None
+    header, sep, payload = uri.partition(",")
+    if not sep or not payload:
+        raise exceptions.GenericAudiobookDLException("Invalid inline data: URI in HLS #EXT-X-KEY")
+    if ";base64" in header.lower():
+        return base64.b64decode(payload)
+    return unquote_to_bytes(payload)
+
+
+def _select_variant_playlist_uri(playlist: m3u8.M3U8) -> str | None:
+    """Select the preferred audio rendition URI if present, else the highest-bandwidth variant URI."""
+    best = max(
+        playlist.playlists,
+        key=lambda p: (p.stream_info.bandwidth or 0) if p.stream_info else 0,
+    )
+    stream_info = getattr(best, "stream_info", None)
+    audio_group = getattr(stream_info, "audio", None) if stream_info else None
+    media_list = getattr(playlist, "media", None) or []
+    if audio_group or media_list:
+        audio_candidates = [
+            m
+            for m in media_list
+            if str(getattr(m, "type", "") or "").upper() == "AUDIO"
+            and getattr(m, "absolute_uri", None)
+            and (not audio_group or getattr(m, "group_id", None) == audio_group)
+        ]
+        if audio_candidates:
+            audio_candidates.sort(
+                key=lambda m: (
+                    0 if str(getattr(m, "default", "") or "").upper() == "YES" else 1,
+                    0 if str(getattr(m, "autoselect", "") or "").upper() == "YES" else 1,
+                )
+            )
+            return str(audio_candidates[0].absolute_uri)
+    return best.absolute_uri
+
+
 def get_stream_files(
     self,
     url: str,
@@ -187,14 +229,10 @@ def get_stream_files(
     content = self.get(url, headers=base_headers).decode("utf-8")
     playlist = m3u8.loads(content, uri=url)
 
-    # Resolve master/variant playlists to the highest-bandwidth stream.
+    # Resolve master/variant playlists to the preferred audio rendition or highest-bandwidth stream.
     seen_urls = {url}
     while playlist.is_variant and playlist.playlists:
-        best = max(
-            playlist.playlists,
-            key=lambda p: (p.stream_info.bandwidth or 0) if p.stream_info else 0,
-        )
-        next_url = best.absolute_uri
+        next_url = _select_variant_playlist_uri(playlist)
         if not next_url or next_url in seen_urls:
             break
         seen_urls.add(next_url)
@@ -214,6 +252,7 @@ def get_stream_files(
             if seg.key is not None
             and getattr(seg.key, "method", None) not in (None, "NONE")
             and getattr(seg.key, "absolute_uri", None)
+            and not str(seg.key.absolute_uri).lower().startswith("data:")
         )
     )
     if len(unique_key_uris) > 1:
@@ -226,7 +265,7 @@ def get_stream_files(
 
     for idx, seg in enumerate(playlist.segments):
         seg_ext = extension if extension is not None else _segment_extension(seg.absolute_uri)
-        seg_headers = dict(base_headers)
+        seg_headers: MutableMapping[str, str | bytes] = dict(base_headers)
 
         raw_byterange = getattr(seg, "byterange", None)
         if raw_byterange:
@@ -262,13 +301,23 @@ def get_stream_files(
             init_section=init_bytes,
         )
         if seg.key is not None and getattr(seg.key, "method", None) not in (None, "NONE"):
+            key_method = str(getattr(seg.key, "method", "") or "").strip().upper()
+            if key_method != "AES-128":
+                raise exceptions.GenericAudiobookDLException(
+                    f"Unsupported HLS encryption method '{key_method}'"
+                )
             if seg.key.iv is not None:
                 iv_bytes = int(seg.key.iv, 0).to_bytes(16, byteorder="big")
             else:
                 iv_bytes = (media_sequence + idx).to_bytes(16, byteorder="big")
             key_uri = str(seg.key.absolute_uri)
             if key_uri not in key_cache:
-                key_cache[key_uri] = self._get_page(key_uri, headers=base_headers)
+                inline_key = _decode_key_data_uri(key_uri)
+                key_cache[key_uri] = (
+                    inline_key
+                    if inline_key is not None
+                    else self._get_page(key_uri, headers=base_headers)
+                )
             current.encryption_method = AESEncryption(
                 key=key_cache[key_uri],
                 iv=iv_bytes,

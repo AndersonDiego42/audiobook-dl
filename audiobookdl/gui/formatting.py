@@ -502,21 +502,31 @@ def resize_cover_thumbnail_bytes(raw_bytes: bytes, size: int = 48) -> bytes | No
         return None
 
 
+def resize_cover_bytes_aspect_thumbnail(raw_bytes: bytes, max_size: int = 160) -> bytes | None:
+    """Decode and aspect-preserving resize raw cover bytes into PNG bytes on a worker thread."""
+    if not raw_bytes:
+        return None
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(raw_bytes)) as opened:
+            img = opened.convert("RGBA") if opened.mode not in ("RGB", "RGBA") else opened.copy()
+        img.thumbnail((max_size, max_size))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
 def resize_cover_file_thumbnail_bytes(path: str, max_size: int = 140) -> bytes | None:
     """Read and resize a local cover image file into PNG bytes on a worker thread."""
     if not path:
         return None
     try:
-        from PIL import Image
-
         with open(path, "rb") as handle:
             raw_bytes = handle.read()
-        with Image.open(io.BytesIO(raw_bytes)) as opened:
-            img = opened.copy()
-        img.thumbnail((max_size, max_size))
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return buf.getvalue()
+        return resize_cover_bytes_aspect_thumbnail(raw_bytes, max_size=max_size)
     except Exception:
         return None
 

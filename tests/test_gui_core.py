@@ -5370,6 +5370,169 @@ def test_gui_21_windows_aumid_registration(monkeypatch):
     assert cmds[0][1]["ABDL_NOTIFY_APP"] == notifications.WINDOWS_APP_USER_MODEL_ID
 
 
+@pytest.mark.gui
+def test_gui_22_catalog_cover_width_series_order_filter_and_details():
+    import io
+    import time
+    from tkinter import ttk
+    from PIL import Image
+    from audiobookdl.gui.pages.library_page import CatalogTab
+    from audiobookdl.gui.theme import apply_theme, scale_px
+    from audiobookdl.sources import ServiceInfo
+    from audiobookdl.sources.source import CatalogBook
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        style = ttk.Style(root)
+        palette = apply_theme(root, style, "dark")
+        assert int(style.lookup("Catalog.Treeview", "rowheight")) >= scale_px(root, 60)
+        assert int(style.lookup("Catalog.Treeview", "indent")) == scale_px(root, 14)
+
+        buf = io.BytesIO()
+        Image.new("RGB", (200, 300), color=(40, 110, 190)).save(buf, format="PNG")
+        sample_cover = buf.getvalue()
+
+        svc = ServiceInfo(
+            key="storytel",
+            label="Storytel / Mofibo",
+            auth_methods=("login",),
+            login_fields=("username", "password"),
+            supports_search=True,
+            supports_library=True,
+        )
+        added_urls: list[str] = []
+        tab = CatalogTab(
+            root,
+            [svc],
+            svc,
+            on_fetch=lambda *_a: None,
+            on_add_urls=added_urls.extend,
+            cover_fetcher=lambda url: sample_cover if "cover-1" in url else None,
+            palette=palette,
+        )
+        tab.pack(fill=tk.BOTH, expand=True)
+        root.update_idletasks()
+        try:
+            assert tab._MAX_COVER_CACHE >= 2000
+            assert int(tab._tree.column("#0", "width")) >= scale_px(tab, 102)
+            assert int(tab._tree.column("#0", "minwidth")) >= scale_px(tab, 84)
+
+            books = [
+                CatalogBook(
+                    title="O conto de Zoe",
+                    url="https://www.storytel.com/br/books/o-conto-de-zoe",
+                    author="John Scalzi",
+                    series="Guerra do Velho",
+                    series_order=4,
+                    source="storytel",
+                    formats=("audiobook", "ebook"),
+                    cover_url="https://covers.example.com/cover-1.jpg",
+                ),
+                CatalogBook(
+                    title="Guerra do velho",
+                    url="https://www.storytel.com/br/books/guerra-do-velho",
+                    author="John Scalzi",
+                    series="Guerra do Velho",
+                    series_order=1,
+                    source="storytel",
+                    formats=("audiobook",),
+                    cover_url="https://covers.example.com/cover-1.jpg",
+                ),
+                CatalogBook(
+                    title="A Very Long Standalone Title That Would Truncate In Grid",
+                    url="https://www.storytel.com/br/books/standalone-long",
+                    author="Ursula K. Le Guin",
+                    source="storytel",
+                    formats=("audiobook",),
+                ),
+            ]
+            tab.populate_items(books, statuses=["", "Downloaded", ""])
+
+            roots = tab._tree.get_children("")
+            assert len(roots) == 2
+            group_iid = roots[0]
+            group_vals = tab._tree.item(group_iid, "values")
+            assert "Guerra do Velho (2 items)" == group_vals[0]
+            assert group_vals[1] == "John Scalzi"
+            assert group_vals[2] == ""
+            assert group_vals[3] == "1/2 downloaded"
+            assert group_vals[4] == "1 w/ Ebook"
+
+            # Series items are ordered by series_order (#1 before #4) and display #order
+            children = tab._tree.get_children(group_iid)
+            assert list(children) == ["book-1", "book-0"]
+            assert tab._tree.item("book-1", "values")[2] == "Guerra do Velho #1"
+            assert tab._tree.item("book-0", "values")[2] == "Guerra do Velho #4"
+
+            # Collapse All / Expand All controls
+            tab.collapse_all_groups()
+            assert not bool(tab._tree.item(group_iid, "open"))
+            tab.expand_all_groups()
+            assert bool(tab._tree.item(group_iid, "open"))
+
+            # Book Details pane updates on single leaf selection and fetches detail cover
+            tab._tree.selection_set(("book-0",))
+            tab._on_tree_selected()
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                root.update()
+                if "https://covers.example.com/cover-1.jpg" in tab._detail_cover_png_cache:
+                    break
+                time.sleep(0.03)
+            assert tab._detail_title_var.get() == "O conto de Zoe"
+            assert "John Scalzi" in tab._detail_meta_var.get()
+            assert "Guerra do Velho #4" in tab._detail_meta_var.get()
+            assert "Audiobook + Ebook" in tab._detail_meta_var.get()
+            assert "https://covers.example.com/cover-1.jpg" in tab._detail_cover_png_cache
+            assert "1 selected" in tab._status_var.get()
+
+            # Group selection summarizes the series in Book Details
+            tab._tree.selection_set((group_iid,))
+            tab._on_tree_selected()
+            assert "Guerra do Velho (2 items)" == tab._detail_title_var.get()
+            assert "Items: 2" in tab._detail_meta_var.get()
+
+            # Select All selects every visible leaf book
+            tab.select_all_visible()
+            assert len(tab._selected_books()) == 3
+            assert "3 selected" in tab._status_var.get()
+
+            # Local filter filters loaded books without wiping _loaded_books
+            tab._local_filter_var.set("ursula standalone")
+            tab._on_filter_toggled()
+            assert list(tab._tree.get_children("")) == ["book-2"]
+            assert "Showing 1 of 3" in tab._status_var.get()
+            assert len(tab._loaded_books) == 3
+
+            tab._clear_local_filter()
+            assert len(tab._tree.get_children("")) == 2
+
+            # Flat mode tightens #0 cover width while keeping minwidth >= 84
+            tab._group_var.set(False)
+            tab._on_group_toggled()
+            assert int(tab._tree.column("#0", "width")) >= scale_px(tab, 84)
+            assert len(tab._tree.get_children("")) == 3
+
+            # Details pane toggle
+            assert tab._details_visible is True
+            tab._toggle_details_pane()
+            assert tab._details_visible is False
+            assert tab._details_toggle_btn.cget("text") == "Show Details"
+            tab._toggle_details_pane()
+            assert tab._details_visible is True
+            assert tab._details_toggle_btn.cget("text") == "Hide Details"
+        finally:
+            if tab.winfo_exists():
+                tab.destroy()
+    finally:
+        root.destroy()
+
+
+
 
 
 

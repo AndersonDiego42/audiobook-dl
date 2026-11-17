@@ -1000,6 +1000,8 @@ def download_file(
         return filepath
     if file.url_resolver is not None:
         file.url = file.url_resolver()
+    if file.encryption_method is None and file.encryption_resolver is not None:
+        file.encryption_method = file.encryption_resolver()
     logging.debug(f"Starting downloading file: {file.url}")
     # Retry transient network failures (e.g. a dropped TLS connection) so one
     # flaky segment does not crash the whole batch via the thread pool.
@@ -1008,6 +1010,19 @@ def download_file(
     decrypted_inline = False
     inline_dec_tmp: str | None = None
     allow_ciphertext_range = not isinstance(file.encryption_method, AESEncryption) or len(audiobook.files) == 1
+    if file.file_writer is not None:
+        logging.wait_if_paused(cancel_event=cancel_event)
+        try:
+            file.file_writer(filepath_tmp)
+        except BaseException:
+            if os.path.exists(filepath_tmp):
+                try:
+                    os.remove(filepath_tmp)
+                except OSError:
+                    pass
+            raise
+        update_progress(1.0)
+        attempt = DOWNLOAD_ATTEMPTS
     while attempt < DOWNLOAD_ATTEMPTS:
         logging.wait_if_paused(cancel_event=cancel_event)
         advanced = 0.0

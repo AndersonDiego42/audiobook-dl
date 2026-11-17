@@ -194,6 +194,7 @@ class ScrolledTreeview(ttk.Frame):
         show_tree: bool = False,
         tree_heading: str = "",
         tree_width: int = 28,
+        tree_minwidth: int = 22,
         tree_style: str | None = None,
         enable_sorting: bool = True,
     ) -> None:
@@ -224,7 +225,7 @@ class ScrolledTreeview(ttk.Frame):
             self.tree.column(
                 "#0",
                 width=scale_px(self, tree_width),
-                minwidth=scale_px(self, 22),
+                minwidth=scale_px(self, tree_minwidth),
                 stretch=False,
             )
         for spec in columns:
@@ -256,6 +257,13 @@ class ScrolledTreeview(ttk.Frame):
         self._empty_label: ttk.Label | None = None
         self._empty_btn: ttk.Button | None = None
         self._empty_cmd: Callable[[], None] | None = None
+
+    def set_tree_column_width(self, width: int, *, minwidth: int | None = None) -> None:
+        """Update the `#0` tree column width (and optional `minwidth`) in logical pixels."""
+        kwargs: dict[str, Any] = {"width": scale_px(self, width)}
+        if minwidth is not None:
+            kwargs["minwidth"] = scale_px(self, minwidth)
+        self.tree.column("#0", **kwargs)
 
     def set_empty_state(
         self,

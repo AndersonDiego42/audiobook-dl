@@ -59,6 +59,8 @@ def _encrypt_chromium_v10(key: bytes, host_key: str, value: str, *, include_host
 def test_domain_helpers_and_service_defaults():
     assert "everand.com" in default_domains_for_service("everand")
     assert "scribd.com" in default_domains_for_service("everand")
+    assert "oreilly.com" in default_domains_for_service("oreilly")
+    assert "learning.oreilly.com" in default_domains_for_service("oreilly")
     assert "libbyapp.com" in default_domains_for_service("overdrive")
 
     parsed = parse_domain_filter("https://www.everand.com/listen/123, scribd.com; .ereolen.dk")

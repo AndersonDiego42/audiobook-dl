@@ -25,6 +25,7 @@ audiobook-dl currently supports downloading from the following built-in sources:
 - [Libro.fm](https://libro.fm)
 - [Librivox](https://librivox.org)
 - [Nextory](https://nextory.com)
+- [O'Reilly Learning](https://learning.oreilly.com)
 - [Overdrive](https://www.overdrive.com/) / [Libby](https://libbyapp.com/)
 - [Podimo](https://podimo.com)
 - RSS / Atom Podcast & Audiobook Feeds (`.xml` / `.rss`)

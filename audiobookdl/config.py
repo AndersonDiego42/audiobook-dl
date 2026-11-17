@@ -172,6 +172,8 @@ _STATIC_SOURCE_ALIASES = {
     "audiobooksdotcom": "audiobooks.com",
     "libby": "overdrive",
     "mofibo": "storytel",
+    "o'reilly": "oreilly",
+    "oreillylearning": "oreilly",
     "scribd": "everand",
     "cloudlibrary": "yourcloudlibrary",
 }
