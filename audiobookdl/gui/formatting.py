@@ -502,6 +502,25 @@ def resize_cover_thumbnail_bytes(raw_bytes: bytes, size: int = 48) -> bytes | No
         return None
 
 
+def resize_cover_file_thumbnail_bytes(path: str, max_size: int = 140) -> bytes | None:
+    """Read and resize a local cover image file into PNG bytes on a worker thread."""
+    if not path:
+        return None
+    try:
+        from PIL import Image
+
+        with open(path, "rb") as handle:
+            raw_bytes = handle.read()
+        with Image.open(io.BytesIO(raw_bytes)) as opened:
+            img = opened.copy()
+        img.thumbnail((max_size, max_size))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
 def photo_from_image_bytes(raw_bytes: bytes, master: tk.Misc) -> Any | None:
     """Convert pre-sized PNG/image bytes into an `ImageTk.PhotoImage` on the Tk main thread."""
     if not raw_bytes:

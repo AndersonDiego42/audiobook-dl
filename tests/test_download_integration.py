@@ -41,9 +41,11 @@ def _make_aac_mpegts_segment(ffmpeg: str, path: Path, duration_sec: float = 1.0)
             "-f",
             "lavfi",
             "-i",
-            "anullsrc=r=44100:cl=stereo",
+            "anullsrc=r=22050:cl=mono",
             "-t",
             str(duration_sec),
+            "-threads",
+            "1",
             "-c:a",
             "aac",
             "-f",
@@ -151,6 +153,7 @@ class _LocalHlsTestSource(Source):
         marker.write_text(json.dumps({"title": audiobook.title}), encoding="utf-8")
 
 
+@pytest.mark.ffmpeg
 def test_downloader_hls_aes_combine_and_metadata_integration(tmp_path, monkeypatch):
     ffmpeg = find_executable("ffmpeg")
     ffprobe = find_executable("ffprobe")
@@ -340,6 +343,7 @@ def test_downloader_hls_aes_combine_and_metadata_integration(tmp_path, monkeypat
     assert tags["covr"][0].imageformat == MP4Cover.FORMAT_JPEG
 
 
+@pytest.mark.ffmpeg
 def test_add_metadata_to_file_preserves_mp3_chapters_tags_and_cover(tmp_path):
     ffmpeg = find_executable("ffmpeg")
     if not ffmpeg:
@@ -354,9 +358,11 @@ def test_add_metadata_to_file_preserves_mp3_chapters_tags_and_cover(tmp_path):
             "-f",
             "lavfi",
             "-i",
-            "anullsrc=r=44100:cl=mono",
+            "anullsrc=r=22050:cl=mono",
             "-t",
             "2",
+            "-threads",
+            "1",
             "-c:a",
             "libmp3lame",
             str(mp3_path),
@@ -392,6 +398,7 @@ def test_add_metadata_to_file_preserves_mp3_chapters_tags_and_cover(tmp_path):
     assert len(tags.getall("APIC")) == 1
 
 
+@pytest.mark.ffmpeg
 def test_downloader_multipart_convert_output_m4b_integration(tmp_path):
     ffmpeg = find_executable("ffmpeg")
     ffprobe = find_executable("ffprobe")
@@ -408,7 +415,9 @@ def test_downloader_multipart_convert_output_m4b_integration(tmp_path):
                 "-f",
                 "lavfi",
                 "-i",
-                f"sine=frequency={freq_hz}:duration=0.8",
+                f"sine=frequency={freq_hz}:sample_rate=22050:duration=0.8",
+                "-threads",
+                "1",
                 "-c:a",
                 "libmp3lame",
                 str(p),

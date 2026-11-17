@@ -23,11 +23,24 @@ def test_url_to_source():
         assert source.__name__ == source_name + "Source"
 
 
-def test_ereolen_rejects_empty_domain_and_unlisted_host():
-    with pytest.raises(NoSourceFound):
-        find_compatible_source("https://www./work/work-of:870970-basis:53978223")
-    with pytest.raises(NoSourceFound):
-        find_compatible_source("https://evil-aakb.dk/work/work-of:870970-basis:53978223")
+def test_ereolen_rejects_empty_domain_and_unlisted_host(monkeypatch):
+    import audiobookdl.sources as sources_mod
+    from audiobookdl.sources.ereolen import EreolenSource
+
+    orig_refreshed = sources_mod._EREOLEN_REFRESHED
+    try:
+        sources_mod._EREOLEN_REFRESHED = False
+        monkeypatch.setattr(
+            EreolenSource,
+            "refresh_library_domains",
+            staticmethod(lambda: list(EreolenSource.library_domains)),
+        )
+        with pytest.raises(NoSourceFound):
+            find_compatible_source("https://www./work/work-of:870970-basis:53978223")
+        with pytest.raises(NoSourceFound):
+            find_compatible_source("https://evil-aakb.dk/work/work-of:870970-basis:53978223")
+    finally:
+        sources_mod._EREOLEN_REFRESHED = orig_refreshed
 
 
 def test_ereolen_refreshes_library_domains_once_on_unknown_dk_url(monkeypatch):

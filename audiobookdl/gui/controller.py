@@ -1,13 +1,14 @@
 """State, queue, background worker, and event-bridge controller for the desktop GUI."""
 
 from collections import deque
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 import os
 import queue
 import threading
 from typing import Any
-from collections.abc import Callable, Mapping, Sequence
 import uuid
 
 from audiobookdl import args, logging
@@ -15,6 +16,7 @@ from audiobookdl.config import (
     Config,
     config_dir,
     load_config,
+    save_check_updates,
     save_ffmpeg_dir,
     save_gui_preferences,
     save_output_preferences,
@@ -22,6 +24,31 @@ from audiobookdl.config import (
 )
 from audiobookdl.utils.fs import atomic_write_text
 from audiobookdl.exceptions import DownloadCancelled
+from audiobookdl.gui.events import (
+    AbsUploadDoneEvent,
+    AuthVerifiedEvent,
+    BatchItemEvent,
+    CatalogLoadedEvent,
+    ControllerEvent,
+    FfmpegInstallDoneEvent,
+    ItemProgressEvent,
+    JobMetaEvent,
+    JobStatusEvent,
+    LogBatchEvent,
+    LogEvent,
+    PreviewDoneEvent,
+    ProgressAdvanceEvent,
+    ProgressFinishEvent,
+    ProgressMetricsEvent,
+    ProgressStartEvent,
+    PromptChoiceEvent,
+    PromptConfirmEvent,
+    PromptInputEvent,
+    RunDoneEvent,
+    SyncDoneEvent,
+    SyncEnqueueReadyEvent,
+    UpdateCheckedEvent,
+)
 from audiobookdl.gui.formatting import format_failed_job_detail
 from audiobookdl.options_schema import PERSISTED_GUI_OPTION_SPECS
 from audiobookdl.pack import (
@@ -192,7 +219,7 @@ class QueuedJob:
 class GuiLogSink:
     """Forwards core log and progress events onto the Tkinter event queue."""
 
-    def __init__(self, event_queue: "queue.Queue[tuple]") -> None:
+    def __init__(self, event_queue: "queue.Queue[ControllerEvent]") -> None:
         self._queue = event_queue
         self._active_run_id = 0
         self._active_job_id: str | None = None
@@ -209,13 +236,13 @@ class GuiLogSink:
         self._last_emitted_title = ""
 
     def on_log(self, level: str, message: str) -> None:
-        self._queue.put(("log", level, message))
+        self._queue.put(LogEvent(level=level, message=message))
 
     def on_progress_start(self, description: str, total: float) -> None:
-        self._queue.put(("progress_start", description, total))
+        self._queue.put(ProgressStartEvent(description=description, total=total))
 
     def on_progress_advance(self, completed: float, total: float) -> None:
-        self._queue.put(("progress_advance", completed, total))
+        self._queue.put(ProgressAdvanceEvent(completed=completed, total=total))
 
     def on_progress_metrics(
         self,
@@ -226,18 +253,26 @@ class GuiLogSink:
         elapsed_seconds: float,
         eta_seconds: float | None,
     ) -> None:
-        self._queue.put((
-            "progress_metrics",
-            completed,
-            total,
-            bytes_downloaded,
-            speed_bps,
-            elapsed_seconds,
-            eta_seconds,
-        ))
+        self._queue.put(
+            ProgressMetricsEvent(
+                completed=completed,
+                total=total,
+                bytes_downloaded=bytes_downloaded,
+                speed_bps=speed_bps,
+                elapsed_seconds=elapsed_seconds,
+                eta_seconds=eta_seconds,
+            )
+        )
 
     def on_item_progress(self, current: int, total: int, title: str) -> None:
-        self._queue.put(("item_progress", self._active_run_id, current, total, title))
+        self._queue.put(
+            ItemProgressEvent(
+                run_id=self._active_run_id,
+                current=current,
+                total=total,
+                title=title,
+            )
+        )
         cleaned = str(title or "").strip()
         if not self._active_job_id or not cleaned:
             return
@@ -253,10 +288,10 @@ class GuiLogSink:
             display_title = cleaned
         if display_title != self._last_emitted_title:
             self._last_emitted_title = display_title
-            self._queue.put(("job_meta", self._active_job_id, display_title, ""))
+            self._queue.put(JobMetaEvent(job_id=self._active_job_id, title=display_title))
 
     def on_progress_finish(self) -> None:
-        self._queue.put(("progress_finish",))
+        self._queue.put(ProgressFinishEvent())
 
 
 class GuiInteractionHandler:
@@ -264,7 +299,7 @@ class GuiInteractionHandler:
 
     def __init__(
         self,
-        event_queue: "queue.Queue[tuple]",
+        event_queue: "queue.Queue[ControllerEvent]",
         cancel_event: threading.Event,
     ) -> None:
         self._queue = event_queue
@@ -279,7 +314,7 @@ class GuiInteractionHandler:
         holder: dict = {"value": None}
         with self._lock:
             self._pending_events.append(done)
-        self._queue.put(("prompt_input", prompt, hidden, holder, done))
+        self._queue.put(PromptInputEvent(prompt=prompt, hidden=hidden, holder=holder, done=done))
         done.wait()
         with self._lock:
             if done in self._pending_events:
@@ -295,7 +330,9 @@ class GuiInteractionHandler:
         holder: dict = {"value": False}
         with self._lock:
             self._pending_events.append(done)
-        self._queue.put(("prompt_confirm", logging.strip_markup(message), holder, done))
+        self._queue.put(
+            PromptConfirmEvent(message=logging.strip_markup(message), holder=holder, done=done)
+        )
         done.wait()
         with self._lock:
             if done in self._pending_events:
@@ -314,7 +351,15 @@ class GuiInteractionHandler:
         holder: dict = {"value": None}
         with self._lock:
             self._pending_events.append(done)
-        self._queue.put(("prompt_choice", title, list(choices), default, holder, done))
+        self._queue.put(
+            PromptChoiceEvent(
+                title=title,
+                choices=tuple(choices),
+                default_index=default,
+                holder=holder,
+                done=done,
+            )
+        )
         done.wait()
         with self._lock:
             if done in self._pending_events:
@@ -338,7 +383,7 @@ class GuiController:
         self.config_location = config_location
         self.config = self.load_saved_config()
 
-        self.event_queue: queue.Queue[tuple] = queue.Queue()
+        self.event_queue: queue.Queue[ControllerEvent] = queue.Queue()
         self.sink = GuiLogSink(self.event_queue)
         self.cancel_event = threading.Event()
         self.pause_event = threading.Event()
@@ -348,6 +393,8 @@ class GuiController:
         self.preview_interaction: GuiInteractionHandler | None = None
         self.sync_cancel_event: threading.Event | None = None
         self.sync_interaction: GuiInteractionHandler | None = None
+        self.catalog_cancel_event: threading.Event | None = None
+        self.catalog_interaction: GuiInteractionHandler | None = None
         self._aux_interactions_lock = threading.Lock()
         self._aux_interactions: set[GuiInteractionHandler] = set()
 
@@ -360,6 +407,7 @@ class GuiController:
         self.batch_total = 0
         self.run_seen_urls: set[str] = set()
         self.queue_records: dict[str, dict[str, Any]] = {}
+        self._saved_queue_loaded = False
         self.catalog_request_id = 0
         self.preview_request_id = 0
         self.active_job_id: str | None = None
@@ -454,6 +502,11 @@ class GuiController:
         use_download_archive: bool | None = None,
         theme: str | None = None,
         notify_on_complete: bool | None = None,
+        clipboard_monitor: bool | None = None,
+        auto_sync_enabled: bool | None = None,
+        auto_sync_minutes: int | None = None,
+        auto_sync_mode: str | None = None,
+        auto_sync_targets: Sequence[str] | None = None,
         output_prefs: Mapping[str, Any] | None = None,
     ) -> None:
         if output_prefs:
@@ -471,7 +524,37 @@ class GuiController:
             use_download_archive=use_download_archive,
             theme=theme,
             notify_on_complete=notify_on_complete,
+            clipboard_monitor=clipboard_monitor,
+            auto_sync_enabled=auto_sync_enabled,
+            auto_sync_minutes=auto_sync_minutes,
+            auto_sync_mode=auto_sync_mode,
+            auto_sync_targets=auto_sync_targets,
         )
+
+    def save_gui_preferences(
+        self,
+        *,
+        clipboard_monitor: bool | None = None,
+        auto_sync_enabled: bool | None = None,
+        auto_sync_minutes: int | None = None,
+        auto_sync_mode: str | None = None,
+        auto_sync_targets: Sequence[str] | None = None,
+    ) -> Config:
+        """Persist incremental `[gui]` preferences and reload `self.config`."""
+        save_gui_preferences(
+            overwrite=self.config_location,
+            clipboard_monitor=clipboard_monitor,
+            auto_sync_enabled=auto_sync_enabled,
+            auto_sync_minutes=auto_sync_minutes,
+            auto_sync_mode=auto_sync_mode,
+            auto_sync_targets=auto_sync_targets,
+        )
+        return self.reload_config()
+
+    def set_check_updates(self, enabled: bool) -> Config:
+        """Persist `check_updates` in `audiobook-dl.toml` and reload `self.config`."""
+        save_check_updates(bool(enabled), overwrite=self.config_location)
+        return self.reload_config()
 
     def get_http_session(self) -> Any:
         """Return a per-thread pooled `requests.Session` closed on controller shutdown."""
@@ -484,6 +567,57 @@ class GuiController:
             with self._sessions_lock:
                 self._thread_sessions.append(session)
         return session
+
+    def fetch_cover_bytes(
+        self,
+        url: str,
+        *,
+        proxy: str | None = None,
+        timeout: float | None = None,
+        max_bytes: int = 5 * 1024 * 1024,
+    ) -> bytes | None:
+        """Download cover image bytes via pooled thread-local session, respecting proxy, timeout, and size cap."""
+        if not url or not url.lower().startswith(("http://", "https://")):
+            return None
+        cfg = self.config_snapshot()
+        eff_proxy = (proxy.strip() if isinstance(proxy, str) else "") or (cfg.proxy or "").strip() or None
+        proxies = {"http": eff_proxy, "https": eff_proxy} if eff_proxy else None
+        eff_timeout = (
+            float(timeout)
+            if timeout is not None and float(timeout) > 0
+            else (float(cfg.timeout) if cfg.timeout and cfg.timeout > 0 else 10.0)
+        )
+        session = self.get_http_session()
+        try:
+            with session.get(
+                url,
+                timeout=eff_timeout,
+                proxies=proxies,
+                headers={"User-Agent": "audiobook-dl"},
+                stream=True,
+            ) as resp:
+                if resp.status_code != 200:
+                    return None
+                raw_len = resp.headers.get("Content-Length")
+                if raw_len is not None:
+                    try:
+                        if int(str(raw_len).strip()) > max_bytes:
+                            return None
+                    except ValueError:
+                        pass
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > max_bytes:
+                        return None
+                    chunks.append(chunk)
+                data = b"".join(chunks)
+                return data if data else None
+        except Exception:
+            return None
 
     @staticmethod
     def _close_job_prefetched(job: QueuedJob | None) -> None:
@@ -568,19 +702,33 @@ class GuiController:
             pass
 
     def load_saved_queue_records(self) -> list[dict[str, Any]]:
-        """Load persisted unresolved download and pack queue items from `gui_queue.json`."""
+        """Load persisted unresolved download and pack queue items from `gui_queue.json` once."""
+        with self.queue_lock:
+            if self._saved_queue_loaded:
+                return [
+                    rec
+                    for rec in self.queue_records.values()
+                    if rec.get("run_id") == 0
+                ]
         target = self.queue_state_path()
-        if not os.path.isfile(target):
-            return []
-        try:
-            with open(target, encoding="utf-8") as fh:
-                raw = json.load(fh)
-        except (OSError, ValueError):
-            return []
-        if not isinstance(raw, list):
-            return []
+        raw: Any = None
+        if os.path.isfile(target):
+            try:
+                with open(target, encoding="utf-8") as fh:
+                    raw = json.load(fh)
+            except (OSError, ValueError):
+                raw = None
         restored: list[dict[str, Any]] = []
         with self.queue_lock:
+            if self._saved_queue_loaded:
+                return [
+                    rec
+                    for rec in self.queue_records.values()
+                    if rec.get("run_id") == 0
+                ]
+            self._saved_queue_loaded = True
+            if not isinstance(raw, list):
+                return []
             for item in raw:
                 if not isinstance(item, dict):
                     continue
@@ -636,14 +784,21 @@ class GuiController:
         return not self.pause_event.is_set()
 
     def pause_queue(self) -> None:
-        """Pause the queue before starting the next queued job."""
+        """Pause the queue cooperatively (mid-job and before upcoming jobs)."""
         self.pause_event.clear()
+        with self.queue_cond:
+            active_id = self.active_job_id if self.active_job_running else None
+        if active_id is not None:
+            self.event_queue.put(JobStatusEvent(job_id=active_id, status="Paused", detail="Paused"))
 
     def resume_queue(self) -> None:
         """Resume queue processing after a pause."""
         self.pause_event.set()
         with self.queue_cond:
+            active_id = self.active_job_id if self.active_job_running else None
             self.queue_cond.notify_all()
+        if active_id is not None:
+            self.event_queue.put(JobStatusEvent(job_id=active_id, status="Running", detail=""))
 
     def toggle_pause(self) -> bool:
         """Toggle queue pause state and return the new `is_paused()` state."""
@@ -749,6 +904,71 @@ class GuiController:
             self._request_save_queue_state()
         return snapshot
 
+    _UNSET_VALUE: Any = object()
+    _EDITABLE_JOB_STATUSES = frozenset({"Queued", "Paused", "Failed", "Cancelled", "Interrupted"})
+    _EDITABLE_OVERRIDE_KEYS = ("output_format", "combine", "split_chapters", "media_type", "output_template")
+
+    def update_queue_job_config(
+        self,
+        job_id: str,
+        *,
+        profile: Any = _UNSET_VALUE,
+        job_overrides: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Update editable `profile` and/or `job_overrides` on a non-running queue job."""
+        snapshot: dict[str, Any] | None = None
+        with self.queue_cond:
+            rec = self.queue_records.get(job_id)
+            if rec is None:
+                return None
+            if str(rec.get("status") or "") not in self._EDITABLE_JOB_STATUSES:
+                return None
+
+            norm_prof: str | None = None
+            has_profile_update = profile is not self._UNSET_VALUE
+            if has_profile_update:
+                cleaned_prof = str(profile or "").strip().lower()
+                if not cleaned_prof or cleaned_prof == "default":
+                    rec.pop("profile", None)
+                    norm_prof = None
+                else:
+                    rec["profile"] = cleaned_prof
+                    norm_prof = cleaned_prof
+
+            updated_overrides: dict[str, Any] | None = None
+            if job_overrides is not None:
+                current_ov = dict(rec.get("job_overrides") or {})
+                for key in self._EDITABLE_OVERRIDE_KEYS:
+                    if key not in job_overrides:
+                        continue
+                    val = job_overrides[key]
+                    if val is None or val == "":
+                        current_ov.pop(key, None)
+                    else:
+                        current_ov[key] = val
+                if current_ov:
+                    rec["job_overrides"] = current_ov
+                else:
+                    rec.pop("job_overrides", None)
+                updated_overrides = current_ov
+
+            for pending in self.pending_jobs:
+                if pending is None or pending.job_id != job_id:
+                    continue
+                if has_profile_update:
+                    pending.options.profile = norm_prof
+                if updated_overrides is not None:
+                    explicit = set(getattr(pending.options, "_explicit_fields", set()))
+                    for key in self._EDITABLE_OVERRIDE_KEYS:
+                        if key in updated_overrides:
+                            setattr(pending.options, key, updated_overrides[key])
+                            explicit.add(key)
+                    pending.options._explicit_fields = frozenset(explicit)
+            snapshot = dict(rec)
+
+        self._request_save_queue_state()
+        return snapshot
+
     def clear_seen_urls(self) -> None:
         with self.queue_lock:
             self.run_seen_urls.clear()
@@ -793,6 +1013,7 @@ class GuiController:
         build_job_options: Callable[[str], args.DownloadOptions],
         *,
         allow_existing: bool = False,
+        selected_indices: list[int] | None = None,
     ) -> tuple[bool, list[QueuedJob], int]:
         """Append unseen URLs (or retried URLs when `allow_existing=True`) to the active queue."""
         unique_urls = list(dict.fromkeys(urls))
@@ -820,6 +1041,7 @@ class GuiController:
                     url=u,
                     options=build_job_options(u),
                     interaction=interaction,
+                    selected_indices=list(selected_indices) if selected_indices is not None and len(new_urls) == 1 else None,
                 )
                 self.pending_jobs.append(job)
                 added_jobs.append(job)
@@ -1128,7 +1350,7 @@ class GuiController:
             self.worker_has_active_run = False
         for job in cancelled_jobs:
             self._close_job_prefetched(job)
-            self.event_queue.put(("job_status", job.job_id, cancel_status, ""))
+            self.event_queue.put(JobStatusEvent(job_id=job.job_id, status=cancel_status, detail=""))
         return saw_sentinel
 
     def _pop_next_job_locked(self) -> tuple[QueuedJob | None, bool]:
@@ -1174,7 +1396,9 @@ class GuiController:
 
             while current_job is not None:
                 if self.is_paused() and not self.cancel_event.is_set():
-                    self.event_queue.put(("job_status", current_job.job_id, "Paused", "Queue paused"))
+                    self.event_queue.put(
+                        JobStatusEvent(job_id=current_job.job_id, status="Paused", detail="Queue paused")
+                    )
                     while not self.pause_event.wait(0.2):
                         if self.cancel_event.is_set():
                             break
@@ -1188,7 +1412,9 @@ class GuiController:
                         self.cancelled_job_ids.discard(current_job.job_id)
                         self.active_job_id = None
                         self.active_job_running = False
-                    self.event_queue.put(("job_status", current_job.job_id, "Cancelled", ""))
+                    self.event_queue.put(
+                        JobStatusEvent(job_id=current_job.job_id, status="Cancelled", detail="")
+                    )
                     saw_sentinel = self._drain_pending_jobs("Cancelled")
                     break
 
@@ -1213,8 +1439,17 @@ class GuiController:
                     continue
 
                 item_index += 1
-                self.event_queue.put(("batch_item", run_id, item_index, item_total, active_job.url))
-                self.event_queue.put(("job_status", active_job.job_id, "Running", ""))
+                self.event_queue.put(
+                    BatchItemEvent(
+                        run_id=run_id,
+                        item_index=item_index,
+                        item_total=item_total,
+                        target_url=active_job.url,
+                    )
+                )
+                self.event_queue.put(
+                    JobStatusEvent(job_id=active_job.job_id, status="Running", detail="")
+                )
                 self.sink.set_active_job_id(active_job.job_id)
 
                 should_break = False
@@ -1234,6 +1469,7 @@ class GuiController:
                             overrides=req.overrides,
                             interaction=active_job.interaction,
                             cancel_event=self.cancel_event,
+                            pause_event=self.pause_event,
                             sink=self.sink,
                         )
                         summary = DownloadSummary(
@@ -1257,6 +1493,7 @@ class GuiController:
                         run_kwargs: dict[str, Any] = {
                             "interaction": active_job.interaction,
                             "cancel_event": self.cancel_event,
+                            "pause_event": self.pause_event,
                             "sink": self.sink,
                         }
                         if active_job.selected_indices is not None:
@@ -1278,7 +1515,11 @@ class GuiController:
                                 resolved_output_path = os.path.dirname(first_out) or first_out
                     if resolved_title or resolved_output_path:
                         self.event_queue.put(
-                            ("job_meta", active_job.job_id, resolved_title, resolved_output_path)
+                            JobMetaEvent(
+                                job_id=active_job.job_id,
+                                title=resolved_title,
+                                output_path=resolved_output_path,
+                            )
                         )
                     batch_summary.completed += summary.completed
                     batch_summary.failed += summary.failed
@@ -1289,13 +1530,17 @@ class GuiController:
                     if summary.cancelled:
                         batch_summary.cancelled = True
                         self._discard_seen_url_if_unpending(active_job.url)
-                        self.event_queue.put(("job_status", active_job.job_id, "Cancelled", ""))
+                        self.event_queue.put(
+                            JobStatusEvent(job_id=active_job.job_id, status="Cancelled", detail="")
+                        )
                         saw_sentinel = self._drain_pending_jobs("Cancelled")
                         should_break = True
                     elif summary.failed > 0 or summary.books_failed > 0:
                         detail = format_failed_job_detail(summary.book_errors)
                         self._discard_seen_url_if_unpending(active_job.url)
-                        self.event_queue.put(("job_status", active_job.job_id, "Failed", detail))
+                        self.event_queue.put(
+                            JobStatusEvent(job_id=active_job.job_id, status="Failed", detail=detail)
+                        )
                     else:
                         if summary.books_completed:
                             out_name = os.path.basename(resolved_output_path) if resolved_output_path else ""
@@ -1306,18 +1551,24 @@ class GuiController:
                             )
                         else:
                             detail = "Skipped" if summary.books_skipped else "Done"
-                        self.event_queue.put(("job_status", active_job.job_id, "Completed", detail))
+                        self.event_queue.put(
+                            JobStatusEvent(job_id=active_job.job_id, status="Completed", detail=detail)
+                        )
                 except DownloadCancelled:
                     batch_summary.cancelled = True
                     self._discard_seen_url_if_unpending(active_job.url)
-                    self.event_queue.put(("job_status", active_job.job_id, "Cancelled", ""))
+                    self.event_queue.put(
+                        JobStatusEvent(job_id=active_job.job_id, status="Cancelled", detail="")
+                    )
                     saw_sentinel = self._drain_pending_jobs("Cancelled")
                     should_break = True
                 except Exception as exc:
                     if self.cancel_event.is_set():
                         batch_summary.cancelled = True
                         self._discard_seen_url_if_unpending(active_job.url)
-                        self.event_queue.put(("job_status", active_job.job_id, "Cancelled", ""))
+                        self.event_queue.put(
+                            JobStatusEvent(job_id=active_job.job_id, status="Cancelled", detail="")
+                        )
                         saw_sentinel = self._drain_pending_jobs("Cancelled")
                         should_break = True
                     else:
@@ -1326,8 +1577,16 @@ class GuiController:
                         batch_summary.books_failed += 1
                         batch_summary.book_errors.append((active_job.url, err_text))
                         self._discard_seen_url_if_unpending(active_job.url)
-                        self.event_queue.put(("log", "ERROR", f"{active_job.url}: {err_text}"))
-                        self.event_queue.put(("job_status", active_job.job_id, "Failed", err_text[:120]))
+                        self.event_queue.put(
+                            LogEvent(level="ERROR", message=f"{active_job.url}: {err_text}")
+                        )
+                        self.event_queue.put(
+                            JobStatusEvent(
+                                job_id=active_job.job_id,
+                                status="Failed",
+                                detail=err_text[:120],
+                            )
+                        )
                 finally:
                     self.sink.set_active_job_id(None)
                     self._close_job_prefetched(active_job)
@@ -1342,7 +1601,9 @@ class GuiController:
                 with self.queue_cond:
                     current_job, saw_sentinel = self._pop_next_job_locked()
 
-            self.event_queue.put(("done", run_id, batch_summary, fatal_exc))
+            self.event_queue.put(
+                RunDoneEvent(run_id=run_id, summary=batch_summary, error=fatal_exc)
+            )
             if saw_sentinel:
                 break
 
@@ -1387,10 +1648,12 @@ class GuiController:
                     if callable(close_fn):
                         close_fn()
                     raise DownloadCancelled()
-                self.event_queue.put(("preview_done", url, (source, result), None))
+                self.event_queue.put(
+                    PreviewDoneEvent(url=url, prepared=(source, result), error=None)
+                )
             except Exception as exc:
                 if request_id == self.preview_request_id:
-                    self.event_queue.put(("preview_done", url, None, exc))
+                    self.event_queue.put(PreviewDoneEvent(url=url, prepared=None, error=exc))
 
         threading.Thread(target=_worker, daemon=True).start()
         return request_id
@@ -1410,6 +1673,19 @@ class GuiController:
         for handler in handlers:
             handler.release_all()
 
+    @contextmanager
+    def auxiliary_interaction(self) -> Iterator[tuple[GuiInteractionHandler, threading.Event]]:
+        """Yield a registered `(GuiInteractionHandler, cancel_event)` pair for an auxiliary worker."""
+        cancel_ev = threading.Event()
+        interaction = GuiInteractionHandler(self.event_queue, cancel_ev)
+        self._register_aux_interaction(interaction)
+        try:
+            yield interaction, cancel_ev
+        finally:
+            cancel_ev.set()
+            interaction.release_all()
+            self._unregister_aux_interaction(interaction)
+
     def start_auth_verification(
         self,
         service_key: str,
@@ -1425,15 +1701,34 @@ class GuiController:
         def _worker() -> None:
             try:
                 ok = verify_service_auth(service_key, options, cfg, interaction=interaction)
-                self.event_queue.put(("auth_verified", service_label, ok, None))
+                self.event_queue.put(
+                    AuthVerifiedEvent(service_label=service_label, ok=ok, error=None)
+                )
             except Exception as exc:
-                self.event_queue.put(("auth_verified", service_label, False, exc))
+                self.event_queue.put(
+                    AuthVerifiedEvent(service_label=service_label, ok=False, error=exc)
+                )
             finally:
                 cancel_ev.set()
                 interaction.release_all()
                 self._unregister_aux_interaction(interaction)
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def cancel_catalog_fetch(self) -> bool:
+        """Cancel the currently in-flight catalog search/list request, if any."""
+        cancel_ev = self.catalog_cancel_event
+        interaction = self.catalog_interaction
+        if cancel_ev is None and interaction is None:
+            return False
+        self.catalog_request_id += 1
+        if cancel_ev is not None:
+            cancel_ev.set()
+        if interaction is not None:
+            interaction.release_all()
+        self.catalog_cancel_event = None
+        self.catalog_interaction = None
+        return True
 
     def start_catalog_fetch(
         self,
@@ -1446,11 +1741,14 @@ class GuiController:
         archive_path: str | None = None,
     ) -> int:
         """Search a service catalog or list its library on a background thread."""
+        self.cancel_catalog_fetch()
         self.catalog_request_id += 1
         request_id = self.catalog_request_id
         cfg = self.config_snapshot()
         cancel_ev = threading.Event()
         interaction = GuiInteractionHandler(self.event_queue, cancel_ev)
+        self.catalog_cancel_event = cancel_ev
+        self.catalog_interaction = interaction
         self._register_aux_interaction(interaction)
 
         def _worker() -> None:
@@ -1470,19 +1768,41 @@ class GuiController:
                         cfg,
                         interaction=interaction,
                     )
+                if cancel_ev.is_set():
+                    return
                 statuses: list[str] | None = None
                 if books and archive_path and os.path.exists(archive_path):
                     from audiobookdl.utils.archive import DownloadArchive
 
                     with DownloadArchive(archive_path, persistent=True) as archive:
                         statuses = archive.lookup_catalog_statuses(service_key, books)
-                self.event_queue.put(("catalog_loaded", request_id, dialog, (books, statuses), None))
+                if not cancel_ev.is_set():
+                    self.event_queue.put(
+                        CatalogLoadedEvent(
+                            request_id=request_id,
+                            target_tab=dialog,
+                            payload=(books, statuses),
+                            error=None,
+                        )
+                    )
             except Exception as exc:
-                self.event_queue.put(("catalog_loaded", request_id, dialog, ([], None), exc))
+                if not cancel_ev.is_set():
+                    self.event_queue.put(
+                        CatalogLoadedEvent(
+                            request_id=request_id,
+                            target_tab=dialog,
+                            payload=([], None),
+                            error=exc,
+                        )
+                    )
             finally:
                 cancel_ev.set()
                 interaction.release_all()
                 self._unregister_aux_interaction(interaction)
+                if self.catalog_cancel_event is cancel_ev:
+                    self.catalog_cancel_event = None
+                if self.catalog_interaction is interaction:
+                    self.catalog_interaction = None
 
         threading.Thread(target=_worker, daemon=True).start()
         return request_id
@@ -1521,9 +1841,9 @@ class GuiController:
                         interaction=interaction,
                         sink=self.sink,
                     )
-                self.event_queue.put(("sync_done", cycle, None))
+                self.event_queue.put(SyncDoneEvent(cycle=cycle, error=None))
             except Exception as exc:
-                self.event_queue.put(("sync_done", None, exc))
+                self.event_queue.put(SyncDoneEvent(cycle=None, error=exc))
             finally:
                 if self.sync_cancel_event is cancel_ev:
                     self.sync_cancel_event = None
@@ -1589,21 +1909,20 @@ class GuiController:
                     except Exception as exc:
                         errors.append(f"{svc} ({prof}): {exc}")
                 self.event_queue.put(
-                    (
-                        "sync_enqueue_ready",
-                        pending_by_profile,
-                        {
+                    SyncEnqueueReadyEvent(
+                        pending_groups=pending_by_profile,
+                        stats={
                             "discovered": discovered,
                             "newly_added": newly_added,
                             "skipped": skipped,
                             "errors": errors,
                             "cancelled": cancel_ev.is_set(),
                         },
-                        None,
+                        error=None,
                     )
                 )
             except Exception as exc:
-                self.event_queue.put(("sync_enqueue_ready", [], {}, exc))
+                self.event_queue.put(SyncEnqueueReadyEvent(pending_groups=[], stats={}, error=exc))
             finally:
                 if self.sync_cancel_event is cancel_ev:
                     self.sync_cancel_event = None
@@ -1631,7 +1950,11 @@ class GuiController:
         def _worker() -> None:
             if not abs_cfg.url or not abs_cfg.api_key or not abs_cfg.library_id:
                 self.event_queue.put(
-                    ("abs_upload_done", title, False, "Configure Audiobookshelf URL, token, and library ID first.")
+                    AbsUploadDoneEvent(
+                        title=title,
+                        ok=False,
+                        error_message="Configure Audiobookshelf URL, token, and library ID first.",
+                    )
                 )
                 return
             client = AudiobookshelfClient(abs_cfg.url, abs_cfg.api_key, session=self.get_http_session())
@@ -1644,9 +1967,9 @@ class GuiController:
                 client.upload_book(local_path, library_id=abs_cfg.library_id, metadata=meta)
                 if abs_cfg.auto_scan:
                     client.scan_library(abs_cfg.library_id)
-                self.event_queue.put(("abs_upload_done", title, True, None))
+                self.event_queue.put(AbsUploadDoneEvent(title=title, ok=True, error_message=None))
             except Exception as exc:
-                self.event_queue.put(("abs_upload_done", title, False, str(exc)))
+                self.event_queue.put(AbsUploadDoneEvent(title=title, ok=False, error_message=str(exc)))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -1657,14 +1980,14 @@ class GuiController:
             session = self.get_http_session()
             info = check_for_updates(proxy=proxy, session=session, respect_opt_out=respect_opt_out)
             if interactive or (info is not None and info.has_update):
-                self.event_queue.put(("update_checked", info, interactive))
+                self.event_queue.put(UpdateCheckedEvent(info=info, interactive=interactive))
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def start_winget_ffmpeg_install(self) -> None:
         def _worker() -> None:
             ok, detail = install_ffmpeg_via_winget()
-            self.event_queue.put(("ffmpeg_install_done", ok, detail))
+            self.event_queue.put(FfmpegInstallDoneEvent(ok=ok, detail=detail))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -1720,12 +2043,12 @@ class GuiController:
 
     def drain_events(
         self,
-        handler: Callable[[tuple], None],
+        handler: Callable[[ControllerEvent], None],
         max_batch: int = MAX_QUEUE_BATCH,
     ) -> int:
         """Drain up to `max_batch` events, coalescing consecutive logs, progress, and queue saves."""
-        pending_progress: tuple | None = None
-        pending_metrics: tuple | None = None
+        pending_progress: ProgressAdvanceEvent | None = None
+        pending_metrics: ProgressMetricsEvent | None = None
         pending_logs: list[tuple[str, str]] = []
         processed = 0
         self._save_defer_depth += 1
@@ -1736,11 +2059,11 @@ class GuiController:
             if len(pending_logs) == 1:
                 lvl, msg = pending_logs[0]
                 pending_logs.clear()
-                handler(("log", lvl, msg))
+                handler(LogEvent(level=lvl, message=msg))
                 return
-            batch = list(pending_logs)
+            batch = tuple(pending_logs)
             pending_logs.clear()
-            handler(("log_batch", batch))
+            handler(LogBatchEvent(entries=batch))
 
         def _flush_progress() -> None:
             nonlocal pending_progress, pending_metrics
@@ -1758,15 +2081,15 @@ class GuiController:
                 except queue.Empty:
                     break
                 processed += 1
-                if item[0] == "log":
+                if isinstance(item, LogEvent):
                     _flush_progress()
-                    pending_logs.append((str(item[1]), str(item[2])))
+                    pending_logs.append((item.level, item.message))
                     continue
-                if item[0] == "progress_advance":
+                if isinstance(item, ProgressAdvanceEvent):
                     _flush_logs()
                     pending_progress = item
                     continue
-                if item[0] == "progress_metrics":
+                if isinstance(item, ProgressMetricsEvent):
                     _flush_logs()
                     pending_metrics = item
                     continue
@@ -1793,6 +2116,7 @@ class GuiController:
             if self.preview_interaction is not None:
                 self.preview_interaction.release_all()
         self.cancel_library_sync()
+        self.cancel_catalog_fetch()
         self.release_auxiliary_interactions()
         drained_jobs: list[QueuedJob] = []
         with self.queue_cond:
@@ -1808,8 +2132,8 @@ class GuiController:
                 ev = self.event_queue.get_nowait()
             except queue.Empty:
                 break
-            if ev and ev[0] == "preview_done" and len(ev) >= 3 and ev[2] is not None:
-                close_fn = getattr(ev[2][0], "close", None)
+            if isinstance(ev, PreviewDoneEvent) and ev.prepared is not None:
+                close_fn = getattr(ev.prepared[0], "close", None)
                 if callable(close_fn):
                     try:
                         close_fn()

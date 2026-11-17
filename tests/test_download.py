@@ -135,6 +135,7 @@ def test_download_file_retries_on_timeout_and_resets_progress(tmp_path, monkeypa
     assert session.get.call_count == 2
 
 
+@pytest.mark.no_worker_cap
 def test_download_files_sizes_thread_pool_dynamically(tmp_path):
     def make_book(count: int) -> Audiobook:
         return Audiobook(
@@ -1218,9 +1219,11 @@ def _generate_real_mp3(tmp_path: Path, name: str = "valid.mp3") -> Path:
             "-f",
             "lavfi",
             "-i",
-            "anullsrc=r=44100:cl=mono",
+            "anullsrc=r=22050:cl=mono",
             "-t",
             "1.0",
+            "-threads",
+            "1",
             "-c:a",
             "libmp3lame",
             "-b:a",

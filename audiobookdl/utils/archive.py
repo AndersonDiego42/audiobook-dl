@@ -16,6 +16,7 @@ from audiobookdl.utils.audiobook import Audiobook, is_ebook
 VALID_LIBRARY_STATUSES: tuple[str, ...] = ("pending", "downloaded", "trashed")
 _SCHEMA_VERSION = 2
 _TAG_CLEAN_RE = re.compile(r"[^a-z0-9_-]+")
+_UNSET: Any = object()
 
 
 @dataclass(frozen=True)
@@ -828,16 +829,14 @@ class DownloadArchive:
             matched = val in haystack
         return (not matched) if term.negated else matched
 
-    def list_entries(
-        self,
+    @staticmethod
+    def _build_filter_plan(
         *,
         query: str = "",
-        limit: int = 500,
         include_trashed: bool = False,
         include_hidden: bool = True,
         status: str | None = None,
-    ) -> list[ArchiveEntry]:
-        """Return library/ledger rows filtered by rich `query`, status, and visibility flags."""
+    ) -> tuple[list[SearchTerm], bool, str, list[object], bool]:
         terms = parse_library_query(query)
         explicit_status_query = any(t.field == "status" for t in terms)
         explicit_hidden_query = any(
@@ -845,13 +844,7 @@ class DownloadArchive:
             or (t.field == "status" and t.value == "hidden")
             for t in terms
         )
-        effective_limit = max(1, int(limit))
 
-        sql = """
-            SELECT id, source, book_key, url, title, author, output_path, format, downloaded_at,
-                   profile, status, series, series_order, narrator, duration_seconds, isbn, asin, last_seen_at
-            FROM downloads
-        """
         clauses: list[str] = []
         params: list[object] = []
         if status is not None:
@@ -918,14 +911,38 @@ class DownloadArchive:
             else:
                 needs_python_filter = True
 
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY id DESC"
-        if not needs_python_filter:
-            sql += " LIMIT ?"
-            params.append(effective_limit)
+        where_sql = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        return terms, explicit_hidden_query, where_sql, params, needs_python_filter
 
-        results: list[ArchiveEntry] = []
+    def count_entries(
+        self,
+        *,
+        query: str = "",
+        include_trashed: bool = False,
+        include_hidden: bool = True,
+        status: str | None = None,
+    ) -> int:
+        """Return total count of ledger rows matching `query`, status, and visibility filters."""
+        terms, explicit_hidden_query, where_sql, params, needs_python_filter = self._build_filter_plan(
+            query=query,
+            include_trashed=include_trashed,
+            include_hidden=include_hidden,
+            status=status,
+        )
+        if not needs_python_filter:
+            with self._connection() as conn:
+                row = conn.execute(
+                    f"SELECT COUNT(*) AS cnt FROM downloads{where_sql}",
+                    tuple(params),
+                ).fetchone()
+                return int(row["cnt"]) if row is not None else 0
+
+        sql = (
+            "SELECT id, source, book_key, url, title, author, output_path, format, downloaded_at,"
+            " profile, status, series, series_order, narrator, duration_seconds, isbn, asin, last_seen_at"
+            f" FROM downloads{where_sql}"
+        )
+        matched = 0
         with self._connection() as conn:
             cursor = conn.execute(sql, tuple(params))
             while True:
@@ -939,10 +956,141 @@ class DownloadArchive:
                         continue
                     if terms and not all(self._matches_term(entry, term) for term in terms):
                         continue
+                    matched += 1
+        return matched
+
+    def list_entries(
+        self,
+        *,
+        query: str = "",
+        limit: int = 500,
+        offset: int = 0,
+        include_trashed: bool = False,
+        include_hidden: bool = True,
+        status: str | None = None,
+    ) -> list[ArchiveEntry]:
+        """Return library/ledger rows filtered by rich `query`, status, and visibility flags."""
+        terms, explicit_hidden_query, where_sql, params, needs_python_filter = self._build_filter_plan(
+            query=query,
+            include_trashed=include_trashed,
+            include_hidden=include_hidden,
+            status=status,
+        )
+        effective_limit = max(1, int(limit))
+        effective_offset = max(0, int(offset))
+
+        sql = """
+            SELECT id, source, book_key, url, title, author, output_path, format, downloaded_at,
+                   profile, status, series, series_order, narrator, duration_seconds, isbn, asin, last_seen_at
+            FROM downloads
+        """ + where_sql + " ORDER BY id DESC"
+        if not needs_python_filter:
+            sql += " LIMIT ? OFFSET ?"
+            params.extend([effective_limit, effective_offset])
+
+        results: list[ArchiveEntry] = []
+        skipped = 0
+        with self._connection() as conn:
+            cursor = conn.execute(sql, tuple(params))
+            while True:
+                batch = cursor.fetchmany(500)
+                if not batch:
+                    break
+                tags_by_id = self._fetch_tags_for_ids(conn, [int(r["id"]) for r in batch])
+                for row in batch:
+                    entry = self._build_entry(row, tags_by_id.get(int(row["id"]), ()))
+                    if not include_hidden and not explicit_hidden_query and entry.is_hidden:
+                        continue
+                    if terms and not all(self._matches_term(entry, term) for term in terms):
+                        continue
+                    if needs_python_filter and skipped < effective_offset:
+                        skipped += 1
+                        continue
                     results.append(entry)
                     if len(results) >= effective_limit:
                         return results
         return results
+
+    def update_entry(
+        self,
+        entry_id: int,
+        *,
+        title: str | Any = _UNSET,
+        author: str | Any = _UNSET,
+        narrator: str | Any = _UNSET,
+        series: str | None | Any = _UNSET,
+        series_order: int | None | Any = _UNSET,
+        isbn: str | None | Any = _UNSET,
+        asin: str | None | Any = _UNSET,
+        output_path: str | None | Any = _UNSET,
+        status: str | Any = _UNSET,
+        tags: Iterable[str] | None | Any = _UNSET,
+    ) -> ArchiveEntry | None:
+        """Update editable metadata, path, status, and optional tags on `entry_id`."""
+        assignments: list[str] = []
+        params: list[object] = []
+
+        if title is not _UNSET:
+            clean_title = str(title or "").strip()
+            if not clean_title:
+                raise ValueError("Title cannot be empty.")
+            assignments.append("title = ?")
+            params.append(clean_title)
+        if author is not _UNSET:
+            assignments.append("author = ?")
+            params.append(str(author or "").strip())
+        if narrator is not _UNSET:
+            assignments.append("narrator = ?")
+            params.append(str(narrator or "").strip())
+        if series is not _UNSET:
+            clean_series = str(series or "").strip() or None
+            assignments.append("series = ?")
+            params.append(clean_series)
+        if series_order is not _UNSET:
+            assignments.append("series_order = ?")
+            params.append(int(series_order) if series_order is not None else None)
+        if isbn is not _UNSET:
+            clean_isbn = str(isbn or "").strip() or None
+            assignments.append("isbn = ?")
+            params.append(clean_isbn)
+        if asin is not _UNSET:
+            clean_asin = str(asin or "").strip() or None
+            assignments.append("asin = ?")
+            params.append(clean_asin)
+        if output_path is not _UNSET:
+            clean_out = str(output_path or "").strip() or None
+            assignments.append("output_path = ?")
+            params.append(clean_out)
+        if status is not _UNSET:
+            clean_status = str(status or "").strip().lower()
+            if clean_status not in VALID_LIBRARY_STATUSES:
+                raise ValueError(f"Invalid library status: {status!r}")
+            assignments.append("status = ?")
+            params.append(clean_status)
+
+        target_id = int(entry_id)
+        with self._connection() as conn:
+            exists_row = conn.execute(
+                "SELECT 1 FROM downloads WHERE id = ? LIMIT 1",
+                (target_id,),
+            ).fetchone()
+            if exists_row is None:
+                return None
+            if assignments:
+                params.append(target_id)
+                conn.execute(
+                    f"UPDATE downloads SET {', '.join(assignments)} WHERE id = ?",
+                    tuple(params),
+                )
+            if tags is not _UNSET and tags is not None:
+                normalized = sorted({t for t in (normalize_tag(raw) for raw in tags) if t})
+                conn.execute("DELETE FROM item_tags WHERE item_id = ?", (target_id,))
+                for tag in normalized:
+                    conn.execute(
+                        "INSERT INTO item_tags (item_id, tag) VALUES (?, ?)",
+                        (target_id, tag),
+                    )
+        return self.get_entry(target_id)
 
     def get_entry(self, entry_id: int) -> ArchiveEntry | None:
         """Fetch a single `ArchiveEntry` by row id, or `None` if not found."""

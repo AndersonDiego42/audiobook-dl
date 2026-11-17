@@ -560,8 +560,8 @@ def apply_theme_to_widget_tree(widget: tk.Misc, palette: ThemePalette) -> None:
     apply_hook = getattr(widget, "apply_theme", None)
     if callable(apply_hook) and not isinstance(widget, (tk.Tk, tk.Toplevel)):
         try:
-            apply_hook(palette.bg)
-        except Exception:
+            apply_hook(palette)
+        except tk.TclError:
             pass
 
     for child in widget.winfo_children():

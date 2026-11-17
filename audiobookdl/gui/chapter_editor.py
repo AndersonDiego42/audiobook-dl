@@ -74,8 +74,41 @@ def parse_chapters_from_file(path: str) -> list[Chapter]:
     raise ValueError(f"Unsupported chapter file extension '{ext}' (use .cue or .json).")
 
 
+def export_chapters_to_file(path: str, chapters: Sequence[Chapter]) -> None:
+    """Serialize `chapters` to a `.json` or `.cue` sidecar file compatible with `parse_chapters_from_file`."""
+    ext = os.path.splitext(path)[1].lower()
+    ordered = sorted((Chapter(start=max(0, int(c.start)), title=str(c.title)) for c in chapters), key=lambda c: c.start)
+    if ext == ".json":
+        payload = {
+            "chapters": [
+                {"title": ch.title, "start_ms": ch.start}
+                for ch in ordered
+            ]
+        }
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, ensure_ascii=False)
+            fh.write("\n")
+        return
+
+    if ext == ".cue":
+        lines = ['TITLE "Chapters"', 'FILE "audiobook.m4b" WAVE']
+        for idx, ch in enumerate(ordered, start=1):
+            total_frames = max(0, round(ch.start * 75.0 / 1000.0))
+            mins, rem_frames = divmod(total_frames, 60 * 75)
+            secs, frames = divmod(rem_frames, 75)
+            safe_title = ch.title.replace('"', "'")
+            lines.append(f"  TRACK {idx:02d} AUDIO")
+            lines.append(f'    TITLE "{safe_title}"')
+            lines.append(f"    INDEX 01 {mins:02d}:{secs:02d}:{frames:02d}")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        return
+
+    raise ValueError(f"Unsupported chapter file extension '{ext}' (use .cue or .json).")
+
+
 class _ChapterEditDialog(ModalDialog):
-    """Small themed modal for editing a single chapter's title and start timestamp."""
+    """Small themed modal for creating or editing a single chapter's title and start timestamp."""
 
     def __init__(
         self,
@@ -83,10 +116,11 @@ class _ChapterEditDialog(ModalDialog):
         chapter: Chapter,
         *,
         palette: ThemePalette,
+        dialog_title: str = "Edit Chapter",
     ) -> None:
         super().__init__(
             parent,
-            "Edit Chapter",
+            dialog_title,
             palette=palette,
             resizable=(False, False),
         )
@@ -129,8 +163,111 @@ class _ChapterEditDialog(ModalDialog):
         self.destroy()
 
 
+class _ChapterShiftDialog(ModalDialog):
+    """Modal dialog for offsetting or scaling chapter start timestamps."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        *,
+        has_selection: bool,
+        palette: ThemePalette,
+    ) -> None:
+        super().__init__(
+            parent,
+            "Shift Chapter Timestamps",
+            palette=palette,
+            resizable=(False, False),
+        )
+        self.result_mode: str | None = None
+        self.result_value: float = 0.0
+        self.result_selected_only: bool = False
+
+        body = ttk.Frame(self, padding=scale_px(self, 12))
+        body.pack(fill=tk.BOTH, expand=True)
+        body.columnconfigure(1, weight=1)
+
+        self._mode_var = tk.StringVar(value="offset")
+        self._value_var = tk.StringVar(value="0.0")
+        self._scope_var = tk.StringVar(value="selected" if has_selection else "all")
+
+        ttk.Label(body, text="Operation:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        mode_row = ttk.Frame(body)
+        mode_row.grid(row=0, column=1, sticky="w", pady=4)
+        ttk.Radiobutton(
+            mode_row,
+            text="Offset (+/- sec)",
+            variable=self._mode_var,
+            value="offset",
+            command=self._on_mode_changed,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Radiobutton(
+            mode_row,
+            text="Scale factor",
+            variable=self._mode_var,
+            value="scale",
+            command=self._on_mode_changed,
+        ).pack(side=tk.LEFT)
+
+        self._value_label = ttk.Label(body, text="Seconds (+/-):")
+        self._value_label.grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        value_entry = ttk.Entry(body, textvariable=self._value_var, width=16)
+        value_entry.grid(row=1, column=1, sticky="w", pady=4)
+
+        ttk.Label(body, text="Apply to:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+        scope_row = ttk.Frame(body)
+        scope_row.grid(row=2, column=1, sticky="w", pady=4)
+        ttk.Radiobutton(
+            scope_row,
+            text="Selected",
+            variable=self._scope_var,
+            value="selected",
+            state="normal" if has_selection else "disabled",
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Radiobutton(
+            scope_row,
+            text="All chapters",
+            variable=self._scope_var,
+            value="all",
+        ).pack(side=tk.LEFT)
+
+        btns = ttk.Frame(body)
+        btns.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Apply", command=self._apply).pack(side=tk.RIGHT, padx=(0, 6))
+
+        self.bind("<Return>", lambda _e: self._apply())
+        self.finalize_modal(initial_focus=value_entry)
+
+    def _on_mode_changed(self) -> None:
+        if self._mode_var.get() == "scale":
+            self._value_label.configure(text="Scale factor:")
+            if self._value_var.get().strip() in ("", "0", "0.0"):
+                self._value_var.set("1.0")
+        else:
+            self._value_label.configure(text="Seconds (+/-):")
+            if self._value_var.get().strip() == "1.0":
+                self._value_var.set("0.0")
+
+    def _apply(self) -> None:
+        raw = self._value_var.get().strip()
+        try:
+            val = float(raw)
+        except ValueError:
+            messagebox.showwarning("Invalid Value", "Enter a valid number.", parent=self)
+            return
+        mode = self._mode_var.get()
+        if mode == "scale" and val <= 0:
+            messagebox.showwarning("Invalid Scale", "Scale factor must be greater than 0.", parent=self)
+            return
+        self.result_mode = mode
+        self.result_value = val
+        self.result_selected_only = self._scope_var.get() == "selected"
+        self.destroy()
+
+
 class ChapterEditorFrame(ttk.Frame):
-    """Interactive chapter table allowing rename, timestamp edit, delete, merge, and import."""
+    """Interactive chapter table allowing add, rename, timestamp edit/shift, delete, merge, and import/export."""
 
     _COLUMNS = (
         TreeColumnSpec("num", "#", width=42, stretch=False, anchor="e", sort_kind="number"),
@@ -161,12 +298,19 @@ class ChapterEditorFrame(ttk.Frame):
 
         toolbar = ttk.Frame(self)
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ttk.Button(toolbar, text="Add...", command=self.add_chapter).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(toolbar, text="Edit...", command=self.edit_selected).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(toolbar, text="Delete", command=self.delete_selected).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(toolbar, text="Merge Next", command=self.merge_with_next).pack(
             side=tk.LEFT, padx=(0, 4)
         )
+        ttk.Button(toolbar, text="Shift...", command=self.shift_chapters).pack(
+            side=tk.LEFT, padx=(0, 4)
+        )
         ttk.Button(toolbar, text="Import .cue/.json...", command=self.import_from_file).pack(
+            side=tk.LEFT, padx=(0, 4)
+        )
+        ttk.Button(toolbar, text="Export...", command=self.export_to_file).pack(
             side=tk.LEFT
         )
         ttk.Label(toolbar, textvariable=self._info_var, style="Muted.TLabel").pack(side=tk.RIGHT)
@@ -181,6 +325,10 @@ class ChapterEditorFrame(ttk.Frame):
         self._scrolled.grid(row=1, column=0, sticky="nsew")
         self.tree = self._scrolled.tree
         self.tree.bind("<Double-1>", lambda _e: self.edit_selected())
+
+    def apply_theme(self, palette: ThemePalette) -> None:
+        """Update the stored palette used when opening chapter edit dialogs."""
+        self._palette = palette
 
     def set_chapters(
         self,
@@ -244,6 +392,67 @@ class ChapterEditorFrame(ttk.Frame):
             total == 0,
             "No chapters detected. Import a .cue or .json file to add chapters.",
         )
+
+    def add_chapter(self) -> None:
+        default_start = self._chapters[-1].start if self._chapters else 0
+        default_title = f"Chapter {len(self._chapters) + 1}"
+        dlg = _ChapterEditDialog(
+            self,
+            Chapter(start=default_start, title=default_title),
+            palette=self._palette,
+            dialog_title="Add Chapter",
+        )
+        self.wait_window(dlg)
+        if dlg.result_chapter is None:
+            return
+        self._chapters.append(dlg.result_chapter)
+        self._chapter_sources.append("Added")
+        self._sort_paired()
+        self._render()
+        self._notify_changed()
+
+    def apply_chapter_shift(
+        self,
+        *,
+        mode: str,
+        value: float,
+        indices: Sequence[int] | None = None,
+    ) -> None:
+        """Apply a timestamp `offset` (seconds) or `scale` factor to selected or all chapters."""
+        if not self._chapters:
+            return
+        target_indices = (
+            set(indices) if indices is not None else set(range(len(self._chapters)))
+        )
+        for idx in sorted(target_indices):
+            if not (0 <= idx < len(self._chapters)):
+                continue
+            ch = self._chapters[idx]
+            if mode == "scale":
+                new_start = max(0, round(ch.start * value))
+            else:
+                new_start = max(0, round(ch.start + value * 1000.0))
+            self._chapters[idx] = Chapter(start=new_start, title=ch.title)
+            if idx < len(self._chapter_sources):
+                self._chapter_sources[idx] = "Edited"
+        self._sort_paired()
+        self._render()
+        self._notify_changed()
+
+    def shift_chapters(self) -> None:
+        if not self._chapters:
+            return
+        selected = [int(iid) for iid in self.tree.selection()]
+        dlg = _ChapterShiftDialog(
+            self,
+            has_selection=bool(selected),
+            palette=self._palette,
+        )
+        self.wait_window(dlg)
+        if dlg.result_mode is None:
+            return
+        indices = selected if (dlg.result_selected_only and selected) else None
+        self.apply_chapter_shift(mode=dlg.result_mode, value=dlg.result_value, indices=indices)
 
     def edit_selected(self) -> None:
         sel = self.tree.selection()
@@ -314,3 +523,20 @@ class ChapterEditorFrame(ttk.Frame):
         self._source_label = os.path.basename(path)
         self._render()
         self._notify_changed()
+
+    def export_to_file(self) -> None:
+        if not self._chapters:
+            messagebox.showinfo("No Chapters", "There are no chapters to export.", parent=self)
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            title="Export Chapters (.cue or .json)",
+            defaultextension=".json",
+            filetypes=[("JSON chapter file", "*.json"), ("CUE sheet", "*.cue")],
+        )
+        if not path:
+            return
+        try:
+            export_chapters_to_file(path, self._chapters)
+        except Exception as exc:
+            messagebox.showerror("Export Failed", str(exc), parent=self)

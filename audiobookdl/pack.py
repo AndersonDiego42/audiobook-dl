@@ -801,6 +801,7 @@ def run_pack(
     overrides: PackOverrides | None = None,
     interaction: logging.InteractionHandler | None = None,
     cancel_event: threading.Event | None = None,
+    pause_event: threading.Event | None = None,
     sink: logging.LogSink | None = None,
 ) -> PackSummary:
     """Discover, inspect, and repackage local audiobooks with isolated `JobContext`."""
@@ -808,6 +809,7 @@ def run_pack(
     ctx = apply_runtime_options(options, resolved_config)
     ctx.interaction = interaction if interaction is not None else logging.CliInteractionHandler()
     ctx.cancel_event = cancel_event
+    ctx.pause_event = pause_event
     ctx.sink = sink if sink is not None else logging.get_ui_sink()
 
     if not getattr(options, "output_format", None):
@@ -823,6 +825,13 @@ def run_pack(
             for idx, (source_root, raw_tracks) in enumerate(groups, start=1):
                 if cancel_event is not None and cancel_event.is_set():
                     summary.cancelled = True
+                    break
+                try:
+                    logging.wait_if_paused(cancel_event=cancel_event)
+                except DownloadCancelled:
+                    summary.cancelled = True
+                    summary.books_skipped += 1
+                    logging.log("Pack cancelled")
                     break
                 book_overrides = scope_overrides_for_batch(overrides, total)
                 try:

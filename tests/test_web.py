@@ -14,9 +14,20 @@ import urllib.request
 import pytest
 
 from audiobookdl import args
+from audiobookdl.gui.events import LogEvent, PromptInputEvent
 from audiobookdl.pipeline import DownloadSummary
 from audiobookdl.sources.source import CatalogBook
 from audiobookdl.sync import SyncCycleResult
+from audiobookdl.utils.audiobook import (
+    Audiobook,
+    AudiobookFile,
+    AudiobookMetadata,
+    BookId,
+    Chapter,
+    Cover,
+    Series,
+)
+from audiobookdl.utils.archive import DownloadArchive
 from audiobookdl.web import MAX_REQUEST_BODY_BYTES, create_web_server
 
 
@@ -157,11 +168,13 @@ def test_web_ui_server_endpoints_auth_and_download_queue(tmp_path, monkeypatch):
 def test_web_ui_catalog_sync_and_error_responses(tmp_path, monkeypatch):
     catalog_calls: list[tuple[str, str, str | None]] = []
 
-    def fake_search(service_key, query_text, opts, _cfg):
+    def fake_search(service_key, query_text, opts, _cfg, *, interaction=None):
+        assert interaction is not None
         catalog_calls.append(("search", service_key, opts.profile))
         return [CatalogBook(title=f"Hit for {query_text}", url="https://librivox.org/hit", author="Author")]
 
-    def fake_library(service_key, opts, _cfg):
+    def fake_library(service_key, opts, _cfg, *, interaction=None):
+        assert interaction is not None
         catalog_calls.append(("library", service_key, opts.profile))
         return [CatalogBook(title="Library Book", url="https://librivox.org/lib", author="Lib Author")]
 
@@ -196,6 +209,22 @@ def test_web_ui_catalog_sync_and_error_responses(tmp_path, monkeypatch):
         # Missing service -> 400
         with pytest.raises(urllib.error.HTTPError) as exc_info:
             _http_json(f"{base}/api/catalog", method="POST", payload={"mode": "search"}, headers=hdr)
+        assert exc_info.value.code == 400
+
+        # Catalog interactive prompt without SSE subscribers unblocks immediately instead of hanging on stdin
+        def fake_prompting_search(_svc, _q, _opts, _cfg, *, interaction=None):
+            assert interaction is not None
+            interaction.ask_input("Enter 2FA code")
+            return []
+
+        monkeypatch.setattr("audiobookdl.web.search_service", fake_prompting_search)
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            _http_json(
+                f"{base}/api/catalog",
+                method="POST",
+                payload={"service": "librivox", "mode": "search", "query": "otp"},
+                headers=hdr,
+            )
         assert exc_info.value.code == 400
 
         # Sync endpoint starts asynchronously -> 202 and completes in background
@@ -424,14 +453,16 @@ def test_web_ui_sse_queue_controls_interactive_prompts_and_option_parity(tmp_pat
             assert "queue" in first_payload
 
             # Emit log event and interactive prompt while SSE subscriber is active
-            state.controller.event_queue.put(("log", "INFO", "SSE test message"))
+            state.controller.event_queue.put(LogEvent(level="INFO", message="SSE test message"))
             ev2, p2 = _read_sse_event()
             assert ev2 == "log"
             assert any("SSE test message" in ln for ln in p2["lines"])
 
             holder: dict[str, Any] = {"value": None}
             done = threading.Event()
-            state.controller.event_queue.put(("prompt_input", "Enter OTP", True, holder, done))
+            state.controller.event_queue.put(
+                PromptInputEvent(prompt="Enter OTP", hidden=True, holder=holder, done=done)
+            )
             ev3, p3 = _read_sse_event()
             assert ev3 == "prompt"
             prompt_id = p3["prompt"]["id"]
@@ -508,4 +539,140 @@ def test_web_ui_sse_queue_controls_interactive_prompts_and_option_parity(tmp_pat
         server.shutdown()
         state.shutdown()
         server.server_close()
+
+
+def test_web_ui_preview_series_library_mutations_export_and_sandbox(tmp_path, monkeypatch):
+    with _running_web_server(tmp_path, token="top-secret") as (server, base, out_dir):
+        headers = {"Authorization": "Bearer top-secret"}
+        state = server.dashboard_state  # type: ignore[attr-defined]
+
+        # 1. HTML includes theme toggle, Preview trigger & library export controls
+        with urllib.request.urlopen(f"{base}/", timeout=5.0) as html_resp:
+            html = html_resp.read().decode("utf-8")
+            assert 'id="theme-toggle-btn"' in html
+            assert 'id="preview-dialog"' in html
+            assert "exportLibrary('csv')" in html
+
+        # 2. POST /api/preview for both Audiobook and Series
+        class _FakeSource:
+            name = "LibriVox"
+
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        fake_ab = Audiobook(
+            session=None,  # type: ignore[arg-type]
+            metadata=AudiobookMetadata(title="Web Preview Book", authors=["Alice"], isbn="123"),
+            files=[AudiobookFile(url="https://librivox.org/a.mp3", ext="mp3")],
+            chapters=[Chapter(0, "Intro")],
+            cover=Cover(image=b"\x89PNG\r\n\x1a\n", extension="png"),
+        )
+        fake_series = Series(
+            title="Web Series",
+            books=[BookId(id="1", title="Vol 1"), BookId(id="2", title="Vol 2")],
+        )
+        monkeypatch.setattr(
+            "audiobookdl.web.prepare_source_result",
+            lambda url, *_a, **_kw: (
+                _FakeSource(),
+                fake_series if "series" in url else fake_ab,
+            ),
+        )
+        st_p1, body_p1 = _http_json(
+            f"{base}/api/preview",
+            method="POST",
+            payload={"url": "https://librivox.org/book"},
+            headers=headers,
+        )
+        assert st_p1 == 200
+        assert body_p1["kind"] == "audiobook"
+        assert body_p1["metadata"]["title"] == "Web Preview Book"
+        assert body_p1["cover_data_url"].startswith("data:image/png;base64,")
+
+        st_p2, body_p2 = _http_json(
+            f"{base}/api/preview",
+            method="POST",
+            payload={"url": "https://librivox.org/series"},
+            headers=headers,
+        )
+        assert st_p2 == 200
+        assert body_p2["kind"] == "series"
+        assert [b["index"] for b in body_p2["books"]] == [0, 1]
+
+        # 3. POST /api/download forwards selected_indices
+        recorded_specs: list[Any] = []
+        monkeypatch.setattr(
+            state.controller,
+            "start_new_run",
+            lambda specs: (recorded_specs.extend(specs) or 1, []),
+        )
+        st_dl, body_dl = _http_json(
+            f"{base}/api/download",
+            method="POST",
+            payload={"urls": ["https://librivox.org/series"], "selected_indices": [1]},
+            headers=headers,
+        )
+        assert st_dl == 202 and body_dl["queued"] == 0
+        assert recorded_specs[0][2] == [1]
+
+        # 4. Library tags, status & export endpoints
+        arch = DownloadArchive(state.archive_path())
+        entry_id = arch.record("librivox", "k1", title="Exported Book", author="Bob", status="downloaded")
+
+        st_t, body_t = _http_json(
+            f"{base}/api/library/tags",
+            method="POST",
+            payload={"id": entry_id, "tags": "scifi favorite"},
+            headers=headers,
+        )
+        assert st_t == 200 and body_t["tags"] == ["favorite", "scifi"]
+
+        st_s, body_s = _http_json(
+            f"{base}/api/library/status",
+            method="POST",
+            payload={"id": entry_id, "status": "pending", "hidden": True},
+            headers=headers,
+        )
+        assert st_s == 200 and body_s["status"] == "pending" and "hidden" in body_s["tags"]
+
+        exp_req = urllib.request.Request(
+            f"{base}/api/library/export?format=json",
+            method="GET",
+            headers=headers,
+        )
+        with urllib.request.urlopen(exp_req, timeout=5.0) as exp_resp:
+            assert exp_resp.status == 200
+            exported_rows = json.loads(exp_resp.read().decode("utf-8"))
+            assert any(r["title"] == "Exported Book" for r in exported_rows)
+
+        # 5. Path sandboxing rejects parent traversal on /api/library/scan and /api/pack/inspect
+        with pytest.raises(urllib.error.HTTPError) as exc_scan:
+            _http_json(
+                f"{base}/api/library/scan",
+                method="POST",
+                payload={"path": "../outside"},
+                headers=headers,
+            )
+        assert exc_scan.value.code == 400
+
+        with pytest.raises(urllib.error.HTTPError) as exc_pack:
+            _http_json(
+                f"{base}/api/pack/inspect",
+                method="POST",
+                payload={"path": str(tmp_path)},
+                headers=headers,
+            )
+        assert exc_pack.value.code == 400
+
+        # Valid local scan inside out_dir succeeds
+        st_scan, body_scan = _http_json(
+            f"{base}/api/library/scan",
+            method="POST",
+            payload={},
+            headers=headers,
+        )
+        assert st_scan == 200 and body_scan["scanned_books"] == 0
 

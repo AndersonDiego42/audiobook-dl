@@ -313,10 +313,11 @@ class DownloadPage(ttk.Frame):
         self.paned.add(self.queue_panel, weight=1)
         self.paned.bind("<Configure>", self._on_paned_configure, add="+")
         self.paned.bind("<ButtonRelease-1>", self._on_paned_release, add="+")
+        self.top_scroll.guard_scroll_inputs()
 
     def apply_theme(self, palette: ThemePalette) -> None:
         self.urls_text.tag_configure("warning_line", foreground=palette.warning, underline=True)
-        self.top_scroll.apply_theme(palette.bg)
+        self.top_scroll.apply_theme(palette)
         self.queue_panel.apply_theme_palette(palette)
 
     def update_ffmpeg_banner(self, available: bool, status_text: str) -> None:

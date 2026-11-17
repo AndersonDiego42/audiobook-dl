@@ -41,7 +41,17 @@ def _make_cover_bytes(fmt: str = "JPEG") -> bytes:
     return buf.getvalue()
 
 
+_PACK_AUDIO_CACHE: dict[tuple[str, tuple[str, ...], float], bytes] = {}
+
+
 def _ffmpeg_silent_file(path: Path, codec_args: Sequence[str], seconds: float = 1.0) -> None:
+    ext = path.suffix.lower() or ".bin"
+    cache_key = (ext, tuple(codec_args), float(seconds))
+    cached = _PACK_AUDIO_CACHE.get(cache_key)
+    if cached is not None:
+        path.write_bytes(cached)
+        return
+
     ffmpeg_bin = shutil.which("ffmpeg")
     if not ffmpeg_bin:
         pytest.skip("ffmpeg not available")
@@ -53,15 +63,18 @@ def _ffmpeg_silent_file(path: Path, codec_args: Sequence[str], seconds: float = 
             "-f",
             "lavfi",
             "-i",
-            "anullsrc=r=44100:cl=mono",
+            "anullsrc=r=22050:cl=mono",
             "-t",
             str(seconds),
+            "-threads",
+            "1",
             *codec_args,
             str(path),
         ],
         capture_output=True,
         check=True,
     )
+    _PACK_AUDIO_CACHE[cache_key] = path.read_bytes()
 
 
 def _empty_config() -> Config:
@@ -139,6 +152,7 @@ def test_sort_track_paths_prefers_disc_and_track_tags_over_filename(tmp_path: Pa
     assert [Path(p).name for p in sorted_tagged] == ["Part 10.mp3", "Part 1.mp3", "Part 2.mp3"]
 
 
+@pytest.mark.ffmpeg
 def test_read_track_tags_id3_mp4_vorbis_roundtrip(tmp_path: Path):
     cover_bytes = _make_cover_bytes("JPEG")
     cover = Cover(image=cover_bytes, extension="jpg")
@@ -435,6 +449,7 @@ def test_run_pack_enrichment_updates_output_template(tmp_path: Path):
     assert summary.output_paths == [str((tmp_path / "out" / "Frank Herbert" / "Dune.m4b").resolve())]
 
 
+@pytest.mark.ffmpeg
 def test_pack_end_to_end_real_ffmpeg(tmp_path: Path):
     ffmpeg_bin = shutil.which("ffmpeg")
     ffprobe_bin = shutil.which("ffprobe")
@@ -584,22 +599,25 @@ def test_gui_controller_executes_pack_job(tmp_path: Path):
         assert len(jobs) == 1
         controller.register_queue_record(jobs[0], "Local Pack")
 
+        from audiobookdl.gui.events import JobStatusEvent, RunDoneEvent
+
         deadline = time.monotonic() + 5.0
         done_seen = False
         while time.monotonic() < deadline and not done_seen:
             controller.drain_events(lambda item: events.append(item))
-            done_seen = any(ev[0] == "done" and ev[1] == run_id for ev in events)
+            done_seen = any(isinstance(ev, RunDoneEvent) and ev.run_id == run_id for ev in events)
             if not done_seen:
                 time.sleep(0.02)
 
     controller.shutdown(is_running=False, is_previewing=False)
     assert done_seen is True
     assert (out_dir / "Gui Author" / "Gui Book.m4b").is_file()
-    status_events = [ev for ev in events if ev[0] == "job_status" and ev[1] == jobs[0].job_id]
-    assert status_events[-1][2] == "Completed"
+    status_events = [ev for ev in events if isinstance(ev, JobStatusEvent) and ev.job_id == jobs[0].job_id]
+    assert status_events[-1].status == "Completed"
     assert controller.retryable_urls([jobs[0].job_id]) == []
 
 
+@pytest.mark.gui
 def test_pack_dialog_renders_and_submits(tmp_path: Path):
     import tkinter as tk
     from audiobookdl.gui.pages.pack_page import PackPage
@@ -644,6 +662,7 @@ def test_pack_dialog_renders_and_submits(tmp_path: Path):
         root.destroy()
 
 
+@pytest.mark.gui
 def test_app_wires_pack_button_and_submission(tmp_path: Path):
     import gc
     import tkinter as tk
@@ -687,7 +706,7 @@ def test_app_wires_pack_button_and_submission(tmp_path: Path):
         assert len(children) == 1
         row_values = app.queue_tree.item(children[0], "values")
         assert row_values[0] == "Local Pack"
-        assert row_values[2] == "Completed", (
+        assert app.queue_tree.set(children[0], "status") == "Completed", (
             f"row={row_values}, running={app._is_running}, "
             f"status={app.status_var.get()!r}, log={app.log_text.get('1.0', tk.END)!r}"
         )
@@ -785,6 +804,7 @@ def test_pack_book_runs_silence_detection_when_chapters_from_silence_enabled(tmp
     assert meta_calls == [(detected, probe_cache)]
 
 
+@pytest.mark.gui
 def test_pack_dialog_preserves_explicit_fields_passes_output_dir_and_keeps_global_format(
     tmp_path: Path,
 ):
@@ -857,6 +877,7 @@ def test_pack_dialog_preserves_explicit_fields_passes_output_dir_and_keeps_globa
         root.destroy()
 
 
+@pytest.mark.gui
 def test_pack_job_persistence_and_retry_across_restart(tmp_path: Path, monkeypatch):
     import gc
     import time
@@ -949,8 +970,8 @@ def test_pack_job_persistence_and_retry_across_restart(tmp_path: Path, monkeypat
         restored_id = children[0]
         row_values = app2.queue_tree.item(restored_id, "values")
         assert row_values[0] == "Local Pack"
-        assert row_values[1] == "Persisted Book"
-        assert row_values[2] == "Interrupted"
+        assert app2.queue_tree.set(restored_id, "url") == "Persisted Book"
+        assert app2.queue_tree.set(restored_id, "status") == "Interrupted"
 
         retryable = app2.controller.retryable_jobs(children)
         assert len(retryable) == 1

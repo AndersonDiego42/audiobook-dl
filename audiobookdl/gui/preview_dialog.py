@@ -25,6 +25,7 @@ from audiobookdl.gui.theme import (
 from audiobookdl.gui.widgets import (
     MainThreadCallbackQueue,
     ModalDialog,
+    ScrollableFrame,
     ScrolledTreeview,
     TreeColumnSpec,
 )
@@ -273,12 +274,14 @@ class PreviewDialog(ModalDialog):
         palette: ThemePalette | None = None,
         on_search_enrichment: Callable[[Audiobook], list[EnrichmentCandidate]] | None = None,
         on_apply_enrichment: Callable[[Audiobook, EnrichmentCandidate], tuple[list[str], bool, bool]] | None = None,
+        manage_source_lifecycle: bool = True,
+        confirm_button_text: str | None = None,
     ) -> None:
         super().__init__(
             parent,
             f"Preview \u2014 {result.title}",
             palette=palette,
-            default_size=(820, 560) if isinstance(result, Audiobook) else (680, 520),
+            default_size=(820, 560) if isinstance(result, Audiobook) else (720, 540),
             min_size=(560, 420),
         )
         self._url = url
@@ -290,6 +293,8 @@ class PreviewDialog(ModalDialog):
         self._on_confirm = on_confirm
         self._on_search_enrichment = on_search_enrichment
         self._on_apply_enrichment = on_apply_enrichment
+        self._manage_source_lifecycle = manage_source_lifecycle
+        self._confirm_button_text = confirm_button_text
         self._source_transferred = False
         self._source_closed = False
         self._cb_queue = MainThreadCallbackQueue(self)
@@ -316,10 +321,15 @@ class PreviewDialog(ModalDialog):
         self._isbn_var = tk.StringVar()
         self._asin_var = tk.StringVar()
         self._desc_text: ScrolledText | None = None
+        self._meta_scroll: ScrollableFrame | None = None
         self._chapter_editor: ChapterEditorFrame | None = None
 
+        self._series_ref: Series[Any] | None = None
+        self._series_title_var = tk.StringVar()
+        self._preview_book_btn: ttk.Button | None = None
         self._check_vars: list[tk.BooleanVar] = []
         self._filter_var = tk.StringVar()
+        self._filter_after_id: str | None = None
         self._item_labels: list[str] = []
         self._last_clicked_index: int | None = None
         self._tree: ttk.Treeview | None = None
@@ -337,7 +347,7 @@ class PreviewDialog(ModalDialog):
         self.bind("<Destroy>", self._on_dialog_destroy, add="+")
 
     def _close_untransferred_source(self) -> None:
-        if self._source_transferred or self._source_closed:
+        if not self._manage_source_lifecycle or self._source_transferred or self._source_closed:
             return
         self._source_closed = True
         close_fn = getattr(self._source, "close", None)
@@ -352,6 +362,12 @@ class PreviewDialog(ModalDialog):
             self._close_untransferred_source()
 
     def destroy(self) -> None:
+        if self._filter_after_id is not None:
+            try:
+                self.after_cancel(self._filter_after_id)
+            except tk.TclError:
+                pass
+            self._filter_after_id = None
         self._close_untransferred_source()
         super().destroy()
 
@@ -476,10 +492,17 @@ class PreviewDialog(ModalDialog):
         right_nb = ttk.Notebook(top)
         right_nb.grid(row=0, column=1, sticky="nsew")
 
-        meta_frame = ttk.Frame(right_nb, padding=scale_px(self, 8))
+        pad = scale_px(self, 8)
+        self._meta_scroll = ScrollableFrame(
+            right_nb,
+            content_padding=(pad, pad),
+            inner_scrollables=lambda: (self._desc_text,) if self._desc_text is not None else (),
+        )
+        right_nb.add(self._meta_scroll, text="Metadata")
+        meta_frame = self._meta_scroll.content_frame
         meta_frame.columnconfigure(1, weight=1)
         meta_frame.columnconfigure(3, weight=1)
-        right_nb.add(meta_frame, text="Metadata")
+        self._meta_scroll.apply_theme(self._palette)
 
         full_rows: tuple[tuple[str, tk.StringVar], ...] = (
             ("Title", self._title_var),
@@ -545,7 +568,7 @@ class PreviewDialog(ModalDialog):
         ttk.Label(meta_frame, text="Description:", font=make_bold_font(self, 9)).grid(
             row=row_idx, column=0, sticky="nw", padx=(0, 8), pady=(2, 2)
         )
-        self._desc_text = ScrolledText(meta_frame, height=4, width=40, wrap="word")
+        self._desc_text = ScrolledText(meta_frame, height=4, width=34, wrap="word")
         self._desc_text.grid(row=row_idx, column=1, columnspan=3, sticky="nsew", pady=(2, 4))
         meta_frame.rowconfigure(row_idx, weight=1)
         if audiobook.metadata.description:
@@ -582,7 +605,9 @@ class PreviewDialog(ModalDialog):
             textvariable=self._enrich_status_var,
             style="Muted.TLabel",
         ).pack(side=tk.LEFT, padx=(8, 0))
-        action_text = "Add to Queue" if self._is_running else "Download"
+        action_text = self._confirm_button_text or (
+            "Add to Queue" if self._is_running else "Download"
+        )
 
         def _confirm_book() -> None:
             if not self._apply_audiobook_edits(audiobook):
@@ -787,19 +812,24 @@ class PreviewDialog(ModalDialog):
             self._enrich_status_var.set("No missing fields updated")
 
     def _build_series_view(self, body: ttk.Frame, series: Series[Any]) -> None:
+        self._series_ref = series
+        self._series_title_var.set(series.title)
         body.rowconfigure(2, weight=1)
         header = ttk.Frame(body)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        header.columnconfigure(0, weight=1)
-        ttk.Label(header, text=series.title, font=make_bold_font(self, 11)).grid(
-            row=0, column=0, sticky="w"
+        header.columnconfigure(1, weight=1)
+        ttk.Label(header, text="Series Title:", font=make_bold_font(self, 10)).grid(
+            row=0, column=0, sticky="w", padx=(0, 8)
+        )
+        ttk.Entry(header, textvariable=self._series_title_var).grid(
+            row=0, column=1, sticky="ew"
         )
         book_count = len(series.books)
         ttk.Label(
             header,
             text=f"{self._source.name}  \u2022  {book_count} book{'s' if book_count != 1 else ''}",
             style="Muted.TLabel",
-        ).grid(row=1, column=0, sticky="w")
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         self._selected_count_var = tk.StringVar()
         self._check_vars = [tk.BooleanVar(value=True) for _ in series.books]
@@ -815,9 +845,16 @@ class PreviewDialog(ModalDialog):
         deselect_existing_btn = ttk.Button(
             toolbar, text="Deselect Existing", command=self._deselect_existing
         )
-        deselect_existing_btn.pack(side=tk.LEFT, padx=(0, 8))
+        deselect_existing_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self._preview_book_btn = ttk.Button(
+            toolbar,
+            text="Preview Selected Book...",
+            command=self.preview_selected_book,
+            state="disabled" if book_count == 0 else "normal",
+        )
+        self._preview_book_btn.pack(side=tk.LEFT, padx=(0, 8))
         ttk.Label(toolbar, text="Filter:").pack(side=tk.LEFT, padx=(0, 4))
-        filter_entry = ttk.Entry(toolbar, textvariable=self._filter_var, width=22)
+        filter_entry = ttk.Entry(toolbar, textvariable=self._filter_var, width=20)
         filter_entry.pack(side=tk.LEFT, padx=(0, 8))
         self._initial_focus_widget = filter_entry
         ttk.Label(
@@ -867,12 +904,18 @@ class PreviewDialog(ModalDialog):
             self._update_selected_count(book_count)
             if not has_existing:
                 deselect_existing_btn.configure(state="disabled")
+            visible = tree.get_children()
+            if visible:
+                tree.selection_set(visible[0])
+                tree.focus(visible[0])
+            self._sync_preview_book_btn()
 
+            tree.bind("<<TreeviewSelect>>", lambda _e: self._sync_preview_book_btn())
             tree.bind("<Button-1>", self._on_tree_click)
             tree.bind("<Double-1>", self._on_tree_double_click)
             tree.bind("<space>", self._on_tree_key)
             tree.bind("<Return>", self._on_tree_key)
-            self._filter_var.trace_add("write", self._apply_filter)
+            self._filter_var.trace_add("write", lambda *_args: self._schedule_filter())
 
         btn_bar = ttk.Frame(body)
         btn_bar.grid(row=3, column=0, sticky="ew", pady=(12, 0))
@@ -887,6 +930,9 @@ class PreviewDialog(ModalDialog):
                     parent=self,
                 )
                 return
+            edited_series_title = self._series_title_var.get().strip()
+            if edited_series_title:
+                series.title = edited_series_title
             self._source_transferred = True
             self.destroy()
             self._on_confirm(self._url, (self._source, series), indices)
@@ -898,6 +944,149 @@ class PreviewDialog(ModalDialog):
             state="disabled" if book_count == 0 else "normal",
         ).pack(side=tk.RIGHT)
         ttk.Button(btn_bar, text="Close", command=self.destroy).pack(side=tk.RIGHT, padx=(0, 6))
+
+    def _selected_series_book_index(self) -> int | None:
+        if self._tree is None or self._series_ref is None:
+            return None
+        sel = self._tree.selection()
+        if not sel:
+            return None
+        try:
+            idx = int(sel[0])
+        except ValueError:
+            return None
+        if 0 <= idx < len(self._series_ref.books):
+            return idx
+        return None
+
+    def _sync_preview_book_btn(self) -> None:
+        if self._preview_book_btn is None:
+            return
+        idx = self._selected_series_book_index()
+        self._preview_book_btn.configure(state="normal" if idx is not None else "disabled")
+
+    def preview_selected_book(self) -> None:
+        """Inspect/enrich the currently selected book in a `Series` view."""
+        if self._series_ref is None:
+            return
+        idx = self._selected_series_book_index()
+        if idx is None:
+            return
+        book_item = self._series_ref.books[idx]
+        if isinstance(book_item, Audiobook):
+            self._open_series_book_subdialog(idx, book_item)
+            return
+
+        download_by_id = getattr(self._source, "download_from_id", None)
+        if not callable(download_by_id):
+            messagebox.showinfo(
+                "Unavailable",
+                "This source does not support inspecting individual lazy series entries.",
+                parent=self,
+            )
+            return
+
+        if self._preview_book_btn is not None:
+            self._preview_book_btn.configure(state="disabled", text="Loading...")
+        self._cb_queue.begin_task()
+
+        def _worker() -> None:
+            try:
+                resolved = download_by_id(book_item.id)
+                audiobook: Audiobook | None = None
+                if isinstance(resolved, Audiobook):
+                    audiobook = resolved
+                elif isinstance(resolved, (list, tuple)):
+                    for item in resolved:
+                        if isinstance(item, Audiobook):
+                            audiobook = item
+                            break
+                err: Exception | None = (
+                    None
+                    if audiobook is not None
+                    else ValueError("Selected entry did not resolve to an audiobook.")
+                )
+
+                def _deliver_ok() -> None:
+                    self._on_series_book_resolved(idx, audiobook, err)
+
+                self._cb_queue.post(_deliver_ok)
+            except Exception as exc:
+                err_exc = exc
+
+                def _deliver_err() -> None:
+                    self._on_series_book_resolved(idx, None, err_exc)
+
+                self._cb_queue.post(_deliver_err)
+            finally:
+                self._cb_queue.finish_worker()
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_series_book_resolved(
+        self,
+        idx: int,
+        audiobook: Audiobook | None,
+        exc: Exception | None,
+    ) -> None:
+        if not self._is_alive():
+            return
+        if self._preview_book_btn is not None:
+            self._preview_book_btn.configure(text="Preview Selected Book...")
+            self._sync_preview_book_btn()
+        if exc is not None or audiobook is None:
+            messagebox.showerror(
+                "Preview Book Failed",
+                str(exc or "Failed to load selected book."),
+                parent=self,
+            )
+            return
+        if (
+            self._series_ref is not None
+            and isinstance(self._series_ref.books, list)
+            and 0 <= idx < len(self._series_ref.books)
+        ):
+            self._series_ref.books[idx] = audiobook
+            self._refresh_series_row_label(idx, audiobook)
+        self._open_series_book_subdialog(idx, audiobook)
+
+    def _refresh_series_row_label(self, idx: int, book: Audiobook) -> None:
+        if self._tree is None or not (0 <= idx < len(self._item_labels)):
+            return
+        label = f"{idx + 1}. {describe_series_book(idx, book)}"
+        if self._series_book_exists(book):
+            label = f"{label} [Exists]"
+        self._item_labels[idx] = label
+        if self._tree.exists(str(idx)):
+            self._tree.set(str(idx), "book", label)
+
+    def _open_series_book_subdialog(self, idx: int, audiobook: Audiobook) -> "PreviewDialog":
+        def _on_book_confirmed(_u: str, pair: tuple[Source, Result], _sel: list[int] | None) -> None:
+            updated = pair[1]
+            if isinstance(updated, Audiobook) and self._series_ref is not None:
+                if (
+                    isinstance(self._series_ref.books, list)
+                    and 0 <= idx < len(self._series_ref.books)
+                ):
+                    self._series_ref.books[idx] = updated
+                    self._refresh_series_row_label(idx, updated)
+
+        dlg = PreviewDialog(
+            self,
+            self._url,
+            self._source,
+            audiobook,
+            is_running=self._is_running,
+            skip_downloaded=self._skip_downloaded,
+            series_book_exists=self._series_book_exists,
+            on_confirm=_on_book_confirmed,
+            palette=self._palette,
+            on_search_enrichment=self._on_search_enrichment,
+            on_apply_enrichment=self._on_apply_enrichment,
+            manage_source_lifecycle=False,
+            confirm_button_text="Apply to Series",
+        )
+        return dlg
 
     def _update_selected_count(self, book_count: int | None = None) -> None:
         total = len(self._check_vars) if book_count is None else book_count
@@ -990,7 +1179,30 @@ class PreviewDialog(ModalDialog):
         self._toggle_series_item(idx_row, bool(getattr(event, "state", 0) & 0x0001))
         return "break"
 
+    _FILTER_DEBOUNCE_MS = 150
+
+    def _schedule_filter(self) -> None:
+        if self._filter_after_id is not None:
+            try:
+                self.after_cancel(self._filter_after_id)
+            except tk.TclError:
+                pass
+            self._filter_after_id = None
+        try:
+            if self.winfo_exists():
+                self._filter_after_id = self.after(
+                    self._FILTER_DEBOUNCE_MS, self._apply_filter
+                )
+        except tk.TclError:
+            self._filter_after_id = None
+
     def _apply_filter(self, *_args: object) -> None:
+        if self._filter_after_id is not None:
+            try:
+                self.after_cancel(self._filter_after_id)
+            except tk.TclError:
+                pass
+            self._filter_after_id = None
         if self._tree is None:
             return
         query = self._filter_var.get().strip().lower()

@@ -92,6 +92,7 @@ def test_export_csv_and_json_via_api_and_cli(tmp_path, capsys):
     assert data[0]["tags"] == ["hidden"]
 
 
+@pytest.mark.gui
 def test_export_xlsx_behavior_and_gui_export_to_path(tmp_path):
     db_path = tmp_path / "downloads.db"
     cfg_path = tmp_path / "audiobook-dl.toml"

@@ -1009,8 +1009,7 @@ def download_file(
     inline_dec_tmp: str | None = None
     allow_ciphertext_range = not isinstance(file.encryption_method, AESEncryption) or len(audiobook.files) == 1
     while attempt < DOWNLOAD_ATTEMPTS:
-        if cancel_event is not None and cancel_event.is_set():
-            raise DownloadCancelled
+        logging.wait_if_paused(cancel_event=cancel_event)
         advanced = 0.0
         request = None
         decrypted_inline = False
@@ -1200,8 +1199,7 @@ def download_file(
                     ):
                         f.write(file.init_section)
                     for chunk in request.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
-                        if cancel_event is not None and cancel_event.is_set():
-                            raise DownloadCancelled
+                        logging.wait_if_paused(cancel_event=cancel_event)
                         if not chunk:
                             continue
                         if stream_decryptor is not None:

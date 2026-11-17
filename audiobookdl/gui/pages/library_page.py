@@ -18,9 +18,8 @@ from audiobookdl.gui.formatting import (
     create_placeholder_cover_thumbnail,
     format_catalog_formats,
     format_duration,
-    load_cover_from_file,
     photo_from_image_bytes,
-    render_cover_thumbnail,
+    resize_cover_file_thumbnail_bytes,
     resize_cover_thumbnail_bytes,
 )
 from audiobookdl.gui.theme import (
@@ -32,6 +31,7 @@ from audiobookdl.gui.theme import (
 )
 from audiobookdl.gui.widgets import (
     MainThreadCallbackQueue,
+    ModalDialog,
     ScrolledTreeview,
     TreeColumnSpec,
     populate_grouped_tree,
@@ -39,13 +39,161 @@ from audiobookdl.gui.widgets import (
 )
 from audiobookdl.sources import ServiceInfo
 from audiobookdl.sources.source import CatalogBook
-from audiobookdl.utils.archive import ArchiveEntry, DownloadArchive, parse_tags_input
+from audiobookdl.utils.archive import (
+    VALID_LIBRARY_STATUSES,
+    ArchiveEntry,
+    DownloadArchive,
+    parse_tags_input,
+)
 from audiobookdl.utils.export import export_library_entries
 from audiobookdl.utils.library_scanner import LocalScanResult, scan_local_library
 
 
+class _ArchiveMetadataDialog(ModalDialog):
+    """Modal editor for updating title, author, narrator, series, IDs, status, path, and tags."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        entry: ArchiveEntry,
+        *,
+        palette: ThemePalette,
+    ) -> None:
+        super().__init__(
+            parent,
+            f"Edit Metadata — {entry.title}",
+            palette=palette,
+            default_size=(540, 440),
+            min_size=(480, 380),
+        )
+        self.result_updates: dict[str, Any] | None = None
+
+        body = ttk.Frame(self, padding=scale_px(self, 12))
+        body.pack(fill=tk.BOTH, expand=True)
+        body.columnconfigure(1, weight=1)
+
+        self._title_var = tk.StringVar(value=entry.title)
+        self._author_var = tk.StringVar(value=entry.author)
+        self._narrator_var = tk.StringVar(value=entry.narrator)
+        self._series_var = tk.StringVar(value=entry.series or "")
+        self._series_order_var = tk.StringVar(
+            value="" if entry.series_order is None else str(entry.series_order)
+        )
+        self._asin_var = tk.StringVar(value=entry.asin or "")
+        self._isbn_var = tk.StringVar(value=entry.isbn or "")
+        self._status_var = tk.StringVar(value=entry.status or "downloaded")
+        self._output_path_var = tk.StringVar(value=entry.output_path or "")
+        self._tags_var = tk.StringVar(value=" ".join(entry.tags))
+
+        fields: list[tuple[str, tk.StringVar]] = [
+            ("Title:", self._title_var),
+            ("Author:", self._author_var),
+            ("Narrator:", self._narrator_var),
+            ("Series:", self._series_var),
+            ("Series Order:", self._series_order_var),
+            ("ASIN:", self._asin_var),
+            ("ISBN:", self._isbn_var),
+            ("Tags:", self._tags_var),
+        ]
+        first_entry: ttk.Entry | None = None
+        row_idx = 0
+        for label_text, var in fields:
+            ttk.Label(body, text=label_text).grid(
+                row=row_idx, column=0, sticky="w", padx=(0, 8), pady=3
+            )
+            widget = ttk.Entry(body, textvariable=var)
+            widget.grid(row=row_idx, column=1, columnspan=2, sticky="ew", pady=3)
+            if first_entry is None:
+                first_entry = widget
+            row_idx += 1
+
+        ttk.Label(body, text="Status:").grid(
+            row=row_idx, column=0, sticky="w", padx=(0, 8), pady=3
+        )
+        status_combo = ttk.Combobox(
+            body,
+            textvariable=self._status_var,
+            values=list(VALID_LIBRARY_STATUSES),
+            state="readonly",
+            width=18,
+        )
+        status_combo.grid(row=row_idx, column=1, sticky="w", pady=3)
+        row_idx += 1
+
+        ttk.Label(body, text="Output Path:").grid(
+            row=row_idx, column=0, sticky="w", padx=(0, 8), pady=3
+        )
+        ttk.Entry(body, textvariable=self._output_path_var).grid(
+            row=row_idx, column=1, sticky="ew", pady=3
+        )
+        ttk.Button(body, text="Browse...", command=self._browse_output_path).grid(
+            row=row_idx, column=2, padx=(6, 0), pady=3
+        )
+        row_idx += 1
+
+        btns = ttk.Frame(body)
+        btns.grid(row=row_idx, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Save", command=self._save).pack(side=tk.RIGHT, padx=(0, 6))
+
+        self.bind("<Return>", lambda _e: self._save())
+        self.finalize_modal(initial_focus=first_entry)
+
+    def _browse_output_path(self) -> None:
+        current = self._output_path_var.get().strip()
+        initial_dir = os.path.dirname(current) if current and os.path.dirname(current) else os.getcwd()
+        chosen = filedialog.askopenfilename(
+            parent=self,
+            title="Relink Audiobook File",
+            initialdir=initial_dir,
+        )
+        if chosen:
+            self._output_path_var.set(chosen)
+
+    def _save(self) -> None:
+        title = self._title_var.get().strip()
+        if not title:
+            messagebox.showwarning("Invalid Metadata", "Title cannot be empty.", parent=self)
+            return
+        raw_order = self._series_order_var.get().strip()
+        series_order: int | None = None
+        if raw_order:
+            try:
+                series_order = int(raw_order)
+            except ValueError:
+                messagebox.showwarning(
+                    "Invalid Metadata",
+                    "Series Order must be a whole number (or empty).",
+                    parent=self,
+                )
+                return
+        status = self._status_var.get().strip().lower()
+        if status not in VALID_LIBRARY_STATUSES:
+            messagebox.showwarning(
+                "Invalid Metadata",
+                f"Status must be one of: {', '.join(VALID_LIBRARY_STATUSES)}.",
+                parent=self,
+            )
+            return
+        self.result_updates = {
+            "title": title,
+            "author": self._author_var.get().strip(),
+            "narrator": self._narrator_var.get().strip(),
+            "series": self._series_var.get().strip() or None,
+            "series_order": series_order,
+            "asin": self._asin_var.get().strip() or None,
+            "isbn": self._isbn_var.get().strip() or None,
+            "output_path": self._output_path_var.get().strip() or None,
+            "status": status,
+            "tags": parse_tags_input(self._tags_var.get()),
+        }
+        self.destroy()
+
+
 class ArchiveTab(ttk.Frame):
     """Tab hosting the unified library grid and SQLite download ledger."""
+
+    _PAGE_SIZE = 1000
 
     _COLUMNS = (
         TreeColumnSpec("status", "Status", width=95, stretch=False),
@@ -82,6 +230,11 @@ class ArchiveTab(ttk.Frame):
         self._cb_queue = MainThreadCallbackQueue(self)
         self._details_visible = True
         self._detail_cover_photo: object | None = None
+        self._detail_token = 0
+        self._loading_ops = 0
+        self._page_offset = 0
+        self._total_matches = 0
+        self._load_all = False
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
@@ -109,13 +262,13 @@ class ArchiveTab(ttk.Frame):
             top_bar,
             text="Show Hidden",
             variable=self._show_hidden_var,
-            command=self._refresh,
+            command=self._on_filter_changed,
         ).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Checkbutton(
             top_bar,
             text="View Trash",
             variable=self._show_trash_var,
-            command=self._refresh,
+            command=self._on_filter_changed,
         ).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(top_bar, text="Refresh", command=self._refresh).pack(side=tk.LEFT, padx=(0, 6))
         self._details_toggle_btn = ttk.Button(
@@ -174,6 +327,9 @@ class ArchiveTab(ttk.Frame):
         ttk.Button(btn_bar, text="Edit Tags...", command=self._edit_selected_tags).pack(
             side=tk.LEFT, padx=(0, 6)
         )
+        ttk.Button(btn_bar, text="Edit Metadata...", command=self._edit_selected_metadata).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
         ttk.Button(btn_bar, text="Hide / Unhide", command=self._toggle_hide_selected).pack(
             side=tk.LEFT, padx=(0, 6)
         )
@@ -187,17 +343,36 @@ class ArchiveTab(ttk.Frame):
             btn_bar, text="Locate Books...", command=self._prompt_locate_local_books
         )
         self._scan_btn.pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(btn_bar, text="Verify Missing", command=self._verify_missing_files).pack(
-            side=tk.LEFT, padx=(0, 6)
+        self._verify_btn = ttk.Button(
+            btn_bar, text="Verify Missing", command=self._verify_missing_files
         )
+        self._verify_btn.pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(btn_bar, text="Export...", command=self._prompt_export).pack(
             side=tk.LEFT, padx=(0, 6)
         )
         ttk.Button(btn_bar, text="Clear All", command=self._clear_all).pack(side=tk.LEFT)
 
-        ttk.Label(self, textvariable=self._status_var, style="Muted.TLabel").grid(
-            row=4, column=0, sticky="w", pady=(6, 0)
+        status_row = ttk.Frame(self)
+        status_row.grid(row=4, column=0, sticky="ew", pady=(6, 0))
+        status_row.columnconfigure(0, weight=1)
+        ttk.Label(status_row, textvariable=self._status_var, style="Muted.TLabel").grid(
+            row=0, column=0, sticky="w"
         )
+        self._pager_frame = ttk.Frame(status_row)
+        self._pager_frame.grid(row=0, column=1, sticky="e")
+        self._prev_page_btn = ttk.Button(
+            self._pager_frame, text="Prev", width=6, command=self._prev_page
+        )
+        self._prev_page_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self._next_page_btn = ttk.Button(
+            self._pager_frame, text="Next", width=6, command=self._next_page
+        )
+        self._next_page_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self._load_all_btn = ttk.Button(
+            self._pager_frame, text="Load All", command=self._load_all_entries
+        )
+        self._load_all_btn.pack(side=tk.LEFT)
+        self._pager_frame.grid_remove()
 
         self.bind("<Destroy>", self._on_destroy)
         self._search_var.trace_add("write", self._schedule_refresh)
@@ -255,6 +430,7 @@ class ArchiveTab(ttk.Frame):
         menu.add_separator()
         if self._on_queue_urls is not None:
             menu.add_command(label="Queue Selected", command=self._queue_selected)
+        menu.add_command(label="Edit Metadata...", command=self._edit_selected_metadata)
         menu.add_command(label="Edit Tags...", command=self._edit_selected_tags)
         menu.add_command(label="Verify Missing Files", command=self._verify_missing_files)
         menu.add_separator()
@@ -305,7 +481,21 @@ class ArchiveTab(ttk.Frame):
                 return cand
         return None
 
+    def _begin_loading(self) -> None:
+        self._loading_ops += 1
+        if self._loading_ops == 1:
+            self._loading_bar.grid()
+            self._loading_bar.start(12)
+
+    def _end_loading(self) -> None:
+        self._loading_ops = max(0, self._loading_ops - 1)
+        if self._loading_ops == 0:
+            self._loading_bar.stop()
+            self._loading_bar.grid_remove()
+
     def _on_entry_selected(self, _event: tk.Event | None = None) -> None:
+        self._detail_token += 1
+        token = self._detail_token
         entries = self._selected_entries()
         if not entries:
             self._detail_cover_photo = None
@@ -315,42 +505,84 @@ class ArchiveTab(ttk.Frame):
             return
         e = entries[0]
         self._detail_title_var.set(e.title)
-        lines: list[str] = [
+        base_lines: list[str] = [
             f"Status: {self._format_status(e)}",
             f"Service: {self._format_service(e)}",
         ]
         if e.profile:
-            lines.append(f"Profile: {e.profile}")
+            base_lines.append(f"Profile: {e.profile}")
         if e.author:
-            lines.append(f"Author: {e.author}")
+            base_lines.append(f"Author: {e.author}")
         if e.narrator:
-            lines.append(f"Narrator: {e.narrator}")
+            base_lines.append(f"Narrator: {e.narrator}")
         if e.series:
             s_txt = f"{e.series} #{e.series_order}" if e.series_order is not None else e.series
-            lines.append(f"Series: {s_txt}")
+            base_lines.append(f"Series: {s_txt}")
         if e.duration_seconds:
-            lines.append(f"Duration: {format_duration(e.duration_seconds)}")
+            base_lines.append(f"Duration: {format_duration(e.duration_seconds)}")
         if e.audio_format:
-            lines.append(f"Format: {e.audio_format}")
+            base_lines.append(f"Format: {e.audio_format}")
         if e.asin:
-            lines.append(f"ASIN: {e.asin}")
+            base_lines.append(f"ASIN: {e.asin}")
         if e.isbn:
-            lines.append(f"ISBN: {e.isbn}")
+            base_lines.append(f"ISBN: {e.isbn}")
         if e.tags:
-            lines.append(f"Tags: {', '.join(e.tags)}")
-        if e.output_path:
-            lines.append(f"Size: {self._format_size(e.output_path)}")
-            lines.append(f"Path: {e.output_path}")
-        self._detail_meta_var.set("\n".join(lines))
+            base_lines.append(f"Tags: {', '.join(e.tags)}")
 
-        cover_path = self._find_nearby_cover(e.output_path or "")
-        photo = None
-        if cover_path:
+        output_path = e.output_path or ""
+        if not output_path:
+            self._detail_meta_var.set("\n".join(base_lines))
+            self._detail_cover_photo = None
+            self._detail_cover_label.configure(image="", text="No Cover")
+            return
+
+        pending_lines = [*base_lines, "Size: Calculating...", f"Path: {output_path}"]
+        self._detail_meta_var.set("\n".join(pending_lines))
+        self._detail_cover_photo = None
+        self._detail_cover_label.configure(image="", text="Loading cover...")
+
+        thumb_max = scale_px(self, 140)
+        self._cb_queue.begin_task()
+
+        def _worker() -> None:
             try:
-                cov = load_cover_from_file(cover_path)
-                photo = render_cover_thumbnail(cov, self, max_size=scale_px(self, 140))
-            except Exception:
-                photo = None
+                if token != self._detail_token:
+                    return
+                size_text = self._format_size(output_path)
+                if token != self._detail_token:
+                    return
+                cover_path = self._find_nearby_cover(output_path)
+                png_bytes = (
+                    resize_cover_file_thumbnail_bytes(cover_path, max_size=thumb_max)
+                    if cover_path
+                    else None
+                )
+                if token == self._detail_token:
+                    def _deliver() -> None:
+                        self._apply_entry_details(
+                            token, base_lines, output_path, size_text, png_bytes
+                        )
+
+                    self._cb_queue.post(_deliver)
+            finally:
+                self._cb_queue.finish_worker()
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_entry_details(
+        self,
+        token: int,
+        base_lines: list[str],
+        output_path: str,
+        size_text: str,
+        png_bytes: bytes | None,
+    ) -> None:
+        if not self.winfo_exists() or token != self._detail_token:
+            return
+        self._detail_meta_var.set(
+            "\n".join([*base_lines, f"Size: {size_text}", f"Path: {output_path}"])
+        )
+        photo = photo_from_image_bytes(png_bytes, self) if png_bytes else None
         self._detail_cover_photo = photo
         if photo is not None:
             self._detail_cover_label.configure(image=photo, text="")
@@ -385,6 +617,10 @@ class ArchiveTab(ttk.Frame):
         self._context_menu.entryconfigure(
             "Repackage in Pack Page...",
             state="normal" if (has_path and self._on_pack_paths is not None) else "disabled",
+        )
+        self._context_menu.entryconfigure(
+            "Edit Metadata...",
+            state="normal" if single is not None else "disabled",
         )
         self._context_menu.entryconfigure(
             "Copy URL",
@@ -441,19 +677,57 @@ class ArchiveTab(ttk.Frame):
         self._status_var.set(f"Copied {len(vals)} {field_name} value(s) to clipboard.")
 
     def _verify_missing_files(self) -> None:
-        ledger = self._get_ledger()
-        if ledger is None:
+        if not os.path.exists(self._archive_path):
             return
-        missing = 0
-        with ledger.batch_connection():
-            for entry in ledger.list_entries(limit=100000, include_trashed=False, include_hidden=True):
-                if entry.status == "downloaded" and entry.output_path and not os.path.exists(entry.output_path):
-                    ledger.set_status(entry.id, "pending")
-                    missing += 1
-        self._refresh()
-        self._status_var.set(
-            f"Verified library paths: marked {missing} missing file(s) as pending."
-        )
+        self._verify_btn.configure(state="disabled")
+        self._status_var.set("Verifying library paths...")
+        self._begin_loading()
+        self._cb_queue.begin_task()
+
+        def _finish(missing: int, error: str | None) -> None:
+            if not self.winfo_exists():
+                return
+            self._end_loading()
+            self._verify_btn.configure(state="normal")
+            if error is not None:
+                self._status_var.set(f"Verify error: {error}")
+                return
+            self._refresh()
+            self._status_var.set(
+                f"Verified library paths: marked {missing} missing file(s) as pending."
+            )
+
+        def _worker() -> None:
+            worker_ledger = DownloadArchive(self._archive_path, persistent=True)
+            try:
+                missing = 0
+                with worker_ledger.batch_connection():
+                    for entry in worker_ledger.list_entries(
+                        limit=100000, include_trashed=False, include_hidden=True
+                    ):
+                        if (
+                            entry.status == "downloaded"
+                            and entry.output_path
+                            and not os.path.exists(entry.output_path)
+                        ):
+                            worker_ledger.set_status(entry.id, "pending")
+                            missing += 1
+                def _post_ok() -> None:
+                    _finish(missing, None)
+
+                self._cb_queue.post(_post_ok)
+            except Exception as exc:
+                err_msg = str(exc)
+
+                def _post_err() -> None:
+                    _finish(0, err_msg)
+
+                self._cb_queue.post(_post_err)
+            finally:
+                worker_ledger.close()
+                self._cb_queue.finish_worker()
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _get_ledger(self, *, create: bool = False) -> DownloadArchive | None:
         if self._ledger is None:
@@ -491,6 +765,30 @@ class ArchiveTab(ttk.Frame):
             entry.downloaded_at,
         )
 
+    def _on_filter_changed(self) -> None:
+        self._page_offset = 0
+        self._load_all = False
+        self._refresh()
+
+    def _prev_page(self) -> None:
+        if self._page_offset <= 0:
+            return
+        self._load_all = False
+        self._page_offset = max(0, self._page_offset - self._PAGE_SIZE)
+        self._refresh()
+
+    def _next_page(self) -> None:
+        if self._page_offset + self._PAGE_SIZE >= self._total_matches:
+            return
+        self._load_all = False
+        self._page_offset += self._PAGE_SIZE
+        self._refresh()
+
+    def _load_all_entries(self) -> None:
+        self._page_offset = 0
+        self._load_all = True
+        self._refresh()
+
     def _refresh(self, *_args: object) -> None:
         self._debounce_after_id = None
         existing = self._tree.get_children()
@@ -499,6 +797,8 @@ class ArchiveTab(ttk.Frame):
         self._entries_by_id.clear()
         ledger = self._get_ledger()
         if ledger is None:
+            self._total_matches = 0
+            self._pager_frame.grid_remove()
             self._status_var.set("No library database yet.")
             self._scrolled_tree.set_empty_state(
                 True,
@@ -509,12 +809,30 @@ class ArchiveTab(ttk.Frame):
             return
         view_trash = bool(self._show_trash_var.get())
         show_hidden = bool(self._show_hidden_var.get())
-        entries = ledger.list_entries(
-            query=self._search_var.get(),
-            limit=1000,
+        query_text = self._search_var.get()
+        status_filter = "trashed" if view_trash else None
+        total = ledger.count_entries(
+            query=query_text,
             include_trashed=view_trash,
             include_hidden=show_hidden,
-            status="trashed" if view_trash else None,
+            status=status_filter,
+        )
+        self._total_matches = total
+        if total == 0:
+            self._page_offset = 0
+        elif self._load_all:
+            self._page_offset = 0
+        elif self._page_offset >= total:
+            self._page_offset = max(0, ((total - 1) // self._PAGE_SIZE) * self._PAGE_SIZE)
+
+        query_limit = max(total, 1) if self._load_all else self._PAGE_SIZE
+        entries = ledger.list_entries(
+            query=query_text,
+            limit=query_limit,
+            offset=self._page_offset,
+            include_trashed=view_trash,
+            include_hidden=show_hidden,
+            status=status_filter,
         )
         for entry in entries:
             self._entries_by_id[entry.id] = entry
@@ -550,16 +868,33 @@ class ArchiveTab(ttk.Frame):
         count = len(entries)
         self._scrolled_tree.set_empty_state(
             count == 0,
-            "No matching entries in library." if self._search_var.get().strip() else "Library ledger is empty.",
-            action_text="" if self._search_var.get().strip() else "Locate Books...",
-            action_command=None if self._search_var.get().strip() else self._prompt_locate_local_books,
+            "No matching entries in library." if query_text.strip() else "Library ledger is empty.",
+            action_text="" if query_text.strip() else "Locate Books...",
+            action_command=None if query_text.strip() else self._prompt_locate_local_books,
         )
+        noun = f"{'trashed ' if view_trash else ''}item{'s' if total != 1 else ''}"
+        if total > count or self._page_offset > 0:
+            start_num = self._page_offset + 1 if count else 0
+            end_num = self._page_offset + count
+            count_label = f"Showing {start_num:,}-{end_num:,} of {total:,} {noun}"
+            self._pager_frame.grid()
+            self._prev_page_btn.configure(
+                state="normal" if self._page_offset > 0 else "disabled"
+            )
+            self._next_page_btn.configure(
+                state="normal" if (self._page_offset + count) < total else "disabled"
+            )
+            self._load_all_btn.configure(state="disabled" if self._load_all else "normal")
+        else:
+            count_label = f"Showing {count:,} {noun}"
+            self._pager_frame.grid_remove()
         self._status_var.set(
-            f"Showing {count} {'trashed ' if view_trash else ''}item{'s' if count != 1 else ''}"
-            "  •  Filters: author:, tag:, status:, series:, -tag:hidden"
+            f"{count_label}  •  Filters: author:, tag:, status:, series:, -tag:hidden"
         )
 
     def _schedule_refresh(self, *_args: object) -> None:
+        self._page_offset = 0
+        self._load_all = False
         if self._debounce_after_id is not None:
             try:
                 self.after_cancel(self._debounce_after_id)
@@ -615,6 +950,26 @@ class ArchiveTab(ttk.Frame):
             for entry_id in selected_ids:
                 ledger.set_tags(entry_id, parsed)
         self._refresh()
+
+    def _edit_selected_metadata(self) -> None:
+        entries = self._selected_entries()
+        if len(entries) != 1:
+            return
+        ledger = self._get_ledger()
+        if ledger is None:
+            return
+        entry = entries[0]
+        dlg = _ArchiveMetadataDialog(self, entry, palette=self._palette)
+        self.wait_window(dlg)
+        if dlg.result_updates is None:
+            return
+        updated = ledger.update_entry(entry.id, **dlg.result_updates)
+        self._refresh()
+        if updated is not None and self._tree.exists(str(updated.id)):
+            self._tree.selection_set(str(updated.id))
+            self._tree.focus(str(updated.id))
+            self._on_entry_selected()
+            self._status_var.set(f"Updated metadata for '{updated.title}'.")
 
     def _toggle_hide_selected(self) -> None:
         selected_ids = self._selected_entry_ids()
@@ -693,14 +1048,13 @@ class ArchiveTab(ttk.Frame):
         self._scan_btn.configure(state="disabled")
         self._status_var.set(f"Scanning '{folder}'...")
         if background:
-            self._loading_bar.grid()
-            self._loading_bar.start(12)
+            self._begin_loading()
 
         def _finish(result: LocalScanResult | None, error: str | None) -> None:
             if not self.winfo_exists():
                 return
-            self._loading_bar.stop()
-            self._loading_bar.grid_remove()
+            if background:
+                self._end_loading()
             self._scan_btn.configure(state="normal")
             if error is not None:
                 self._status_var.set(f"Scan error: {error}")
@@ -806,7 +1160,7 @@ class CatalogTab(ttk.Frame):
         services: Sequence[ServiceInfo],
         selected_service: ServiceInfo | None,
         *,
-        on_fetch: Callable[[str, ServiceInfo, str, "CatalogTab"], None],
+        on_fetch: Callable[[str, ServiceInfo, str, CatalogTab], None],
         on_add_urls: Callable[[list[str]], None],
         on_download_urls: Callable[[list[str], str, str], None] | None = None,
         on_save_to_library: Callable[[str, str, Sequence[CatalogBook]], tuple[int, int]] | None = None,
@@ -814,6 +1168,7 @@ class CatalogTab(ttk.Frame):
         profile_resolver: Callable[[str], Sequence[str]] | None = None,
         status_resolver: Callable[[str, Sequence[CatalogBook]], Sequence[str]] | None = None,
         cover_fetcher: Callable[[str], bytes | None] | None = None,
+        on_cancel_fetch: Callable[[], object] | None = None,
         selected_profile: str = "default",
         palette: ThemePalette | None = None,
     ) -> None:
@@ -828,6 +1183,7 @@ class CatalogTab(ttk.Frame):
         self._profile_resolver = profile_resolver
         self._status_resolver = status_resolver
         self._cover_fetcher = cover_fetcher
+        self._on_cancel_fetch = on_cancel_fetch
         self._loaded_books: list[CatalogBook] = []
         self._book_statuses: list[str] = []
         self._loaded_service_key: str = ""
@@ -885,7 +1241,11 @@ class CatalogTab(ttk.Frame):
         self._library_btn = ttk.Button(
             top_bar, text="List Library", command=lambda: self.run_fetch("library")
         )
-        self._library_btn.pack(side=tk.LEFT)
+        self._library_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self._cancel_btn = ttk.Button(
+            top_bar, text="Cancel", command=self.cancel_fetch, state="disabled"
+        )
+        self._cancel_btn.pack(side=tk.LEFT)
 
         self._group_var = tk.BooleanVar(value=True)
         self._hide_downloaded_var = tk.BooleanVar(value=False)
@@ -1090,6 +1450,7 @@ class CatalogTab(ttk.Frame):
             return
         self._search_btn.configure(state="disabled")
         self._library_btn.configure(state="disabled")
+        self._cancel_btn.configure(state="normal")
         if self._save_lib_btn is not None:
             self._save_lib_btn.configure(state="disabled")
         self._loaded_service_key = svc.key
@@ -1100,9 +1461,23 @@ class CatalogTab(ttk.Frame):
         self._loading_bar.start(12)
         self._on_fetch(mode, svc, query_text, self)
 
+    def cancel_fetch(self) -> None:
+        """Cancel the active catalog search or library listing request."""
+        if self._on_cancel_fetch is not None:
+            self._on_cancel_fetch()
+        self._stop_loading()
+        self.sync_buttons()
+        self._status_var.set("Catalog request cancelled.")
+        if not self._loaded_books:
+            self._scrolled_tree.set_empty_state(
+                True,
+                "Catalog request cancelled.",
+            )
+
     def _stop_loading(self) -> None:
         self._loading_bar.stop()
         self._loading_bar.grid_remove()
+        self._cancel_btn.configure(state="disabled")
 
     def set_error_status(self, message: str = "Error loading items") -> None:
         self._stop_loading()
@@ -1129,16 +1504,32 @@ class CatalogTab(ttk.Frame):
         if not url.lower().startswith(("http://", "https://")):
             return None
         try:
-            resp = requests.get(
+            with requests.get(
                 url,
                 timeout=10,
                 headers={"User-Agent": "audiobook-dl"},
-            )
-            if resp.status_code != 200 or not resp.content:
-                return None
-            if len(resp.content) > self._MAX_COVER_BYTES:
-                return None
-            return resp.content
+                stream=True,
+            ) as resp:
+                if resp.status_code != 200:
+                    return None
+                raw_len = resp.headers.get("Content-Length")
+                if raw_len is not None:
+                    try:
+                        if int(str(raw_len).strip()) > self._MAX_COVER_BYTES:
+                            return None
+                    except ValueError:
+                        pass
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > self._MAX_COVER_BYTES:
+                        return None
+                    chunks.append(chunk)
+                data = b"".join(chunks)
+                return data if data else None
         except Exception:
             return None
 
@@ -1388,8 +1779,11 @@ class SyncTab(ttk.Frame):
         *,
         auto_sync_enabled: bool = False,
         auto_sync_minutes: int = 30,
+        auto_sync_mode: str = "enqueue",
+        auto_sync_targets: Sequence[tuple[str, str]] | None = None,
         on_run_sync: Callable[[list[tuple[str, str]], str], None],
         on_auto_sync_changed: Callable[[bool, int], None] | None = None,
+        on_save_schedule: Callable[[bool, int, str, list[tuple[str, str]]], None] | None = None,
     ) -> None:
         super().__init__(parent, padding=scale_px(parent, 12))
         self._config_provider = config_provider
@@ -1397,6 +1791,13 @@ class SyncTab(ttk.Frame):
         self._services_by_key = {s.key: s for s in self._services}
         self._on_run_sync = on_run_sync
         self._on_auto_sync_changed = on_auto_sync_changed
+        self._on_save_schedule = on_save_schedule
+        self._initial_targets: set[tuple[str, str]] | None = (
+            {(svc, prof) for svc, prof in auto_sync_targets}
+            if auto_sync_targets is not None
+            else None
+        )
+        self._targets_initialized = False
         self._target_vars: list[tuple[str, str, tk.BooleanVar]] = []
 
         self.columnconfigure(0, weight=1)
@@ -1416,7 +1817,10 @@ class SyncTab(ttk.Frame):
 
         mode_frame = ttk.LabelFrame(self, text="Sync Mode", padding=scale_px(self, 8))
         mode_frame.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        self.mode_var = tk.StringVar(value="enqueue")
+        initial_mode = (
+            auto_sync_mode if auto_sync_mode in ("enqueue", "scan_only", "dry_run") else "enqueue"
+        )
+        self.mode_var = tk.StringVar(value=initial_mode)
         ttk.Radiobutton(
             mode_frame,
             text="Scan & Enqueue Pending Books (uses main download queue)",
@@ -1492,13 +1896,43 @@ class SyncTab(ttk.Frame):
         for row_idx, (svc_key, prof) in enumerate(configured):
             svc_info = self._services_by_key.get(svc_key)
             label = svc_info.label if svc_info else svc_key
-            var = tk.BooleanVar(value=prev_states.get((svc_key, prof), True))
+            if self._targets_initialized:
+                checked = prev_states.get((svc_key, prof), True)
+            elif self._initial_targets is not None:
+                checked = (svc_key, prof) in self._initial_targets
+            else:
+                checked = True
+            var = tk.BooleanVar(value=checked)
             self._target_vars.append((svc_key, prof, var))
             ttk.Checkbutton(
                 self._accounts_frame,
                 text=f"{label} ({prof})",
                 variable=var,
             ).grid(row=row_idx, column=0, sticky="w", pady=2)
+        self._targets_initialized = True
+
+    def selected_targets(self) -> list[tuple[str, str]]:
+        """Return currently checked `(service_key, profile)` sync target pairs."""
+        return [(svc, prof) for svc, prof, var in self._target_vars if var.get()]
+
+    def apply_saved_schedule(
+        self,
+        *,
+        enabled: bool,
+        minutes: int,
+        mode: str,
+        targets: Sequence[tuple[str, str]] | None,
+    ) -> None:
+        """Update SyncTab controls from reloaded configuration."""
+        self.auto_sync_var.set(bool(enabled))
+        self.interval_var.set(str(max(1, int(minutes))))
+        if mode in ("enqueue", "scan_only", "dry_run"):
+            self.mode_var.set(mode)
+        self._initial_targets = (
+            {(svc, prof) for svc, prof in targets} if targets is not None else None
+        )
+        self._targets_initialized = False
+        self.refresh_targets()
 
     def _read_schedule(self) -> tuple[bool, int] | None:
         enabled = bool(self.auto_sync_var.get())
@@ -1525,7 +1959,11 @@ class SyncTab(ttk.Frame):
         sched = self._read_schedule()
         if sched is None:
             return
-        if self._on_auto_sync_changed is not None:
+        targets = self.selected_targets()
+        mode = self.mode_var.get()
+        if self._on_save_schedule is not None:
+            self._on_save_schedule(sched[0], sched[1], mode, targets)
+        elif self._on_auto_sync_changed is not None:
             self._on_auto_sync_changed(sched[0], sched[1])
 
     def _start_sync(self) -> None:
@@ -1568,10 +2006,15 @@ class LibraryPage(ttk.Frame):
         on_sync_from_catalog: Callable[[str], None],
         profile_resolver: Callable[[str], Sequence[str]],
         status_resolver: Callable[[str, Sequence[CatalogBook]], Sequence[str]],
+        cover_fetcher: Callable[[str], bytes | None] | None = None,
+        on_catalog_cancel: Callable[[], object] | None = None,
         auto_sync_enabled: bool = False,
         auto_sync_minutes: int = 30,
+        auto_sync_mode: str = "enqueue",
+        auto_sync_targets: Sequence[tuple[str, str]] | None = None,
         on_run_sync: Callable[[list[tuple[str, str]], str], None],
         on_auto_sync_changed: Callable[[bool, int], None],
+        on_save_schedule: Callable[[bool, int, str, list[tuple[str, str]]], None] | None = None,
         palette_provider: Callable[[], ThemePalette],
     ) -> None:
         super().__init__(parent, padding=scale_px(parent, 12))
@@ -1615,6 +2058,8 @@ class LibraryPage(ttk.Frame):
             on_sync_libraries=on_sync_from_catalog,
             profile_resolver=profile_resolver,
             status_resolver=status_resolver,
+            cover_fetcher=cover_fetcher,
+            on_cancel_fetch=on_catalog_cancel,
             selected_profile=selected_profile_provider(),
             palette=palette,
         )
@@ -1624,8 +2069,11 @@ class LibraryPage(ttk.Frame):
             services,
             auto_sync_enabled=auto_sync_enabled,
             auto_sync_minutes=auto_sync_minutes,
+            auto_sync_mode=auto_sync_mode,
+            auto_sync_targets=auto_sync_targets,
             on_run_sync=on_run_sync,
             on_auto_sync_changed=on_auto_sync_changed,
+            on_save_schedule=on_save_schedule,
         )
 
         self.notebook.add(self.archive_tab, text="Archive Ledger")

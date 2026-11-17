@@ -1,6 +1,8 @@
 import threading
 from unittest.mock import patch
 
+import pytest
+
 from audiobookdl import args, logging
 from audiobookdl.pipeline import run_downloads
 from audiobookdl.config import Config
@@ -32,6 +34,7 @@ class _CaptureSink:
             self.finished += 1
 
 
+@pytest.mark.no_worker_cap
 def test_concurrent_run_downloads_isolate_logging_sinks_and_flags():
     sink_a = _CaptureSink()
     sink_b = _CaptureSink()
@@ -115,3 +118,91 @@ def test_cli_progress_adapter_tracks_bytes_and_speed():
         assert stats is not None
         assert stats[0] == 2048
         assert stats[1] > 0.0
+
+
+def test_wait_if_paused_blocks_until_resumed_or_cancelled():
+    from audiobookdl.exceptions import DownloadCancelled
+
+    pause_ev = threading.Event()
+    pause_ev.clear()  # paused
+    cancel_ev = threading.Event()
+
+    resumed_at: list[float] = []
+    started = threading.Event()
+
+    def _worker() -> None:
+        with logging.job_context(logging.JobContext(cancel_event=cancel_ev, pause_event=pause_ev)):
+            started.set()
+            logging.wait_if_paused()
+            resumed_at.append(1.0)
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    assert started.wait(timeout=1.0)
+    t.join(timeout=0.05)
+    assert t.is_alive()  # still paused
+    pause_ev.set()
+    t.join(timeout=2.0)
+    assert not t.is_alive()
+    assert resumed_at == [1.0]
+
+    # Cancelling while paused raises DownloadCancelled
+    pause_ev.clear()
+    cancel_ev.set()
+    try:
+        with logging.job_context(logging.JobContext(cancel_event=cancel_ev, pause_event=pause_ev)):
+            logging.wait_if_paused()
+        raise AssertionError("Expected DownloadCancelled")
+    except DownloadCancelled:
+        pass
+
+
+def test_series_download_pauses_between_books(tmp_path):
+    from types import SimpleNamespace
+    from audiobookdl import args
+    from audiobookdl.config import Config
+    from audiobookdl.pipeline import Downloader
+    from audiobookdl.utils.audiobook import BookId, Series
+
+    pause_ev = threading.Event()
+    pause_ev.set()
+    cancel_ev = threading.Event()
+
+    b1 = BookId(id="1", title="Book 1")
+    b2 = BookId(id="2", title="Book 2")
+    series = Series(title="Paused Series", books=[b1, b2])
+    processed: list[str] = []
+    first_done = threading.Event()
+
+    class _FakeSource:
+        name = "FakeSource"
+        names = ["FakeSource"]
+
+        def download_from_id(self, bid: str):
+            return bid
+
+    with patch("audiobookdl.pipeline._flatten_resolved_books", side_effect=lambda _s, b: [SimpleNamespace(title=f"T{b}")]), patch(
+        "audiobookdl.pipeline.process_audiobook",
+        side_effect=lambda _src, ab, *_a, **_kw: (
+            processed.append(ab.title),
+            pause_ev.clear() if len(processed) == 1 else None,
+            first_done.set() if len(processed) == 1 else None,
+            True,
+        )[-1],
+    ):
+        dl = Downloader(
+            config=Config(sources={}, output_template=str(tmp_path / "{title}"), database_directory=None, skip_downloaded=False),
+            options=args.build_default_options(),
+            cancel_event=cancel_ev,
+            pause_event=pause_ev,
+        )
+        t = threading.Thread(target=lambda: dl.download_result(_FakeSource(), series), daemon=True)  # type: ignore[arg-type]
+        t.start()
+        assert first_done.wait(timeout=2.0)
+        t.join(timeout=0.15)
+        assert t.is_alive()
+        assert processed == ["T1"]
+        pause_ev.set()
+        t.join(timeout=2.0)
+        assert not t.is_alive()
+        assert processed == ["T1", "T2"]

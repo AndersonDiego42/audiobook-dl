@@ -28,7 +28,21 @@ def _make_image_bytes(fmt: str, mode: str = "RGB") -> bytes:
     return buf.getvalue()
 
 
+_SILENT_AUDIO_CACHE: dict[tuple[str, tuple[str, ...]], bytes] = {}
+
+
 def _create_silent_audio(path: Path, codec_args: Sequence[str]) -> None:
+    ext = path.suffix.lower() or ".bin"
+    # Normalize "-f mp4" vs implicit mp4 so m4b variants share one cached template.
+    norm_args = tuple(codec_args)
+    if ext in (".m4b", ".m4a") and norm_args == ("-c:a", "aac"):
+        norm_args = ("-c:a", "aac", "-f", "mp4")
+    cache_key = (ext, norm_args)
+    cached = _SILENT_AUDIO_CACHE.get(cache_key)
+    if cached is not None:
+        path.write_bytes(cached)
+        return
+
     ffmpeg_bin = shutil.which("ffmpeg")
     if not ffmpeg_bin:
         pytest.skip("ffmpeg not available")
@@ -40,15 +54,18 @@ def _create_silent_audio(path: Path, codec_args: Sequence[str]) -> None:
             "-f",
             "lavfi",
             "-i",
-            "anullsrc=r=44100:cl=mono",
+            "anullsrc=r=24000:cl=mono",
             "-t",
             "2",
+            "-threads",
+            "1",
             *codec_args,
             str(path),
         ],
         capture_output=True,
         check=True,
     )
+    _SILENT_AUDIO_CACHE[cache_key] = path.read_bytes()
 
 
 def test_ffmetadata_escapes_special_characters():
@@ -93,6 +110,7 @@ def test_extension_matching_is_case_insensitive():
     assert not mp4.is_mp4_file("book.mp3")
 
 
+@pytest.mark.ffmpeg
 def test_mp4_metadata_publisher_and_webp_cover(tmp_path):
     m4b_path = tmp_path / "sample.M4B"
     _create_silent_audio(m4b_path, ["-c:a", "aac"])
@@ -115,6 +133,7 @@ def test_mp4_metadata_publisher_and_webp_cover(tmp_path):
     assert tags["covr"][0].imageformat == MP4Cover.FORMAT_JPEG
 
 
+@pytest.mark.ffmpeg
 def test_mp4_metadata_standard_atoms_and_no_runtime_class_mutation(tmp_path):
     m4b_path = tmp_path / "full.m4b"
     _create_silent_audio(m4b_path, ["-c:a", "aac"])
@@ -161,6 +180,7 @@ def test_mp4_metadata_standard_atoms_and_no_runtime_class_mutation(tmp_path):
     assert tags["----:com.apple.iTunes:ISBN"] == [MP4FreeForm(b"9781234567890")]
 
 
+@pytest.mark.ffmpeg
 def test_id3_cover_type_3_webp_conversion_and_ctoc_chap_frames(tmp_path):
     mp3_path = tmp_path / "sample.MP3"
     _create_silent_audio(mp3_path, ["-c:a", "libmp3lame"])
@@ -271,6 +291,7 @@ def test_create_tmp_chapter_file_sorts_clamps_and_skips_invalid_bounds(monkeypat
     assert "Too Late 2" not in content
 
 
+@pytest.mark.ffmpeg
 def test_id3_chapters_mutagen_none_fallback_and_bounds(tmp_path, monkeypatch):
     mp3_path = tmp_path / "bounded.mp3"
     _create_silent_audio(mp3_path, ["-c:a", "libmp3lame"])
@@ -305,6 +326,7 @@ def test_id3_chapters_mutagen_none_fallback_and_bounds(tmp_path, monkeypatch):
     assert len(tags_after.getall("CHAP")) == 2
 
 
+@pytest.mark.ffmpeg
 def test_add_chapters_ffmpeg_succeeds_with_ffprobe_fallback_and_clamped_chapters(
     tmp_path, monkeypatch
 ):
@@ -412,6 +434,7 @@ def test_add_chapters_ffmpeg_preserves_original_when_fallback_nonzero(
     assert target.read_bytes() == b"intact-original"
 
 
+@pytest.mark.ffmpeg
 def test_add_id3_metadata_sets_4_digit_tyer_and_full_iso_tdrc_tdor(
     tmp_path, monkeypatch
 ):
@@ -467,6 +490,7 @@ def test_add_chapters_forwards_audio_bitrate_to_ffmpeg(monkeypatch):
     assert seen == {"filepath": "book.m4b", "audio_bitrate": "192k"}
 
 
+@pytest.mark.ffmpeg
 @pytest.mark.parametrize(
     ("ext", "codec_args"),
     [
@@ -559,6 +583,7 @@ def test_sidecars_opf_cue_and_enriched_as_json(tmp_path):
     assert "INDEX 01 01:05:30" in cue_text
 
 
+@pytest.mark.ffmpeg
 def test_id3_metadata_persists_source_and_isbn_txxx_frames(tmp_path):
     mp3_path = tmp_path / "tagged.mp3"
     _create_silent_audio(mp3_path, ["-c:a", "libmp3lame"])
@@ -607,6 +632,7 @@ def test_audiobook_metadata_all_properties_and_dict_value_types():
     assert [v for k, v in multi if k == "author"] == ["Frank Herbert", "Co-Author"]
 
 
+@pytest.mark.ffmpeg
 def test_single_save_pass_for_mp4_metadata_and_id3_chapters_cover(tmp_path):
     from unittest.mock import patch
     from mutagen.id3 import ID3
@@ -655,6 +681,7 @@ def test_single_save_pass_for_mp4_metadata_and_id3_chapters_cover(tmp_path):
     assert len(tags.getall("CHAP")) == 2
 
 
+@pytest.mark.ffmpeg
 def test_asin_metadata_across_mp4_id3_vorbis_opf_json_and_template(tmp_path):
     import json
     from mutagen.flac import FLAC
@@ -705,6 +732,7 @@ def test_cover_square_padding_and_max_size_normalization():
         assert out_img.size == (128, 128)
 
 
+@pytest.mark.ffmpeg
 def test_audiobook_metadata_normalizes_language_and_release_date_and_serializes_cleanly(tmp_path):
     from audiobookdl.output import output as out_mod
     from audiobookdl.utils.audiobook import parse_language, parse_release_date
@@ -783,6 +811,7 @@ def test_audiobook_metadata_normalizes_language_and_release_date_and_serializes_
     assert reloaded.metadata.release_date == date(2022, 3, 14)
 
 
+@pytest.mark.ffmpeg
 def test_series_order_zero_included_and_roundtripped(tmp_path):
     from audiobookdl.output.metadata.reader import read_track_tags
 
@@ -823,6 +852,7 @@ def test_series_order_zero_included_and_roundtripped(tmp_path):
     assert flac_reloaded.metadata.description == "First line; contains semicolon; end"
 
 
+@pytest.mark.ffmpeg
 def test_add_metadata_with_track_context_writes_track_and_preserves_series(tmp_path):
     from audiobookdl.output.metadata.reader import read_track_tags
     from audiobookdl.utils.audiobook import TrackTagContext
@@ -851,6 +881,7 @@ def test_add_metadata_with_track_context_writes_track_and_preserves_series(tmp_p
         assert info.metadata.series_order == 2
 
 
+@pytest.mark.ffmpeg
 def test_add_id3_metadata_writes_tags_chapters_and_cover_in_single_save(tmp_path, monkeypatch):
     from audiobookdl import Cover
 

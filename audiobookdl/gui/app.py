@@ -5,25 +5,58 @@ from collections import Counter, deque
 import dataclasses
 import importlib.resources
 import os
-import re
 import subprocess
 import sys
 import tempfile
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from audiobookdl import __version__, args, output
 from audiobookdl.config import (
     DEFAULT_PROFILE,
     is_portable_mode,
     list_source_profiles,
+    make_source_profile_key,
     normalize_profile_name,
+    split_source_profile_key,
 )
 from audiobookdl.exceptions import DownloadCancelled
 from audiobookdl.gui.auth_panel import ServiceAuthCoordinator
 from audiobookdl.gui.controller import GuiController, PackJobRequest
+from audiobookdl.gui.coordinators import (
+    AutomationCoordinator,
+    partition_input_tokens,
+    series_book_exists,
+    split_dropped_tokens,
+)
+from audiobookdl.gui.dnd import create_tk_root, install_windows_file_drop
+from audiobookdl.gui.events import (
+    AbsUploadDoneEvent,
+    AuthVerifiedEvent,
+    BatchItemEvent,
+    CatalogLoadedEvent,
+    ControllerEvent,
+    FfmpegInstallDoneEvent,
+    ItemProgressEvent,
+    JobMetaEvent,
+    JobStatusEvent,
+    LogBatchEvent,
+    LogEvent,
+    PreviewDoneEvent,
+    ProgressAdvanceEvent,
+    ProgressFinishEvent,
+    ProgressMetricsEvent,
+    ProgressStartEvent,
+    PromptChoiceEvent,
+    PromptConfirmEvent,
+    PromptInputEvent,
+    RunDoneEvent,
+    SyncDoneEvent,
+    SyncEnqueueReadyEvent,
+    UpdateCheckedEvent,
+)
 from audiobookdl.gui.ffmpeg_assistant import FFmpegAssistant
 from audiobookdl.gui.formatting import (
     PRESET_LABEL_TO_TEMPLATE,
@@ -37,6 +70,7 @@ from audiobookdl.gui.formatting import (
     is_valid_geometry,
     parse_url_text,
 )
+from audiobookdl.gui.notifications import set_windows_process_app_id
 from audiobookdl.gui.pages import (
     AccountsPage,
     CatalogTab,
@@ -68,7 +102,7 @@ from audiobookdl.sources import ServiceInfo, detect_service_key, get_available_s
 from audiobookdl.sources.source import Source
 from audiobookdl.utils import read_asset_file
 from audiobookdl.utils.archive import DownloadArchive, resolve_archive_path
-from audiobookdl.utils.audiobook import Audiobook, AudiobookMetadata, BookId, Result, Series
+from audiobookdl.utils.audiobook import Audiobook, AudiobookMetadata, Result, Series
 from audiobookdl.utils.updater import UpdateInfo
 
 SAMPLE_STANDALONE_METADATA = AudiobookMetadata(
@@ -188,22 +222,49 @@ class AudiobookDLApp:
         self._theme_var = tk.StringVar(value=self._theme_mode)
         self._palette: ThemePalette = apply_theme(self.root, self._style, self._theme_mode)
 
+        cfg_gui = self._controller.config.gui
         self._services: list[ServiceInfo] = get_available_services()
         self._is_running = False
         self._is_previewing = False
         self._is_syncing = False
         self._preview_dialog: PreviewDialog | None = None
         self._about_dialog: AboutDialog | None = None
-        self._auto_sync_enabled = False
-        self._auto_sync_minutes = 30
-        self._auto_sync_targets: list[tuple[str, str]] = []
-        self._auto_sync_after_id: str | None = None
-        self._clipboard_after_id: str | None = None
-        self._last_seen_clipboard = ""
         self._last_ffmpeg_available = True
         self._last_ffmpeg_status_text = ""
+        self._pending_log_entries: deque[tuple[str | None, str]] = deque(
+            maxlen=ActivityQueuePanel.MAX_LOG_LINES
+        )
 
         self._init_variables()
+
+        self._automation = AutomationCoordinator(
+            self.root,
+            is_clipboard_enabled=lambda: bool(self.clipboard_monitor_var.get()),
+            append_urls=self._append_urls_to_input,
+            save_clipboard_pref=lambda en: self._controller.save_gui_preferences(clipboard_monitor=en),
+            set_status=self.status_var.set,
+            can_run_auto_sync=lambda: (
+                not self._is_running and not self._is_syncing and not self._is_previewing
+            ),
+            execute_sync_targets=self._execute_sync_targets,
+            sync_libraries=self._sync_libraries,
+        )
+        self._automation.auto_sync_enabled = bool(cfg_gui.auto_sync_enabled)
+        self._automation.auto_sync_minutes = (
+            max(1, int(cfg_gui.auto_sync_minutes))
+            if cfg_gui.auto_sync_minutes is not None
+            else 30
+        )
+        self._automation.auto_sync_mode = (
+            cfg_gui.auto_sync_mode
+            if cfg_gui.auto_sync_mode in ("enqueue", "scan_only", "dry_run")
+            else "enqueue"
+        )
+        self._automation.auto_sync_targets = (
+            [split_source_profile_key(t) for t in cfg_gui.auto_sync_targets]
+            if cfg_gui.auto_sync_targets is not None
+            else []
+        )
 
         self._auth = ServiceAuthCoordinator(
             self.root,
@@ -223,7 +284,7 @@ class AudiobookDLApp:
             palette_provider=lambda: self._palette,
             build_verify_options=lambda: self._try_build_options(urls_override=[]),
             is_running_provider=lambda: self._is_running,
-            on_log=lambda msg: self._queue_panel.append_log(msg),
+            on_log=self._append_log,
             on_credentials_changed=self._on_credentials_changed,
         )
 
@@ -232,7 +293,7 @@ class AudiobookDLApp:
             self._controller,
             status_var=self.status_var,
             ffmpeg_status_var=self.ffmpeg_status_var,
-            on_log=lambda msg: self._queue_panel.append_log(msg),
+            on_log=self._append_log,
             on_status_changed=self._on_ffmpeg_status_changed,
         )
 
@@ -254,10 +315,14 @@ class AudiobookDLApp:
         self._poll_after_id: str | None = None
         self._url_debounce_after_id: str | None = None
         self._modal_prompt_active = False
-        self._deferred_modal_events: deque[tuple] = deque()
+        self._deferred_modal_events: deque[ControllerEvent] = deque()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<Destroy>", self._on_root_destroy, add="+")
         self._poll_after_id = self.root.after(50, self._poll_queue)
+        if self.clipboard_monitor_var.get():
+            self._automation.apply_clipboard_monitor(quiet=True, persist=False)
+        if self._automation.auto_sync_enabled:
+            self._automation.configure_auto_sync_timer(True, self._automation.auto_sync_minutes)
 
     def _restore_window_geometry(self) -> None:
         min_w = scale_px(self.root, self.MIN_WIDTH_DP)
@@ -471,13 +536,29 @@ class AudiobookDLApp:
         notify_default = True if cfg.gui.notify_on_complete is None else bool(cfg.gui.notify_on_complete)
         self.notify_on_complete_var = tk.BooleanVar(value=notify_default)
 
-        self.clipboard_monitor_var = tk.BooleanVar(value=False)
+        self.clipboard_monitor_var = tk.BooleanVar(value=bool(cfg.gui.clipboard_monitor))
+        self.check_updates_var = tk.BooleanVar(value=(cfg.check_updates is not False))
         self.status_var = tk.StringVar(value="Ready")
         self.active_job_var = tk.StringVar(value="Idle")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.batch_var = tk.StringVar(value="")
         self.metrics_var = tk.StringVar(value="")
         self.ffmpeg_status_var = tk.StringVar(value="")
+        self._cached_proxy: str | None = None
+        self._cached_timeout: float | None = None
+        self._sync_cached_network_prefs()
+        self.proxy_var.trace_add("write", lambda *_args: self._sync_cached_network_prefs())
+        self.timeout_var.trace_add("write", lambda *_args: self._sync_cached_network_prefs())
+
+    def _sync_cached_network_prefs(self) -> None:
+        raw_proxy = self.proxy_var.get().strip()
+        self._cached_proxy = raw_proxy or None
+        raw_timeout = self.timeout_var.get().strip()
+        try:
+            parsed_timeout = float(raw_timeout) if raw_timeout else None
+            self._cached_timeout = parsed_timeout if (parsed_timeout and parsed_timeout > 0) else None
+        except ValueError:
+            self._cached_timeout = None
 
     def _build_shell(self) -> None:
         self.shell = SidebarShell(
@@ -498,6 +579,24 @@ class AudiobookDLApp:
         self.shell.register_page("settings", self._create_settings_page)
 
         self._bind_drop_target(self.root, stop_prop=False)
+        if not (hasattr(self.root, "drop_target_register") and hasattr(self.root, "dnd_bind")):
+            self._win_drop_installed = False
+
+            def _ensure_win_drop(_ev: tk.Event | None = None) -> None:
+                if self._win_drop_installed:
+                    return
+                try:
+                    if not self.root.winfo_exists() or not self.root.winfo_ismapped():
+                        return
+                except tk.TclError:
+                    return
+                self._win_drop_installed = True
+                install_windows_file_drop(self.root, self._on_dropped_paths)
+
+            if self.root.winfo_ismapped():
+                _ensure_win_drop()
+            else:
+                self.root.bind("<Map>", _ensure_win_drop, add="+")
 
         for var in (
             self.output_dir_var,
@@ -567,6 +666,7 @@ class AudiobookDLApp:
         page.preset_combo.bind("<<ComboboxSelected>>", self._on_preset_selected)
         self._bind_drop_target(page.urls_text, stop_prop=True)
         page.queue_panel.restore_saved_queue_history()
+        self._flush_pending_logs(page.queue_panel)
         page.queue_panel.set_running_state(
             self._is_running,
             is_previewing=self._is_previewing,
@@ -643,20 +743,9 @@ class AudiobookDLApp:
             )
 
         def _on_run_sync(targets: list[tuple[str, str]], mode: str) -> None:
-            self._auto_sync_targets = list(targets)
-            if mode == "enqueue":
-                self._sync_and_enqueue_targets(targets)
-            elif mode == "dry_run":
-                self._sync_libraries(
-                    services=[s for s, _p in targets],
-                    scan_only=True,
-                    dry_run=True,
-                )
-            else:
-                self._sync_libraries(
-                    services=[s for s, _p in targets],
-                    scan_only=True,
-                )
+            self._automation.auto_sync_targets = list(targets)
+            self._automation.auto_sync_mode = mode
+            self._execute_sync_targets(targets, mode)
 
         return LibraryPage(
             parent,
@@ -678,10 +767,19 @@ class AudiobookDLApp:
             ),
             profile_resolver=_profile_resolver,
             status_resolver=_status_resolver,
-            auto_sync_enabled=self._auto_sync_enabled,
-            auto_sync_minutes=self._auto_sync_minutes,
+            cover_fetcher=lambda url: self._controller.fetch_cover_bytes(
+                url,
+                proxy=self._cached_proxy,
+                timeout=self._cached_timeout,
+            ),
+            on_catalog_cancel=self._controller.cancel_catalog_fetch,
+            auto_sync_enabled=self._automation.auto_sync_enabled,
+            auto_sync_minutes=self._automation.auto_sync_minutes,
+            auto_sync_mode=self._automation.auto_sync_mode,
+            auto_sync_targets=self._automation.auto_sync_targets or None,
             on_run_sync=_on_run_sync,
-            on_auto_sync_changed=self._configure_auto_sync_timer,
+            on_auto_sync_changed=self._automation.configure_auto_sync_timer,
+            on_save_schedule=self._save_sync_schedule,
             palette_provider=lambda: self._palette,
         )
 
@@ -720,8 +818,10 @@ class AudiobookDLApp:
             theme_var=self._theme_var,
             notify_on_complete_var=self.notify_on_complete_var,
             clipboard_monitor_var=self.clipboard_monitor_var,
+            check_updates_var=self.check_updates_var,
             on_theme_changed=self.set_theme,
             on_toggle_clipboard_monitor=self._toggle_clipboard_monitor,
+            on_toggle_check_updates=self._toggle_check_updates,
             on_reload_config=self._reload_config,
             on_check_updates=self.check_updates_interactive,
             ffmpeg_assistant=self._ffmpeg_assistant,
@@ -751,9 +851,88 @@ class AudiobookDLApp:
 
     def _refresh_saved_queue_badge(self) -> None:
         records = self._controller.load_saved_queue_records()
+        self._update_download_badge_from_records(records)
+
+    def _update_download_badge_from_records(self, records: Sequence[Mapping[str, Any]]) -> None:
         active = sum(1 for r in records if str(r.get("status") or "") in ("Running", "Queued", "Paused"))
         failed = sum(1 for r in records if str(r.get("status") or "") in ("Failed", "Interrupted"))
         self.shell.set_download_badge(active, failed)
+
+    def _append_log(self, text: str, *, level: str | None = None) -> None:
+        dl_page = self.shell.get_page("download")
+        if dl_page is not None:
+            if level is None:
+                dl_page.queue_panel.append_log(text)
+            else:
+                dl_page.queue_panel.append_log_batch([(level, text)])
+            return
+        self._pending_log_entries.append((level, text))
+
+    def _flush_pending_logs(self, panel: ActivityQueuePanel) -> None:
+        if not self._pending_log_entries:
+            return
+        entries: list[tuple[str, str]] = []
+        for level, text in self._pending_log_entries:
+            if level is None:
+                tag = panel._classify_log_tag("INFO", text)
+                resolved = {"error": "ERROR", "warn": "WARNING", "debug": "DEBUG"}.get(tag, "INFO")
+                entries.append((resolved, text))
+            else:
+                entries.append((level, text))
+        self._pending_log_entries.clear()
+        panel.append_log_batch(entries)
+
+    def _handle_deferred_activity_event(self, item: ControllerEvent) -> bool:
+        """Handle activity events without forcing lazy `DownloadPage` creation."""
+        if isinstance(item, LogEvent):
+            prefix = f"[{item.level}] " if item.level in ("DEBUG", "ERROR") else ""
+            self._append_log(f"{prefix}{item.message}", level=str(item.level))
+            if item.level == "INFO" and str(item.message).strip():
+                self.status_var.set(str(item.message).strip().splitlines()[0][:80])
+            return True
+        if isinstance(item, LogBatchEvent):
+            last_info = ""
+            for level, message in item.entries:
+                prefix = f"[{level}] " if level in ("DEBUG", "ERROR") else ""
+                self._append_log(f"{prefix}{message}", level=str(level))
+                if level == "INFO" and str(message).strip():
+                    last_info = str(message)
+            if last_info:
+                self.status_var.set(last_info.strip().splitlines()[0][:80])
+            return True
+        if isinstance(item, JobStatusEvent):
+            self._controller.update_queue_record(item.job_id, item.status, item.detail)
+            with self._controller.queue_lock:
+                records = list(self._controller.queue_records.values())
+            self._update_download_badge_from_records(records)
+            return True
+        if isinstance(item, JobMetaEvent):
+            self._controller.update_queue_metadata(
+                item.job_id,
+                title=item.title or None,
+                output_path=item.output_path or None,
+            )
+            if item.title:
+                self.active_job_var.set(str(item.title).strip()[:60])
+            return True
+        if isinstance(item, ProgressStartEvent):
+            self.progress_var.set(0.0)
+            self.status_var.set(str(item.description)[:80])
+            if str(item.description).strip():
+                self.active_job_var.set(str(item.description).strip()[:60])
+            return True
+        if isinstance(item, ProgressAdvanceEvent):
+            pct = (item.completed / item.total * 100.0) if item.total > 0 else 0.0
+            self.progress_var.set(min(100.0, max(0.0, pct)))
+            return True
+        if isinstance(item, ProgressMetricsEvent):
+            pct = (item.completed / item.total * 100.0) if item.total > 0 else 0.0
+            self.progress_var.set(min(100.0, max(0.0, pct)))
+            return True
+        if isinstance(item, ProgressFinishEvent):
+            self.progress_var.set(100.0)
+            return True
+        return isinstance(item, (BatchItemEvent, ItemProgressEvent))
 
     def _bind_drop_target(self, target: Any, *, stop_prop: bool) -> None:
         if not (hasattr(target, "drop_target_register") and hasattr(target, "dnd_bind")):
@@ -864,84 +1043,34 @@ class AudiobookDLApp:
             syncing=self._is_syncing,
         )
 
-    @staticmethod
-    def _split_dropped_tokens(raw_data: str) -> list[str]:
-        tokens: list[str] = []
-        for match in re.finditer(r"\{([^}]+)\}|(\S+)", raw_data):
-            val = (match.group(1) or match.group(2) or "").strip()
-            if val:
-                tokens.append(val)
-        return tokens
-
-    def _partition_input_tokens(self, tokens: Sequence[str]) -> tuple[list[str], list[str]]:
-        local_paths: list[str] = []
-        url_tokens: list[str] = []
-        for tok in tokens:
-            cleaned = tok.strip().strip('"').strip("'")
-            if not cleaned:
-                continue
-            if os.path.isdir(cleaned) or (
-                os.path.isfile(cleaned)
-                and os.path.splitext(cleaned)[1].lstrip(".").lower() in SUPPORTED_PACK_EXTENSIONS
-            ):
-                local_paths.append(cleaned)
-            else:
-                url_tokens.append(cleaned)
-        return local_paths, url_tokens
-
-    def _on_url_drop(self, event: Any) -> None:
-        dropped = getattr(event, "data", "")
-        if not dropped:
-            return
-        tokens = self._split_dropped_tokens(str(dropped))
-        local_paths, url_tokens = self._partition_input_tokens(tokens)
+    def _on_dropped_paths(self, tokens: Sequence[str]) -> None:
+        local_paths, url_tokens = partition_input_tokens(tokens)
         if local_paths:
             self.open_pack_with_paths(local_paths)
         if url_tokens:
             self._append_urls_to_input(url_tokens)
 
-    def _toggle_clipboard_monitor(self) -> None:
-        if self._clipboard_after_id is not None:
-            try:
-                self.root.after_cancel(self._clipboard_after_id)
-            except tk.TclError:
-                pass
-            self._clipboard_after_id = None
-        if self.clipboard_monitor_var.get():
-            try:
-                self._last_seen_clipboard = str(self.root.clipboard_get() or "")
-            except tk.TclError:
-                self._last_seen_clipboard = ""
-            self.status_var.set("Clipboard URL monitor enabled")
-            self._clipboard_after_id = self.root.after(1200, self._poll_clipboard)
-        else:
-            self.status_var.set("Clipboard URL monitor disabled")
-
-    def _poll_clipboard(self) -> None:
-        self._clipboard_after_id = None
-        if not self.clipboard_monitor_var.get():
+    def _on_url_drop(self, event: Any) -> None:
+        dropped = getattr(event, "data", "")
+        if not dropped:
             return
+        tokens = split_dropped_tokens(str(dropped))
+        self._on_dropped_paths(tokens)
+
+    def _toggle_clipboard_monitor(self) -> None:
+        self._automation.apply_clipboard_monitor(quiet=False, persist=True)
+
+    def _toggle_check_updates(self) -> None:
+        enabled = bool(self.check_updates_var.get())
         try:
-            if not self.root.winfo_exists():
-                return
-            raw = str(self.root.clipboard_get() or "")
-        except tk.TclError:
-            raw = ""
-        if raw and raw != self._last_seen_clipboard:
-            self._last_seen_clipboard = raw
-            candidates = [
-                u for u in parse_url_text(raw)
-                if u.lower().startswith(("http://", "https://")) and detect_service_key(u)
-            ]
-            if candidates:
-                added = self._append_urls_to_input(candidates)
-                if added:
-                    self.status_var.set(f"Captured {len(added)} URL(s) from clipboard")
-        try:
-            if self.root.winfo_exists() and self.clipboard_monitor_var.get():
-                self._clipboard_after_id = self.root.after(1200, self._poll_clipboard)
-        except tk.TclError:
+            self._controller.set_check_updates(enabled)
+        except OSError:
             pass
+        self.status_var.set(
+            "Automatic startup update checks enabled"
+            if enabled
+            else "Automatic startup update checks disabled"
+        )
 
     def _append_urls_to_input(self, urls: Sequence[str]) -> list[str]:
         box = self.urls_text
@@ -1048,12 +1177,38 @@ class AudiobookDLApp:
                 self.download_archive_var.set(bool(cfg.gui.use_download_archive))
             if cfg.gui.notify_on_complete is not None:
                 self.notify_on_complete_var.set(bool(cfg.gui.notify_on_complete))
+            if cfg.gui.clipboard_monitor is not None:
+                self.clipboard_monitor_var.set(bool(cfg.gui.clipboard_monitor))
+                self._automation.apply_clipboard_monitor(quiet=True, persist=False)
+            self.check_updates_var.set(cfg.check_updates is not False)
+            if cfg.gui.auto_sync_enabled is not None:
+                self._automation.auto_sync_enabled = bool(cfg.gui.auto_sync_enabled)
+            if cfg.gui.auto_sync_minutes is not None:
+                self._automation.auto_sync_minutes = max(1, int(cfg.gui.auto_sync_minutes))
+            if cfg.gui.auto_sync_mode in ("enqueue", "scan_only", "dry_run"):
+                self._automation.auto_sync_mode = cfg.gui.auto_sync_mode
+            if cfg.gui.auto_sync_targets is not None:
+                self._automation.auto_sync_targets = [
+                    split_source_profile_key(t) for t in cfg.gui.auto_sync_targets
+                ]
+            self._automation.configure_auto_sync_timer(
+                self._automation.auto_sync_enabled,
+                self._automation.auto_sync_minutes,
+            )
+            lib_page = self.shell.get_page("library")
+            if lib_page is not None:
+                lib_page.sync_tab.apply_saved_schedule(
+                    enabled=self._automation.auto_sync_enabled,
+                    minutes=self._automation.auto_sync_minutes,
+                    mode=self._automation.auto_sync_mode,
+                    targets=self._automation.auto_sync_targets or None,
+                )
             self.set_theme(cfg.gui.theme or "system")
             self.m4b_var.set(self.output_format_var.get() == "m4b")
             self._auth.load_service_into_form()
             self._auth.update_field_states()
             self.status_var.set("Config reloaded")
-            self._queue_panel.append_log("Reloaded configuration.")
+            self._append_log("Reloaded configuration.")
         except Exception as exc:
             messagebox.showerror("Config Error", str(exc), parent=self.root)
 
@@ -1080,7 +1235,7 @@ class AudiobookDLApp:
         if not entry.output_path:
             return
         self.status_var.set(f"Uploading '{entry.title}' to Audiobookshelf...")
-        self._queue_panel.append_log(f"Uploading to Audiobookshelf: {entry.title}")
+        self._append_log(f"Uploading to Audiobookshelf: {entry.title}")
         authors = [a.strip() for a in (entry.author or "").split(";") if a.strip()]
         self._controller.start_abs_upload(
             entry.output_path,
@@ -1101,7 +1256,7 @@ class AudiobookDLApp:
 
     def _schedule_update_check(self) -> None:
         """Run a quiet background update check at launch unless opted out."""
-        if self._controller.config.check_updates is False:
+        if not self.check_updates_var.get() or self._controller.config.check_updates is False:
             return
         self._controller.start_update_check(interactive=False, respect_opt_out=True)
 
@@ -1195,7 +1350,7 @@ class AudiobookDLApp:
             self.status_var.set("Clipboard is empty")
             return []
         lines = [ln.strip() for ln in str(raw).splitlines() if ln.strip()]
-        local_paths, _url_candidates = self._partition_input_tokens(lines)
+        local_paths, _url_candidates = partition_input_tokens(lines)
         pasted = [
             u
             for u in parse_url_text(raw)
@@ -1670,30 +1825,48 @@ class AudiobookDLApp:
             append_log_msg=f"--- Added {len(queued_jobs)} retry job(s) to queue (total {new_total}) ---",
         )
 
-    def _configure_auto_sync_timer(self, enabled: bool, minutes: int) -> None:
-        self._auto_sync_enabled = enabled
-        self._auto_sync_minutes = max(1, int(minutes))
-        if self._auto_sync_after_id is not None:
-            try:
-                self.root.after_cancel(self._auto_sync_after_id)
-            except tk.TclError:
-                pass
-            self._auto_sync_after_id = None
-        if enabled:
-            delay_ms = self._auto_sync_minutes * 60 * 1000
-            self._auto_sync_after_id = self.root.after(delay_ms, self._on_auto_sync_tick)
+    def _execute_sync_targets(self, targets: Sequence[tuple[str, str]], mode: str) -> None:
+        if mode == "enqueue":
+            self._sync_and_enqueue_targets(targets)
+        elif mode == "dry_run":
+            self._sync_libraries(
+                services=[s for s, _p in targets],
+                scan_only=True,
+                dry_run=True,
+            )
+        else:
+            self._sync_libraries(
+                services=[s for s, _p in targets],
+                scan_only=True,
+            )
 
-    def _on_auto_sync_tick(self) -> None:
-        self._auto_sync_after_id = None
-        if not self._auto_sync_enabled:
+    def _save_sync_schedule(
+        self,
+        enabled: bool,
+        minutes: int,
+        mode: str,
+        targets: list[tuple[str, str]],
+    ) -> None:
+        norm_minutes = max(1, int(minutes))
+        norm_mode = mode if mode in ("enqueue", "scan_only", "dry_run") else "enqueue"
+        self._automation.auto_sync_mode = norm_mode
+        self._automation.auto_sync_targets = list(targets)
+        self._automation.configure_auto_sync_timer(enabled, norm_minutes)
+        serialized_targets = [make_source_profile_key(s, p) for s, p in targets]
+        try:
+            self._controller.save_gui_preferences(
+                auto_sync_enabled=bool(enabled),
+                auto_sync_minutes=norm_minutes,
+                auto_sync_mode=norm_mode,
+                auto_sync_targets=serialized_targets,
+            )
+        except OSError as exc:
+            self.status_var.set(f"Failed to save auto-sync schedule: {exc}")
             return
-        if not self._is_running and not self._is_syncing and not self._is_previewing:
-            targets = list(self._auto_sync_targets)
-            if targets:
-                self._sync_and_enqueue_targets(targets)
-            else:
-                self._sync_libraries()
-        self._configure_auto_sync_timer(True, self._auto_sync_minutes)
+        if enabled:
+            self.status_var.set(f"Saved auto-sync schedule (every {norm_minutes} min)")
+        else:
+            self.status_var.set("Saved auto-sync schedule (disabled)")
 
     def _sync_and_enqueue_targets(self, targets: Sequence[tuple[str, str]]) -> None:
         if self._is_running:
@@ -1707,7 +1880,7 @@ class AudiobookDLApp:
             return
         self._set_syncing_state(True)
         self.status_var.set("Scanning libraries for pending books...")
-        self._queue_panel.append_log("--- Scanning libraries for pending books ---")
+        self._append_log("--- Scanning libraries for pending books ---")
         sync_opts = args.SyncOptions(
             services=[s for s, _p in targets],
             scan_only=True,
@@ -1737,7 +1910,7 @@ class AudiobookDLApp:
             return
         self._set_syncing_state(True)
         self.status_var.set("Syncing libraries...")
-        self._queue_panel.append_log("--- Starting library sync ---")
+        self._append_log("--- Starting library sync ---")
         sync_opts = args.SyncOptions(
             services=list(services),
             scan_only=scan_only,
@@ -1753,7 +1926,7 @@ class AudiobookDLApp:
         self._set_syncing_state(False)
         if exc is not None:
             self.status_var.set("Library sync failed")
-            self._queue_panel.append_log(f"[ERROR] Library sync failed: {exc}")
+            self._append_log(f"[ERROR] Library sync failed: {exc}")
             messagebox.showerror("Library Sync Failed", str(exc), parent=self.root)
             return
         if cycle is None:
@@ -1761,16 +1934,16 @@ class AudiobookDLApp:
             return
         if getattr(cycle, "cancelled", False):
             self.status_var.set("Library sync cancelled")
-            self._queue_panel.append_log("--- Library sync cancelled ---")
+            self._append_log("--- Library sync cancelled ---")
             return
         msg = (
             f"Discovered {cycle.books_discovered}, new {cycle.newly_added}, "
             f"downloaded {cycle.downloaded}, skipped {cycle.skipped}, failed {cycle.failed}"
         )
         self.status_var.set(f"Sync complete: {msg}")
-        self._queue_panel.append_log(f"--- Library sync finished: {msg} ---")
+        self._append_log(f"--- Library sync finished: {msg} ---")
         for err in getattr(cycle, "errors", ()):
-            self._queue_panel.append_log(f"[WARN] {err}")
+            self._append_log(f"[WARN] {err}")
         lib_page = self.shell.get_page("library")
         if lib_page is not None:
             lib_page.archive_tab.refresh()
@@ -1999,12 +2172,16 @@ class AudiobookDLApp:
             result,
             is_running=self._is_running,
             skip_downloaded=self.skip_downloaded_var.get(),
-            series_book_exists=lambda book: self._series_book_exists(
-                book,
-                options=cached_series_opts,
-                dir_stems_cache=dir_stems_cache,
-                archive_titles_cache=archive_titles_cache,
-                series_title=series_title,
+            series_book_exists=lambda book: (
+                series_book_exists(
+                    book,
+                    options=cached_series_opts,
+                    dir_stems_cache=dir_stems_cache,
+                    archive_titles_cache=archive_titles_cache,
+                    series_title=series_title,
+                )
+                if cached_series_opts is not None
+                else False
             ),
             on_confirm=self._enqueue_from_preview,
             palette=self._palette,
@@ -2013,56 +2190,6 @@ class AudiobookDLApp:
         )
         self._preview_dialog = dialog
         return dialog
-
-    def _series_book_exists(
-        self,
-        book: BookId[Any] | Audiobook,
-        *,
-        options: args.DownloadOptions | None = None,
-        dir_stems_cache: dict[str, set[str]] | None = None,
-        archive_titles_cache: set[str] | None = None,
-        series_title: str | None = None,
-    ) -> bool:
-        """Return True when `book` already appears on disk or in the archive ledger."""
-        meta: AudiobookMetadata | None = None
-        book_title = ""
-        if isinstance(book, Audiobook):
-            meta = book.metadata
-            book_title = meta.title.strip()
-        else:
-            raw_title = getattr(book, "title", None)
-            if not raw_title and isinstance(getattr(book, "id", None), dict):
-                raw_title = book.id.get("title") or book.id.get("name")
-            if raw_title:
-                book_title = str(raw_title).strip()
-                meta = AudiobookMetadata(title=book_title, series=series_title)
-        if archive_titles_cache and book_title and book_title.casefold() in archive_titles_cache:
-            return True
-        if meta is None:
-            return False
-        try:
-            opts = options if options is not None else self.build_options()
-            template = opts.output_template or "{title}"
-            if not isinstance(book, Audiobook):
-                if "{author" in template or "{narrator" in template:
-                    return False
-            target = output.gen_output_location(template, meta, opts.remove_chars)
-            if os.path.exists(target):
-                return True
-            if opts.output_format and os.path.exists(f"{target}.{opts.output_format}"):
-                return True
-            parent = os.path.dirname(target) or "."
-            base = os.path.basename(target)
-            if dir_stems_cache is not None and parent in dir_stems_cache:
-                return base in dir_stems_cache[parent]
-            if os.path.isdir(parent):
-                stems = {os.path.splitext(entry)[0] for entry in os.listdir(parent)}
-                if dir_stems_cache is not None:
-                    dir_stems_cache[parent] = stems
-                return base in stems
-        except (OSError, ValueError, KeyError):
-            return False
-        return False
 
     def _enqueue_from_preview(
         self,
@@ -2171,121 +2298,112 @@ class AudiobookDLApp:
     def _on_root_destroy(self, event: tk.Event) -> None:
         if getattr(event, "widget", None) is self.root:
             self._cancel_poll_timer()
-        if self._auto_sync_after_id is not None:
-            try:
-                self.root.after_cancel(self._auto_sync_after_id)
-            except tk.TclError:
-                pass
-            self._auto_sync_after_id = None
-        if self._clipboard_after_id is not None:
-            try:
-                self.root.after_cancel(self._clipboard_after_id)
-            except tk.TclError:
-                pass
-            self._clipboard_after_id = None
+        self._automation.cancel_auto_sync()
+        self._automation.cancel_clipboard()
 
-    def _handle_event(self, item: tuple) -> None:
-        if item[0] in (
-            "log",
-            "log_batch",
-            "batch_item",
-            "job_status",
-            "job_meta",
-            "item_progress",
-            "progress_start",
-            "progress_advance",
-            "progress_metrics",
-            "progress_finish",
+    def _handle_event(self, item: ControllerEvent) -> None:
+        if isinstance(
+            item,
+            (
+                LogEvent,
+                LogBatchEvent,
+                BatchItemEvent,
+                JobStatusEvent,
+                JobMetaEvent,
+                ItemProgressEvent,
+                ProgressStartEvent,
+                ProgressAdvanceEvent,
+                ProgressMetricsEvent,
+                ProgressFinishEvent,
+            ),
         ):
-            if self._queue_panel.handle_activity_event(item):
+            dl_page = self.shell.get_page("download")
+            if dl_page is not None:
+                if dl_page.queue_panel.handle_activity_event(item):
+                    return
+            elif self._handle_deferred_activity_event(item):
                 return
-        kind = item[0]
-        if kind in ("prompt_input", "prompt_confirm", "prompt_choice"):
+        if isinstance(item, (PromptInputEvent, PromptConfirmEvent, PromptChoiceEvent)):
             if self._modal_prompt_active:
                 self._deferred_modal_events.append(item)
                 return
             self._modal_prompt_active = True
             try:
-                if kind == "prompt_input":
-                    _, prompt, hidden, holder, done = item
-                    holder["value"] = simpledialog.askstring(
+                if isinstance(item, PromptInputEvent):
+                    item.holder["value"] = simpledialog.askstring(
                         "Authentication Required",
-                        f"{prompt}:",
-                        show="*" if hidden else None,
+                        f"{item.prompt}:",
+                        show="*" if item.hidden else None,
                         parent=self.root,
                     )
-                    done.set()
-                elif kind == "prompt_confirm":
-                    _, message, holder, done = item
-                    holder["value"] = messagebox.askyesno("Confirm", message, parent=self.root)
-                    done.set()
-                elif kind == "prompt_choice":
-                    _, choice_title, choices, default_idx, holder, done = item
+                    item.done.set()
+                elif isinstance(item, PromptConfirmEvent):
+                    item.holder["value"] = messagebox.askyesno(
+                        "Confirm", item.message, parent=self.root
+                    )
+                    item.done.set()
+                elif isinstance(item, PromptChoiceEvent):
                     dlg = ChoiceDialog(
                         self.root,
-                        choice_title,
-                        choices,
-                        default=default_idx,
+                        item.title,
+                        item.choices,
+                        default=item.default_index,
                         palette=self._palette,
                     )
                     self.root.wait_window(dlg)
-                    holder["value"] = dlg.selected_index
-                    done.set()
+                    item.holder["value"] = dlg.selected_index
+                    item.done.set()
             finally:
                 self._modal_prompt_active = False
-        elif kind == "preview_done":
-            _, preview_url, prepared, preview_exc = item
-            self._handle_preview_done(preview_url, prepared, preview_exc)
-        elif kind == "auth_verified":
-            _, service_label, ok, auth_exc = item
-            self._auth.handle_auth_verified(service_label, ok, auth_exc)
-        elif kind == "catalog_loaded":
-            _, req_id, target_tab, payload, cat_exc = item
-            if req_id != self._controller.catalog_request_id:
+        elif isinstance(item, PreviewDoneEvent):
+            self._handle_preview_done(item.url, item.prepared, item.error)
+        elif isinstance(item, AuthVerifiedEvent):
+            self._auth.handle_auth_verified(item.service_label, item.ok, item.error)
+        elif isinstance(item, CatalogLoadedEvent):
+            if item.request_id != self._controller.catalog_request_id:
                 return
-            catalog_tab: CatalogTab = target_tab
+            catalog_tab: CatalogTab = item.target_tab
             try:
                 if not catalog_tab.winfo_exists():
                     return
             except tk.TclError:
                 return
-            if cat_exc is not None:
-                err_text = str(cat_exc).strip() or type(cat_exc).__name__
+            if item.error is not None:
+                err_text = str(item.error).strip() or type(item.error).__name__
                 first_line = err_text.splitlines()[0].strip()
                 catalog_tab.set_error_status(f"Error: {first_line}")
-                self._queue_panel.append_log(f"[ERROR] Catalog fetch failed: {err_text}")
+                self._append_log(f"[ERROR] Catalog fetch failed: {err_text}")
                 messagebox.showerror("Catalog Error", err_text, parent=self.root)
             else:
-                if isinstance(payload, tuple) and len(payload) == 2:
-                    books, statuses = payload
+                if isinstance(item.payload, tuple) and len(item.payload) == 2:
+                    books, statuses = item.payload
                 else:
-                    books, statuses = payload, None
+                    books, statuses = item.payload, None
                 catalog_tab.populate_items(books, statuses=statuses)
-        elif kind == "ffmpeg_install_done":
-            _, ok, detail = item
-            self._ffmpeg_assistant.handle_install_done(ok, detail)
-        elif kind == "update_checked":
-            _, info, interactive = item
-            self._handle_update_checked(info, interactive)
-        elif kind == "sync_done":
-            _, cycle, sync_exc = item
-            self._handle_sync_done(cycle, sync_exc)
-        elif kind == "sync_enqueue_ready":
-            _, pending_groups, stats, sync_exc = item
-            self._handle_sync_enqueue_ready(pending_groups, stats, sync_exc)
-        elif kind == "abs_upload_done":
-            _, book_title, ok, err_msg = item
-            if ok:
-                self.status_var.set(f"Uploaded '{book_title}' to Audiobookshelf")
-                self._queue_panel.append_log(f"Uploaded '{book_title}' to Audiobookshelf")
+        elif isinstance(item, FfmpegInstallDoneEvent):
+            self._ffmpeg_assistant.handle_install_done(item.ok, item.detail)
+        elif isinstance(item, UpdateCheckedEvent):
+            self._handle_update_checked(item.info, item.interactive)
+        elif isinstance(item, SyncDoneEvent):
+            self._handle_sync_done(item.cycle, item.error)
+        elif isinstance(item, SyncEnqueueReadyEvent):
+            self._handle_sync_enqueue_ready(item.pending_groups, item.stats, item.error)
+        elif isinstance(item, AbsUploadDoneEvent):
+            if item.ok:
+                self.status_var.set(f"Uploaded '{item.title}' to Audiobookshelf")
+                self._append_log(f"Uploaded '{item.title}' to Audiobookshelf")
             else:
                 self.status_var.set("Audiobookshelf upload failed")
-                self._queue_panel.append_log(f"[ERROR] Audiobookshelf upload failed: {err_msg}")
-                messagebox.showerror("Audiobookshelf Upload Failed", str(err_msg), parent=self.root)
-        elif kind == "done":
-            _, run_id, summary, exc = item
-            if run_id == self._queue_panel.current_ui_run_id:
-                self._finish_run(summary, exc)
+                self._append_log(f"[ERROR] Audiobookshelf upload failed: {item.error_message}")
+                messagebox.showerror(
+                    "Audiobookshelf Upload Failed",
+                    str(item.error_message),
+                    parent=self.root,
+                )
+        elif isinstance(item, RunDoneEvent):
+            dl_page = self.shell.get_page("download")
+            if dl_page is None or item.run_id == dl_page.queue_panel.current_ui_run_id:
+                self._finish_run(item.summary, item.error)
 
     def _handle_sync_enqueue_ready(
         self,
@@ -2296,15 +2414,15 @@ class AudiobookDLApp:
         self._set_syncing_state(False)
         if exc is not None:
             self.status_var.set("Library sync failed")
-            self._queue_panel.append_log(f"[ERROR] Library sync failed: {exc}")
+            self._append_log(f"[ERROR] Library sync failed: {exc}")
             messagebox.showerror("Library Sync Failed", str(exc), parent=self.root)
             return
         if stats.get("cancelled"):
             self.status_var.set("Library sync cancelled")
-            self._queue_panel.append_log("--- Library sync cancelled ---")
+            self._append_log("--- Library sync cancelled ---")
             return
         for err in stats.get("errors") or ():
-            self._queue_panel.append_log(f"[WARN] {err}")
+            self._append_log(f"[WARN] {err}")
         lib_page = self.shell.get_page("library")
         if lib_page is not None:
             lib_page.archive_tab.refresh()
@@ -2312,7 +2430,7 @@ class AudiobookDLApp:
         if total_urls == 0:
             discovered = stats.get("discovered", 0)
             self.status_var.set(f"Sync complete: {discovered} discovered, 0 pending")
-            self._queue_panel.append_log(
+            self._append_log(
                 f"--- Library sync finished: {discovered} discovered, 0 pending ---"
             )
             return
@@ -2358,7 +2476,7 @@ class AudiobookDLApp:
                 f"Download: {info.release_url}"
             )
             self.status_var.set(f"Update available: v{info.latest_version}")
-            self._queue_panel.append_log(
+            self._append_log(
                 f"Update available: v{info.latest_version} ({info.release_url})"
             )
             if interactive:
@@ -2422,23 +2540,14 @@ class AudiobookDLApp:
                 use_download_archive=self.download_archive_var.get(),
                 theme=self._theme_mode,
                 notify_on_complete=self.notify_on_complete_var.get(),
+                clipboard_monitor=self.clipboard_monitor_var.get(),
                 output_prefs=self._read_persisted_gui_preferences(),
             )
         except OSError:
             pass
         self._cancel_poll_timer()
-        if self._auto_sync_after_id is not None:
-            try:
-                self.root.after_cancel(self._auto_sync_after_id)
-            except tk.TclError:
-                pass
-            self._auto_sync_after_id = None
-        if self._clipboard_after_id is not None:
-            try:
-                self.root.after_cancel(self._clipboard_after_id)
-            except tk.TclError:
-                pass
-            self._clipboard_after_id = None
+        self._automation.cancel_auto_sync()
+        self._automation.cancel_clipboard()
         self._controller.shutdown(
             is_running=self._is_running,
             is_previewing=self._is_previewing,
@@ -2576,7 +2685,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         run_self_test(check_gui=True)
         return
     _enable_high_dpi_awareness()
-    root = tk.Tk()
+    set_windows_process_app_id()
+    root = create_tk_root()
     app = AudiobookDLApp(root, config_location=parsed.config_location)
     app._schedule_update_check()
     root.mainloop()

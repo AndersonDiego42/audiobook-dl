@@ -518,4 +518,88 @@ def test_debug_and_cover_keys_merge_from_config(tmp_path):
     assert opts.cover is True
 
 
+def test_gui_clipboard_sync_schedule_and_check_updates_round_trip(tmp_path):
+    from audiobookdl import logging
+    from audiobookdl.config import save_check_updates
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    save_gui_preferences(
+        overwrite=str(cfg_path),
+        clipboard_monitor=True,
+        auto_sync_enabled=True,
+        auto_sync_minutes=45,
+        auto_sync_mode="scan_only",
+        auto_sync_targets=["storytel", "everand:work"],
+    )
+    save_check_updates(False, overwrite=str(cfg_path))
+
+    loaded = load_config(str(cfg_path))
+    assert loaded.check_updates is False
+    assert loaded.gui.clipboard_monitor is True
+    assert loaded.gui.auto_sync_enabled is True
+    assert loaded.gui.auto_sync_minutes == 45
+    assert loaded.gui.auto_sync_mode == "scan_only"
+    assert loaded.gui.auto_sync_targets == ["storytel", "everand:work"]
+
+    # Empty targets list round-trips cleanly as []
+    save_gui_preferences(overwrite=str(cfg_path), auto_sync_targets=[])
+    loaded_empty = load_config(str(cfg_path))
+    assert loaded_empty.gui.auto_sync_targets == []
+
+    # Invalid values emit warnings and fall back to None
+    cfg_path.write_text(
+        "[gui]\n"
+        'clipboard_monitor = "yes"\n'
+        "auto_sync_minutes = 0\n"
+        'auto_sync_mode = "bogus"\n'
+        'auto_sync_targets = "not-a-list"\n',
+        encoding="utf-8",
+    )
+    sink = _RecordingSink()
+    with logging.job_context(logging.JobContext(sink=sink)):
+        invalid = load_config(str(cfg_path))
+    assert invalid.gui.clipboard_monitor is None
+    assert invalid.gui.auto_sync_minutes is None
+    assert invalid.gui.auto_sync_mode is None
+    assert invalid.gui.auto_sync_targets is None
+    joined = "\n".join(sink.messages)
+    assert "clipboard_monitor" in joined
+    assert "auto_sync_minutes" in joined
+    assert "auto_sync_mode" in joined
+    assert "auto_sync_targets" in joined
+
+
+def test_resolve_effective_source_profile(tmp_path):
+    from audiobookdl.config import resolve_effective_source_profile, structure_config
+
+    cfg = structure_config(
+        str(tmp_path / "audiobook-dl.toml"),
+        {
+            "sources": {
+                "everand": {"profiles": {"work": {"username": "bob"}}},
+                "storytel": {
+                    "username": "alice",
+                    "profiles": {"kids": {"username": "kid"}},
+                },
+                "nextory": {
+                    "profiles": {
+                        "a": {"username": "u1"},
+                        "b": {"username": "u2"},
+                    }
+                },
+            }
+        },
+        credential_store=None,
+    )
+    # Sole named profile auto-selected when default is absent
+    assert resolve_effective_source_profile(cfg, "everand") == "work"
+    # Default takes precedence when present
+    assert resolve_effective_source_profile(cfg, "storytel") == "default"
+    # Explicit profile always wins
+    assert resolve_effective_source_profile(cfg, "storytel", "kids") == "kids"
+    # Multiple named profiles without default falls back to default
+    assert resolve_effective_source_profile(cfg, "nextory") == "default"
+
+
+
 

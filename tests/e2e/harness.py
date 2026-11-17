@@ -367,7 +367,7 @@ class GuiHarness:
             if predicate():
                 self.diagnostics.record_gui_snapshot(self.snapshot())
                 return
-            time.sleep(0.02)
+            time.sleep(0.05)
         self.diagnostics.record_gui_snapshot(self.snapshot())
         raise TimeoutError(
             f"GUI timed out after {effective_timeout:.1f}s waiting for {description}: "

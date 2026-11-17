@@ -15,7 +15,7 @@ from audiobookdl.config import (
 )
 from audiobookdl.credentials import get_credential_store
 from audiobookdl.gui.auth_panel import ServiceAuthCoordinator, ServiceAuthPanel
-from audiobookdl.gui.controller import GuiController
+from audiobookdl.gui.controller import GuiController, GuiInteractionHandler
 from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, make_bold_font, scale_px
 from audiobookdl.gui.widgets import MainThreadCallbackQueue, ScrolledTreeview, TreeColumnSpec
 from audiobookdl.pipeline import verify_service_auth
@@ -54,6 +54,9 @@ class AccountsPage(ttk.Frame):
         self._cb_queue = MainThreadCallbackQueue(self)
         self._rows: list[tuple[str, str]] = []
         self._is_testing = False
+        self._test_cancel_event: threading.Event | None = None
+        self._test_interaction: GuiInteractionHandler | None = None
+        self.bind("<Destroy>", self._on_destroy)
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(2, weight=1)
@@ -92,6 +95,13 @@ class AccountsPage(ttk.Frame):
         btn_bar.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         self._test_all_btn = ttk.Button(btn_bar, text="Test All Logins", command=self._test_all_logins)
         self._test_all_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self._cancel_test_btn = ttk.Button(
+            btn_bar,
+            text="Cancel Test",
+            command=self._cancel_test_logins,
+            state="disabled",
+        )
+        self._cancel_test_btn.pack(side=tk.LEFT, padx=(0, 6))
         if self._on_import_cookies is not None:
             ttk.Button(btn_bar, text="Import Cookies...", command=self._import_cookies).pack(
                 side=tk.LEFT, padx=(0, 6)
@@ -214,6 +224,16 @@ class AccountsPage(ttk.Frame):
         self.refresh()
         self._status_var.set(f"Removed credentials for {svc_key} ({prof}).")
 
+    def _cancel_test_logins(self) -> None:
+        if not self._is_testing:
+            return
+        self._cancel_test_btn.configure(state="disabled")
+        self._status_var.set("Cancelling login verification...")
+        if self._test_cancel_event is not None:
+            self._test_cancel_event.set()
+        if self._test_interaction is not None:
+            self._test_interaction.release_all()
+
     def _test_all_logins(self) -> None:
         if self._is_testing:
             return
@@ -231,6 +251,7 @@ class AccountsPage(ttk.Frame):
             return
         self._is_testing = True
         self._test_all_btn.configure(state="disabled")
+        self._cancel_test_btn.configure(state="normal")
         self._loading_bar.grid()
         self._loading_bar.start(12)
         self._status_var.set(f"Verifying {len(targets)} configured account(s)...")
@@ -245,21 +266,37 @@ class AccountsPage(ttk.Frame):
                     vals[5] = "Valid" if ok else (f"Failed: {err}" if err else "Failed")
                     self._tree.item(iid, values=tuple(vals), tags=("ok" if ok else "err",))
 
-        def _finish(valid_count: int, total: int) -> None:
+        def _finish(valid_count: int, checked_count: int, total: int, cancelled: bool) -> None:
             if not self.winfo_exists():
                 return
             self._is_testing = False
             self._loading_bar.stop()
             self._loading_bar.grid_remove()
+            self._cancel_test_btn.configure(state="disabled")
             self._test_all_btn.configure(state="normal")
-            self._status_var.set(f"Verified {valid_count}/{total} configured account(s).")
+            if cancelled:
+                self._status_var.set(
+                    f"Verification cancelled ({checked_count}/{total} checked, {valid_count} valid)."
+                )
+            else:
+                self._status_var.set(f"Verified {valid_count}/{total} configured account(s).")
 
+        cancel_ev = threading.Event()
+        interaction = GuiInteractionHandler(self._controller.event_queue, cancel_ev)
+        self._test_cancel_event = cancel_ev
+        self._test_interaction = interaction
+        self._controller._register_aux_interaction(interaction)
         self._cb_queue.begin_task()
 
         def _worker() -> None:
             valid = 0
+            checked = 0
+            was_cancelled = False
             try:
                 for svc_key, prof in targets:
+                    if cancel_ev.is_set():
+                        was_cancelled = True
+                        break
                     opts = args.build_default_options(
                         config_location=self._controller.config_location,
                         profile=None if prof == DEFAULT_PROFILE else prof,
@@ -267,9 +304,18 @@ class AccountsPage(ttk.Frame):
                     ok = False
                     err: str | None = None
                     try:
-                        ok = verify_service_auth(svc_key, opts, cfg)
+                        ok = verify_service_auth(
+                            svc_key,
+                            opts,
+                            cfg,
+                            interaction=interaction,
+                        )
                     except Exception as exc:
-                        err = str(exc)
+                        err = str(exc) or type(exc).__name__
+                    if cancel_ev.is_set():
+                        was_cancelled = True
+                        break
+                    checked += 1
                     if ok:
                         valid += 1
 
@@ -283,12 +329,30 @@ class AccountsPage(ttk.Frame):
 
                     self._cb_queue.post(_emit_row)
             finally:
+                cancel_ev.set()
+                interaction.release_all()
+                self._controller._unregister_aux_interaction(interaction)
+                self._test_cancel_event = None
+                self._test_interaction = None
                 total = len(targets)
 
-                def _emit_finish(v: int = valid, tot: int = total) -> None:
-                    _finish(v, tot)
+                def _emit_finish(
+                    v: int = valid,
+                    chk: int = checked,
+                    tot: int = total,
+                    can: bool = was_cancelled,
+                ) -> None:
+                    _finish(v, chk, tot, can)
 
                 self._cb_queue.post(_emit_finish)
                 self._cb_queue.finish_worker()
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_destroy(self, event: tk.Event) -> None:
+        if event.widget is not self:
+            return
+        if self._test_cancel_event is not None:
+            self._test_cancel_event.set()
+        if self._test_interaction is not None:
+            self._test_interaction.release_all()

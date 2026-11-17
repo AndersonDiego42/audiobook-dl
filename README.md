@@ -73,13 +73,13 @@ python -m audiobookdl.gui
 ```
 
 Key GUI features:
-- **URL auto-detection & queueing**: Paste, drag, or load `.txt` URL lists; add extra URLs to the active queue with **Add to Queue**.
-- **Preview & Series selection**: Click **Preview** to inspect/edit metadata and inspect part/chapter counts before downloading, or select specific books from a series.
-- **One-click `.m4b` & quality control**: Check **Download as .m4b** to automatically combine parts and convert to `.m4b` in a single pass, and choose **M4B Quality** (`Auto`, `64k`, `96k`, `128k`, `192k`, `256k`). In `Auto` mode, source bitrate is probed via `ffprobe` and clamped to `64k`–`192k`.
-- **Resumable downloads**: Enable **Resume partial** to keep downloaded segments and resume partial files via HTTP `Range` requests after interruption.
-- **Library Ledger & Local Scanner**: Browse `downloads.db`, search with field-scoped queries, edit tags, hide/trash items, scan local folders for existing audiobooks, and export catalogs to `.csv`, `.json`, or `.xlsx`.
-- **Credential management**: Save per-service/profile logins or import browser cookies in `audiobook-dl.toml` with passwords stored in the OS credential store.
-- **FFmpeg folder picker**: Click **Locate FFmpeg...** if `ffmpeg`/`ffprobe` is not on your `PATH`; the path is saved in `audiobook-dl.toml`.
+- **Five-page sidebar navigation**: Switch between **Download**, **Library** (`Archive`, `Catalog`, `Sync`), **Pack**, **Accounts**, and **Settings** using the sidebar or keyboard shortcuts (`Ctrl+1`–`Ctrl+5`, `Ctrl+O` open URL list, `Ctrl+P` preview, `F5` refresh, `Ctrl+Enter` start/queue, `Ctrl+Q` exit).
+- **URL auto-detection & drag-and-drop**: Paste, drop OS files/folders/URLs/`.txt` URL lists onto the window, capture supported URLs from the clipboard, or add extra items directly to an active batch with **Add to Queue**.
+- **Preview, Enrichment & Chapter Editor**: Inspect and edit metadata/cover, preview individual books in a series, search external metadata providers via the diff picker, and edit, add, shift timestamps, merge, import, or export `.cue`/`.json` chapters in the interactive chapter editor.
+- **Persistent Queue & Per-Job Options**: View inline job profiles and live stage progress, edit per-job profile/format overrides before running, cooperatively pause/resume mid-book, and export or import queues as `.json`/`.txt`.
+- **One-click `.m4b` & Local Pack**: Repackage local audio folders into chaptered `.m4b` files on the **Pack** page, and choose **M4B Quality** (`Auto`, `64k`, `96k`, `128k`, `192k`, `256k`).
+- **Paginated Library Ledger & Sync**: Browse `downloads.db` with pagination, edit item metadata/tags, hide/trash items, verify missing paths, scan local folders, sync linked accounts on a schedule, upload to Audiobookshelf, and export to `.csv`, `.json`, or `.xlsx`.
+- **Credential & FFmpeg Management**: Configure multi-profile logins, import browser cookies, and run connection tests from **Accounts**, or pick a custom `ffmpeg`/`ffprobe` directory in **Settings**.
 
 ## Authentication
 

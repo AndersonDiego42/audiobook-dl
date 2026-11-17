@@ -37,8 +37,10 @@ class SettingsPage(ttk.Frame):
         theme_var: tk.StringVar,
         notify_on_complete_var: tk.BooleanVar,
         clipboard_monitor_var: tk.BooleanVar,
+        check_updates_var: tk.BooleanVar | None = None,
         on_theme_changed: Callable[[str], object],
         on_toggle_clipboard_monitor: Callable[[], None],
+        on_toggle_check_updates: Callable[[], None] | None = None,
         on_reload_config: Callable[[], None],
         on_check_updates: Callable[[], None],
         ffmpeg_assistant: FFmpegAssistant,
@@ -209,8 +211,17 @@ class SettingsPage(ttk.Frame):
             wraplength=scale_px(self, 560),
         ).grid(row=0, column=0, sticky="w", pady=(0, 6))
 
+        updates_var = check_updates_var if check_updates_var is not None else tk.BooleanVar(value=True)
+        chk_kwargs: dict[str, object] = {
+            "text": "Automatically check for updates at startup",
+            "variable": updates_var,
+        }
+        if on_toggle_check_updates is not None:
+            chk_kwargs["command"] = on_toggle_check_updates
+        ttk.Checkbutton(cfg_frame, **chk_kwargs).grid(row=1, column=0, sticky="w", pady=(0, 6))  # type: ignore[arg-type]
+
         cfg_btns = ttk.Frame(cfg_frame)
-        cfg_btns.grid(row=1, column=0, sticky="w")
+        cfg_btns.grid(row=2, column=0, sticky="w")
         ttk.Button(cfg_btns, text="Reload Config", command=on_reload_config).pack(
             side=tk.LEFT, padx=(0, 6)
         )
@@ -218,10 +229,11 @@ class SettingsPage(ttk.Frame):
             side=tk.LEFT, padx=(0, 10)
         )
         ttk.Label(cfg_btns, text=f"v{__version__}", style="Muted.TLabel").pack(side=tk.LEFT)
+        self._scroll.guard_scroll_inputs()
 
     def apply_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
-        self._scroll.apply_theme(palette.bg)
+        self._scroll.apply_theme(palette)
 
     def on_show(self) -> None:
         """Refresh FFmpeg and Audiobookshelf field values from current config."""

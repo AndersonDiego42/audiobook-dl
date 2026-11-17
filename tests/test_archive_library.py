@@ -231,6 +231,7 @@ def test_cli_library_subcommand_list_tag_hide_trash_restore(tmp_path, capsys):
     assert restored is not None and restored.status == "downloaded"
 
 
+@pytest.mark.gui
 def test_gui_archive_dialog_tags_hide_trash_and_queue(tmp_path):
     try:
         root = tk.Tk()
@@ -272,6 +273,7 @@ def test_gui_archive_dialog_tags_hide_trash_and_queue(tmp_path):
         root.destroy()
 
 
+@pytest.mark.gui
 def test_gui_series_and_podcast_grouping_in_catalog_and_archive(tmp_path):
     from audiobookdl.gui.pages.library_page import CatalogTab
     from audiobookdl.sources import ServiceInfo
@@ -464,6 +466,68 @@ def test_lookup_catalog_statuses_badges(tmp_path):
             "",
             "Downloaded",
         ]
+    finally:
+        archive.close()
+
+
+def test_archive_count_offset_pagination_and_update_entry(tmp_path):
+    db_path = tmp_path / "paginated.db"
+    archive = DownloadArchive(str(db_path), persistent=True)
+    try:
+        for i in range(7):
+            archive.record(
+                "librivox",
+                f"k{i}",
+                title=f"Book {i:02d}",
+                author="Author X" if i % 2 == 0 else "Author Y",
+                status="downloaded",
+            )
+        assert archive.count_entries() == 7
+        assert archive.count_entries(query='author:"Author X"') == 4
+
+        page1 = archive.list_entries(limit=3, offset=0)
+        page2 = archive.list_entries(limit=3, offset=3)
+        page3 = archive.list_entries(limit=3, offset=6)
+        assert [e.title for e in page1] == ["Book 06", "Book 05", "Book 04"]
+        assert [e.title for e in page2] == ["Book 03", "Book 02", "Book 01"]
+        assert [e.title for e in page3] == ["Book 00"]
+
+        # Python-filter fallback path (negated term) respects count_entries and offset
+        assert archive.count_entries(query='-author:"Author Y"') == 4
+        neg_p2 = archive.list_entries(query='-author:"Author Y"', limit=2, offset=2)
+        assert len(neg_p2) == 2
+
+        target_id = page3[0].id
+        moved_file = tmp_path / "Relinked.m4b"
+        updated = archive.update_entry(
+            target_id,
+            title="Book 00 Revised",
+            author="New Author",
+            narrator="New Narrator",
+            series="Saga",
+            series_order=1,
+            isbn="9780000000001",
+            asin="B0NEW123",
+            output_path=str(moved_file),
+            status="pending",
+            tags=["Sci-Fi", "Edited"],
+        )
+        assert updated is not None
+        assert updated.title == "Book 00 Revised"
+        assert updated.author == "New Author"
+        assert updated.narrator == "New Narrator"
+        assert updated.series == "Saga"
+        assert updated.series_order == 1
+        assert updated.isbn == "9780000000001"
+        assert updated.asin == "B0NEW123"
+        assert updated.output_path == str(moved_file)
+        assert updated.status == "pending"
+        assert updated.tags == ("edited", "sci-fi")
+
+        with pytest.raises(ValueError, match="Title cannot be empty"):
+            archive.update_entry(target_id, title="   ")
+        with pytest.raises(ValueError, match="Invalid library status"):
+            archive.update_entry(target_id, status="bogus")
     finally:
         archive.close()
 

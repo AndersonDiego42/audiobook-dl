@@ -29,6 +29,11 @@ GUI_CONFIG_KEYS: frozenset[str] = frozenset(
         "use_download_archive",
         "theme",
         "notify_on_complete",
+        "clipboard_monitor",
+        "auto_sync_enabled",
+        "auto_sync_minutes",
+        "auto_sync_mode",
+        "auto_sync_targets",
     }
 )
 SOURCE_CONFIG_KEYS: frozenset[str] = frozenset({"username", "password", "library", "cookie_file"})

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 import shutil
 import subprocess
@@ -9,6 +10,11 @@ import sys
 import threading
 
 from audiobookdl.pipeline import DownloadSummary
+
+WINDOWS_APP_USER_MODEL_ID = "jo1gi.audiobook-dl"
+_POWERSHELL_FALLBACK_AUMID = (
+    r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe"
+)
 
 
 def format_completion_notification(
@@ -67,12 +73,60 @@ def _resolve_windows_powershell() -> tuple[str | None, bool]:
     return None, False
 
 
+def set_windows_process_app_id(aumid: str = WINDOWS_APP_USER_MODEL_ID) -> bool:
+    """Bind the current process to a custom Windows AppUserModelID for taskbar & toasts."""
+    if sys.platform != "win32":
+        return False
+    try:
+        shell32 = getattr(ctypes, "windll", None)
+        if shell32 is None:
+            return False
+        rc = int(shell32.shell32.SetCurrentProcessExplicitAppUserModelID(str(aumid)))
+        return rc >= 0
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def ensure_windows_aumid_registered(
+    *,
+    app_name: str = "audiobook-dl",
+    aumid: str = WINDOWS_APP_USER_MODEL_ID,
+    icon_path: str | None = None,
+) -> bool:
+    """Register per-user HKCU AppUserModelId metadata so Windows toasts show `app_name`."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+    except ImportError:
+        return False
+    key_path = rf"Software\Classes\AppUserModelId\{aumid}"
+    try:
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_WRITE) as key:
+            winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, str(app_name))
+            resolved_icon = icon_path
+            if resolved_icon is None:
+                candidate = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "icon.ico")
+                if os.path.isfile(candidate):
+                    resolved_icon = candidate
+            if resolved_icon and os.path.isfile(resolved_icon):
+                winreg.SetValueEx(key, "IconUri", 0, winreg.REG_SZ, os.path.abspath(resolved_icon))
+        return True
+    except OSError:
+        return False
+
+
 def _send_windows_toast(title: str, message: str, *, app_name: str, timeout: float) -> bool:
     """Display a Windows 10/11 toast notification via WinRT PowerShell 5.1 or `pwsh` NotifyIcon fallback."""
     exe, supports_winrt = _resolve_windows_powershell()
     if not exe:
         return False
 
+    aumid = (
+        WINDOWS_APP_USER_MODEL_ID
+        if ensure_windows_aumid_registered(app_name=app_name, aumid=WINDOWS_APP_USER_MODEL_ID)
+        else _POWERSHELL_FALLBACK_AUMID
+    )
     if supports_winrt:
         script = (
             "$ErrorActionPreference = 'Stop'\n"
@@ -103,7 +157,7 @@ def _send_windows_toast(title: str, message: str, *, app_name: str, timeout: flo
     env = os.environ.copy()
     env["ABDL_NOTIFY_TITLE"] = title
     env["ABDL_NOTIFY_MSG"] = message
-    env["ABDL_NOTIFY_APP"] = r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe"
+    env["ABDL_NOTIFY_APP"] = aumid
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         completed = subprocess.run(

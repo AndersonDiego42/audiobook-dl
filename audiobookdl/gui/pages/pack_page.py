@@ -7,6 +7,7 @@ import os
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from typing import Any
 from collections.abc import Callable, Sequence
 
 from audiobookdl import args
@@ -15,9 +16,91 @@ from audiobookdl.gui.chapter_editor import ChapterEditorFrame
 from audiobookdl.gui.controller import GuiController, PackJobRequest
 from audiobookdl.gui.formatting import format_duration
 from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, make_bold_font, scale_px
-from audiobookdl.gui.widgets import MainThreadCallbackQueue, ScrolledTreeview, TreeColumnSpec
+from audiobookdl.gui.widgets import MainThreadCallbackQueue, ModalDialog, ScrolledTreeview, TreeColumnSpec
 from audiobookdl.pack import PackBookSpec, PackOverrides, scope_overrides_for_batch
 from audiobookdl.utils.audiobook import Chapter, parse_language, parse_release_date
+
+
+def _parse_series_order(raw_order: str) -> int | None:
+    cleaned = raw_order.strip()
+    if not cleaned:
+        return None
+    try:
+        num = float(cleaned)
+    except ValueError as exc:
+        raise ValueError(f"Invalid series order {cleaned!r}") from exc
+    if not num.is_integer():
+        raise ValueError(f"Series order must be a whole integer, got {cleaned!r}")
+    return int(num)
+
+
+class _PackBookEditDialog(ModalDialog):
+    """Modal dialog for overriding a single detected book's Title, Author(s), and Series #."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        *,
+        title: str,
+        authors: Sequence[str],
+        series_order: int | None,
+        palette: ThemePalette,
+    ) -> None:
+        super().__init__(
+            parent,
+            "Edit Detected Book",
+            palette=palette,
+            resizable=(False, False),
+        )
+        self.result: dict[str, Any] | None = None
+
+        body = ttk.Frame(self, padding=scale_px(self, 12))
+        body.pack(fill=tk.BOTH, expand=True)
+        body.columnconfigure(1, weight=1)
+
+        self._title_var = tk.StringVar(value=title)
+        self._authors_var = tk.StringVar(value="; ".join(authors))
+        self._order_var = tk.StringVar(value="" if series_order is None else str(series_order))
+
+        ttk.Label(body, text="Title:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        title_entry = ttk.Entry(body, textvariable=self._title_var, width=40)
+        title_entry.grid(row=0, column=1, sticky="ew", pady=4)
+
+        ttk.Label(body, text="Author(s):").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(body, textvariable=self._authors_var, width=40).grid(
+            row=1, column=1, sticky="ew", pady=4
+        )
+
+        ttk.Label(body, text="Series #:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(body, textvariable=self._order_var, width=10).grid(
+            row=2, column=1, sticky="w", pady=4
+        )
+
+        btns = ttk.Frame(body)
+        btns.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Save", command=self._save).pack(side=tk.RIGHT, padx=(0, 6))
+
+        self.bind("<Return>", lambda _e: self._save())
+        self.finalize_modal(initial_focus=title_entry)
+
+    def _save(self) -> None:
+        title = self._title_var.get().strip()
+        if not title:
+            messagebox.showwarning("Invalid Book", "Title cannot be empty.", parent=self)
+            return
+        try:
+            series_order = _parse_series_order(self._order_var.get())
+        except ValueError as exc:
+            messagebox.showwarning("Invalid Series #", str(exc), parent=self)
+            return
+        authors = [part.strip() for part in self._authors_var.get().split(";") if part.strip()]
+        self.result = {
+            "title": title,
+            "authors": authors,
+            "series_order": series_order,
+        }
+        self.destroy()
 
 
 class PackPage(ttk.Frame):
@@ -53,7 +136,8 @@ class PackPage(ttk.Frame):
         self._palette = palette or LIGHT_PALETTE
         self._paths: list[str] = []
         self._preview_specs: list[PackBookSpec] = []
-        self._edited_chapters: list[Chapter] | None = None
+        self._edited_chapters_by_idx: dict[int, list[Chapter]] = {}
+        self._book_overrides_by_idx: dict[int, dict[str, Any]] = {}
         self._scan_token = 0
         self._is_scanning = False
         self._cb_queue = MainThreadCallbackQueue(self)
@@ -108,7 +192,7 @@ class PackPage(ttk.Frame):
     def apply_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
         if hasattr(self, "_chapter_editor"):
-            self._chapter_editor._palette = palette
+            self._chapter_editor.apply_theme(palette)
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
@@ -233,12 +317,18 @@ class PackPage(ttk.Frame):
         scan_bar.grid(row=3, column=0, sticky="ew", pady=(0, 6))
         scan_bar.columnconfigure(1, weight=1)
         self._scan_btn = ttk.Button(scan_bar, text="Scan & Preview", command=self._start_scan)
-        self._scan_btn.grid(row=0, column=0, padx=(0, 10))
+        self._scan_btn.grid(row=0, column=0, padx=(0, 6))
+        self._edit_book_btn = ttk.Button(
+            scan_bar, text="Edit Book...", command=self._edit_selected_book
+        )
+        self._edit_book_btn.grid(row=0, column=1, padx=(0, 10))
+        scan_bar.columnconfigure(1, weight=0)
+        scan_bar.columnconfigure(2, weight=1)
         ttk.Label(scan_bar, textvariable=self.status_var, style="Secondary.TLabel").grid(
-            row=0, column=1, sticky="w"
+            row=0, column=2, sticky="w"
         )
         self._loading_bar = ttk.Progressbar(scan_bar, mode="indeterminate", length=120)
-        self._loading_bar.grid(row=0, column=2, sticky="e", padx=(8, 0))
+        self._loading_bar.grid(row=0, column=3, sticky="e", padx=(8, 0))
         self._loading_bar.grid_remove()
 
         # Row 4: Preview Tree & Chapters Editor Notebook
@@ -254,6 +344,7 @@ class PackPage(ttk.Frame):
         self._scrolled_tree.grid(row=0, column=0, sticky="nsew")
         self._tree = self._scrolled_tree.tree
         self._tree.bind("<<TreeviewSelect>>", self._on_book_selected)
+        self._tree.bind("<Double-1>", lambda _e: self._edit_selected_book())
         self._scrolled_tree.set_empty_state(
             True,
             "Add a local folder or audio tracks above to preview.",
@@ -328,7 +419,8 @@ class PackPage(ttk.Frame):
         self._scan_btn.configure(state="normal")
         self._pack_btn.configure(state="normal")
         self._preview_specs.clear()
-        self._edited_chapters = None
+        self._edited_chapters_by_idx.clear()
+        self._book_overrides_by_idx.clear()
         self._chapter_editor.set_chapters([])
         for iid in self._tree.get_children():
             self._tree.delete(iid)
@@ -340,38 +432,91 @@ class PackPage(ttk.Frame):
         )
         self.status_var.set(message)
 
-    def _on_book_selected(self, _event: tk.Event | None = None) -> None:
+    def _selected_book_index(self) -> int | None:
         sel = self._tree.selection()
         if not sel:
-            return
+            return None
         try:
             idx = int(sel[0])
         except ValueError:
+            return None
+        return idx if 0 <= idx < len(self._preview_specs) else None
+
+    def _on_book_selected(self, _event: tk.Event | None = None) -> None:
+        idx = self._selected_book_index()
+        if idx is None:
             return
-        if 0 <= idx < len(self._preview_specs):
-            spec = self._preview_specs[idx]
-            dur_ms = round(spec.total_duration_seconds * 1000) if spec.total_duration_seconds > 0 else None
-            self._chapter_editor.set_chapters(
-                spec.audiobook.chapters,
-                total_duration_ms=dur_ms,
-                source_label=spec.chapters_source,
-            )
+        spec = self._preview_specs[idx]
+        dur_ms = round(spec.total_duration_seconds * 1000) if spec.total_duration_seconds > 0 else None
+        chapters = self._edited_chapters_by_idx.get(idx, spec.audiobook.chapters)
+        self._chapter_editor.set_chapters(
+            chapters,
+            total_duration_ms=dur_ms,
+            source_label=spec.chapters_source,
+        )
 
     def _on_chapters_edited(self, chapters: list[Chapter]) -> None:
-        self._edited_chapters = chapters
-        sel = self._tree.selection()
-        if sel:
-            try:
-                idx = int(sel[0])
-                if 0 <= idx < len(self._preview_specs):
-                    self._preview_specs[idx].audiobook.chapters = chapters
-                    self._preview_specs[idx].chapters_source = "edited"
-                    vals = list(self._tree.item(sel[0], "values"))
-                    if len(vals) >= 4:
-                        vals[3] = len(chapters)
-                        self._tree.item(sel[0], values=tuple(vals))
-            except ValueError:
-                pass
+        idx = self._selected_book_index()
+        if idx is None and len(self._preview_specs) == 1:
+            idx = 0
+        if idx is None:
+            return
+        ch_copy = [Chapter(start=ch.start, title=ch.title) for ch in chapters]
+        self._edited_chapters_by_idx[idx] = ch_copy
+        self._preview_specs[idx].audiobook.chapters = ch_copy
+        self._preview_specs[idx].chapters_source = "edited"
+        iid = str(idx)
+        if self._tree.exists(iid):
+            vals = list(self._tree.item(iid, "values"))
+            if len(vals) >= 4:
+                vals[3] = len(ch_copy)
+                self._tree.item(iid, values=tuple(vals))
+
+    def _edit_selected_book(self) -> None:
+        idx = self._selected_book_index()
+        if idx is None:
+            return
+        spec = self._preview_specs[idx]
+        existing = self._book_overrides_by_idx.get(idx, {})
+        dlg = _PackBookEditDialog(
+            self,
+            title=str(existing.get("title") or spec.audiobook.title),
+            authors=existing.get("authors", spec.audiobook.metadata.authors),
+            series_order=(
+                existing["series_order"]
+                if "series_order" in existing
+                else spec.audiobook.metadata.series_order
+            ),
+            palette=self._palette,
+        )
+        self.wait_window(dlg)
+        if dlg.result is None:
+            return
+        self._apply_book_override(idx, dlg.result)
+
+    def _apply_book_override(self, idx: int, book_ov: dict[str, Any]) -> None:
+        if not (0 <= idx < len(self._preview_specs)):
+            return
+        spec = self._preview_specs[idx]
+        self._book_overrides_by_idx[idx] = dict(book_ov)
+        if book_ov.get("title"):
+            spec.audiobook.metadata.title = str(book_ov["title"])
+        if "authors" in book_ov:
+            spec.audiobook.metadata.authors = list(book_ov["authors"])
+        if "series_order" in book_ov:
+            spec.audiobook.metadata.series_order = book_ov["series_order"]
+        if len(self._preview_specs) == 1:
+            self.title_var.set(str(book_ov.get("title") or ""))
+            self.author_var.set("; ".join(book_ov.get("authors") or []))
+            order_val = book_ov.get("series_order")
+            self.series_order_var.set("" if order_val is None else str(order_val))
+        iid = str(idx)
+        if self._tree.exists(iid):
+            vals = list(self._tree.item(iid, "values"))
+            if len(vals) >= 2:
+                vals[0] = spec.audiobook.title
+                vals[1] = spec.audiobook.metadata.author or "(Unknown)"
+                self._tree.item(iid, values=tuple(vals))
 
     def _on_scan_option_changed(self) -> None:
         if self._paths:
@@ -404,21 +549,12 @@ class PackPage(ttk.Frame):
     def _split_multi_value(raw: str) -> list[str]:
         return [part.strip() for part in raw.split(";") if part.strip()]
 
-    def _build_overrides(self) -> PackOverrides | None:
+    def _build_overrides(self, *, book_idx: int | None = None) -> PackOverrides | None:
         title = self.title_var.get().strip() or None
         authors = self._split_multi_value(self.author_var.get())
         narrators = self._split_multi_value(self.narrator_var.get())
         series = self.series_var.get().strip() or None
-        raw_order = self.series_order_var.get().strip()
-        series_order: int | None = None
-        if raw_order:
-            try:
-                num = float(raw_order)
-            except ValueError as exc:
-                raise ValueError(f"Invalid series order {raw_order!r}") from exc
-            if not num.is_integer():
-                raise ValueError(f"Series order must be a whole integer, got {raw_order!r}")
-            series_order = int(num)
+        series_order = _parse_series_order(self.series_order_var.get())
         asin = self.asin_var.get().strip() or None
         isbn = self.isbn_var.get().strip() or None
         cover_path = self.cover_path_var.get().strip() or None
@@ -431,7 +567,12 @@ class PackPage(ttk.Frame):
         if raw_lang and parse_language(raw_lang) is None:
             raise ValueError(f"Unrecognized language {raw_lang!r}")
         description = self.description_var.get().strip() or None
-        chapters = self._edited_chapters
+        raw_chapters = self._edited_chapters_by_idx.get(book_idx) if book_idx is not None else None
+        chapters = (
+            [Chapter(start=ch.start, title=ch.title) for ch in raw_chapters]
+            if raw_chapters is not None
+            else None
+        )
         if not any(
             (
                 title,
@@ -468,6 +609,31 @@ class PackPage(ttk.Frame):
             chapters=chapters,
         )
 
+    def _merge_book_overrides(
+        self,
+        base_overrides: PackOverrides | None,
+        idx: int,
+    ) -> PackOverrides | None:
+        raw_chapters = self._edited_chapters_by_idx.get(idx)
+        book_ov = self._book_overrides_by_idx.get(idx)
+        if raw_chapters is None and not book_ov:
+            return base_overrides
+        merged = (
+            dataclasses.replace(base_overrides)
+            if base_overrides is not None
+            else PackOverrides()
+        )
+        if raw_chapters is not None:
+            merged.chapters = [Chapter(start=ch.start, title=ch.title) for ch in raw_chapters]
+        if book_ov:
+            if book_ov.get("title"):
+                merged.title = str(book_ov["title"])
+            if book_ov.get("authors"):
+                merged.authors = list(book_ov["authors"])
+            if book_ov.get("series_order") is not None:
+                merged.series_order = int(book_ov["series_order"])
+        return merged
+
     def _clone_options_for_pack(self) -> args.DownloadOptions | None:
         base = self._options_provider()
         if base is None:
@@ -486,7 +652,7 @@ class PackPage(ttk.Frame):
             )
             return
         try:
-            overrides = self._build_overrides()
+            overrides = self._build_overrides(book_idx=None)
         except ValueError as exc:
             messagebox.showerror("Invalid Override", str(exc), parent=self.winfo_toplevel())
             return
@@ -519,9 +685,13 @@ class PackPage(ttk.Frame):
                 self._tree.delete(iid)
             if e is not None:
                 self._preview_specs.clear()
+                self._edited_chapters_by_idx.clear()
+                self._book_overrides_by_idx.clear()
                 self._scrolled_tree.set_empty_state(True, f"Scan error: {e}")
                 self.status_var.set(f"Scan error: {e}")
                 return
+            self._edited_chapters_by_idx.clear()
+            self._book_overrides_by_idx.clear()
             self._preview_specs = s or []
             for idx, spec in enumerate(self._preview_specs):
                 dur = format_duration(spec.total_duration_seconds) if spec.total_duration_seconds > 0 else "-"
@@ -581,7 +751,8 @@ class PackPage(ttk.Frame):
             )
             return
         try:
-            overrides = self._build_overrides()
+            book_idx = 0 if len(self._preview_specs) <= 1 else None
+            overrides = self._build_overrides(book_idx=book_idx)
         except ValueError as exc:
             messagebox.showerror("Invalid Override", str(exc), parent=self.winfo_toplevel())
             return
@@ -603,23 +774,30 @@ class PackPage(ttk.Frame):
 
         if len(self._preview_specs) > 1:
             batch_overrides = scope_overrides_for_batch(overrides, len(self._preview_specs))
-            requests = [
-                PackJobRequest(
-                    paths=[spec.source_root] if os.path.isdir(spec.source_root) else list(spec.track_paths),
-                    recursive=False,
-                    delete_source=delete_source,
-                    output_dir=output_dir,
-                    overrides=batch_overrides,
-                    label=spec.audiobook.title,
-                    output_format=fmt,
+            requests = []
+            for idx, spec in enumerate(self._preview_specs):
+                book_ov = self._book_overrides_by_idx.get(idx)
+                label = str((book_ov or {}).get("title") or spec.audiobook.title)
+                requests.append(
+                    PackJobRequest(
+                        paths=[spec.source_root] if os.path.isdir(spec.source_root) else list(spec.track_paths),
+                        recursive=False,
+                        delete_source=delete_source,
+                        output_dir=output_dir,
+                        overrides=self._merge_book_overrides(batch_overrides, idx),
+                        label=label,
+                        output_format=fmt,
+                    )
                 )
-                for spec in self._preview_specs
-            ]
         else:
-            label = (
-                self._preview_specs[0].audiobook.title
-                if self._preview_specs
-                else (os.path.basename(self._paths[0]) or self._paths[0])
+            book_ov = self._book_overrides_by_idx.get(0)
+            label = str(
+                (book_ov or {}).get("title")
+                or (
+                    self._preview_specs[0].audiobook.title
+                    if self._preview_specs
+                    else (os.path.basename(self._paths[0]) or self._paths[0])
+                )
             )
             requests = [
                 PackJobRequest(
@@ -627,7 +805,11 @@ class PackPage(ttk.Frame):
                     recursive=recursive,
                     delete_source=delete_source,
                     output_dir=output_dir,
-                    overrides=overrides,
+                    overrides=(
+                        self._merge_book_overrides(overrides, 0)
+                        if 0 in self._book_overrides_by_idx
+                        else overrides
+                    ),
                     label=label,
                     output_format=fmt,
                 )

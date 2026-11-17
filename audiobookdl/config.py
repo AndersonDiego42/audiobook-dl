@@ -54,6 +54,11 @@ class GuiConfig:
     use_download_archive: bool | None = None
     theme: str | None = None
     notify_on_complete: bool | None = None
+    clipboard_monitor: bool | None = None
+    auto_sync_enabled: bool | None = None
+    auto_sync_minutes: int | None = None
+    auto_sync_mode: str | None = None
+    auto_sync_targets: list[str] | None = None
 
 
 @define
@@ -135,6 +140,15 @@ class Config:
             use_download_archive=self.gui.use_download_archive,
             theme=self.gui.theme,
             notify_on_complete=self.gui.notify_on_complete,
+            clipboard_monitor=self.gui.clipboard_monitor,
+            auto_sync_enabled=self.gui.auto_sync_enabled,
+            auto_sync_minutes=self.gui.auto_sync_minutes,
+            auto_sync_mode=self.gui.auto_sync_mode,
+            auto_sync_targets=(
+                list(self.gui.auto_sync_targets)
+                if self.gui.auto_sync_targets is not None
+                else None
+            ),
         )
         abs_copy = AudiobookshelfConfig(
             url=self.audiobookshelf.url,
@@ -240,6 +254,26 @@ def list_source_profiles(config: Config, service_key: str) -> list[str]:
             profiles.append(prof)
     profiles.sort(key=lambda p: (0 if p == DEFAULT_PROFILE else 1, p))
     return profiles
+
+
+def resolve_effective_source_profile(
+    config: Config,
+    service_key: str,
+    requested_profile: str | None = None,
+    *,
+    aliases: Sequence[str] = (),
+) -> str:
+    """Resolve the active profile for `service_key`, auto-selecting a sole named profile when `default` is absent."""
+    if requested_profile is not None and requested_profile.strip():
+        norm_req = normalize_profile_name(requested_profile)
+        if norm_req != DEFAULT_PROFILE:
+            return norm_req
+    if get_source_config(config, service_key, DEFAULT_PROFILE, aliases=aliases) is not None:
+        return DEFAULT_PROFILE
+    profiles = list_source_profiles(config, service_key)
+    if DEFAULT_PROFILE not in profiles and len(profiles) == 1:
+        return profiles[0]
+    return DEFAULT_PROFILE
 
 
 def list_configured_source_profiles(config: Config) -> list[tuple[str, str, SourceConfig]]:
@@ -488,6 +522,46 @@ def _read_gui_split_ratio(gui_section: dict[str, Any]) -> float | None:
     return float(raw)
 
 
+def _read_gui_positive_int(gui_section: dict[str, Any], key: str) -> int | None:
+    """Return a positive integer `[gui]` value, logging and ignoring invalid entries."""
+    raw = gui_section.get(key)
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        logging.log(f"Warning: config '[gui].{key}' must be an integer >= 1; ignoring")
+        return None
+    return raw
+
+
+_VALID_AUTO_SYNC_MODES = ("enqueue", "scan_only", "dry_run")
+
+
+def _read_gui_sync_mode(gui_section: dict[str, Any]) -> str | None:
+    """Return `[gui].auto_sync_mode` when it is `'enqueue'`, `'scan_only'`, or `'dry_run'`."""
+    raw = gui_section.get("auto_sync_mode")
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized in _VALID_AUTO_SYNC_MODES:
+            return normalized
+    logging.log(
+        "Warning: config '[gui].auto_sync_mode' must be 'enqueue', 'scan_only', or 'dry_run'; ignoring"
+    )
+    return None
+
+
+def _read_gui_sync_targets(gui_section: dict[str, Any]) -> list[str] | None:
+    """Return `[gui].auto_sync_targets` when it is a list of non-empty strings."""
+    raw = gui_section.get("auto_sync_targets")
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        logging.log("Warning: config '[gui].auto_sync_targets' must be a list of strings; ignoring")
+        return None
+    return [item.strip() for item in raw if item.strip()]
+
+
 def structure_config(
     config_location: str,
     config_dict: dict,
@@ -624,6 +698,11 @@ def structure_config(
             use_download_archive=use_archive_val,
             theme=theme_val,
             notify_on_complete=notify_val,
+            clipboard_monitor=_read_gui_bool(gui_section, "clipboard_monitor"),
+            auto_sync_enabled=_read_gui_bool(gui_section, "auto_sync_enabled"),
+            auto_sync_minutes=_read_gui_positive_int(gui_section, "auto_sync_minutes"),
+            auto_sync_mode=_read_gui_sync_mode(gui_section),
+            auto_sync_targets=_read_gui_sync_targets(gui_section),
         )
 
     abs_section = config_dict.get("audiobookshelf")
@@ -694,6 +773,8 @@ def _format_toml_value(value: Any) -> str:
         return "true" if value else "false"
     if isinstance(value, (int, float)):
         return str(value)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_format_toml_value(item) for item in value) + "]"
     text = str(value)
     escaped = []
     for ch in text:
@@ -1086,8 +1167,13 @@ def save_gui_preferences(
     use_download_archive: bool | None = None,
     theme: str | None = None,
     notify_on_complete: bool | None = None,
+    clipboard_monitor: bool | None = None,
+    auto_sync_enabled: bool | None = None,
+    auto_sync_minutes: int | None = None,
+    auto_sync_mode: str | None = None,
+    auto_sync_targets: Sequence[str] | None = None,
 ) -> str:
-    """Persist GUI window state, output prefs, archive toggle, theme, and notifications in `audiobook-dl.toml`."""
+    """Persist GUI window state, output prefs, archive toggle, theme, notifications, clipboard, and sync schedule."""
     config_location = overwrite or get_config_location(None)
     with file_lock(config_location):
         config_dict = read_config(config_location)
@@ -1113,16 +1199,40 @@ def save_gui_preferences(
             "output_naming_collapsed": output_naming_collapsed,
             "use_download_archive": use_download_archive,
             "notify_on_complete": notify_on_complete,
+            "clipboard_monitor": clipboard_monitor,
+            "auto_sync_enabled": auto_sync_enabled,
         }
-        for key, val in bool_updates.items():
-            if val is not None:
-                gui_dict[key] = bool(val)
+        for bkey, bval in bool_updates.items():
+            if bval is not None:
+                gui_dict[bkey] = bool(bval)
+        if auto_sync_minutes is not None and int(auto_sync_minutes) >= 1:
+            gui_dict["auto_sync_minutes"] = int(auto_sync_minutes)
+        if auto_sync_mode is not None:
+            norm_mode = auto_sync_mode.strip().lower()
+            if norm_mode in _VALID_AUTO_SYNC_MODES:
+                gui_dict["auto_sync_mode"] = norm_mode
+        if auto_sync_targets is not None:
+            gui_dict["auto_sync_targets"] = [
+                str(t).strip() for t in auto_sync_targets if str(t).strip()
+            ]
         if download_split_ratio is not None and 0.0 < float(download_split_ratio) < 1.0:
             gui_dict["download_split_ratio"] = round(float(download_split_ratio), 4)
         if gui_dict:
             config_dict["gui"] = gui_dict
         else:
             config_dict.pop("gui", None)
+        return _write_config_dict(config_location, config_dict)
+
+
+def save_check_updates(
+    enabled: bool,
+    overwrite: str | None = None,
+) -> str:
+    """Persist top-level `check_updates` preference in `audiobook-dl.toml`."""
+    config_location = overwrite or get_config_location(None)
+    with file_lock(config_location):
+        config_dict = read_config(config_location)
+        config_dict["check_updates"] = bool(enabled)
         return _write_config_dict(config_location, config_dict)
 
 

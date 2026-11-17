@@ -12,6 +12,7 @@ from audiobookdl.config import (
     get_source_config,
     list_source_profiles,
     normalize_profile_name,
+    resolve_effective_source_profile,
 )
 from audiobookdl.gui.controller import GuiController
 from audiobookdl.gui.cookie_dialog import CookieImportDialog
@@ -433,6 +434,14 @@ class ServiceAuthCoordinator:
                 result["password"] = self.password_var.get() or None
                 if "library" in service.login_fields:
                     result["library"] = self.library_var.get().strip() or None
+        elif len(detected_keys) == 1:
+            target_key = next(iter(detected_keys))
+            resolved_prof = resolve_effective_source_profile(
+                self._controller.config_snapshot(),
+                target_key,
+            )
+            if resolved_prof != DEFAULT_PROFILE:
+                result["profile"] = resolved_prof
         return result
 
 

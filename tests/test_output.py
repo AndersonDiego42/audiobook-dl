@@ -113,6 +113,7 @@ def test_convert_output_aac_to_m4b_uses_stream_copy(tmp_path):
     assert "-vn" in cmd
 
 
+@pytest.mark.ffmpeg
 def test_real_ffmpeg_mp3_and_combine_to_m4b(tmp_path):
     ffmpeg = find_executable("ffmpeg")
     if not ffmpeg:
@@ -122,7 +123,7 @@ def test_real_ffmpeg_mp3_and_combine_to_m4b(tmp_path):
     # 1. Single MP3 -> M4B transcode
     mp3 = tmp_path / "single.mp3"
     subprocess.run(
-        [ffmpeg, "-y", "-f", "lavfi", "-i", "anullsrc=r=22050:cl=mono", "-t", "0.2", str(mp3)],
+        [ffmpeg, "-y", "-f", "lavfi", "-i", "anullsrc=r=22050:cl=mono", "-t", "0.2", "-threads", "1", str(mp3)],
         check=True,
         capture_output=True,
     )
@@ -138,7 +139,7 @@ def test_real_ffmpeg_mp3_and_combine_to_m4b(tmp_path):
     p2 = parts_dir / "part1.ts"
     for p in (p1, p2):
         subprocess.run(
-            [ffmpeg, "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", "1.0", "-c:a", "aac", "-f", "mpegts", str(p)],
+            [ffmpeg, "-y", "-f", "lavfi", "-i", "anullsrc=r=22050:cl=mono", "-t", "1.0", "-threads", "1", "-c:a", "aac", "-f", "mpegts", str(p)],
             check=True,
             capture_output=True,
         )
@@ -200,6 +201,7 @@ def test_gen_output_location_enforces_utf8_component_limit_and_windows_max_path(
     assert win_path.startswith(long_prefix + os.sep)
 
 
+@pytest.mark.no_worker_cap
 def test_combine_audiofiles_sizes_remux_pool_dynamically(tmp_path, monkeypatch):
     monkeypatch.setattr(output, "_require_executable", lambda name: name)
     monkeypatch.setattr(output, "_remux_to_mpegts", lambda src, dst, cancel_event=None: open(dst, "wb").write(b"ts") > 0)
@@ -444,6 +446,7 @@ def test_convert_output_passes_auto_and_explicit_aac_bitrate(tmp_path):
         convert_output([str(mp3)], "m4b", audio_bitrate="invalid")
 
 
+@pytest.mark.ffmpeg
 def test_real_ffprobe_and_m4b_bitrate_conversion(tmp_path):
     ffmpeg = find_executable("ffmpeg")
     ffprobe = find_executable("ffprobe")
@@ -454,7 +457,7 @@ def test_real_ffprobe_and_m4b_bitrate_conversion(tmp_path):
 
     mp3 = tmp_path / "speech_64k.mp3"
     subprocess.run(
-        [ffmpeg, "-y", "-f", "lavfi", "-i", "anullsrc=r=22050:cl=mono", "-t", "1.0", "-b:a", "64k", str(mp3)],
+        [ffmpeg, "-y", "-f", "lavfi", "-i", "anullsrc=r=22050:cl=mono", "-t", "1.0", "-threads", "1", "-b:a", "64k", str(mp3)],
         check=True,
         capture_output=True,
     )
@@ -686,6 +689,7 @@ def test_gen_output_location_conditional_segments_and_presets():
     assert rendered_else.replace("\\", "/") == "librivox/deu/Standalone - Standalone Title"
 
 
+@pytest.mark.ffmpeg
 def test_real_ffmpeg_split_chapters_and_hls_smart_merge(tmp_path):
     ffmpeg_bin = find_executable("ffmpeg")
     if not ffmpeg_bin:
@@ -708,7 +712,9 @@ def test_real_ffmpeg_split_chapters_and_hls_smart_merge(tmp_path):
                 "-f",
                 "lavfi",
                 "-i",
-                f"sine=frequency={440 + idx * 110}:duration=1",
+                f"sine=frequency={440 + idx * 110}:sample_rate=22050:duration=1",
+                "-threads",
+                "1",
                 "-c:a",
                 "aac",
                 "-f",
@@ -754,7 +760,9 @@ def test_real_ffmpeg_split_chapters_and_hls_smart_merge(tmp_path):
             "-f",
             "lavfi",
             "-i",
-            "sine=frequency=440:duration=3",
+            "sine=frequency=440:sample_rate=22050:duration=3",
+            "-threads",
+            "1",
             "-c:a",
             "libmp3lame",
             str(master),
@@ -952,6 +960,7 @@ def test_combine_audiofiles_parallel_aac_transcode_concat_and_fallback(tmp_path)
     assert "+faststart" in mux_cmd_2
 
 
+@pytest.mark.ffmpeg
 def test_real_ffmpeg_combine_mixed_mp3_and_m4a_to_m4b(tmp_path):
     ffmpeg_bin = find_executable("ffmpeg")
     ffprobe_bin = find_executable("ffprobe")
@@ -963,12 +972,12 @@ def test_real_ffmpeg_combine_mixed_mp3_and_m4a_to_m4b(tmp_path):
     p1 = tmp_path / "01.mp3"
     p2 = tmp_path / "02.m4a"
     subprocess.run(
-        [ffmpeg_bin, "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=1.2", "-ac", "1", "-c:a", "libmp3lame", "-b:a", "96k", str(p1)],
+        [ffmpeg_bin, "-y", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=22050:duration=1.2", "-threads", "1", "-ac", "1", "-c:a", "libmp3lame", "-b:a", "96k", str(p1)],
         check=True,
         capture_output=True,
     )
     subprocess.run(
-        [ffmpeg_bin, "-y", "-f", "lavfi", "-i", "sine=frequency=550:duration=1.2", "-ac", "2", "-c:a", "aac", "-b:a", "128k", str(p2)],
+        [ffmpeg_bin, "-y", "-f", "lavfi", "-i", "sine=frequency=550:sample_rate=22050:duration=1.2", "-threads", "1", "-ac", "2", "-c:a", "aac", "-b:a", "128k", str(p2)],
         check=True,
         capture_output=True,
     )
@@ -1348,6 +1357,7 @@ def test_detect_silence_chapters_reuses_probe_cache(tmp_path, monkeypatch):
     assert [(c.start, c.title) for c in chapters] == [(0, "Chapter 1"), (10000, "Chapter 2")]
 
 
+@pytest.mark.no_worker_cap
 def test_run_cancellable_pool_bounds_in_flight_futures():
     from audiobookdl.utils.concurrency import run_cancellable_pool
 

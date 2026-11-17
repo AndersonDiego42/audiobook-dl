@@ -9,6 +9,7 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Any
 from collections.abc import Callable, Sequence
+import weakref
 
 from audiobookdl.gui.formatting import (
     clamp_rect_to_monitor,
@@ -307,6 +308,8 @@ class ScrolledTreeview(ttk.Frame):
 
     def sort_by_column(self, col_key: str, *, descending: bool | None = None) -> None:
         """Sort rows by `col_key`, preserving parent group hierarchy when present."""
+        if not self._enable_sorting:
+            return
         spec = self._col_specs.get(col_key)
         col_idx = self._col_index.get(col_key)
         if spec is None or col_idx is None or not spec.sortable:
@@ -341,6 +344,37 @@ class ScrolledTreeview(ttk.Frame):
         _sort_children("")
 
 
+_SCROLLABLE_TOPLEVEL_ROUTES: weakref.WeakKeyDictionary[
+    tk.Misc, list[weakref.ref["ScrollableFrame"]]
+] = weakref.WeakKeyDictionary()
+
+
+def _iter_live_scrollables(toplevel: tk.Misc) -> list["ScrollableFrame"]:
+    refs = _SCROLLABLE_TOPLEVEL_ROUTES.get(toplevel)
+    if not refs:
+        return []
+    live: list[ScrollableFrame] = []
+    kept: list[weakref.ref[ScrollableFrame]] = []
+    for ref in refs:
+        frame = ref()
+        if frame is not None:
+            live.append(frame)
+            kept.append(ref)
+    if len(kept) != len(refs):
+        _SCROLLABLE_TOPLEVEL_ROUTES[toplevel] = kept
+    return live
+
+
+def _dispatch_toplevel_focus(toplevel: tk.Misc, event: tk.Event) -> None:
+    for frame in _iter_live_scrollables(toplevel):
+        frame.ensure_focus_visible(event)
+
+
+def _dispatch_toplevel_wheel(toplevel: tk.Misc, event: tk.Event) -> None:
+    for frame in _iter_live_scrollables(toplevel):
+        frame.on_mousewheel(event)
+
+
 class ScrollableFrame(ttk.Frame):
     """Vertically scrollable container that auto-hides its scrollbar when content fits."""
 
@@ -360,6 +394,7 @@ class ScrollableFrame(ttk.Frame):
         self.vscroll_visible = False
         self._last_canvas_size: tuple[int, int] | None = None
         self._last_content_req_size: tuple[int, int] | None = None
+        self._guarded_inputs: weakref.WeakSet[tk.Misc] = weakref.WeakSet()
 
         canvas_bg = style.lookup("TFrame", "background") if style is not None else ""
         canvas_kwargs: dict[str, Any] = {"highlightthickness": 0, "borderwidth": 0}
@@ -378,14 +413,82 @@ class ScrollableFrame(ttk.Frame):
         self.canvas.bind("<Configure>", self.sync_layout)
 
         toplevel = self.winfo_toplevel()
-        toplevel.bind("<FocusIn>", self.ensure_focus_visible, add="+")
-        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            toplevel.bind(seq, self.on_mousewheel, add="+")
+        self._toplevel_ref: tk.Misc = toplevel
+        is_first = toplevel not in _SCROLLABLE_TOPLEVEL_ROUTES
+        _SCROLLABLE_TOPLEVEL_ROUTES.setdefault(toplevel, []).append(weakref.ref(self))
+        if is_first:
 
-    def apply_theme(self, background: str) -> None:
+            def _route_focus(ev: tk.Event) -> None:
+                _dispatch_toplevel_focus(toplevel, ev)
+
+            def _route_wheel(ev: tk.Event) -> None:
+                _dispatch_toplevel_wheel(toplevel, ev)
+
+            toplevel.bind("<FocusIn>", _route_focus, add="+")
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                toplevel.bind(seq, _route_wheel, add="+")
+        self.bind("<Destroy>", self._on_scrollable_destroy, add="+")
+
+    def _on_scrollable_destroy(self, event: tk.Event) -> None:
+        if getattr(event, "widget", None) is not self:
+            return
+        refs = _SCROLLABLE_TOPLEVEL_ROUTES.get(self._toplevel_ref)
+        if not refs:
+            return
+        _SCROLLABLE_TOPLEVEL_ROUTES[self._toplevel_ref] = [
+            ref for ref in refs if ref() not in (None, self)
+        ]
+
+    @staticmethod
+    def _is_combobox_popdown_open(widget: tk.Misc) -> bool:
+        if not isinstance(widget, ttk.Combobox):
+            return False
+        try:
+            popdown_name = widget.tk.call("ttk::combobox::PopdownWindow", str(widget))
+            if popdown_name:
+                return bool(int(widget.tk.call("winfo", "ismapped", popdown_name)))
+        except tk.TclError:
+            pass
+        return False
+
+    def _on_guarded_input_wheel(self, event: tk.Event) -> str | None:
+        widget = getattr(event, "widget", None)
+        if widget is None:
+            return None
+        try:
+            if not self.winfo_exists() or not widget.winfo_exists():
+                return None
+            if self._is_combobox_popdown_open(widget):
+                return None
+            if widget.focus_get() is widget:
+                return None
+        except tk.TclError:
+            return None
+        self.on_mousewheel(event)
+        return "break"
+
+    def guard_scroll_inputs(self) -> None:
+        """Bind wheel pass-through on descendant `Combobox` and `Spinbox` widgets so scrolling won't mutate values."""
+        stack: list[tk.Misc] = [self.content_frame]
+        while stack:
+            node = stack.pop()
+            try:
+                children = node.winfo_children()
+            except tk.TclError:
+                continue
+            for child in children:
+                if isinstance(child, (ttk.Combobox, ttk.Spinbox)):
+                    if child not in self._guarded_inputs:
+                        self._guarded_inputs.add(child)
+                        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                            child.bind(seq, self._on_guarded_input_wheel, add="+")
+                else:
+                    stack.append(child)
+
+    def apply_theme(self, palette: ThemePalette) -> None:
         """Update the underlying canvas background to match the active theme."""
-        if background:
-            self.canvas.configure(background=background)
+        if palette.bg:
+            self.canvas.configure(background=palette.bg)
 
     def sync_layout(self, event: Any | None = None) -> None:
         """Synchronize embedded content dimensions and scrollbar visibility with canvas size."""
@@ -417,6 +520,7 @@ class ScrollableFrame(ttk.Frame):
             self.canvas.yview_moveto(0.0)
 
     def _on_content_configure(self, _event: tk.Event | None = None) -> None:
+        self.guard_scroll_inputs()
         req_size = (
             self.content_frame.winfo_reqwidth(),
             self.content_frame.winfo_reqheight(),

@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import contextvars
+import os
 import subprocess
 import tempfile
 import threading
@@ -42,6 +43,34 @@ def _terminate_process(proc: subprocess.Popen[bytes], timeout: float = 3.0) -> N
         proc.wait()
 
 
+def _configured_ffmpeg_threads() -> str | None:
+    raw = os.environ.get("AUDIOBOOK_DL_FFMPEG_THREADS", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return str(int(raw))
+    return None
+
+
+def _configured_worker_cap() -> int | None:
+    raw = os.environ.get("AUDIOBOOK_DL_MAX_WORKERS", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return None
+
+
+def _apply_ffmpeg_thread_limit(command: Sequence[str]) -> list[str]:
+    """Inject `-filter_threads` and `-threads` into `ffmpeg` media invocations when configured."""
+    cmd = list(command)
+    threads = _configured_ffmpeg_threads()
+    if threads is None or len(cmd) < 3 or "-i" not in cmd:
+        return cmd
+    exe_name = os.path.basename(cmd[0]).lower()
+    if not (exe_name == "ffmpeg" or exe_name.startswith("ffmpeg.")):
+        return cmd
+    if "-threads" in cmd or "-filter_threads" in cmd:
+        return cmd
+    return [cmd[0], "-filter_threads", threads, *cmd[1:-1], "-threads", threads, cmd[-1]]
+
+
 def run_cancellable_subprocess(
     command: Sequence[str],
     *,
@@ -58,14 +87,15 @@ def run_cancellable_subprocess(
     """
     if cancel_event is not None and cancel_event.is_set():
         raise DownloadCancelled
+    effective_command = _apply_ffmpeg_thread_limit(command)
     stderr_file = tempfile.TemporaryFile() if capture_output else None
     progress_cb = _ffmpeg_progress_var.get()
-    wants_progress = progress_cb is not None and "-progress" in command
+    wants_progress = progress_cb is not None and "-progress" in effective_command
     proc: subprocess.Popen[bytes] | None = None
     reader_thread: threading.Thread | None = None
     try:
         proc = subprocess.Popen(
-            list(command),
+            effective_command,
             stdout=subprocess.PIPE if wants_progress else (subprocess.DEVNULL if capture_output else None),
             stderr=stderr_file,
             **subprocess_kwargs(capture_output=capture_output),
@@ -142,7 +172,9 @@ def run_cancellable_pool(
     count = len(items)
     if count == 0:
         return []
-    if count == 1 or max_workers <= 1:
+    worker_cap = _configured_worker_cap()
+    effective_workers = min(max_workers, worker_cap) if worker_cap is not None else max_workers
+    if count == 1 or effective_workers <= 1:
         results: list[T_out] = []
         for item in items:
             if cancel_event is not None and cancel_event.is_set():
@@ -150,7 +182,7 @@ def run_cancellable_pool(
             results.append(fn(item))
         return results
 
-    workers = min(max_workers, count)
+    workers = min(effective_workers, count)
     executor = ThreadPoolExecutor(max_workers=workers)
 
     def _run_item(item: T_in) -> T_out:

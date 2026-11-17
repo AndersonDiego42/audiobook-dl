@@ -19,6 +19,7 @@ from .config import (
     get_source_config,
     load_config,
     normalize_profile_name,
+    resolve_effective_source_profile,
 )
 from .options_schema import MERGEABLE_OPTION_SPECS
 from .exceptions import (
@@ -230,6 +231,7 @@ class Downloader:
         sink: logging.LogSink | None = None,
         interaction: logging.InteractionHandler | None = None,
         cancel_event: threading.Event | None = None,
+        pause_event: threading.Event | None = None,
     ) -> None:
         if sink is not None and on_event is not None:
             raise ValueError("Specify either 'sink' or 'on_event', not both")
@@ -243,6 +245,7 @@ class Downloader:
             interaction if interaction is not None else logging.CliInteractionHandler()
         )
         self.cancel_event: threading.Event | None = cancel_event
+        self.pause_event: threading.Event | None = pause_event
         if sink is not None:
             self.sink: logging.LogSink | None = sink
         elif on_event is not None:
@@ -266,6 +269,7 @@ class Downloader:
         ctx = apply_runtime_options(self.options, self.config)
         ctx.interaction = self.interaction
         ctx.cancel_event = self.cancel_event
+        ctx.pause_event = self.pause_event
         ctx.sink = self.sink if self.sink is not None else logging.get_ui_sink()
         return ctx
 
@@ -323,8 +327,14 @@ class Downloader:
             logging.debug(f"audiobook-dl {__version__}", remove_styling=True)
             logging.debug(f"python {sys.version}", remove_styling=True)
             for index, url in enumerate(url_list):
-                if self.cancel_event is not None and self.cancel_event.is_set():
+                try:
+                    logging.wait_if_paused(
+                        cancel_event=self.cancel_event,
+                        pause_event=self.pause_event,
+                    )
+                except DownloadCancelled:
                     summary.cancelled = True
+                    logging.log("Download cancelled")
                     break
                 if index > 0 and self.options.book_delay > 0:
                     try:
@@ -381,6 +391,7 @@ def run_downloads(
     config: Config,
     interaction: logging.InteractionHandler | None = None,
     cancel_event: threading.Event | None = None,
+    pause_event: threading.Event | None = None,
     sink: logging.LogSink | None = None,
     selected_indices: Sequence[int] | None = None,
     prefetched: tuple[Source, Result] | None = None,
@@ -392,6 +403,7 @@ def run_downloads(
         sink=sink,
         interaction=interaction,
         cancel_event=cancel_event,
+        pause_event=pause_event,
     ).download(
         urls,
         selected_indices=selected_indices,
@@ -644,8 +656,7 @@ def download_result(
         fail_count = 0
         errors: list[tuple[str, str]] = []
         for index, book in enumerate(books_to_process, start=1):
-            if cancel_event is not None and cancel_event.is_set():
-                raise DownloadCancelled
+            logging.wait_if_paused(cancel_event=cancel_event)
             if index > 1 and getattr(options, "book_delay", 0.0) > 0:
                 _pause_between_books(options.book_delay, cancel_event)
             logging.emit_item_progress(index, count, getattr(book, "title", None) or result.title)
@@ -802,7 +813,21 @@ def authenticate(
     interaction: logging.InteractionHandler | None = None,
 ) -> None:
     """Authenticate `source` using cookie file and/or login credentials."""
-    req_profile = normalize_profile_name(getattr(options, "profile", None))
+    explicit_inline_creds = bool(
+        getattr(options, "username", None)
+        or getattr(options, "password", None)
+        or getattr(options, "cookie_file", None)
+    )
+    requested_profile = getattr(options, "profile", None)
+    if explicit_inline_creds and not (requested_profile and str(requested_profile).strip()):
+        req_profile = DEFAULT_PROFILE
+    else:
+        req_profile = resolve_effective_source_profile(
+            config,
+            source.name,
+            requested_profile,
+            aliases=getattr(source, "names", ()),
+        )
     profile_label = f" ({req_profile})" if req_profile != DEFAULT_PROFILE else ""
     logging.log(f"Authenticating with [magenta]{source.name}{profile_label}[/]")
     source_config = get_source_config(
@@ -1077,6 +1102,7 @@ def process_audiobook(
             interaction=interaction,
         )
 
+    logging.wait_if_paused(cancel_event=cancel_event)
     download(audiobook, options, interaction=interaction, cancel_event=cancel_event)
     if source is not None:
         source.on_download_complete(audiobook)

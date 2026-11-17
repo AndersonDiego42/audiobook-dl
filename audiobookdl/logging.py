@@ -79,7 +79,7 @@ class CliInteractionHandler:
 
 @dataclass
 class JobContext:
-    """Per-job logging, UI sink, interaction, and cancellation context."""
+    """Per-job logging, UI sink, interaction, cancellation, and pause context."""
 
     debug: bool = False
     quiet: bool = False
@@ -88,6 +88,7 @@ class JobContext:
     sink: LogSink | None = None
     interaction: InteractionHandler | None = None
     cancel_event: threading.Event | None = None
+    pause_event: threading.Event | None = None
 
 
 _job_context: contextvars.ContextVar[JobContext | None] = contextvars.ContextVar(
@@ -127,6 +128,31 @@ def is_debug_mode() -> bool:
     """Return whether debug logging is enabled in the active `JobContext`."""
     ctx = _job_context.get()
     return bool(ctx.debug) if ctx is not None else False
+
+
+def wait_if_paused(
+    cancel_event: threading.Event | None = None,
+    pause_event: threading.Event | None = None,
+) -> None:
+    """Block cooperatively while `pause_event` is cleared, raising `DownloadCancelled` on cancel."""
+    ctx = _job_context.get()
+    ce = cancel_event if cancel_event is not None else (ctx.cancel_event if ctx is not None else None)
+    if ce is not None and ce.is_set():
+        from audiobookdl.exceptions import DownloadCancelled
+
+        raise DownloadCancelled
+    pe = pause_event if pause_event is not None else (ctx.pause_event if ctx is not None else None)
+    if pe is None or pe.is_set():
+        return
+    while not pe.wait(0.2):
+        if ce is not None and ce.is_set():
+            from audiobookdl.exceptions import DownloadCancelled
+
+            raise DownloadCancelled
+    if ce is not None and ce.is_set():
+        from audiobookdl.exceptions import DownloadCancelled
+
+        raise DownloadCancelled
 
 
 def is_quiet_mode() -> bool:

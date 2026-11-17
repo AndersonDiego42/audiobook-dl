@@ -153,6 +153,14 @@ def build(
     if ICON_PATH.is_file():
         cmd.extend(["--icon", str(ICON_PATH)])
 
+    try:
+        import importlib.util
+
+        if importlib.util.find_spec("tkinterdnd2") is not None:
+            cmd.extend(["--collect-all", "tkinterdnd2"])
+    except Exception:
+        pass
+
     if os.name == "nt":
         version_file = _write_windows_version_file(
             BUILD_DIR / "version_info.txt",
