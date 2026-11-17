@@ -365,6 +365,8 @@ def test_oreilly_media_type_errors_and_catalog_search_library(tmp_path):
 
     lib_items = src.list_library()
     assert [b.title for b in lib_items] == ["Clean Architecture", "Kubernetes Course"]
+    assert lib_items[1].formats == ("video", "audiobook")
+    assert lib_items[1].has_video is True
     assert all(find_compatible_source(b.url) is OReillySource for b in lib_items)
 
     assert src.search("   ") == []
@@ -372,3 +374,217 @@ def test_oreilly_media_type_errors_and_catalog_search_library(tmp_path):
     src.request = lambda _m, url, **_kw: _json_resp(url, {}, status_code=401)  # type: ignore[method-assign]
     with pytest.raises(UserNotAuthorized):
         src.list_library()
+
+
+def test_oreilly_video_mode_and_format_preserve_video_stream(tmp_path):
+    from audiobookdl.exceptions import GenericAudiobookDLException
+    from audiobookdl.utils.audiobook import is_video, resolve_audiobook_output_format
+
+    master_m3u8 = (
+        b"#EXTM3U\n"
+        b'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",DEFAULT=YES,URI="audio/prog.m3u8"\n'
+        b'#EXT-X-STREAM-INF:BANDWIDTH=1500000,AUDIO="aud"\n'
+        b"video/1080p.m3u8\n"
+    )
+    video_m3u8 = (
+        b"#EXTM3U\n"
+        b"#EXTINF:5.0,\n"
+        b"seg0.ts\n"
+        b"#EXTINF:5.0,\n"
+        b"seg1.ts\n"
+        b"#EXT-X-ENDLIST\n"
+    )
+
+    def _wire(source: OReillySource) -> None:
+        source._session.cookies.set("orm-jwt", "jwt-123", domain=".oreilly.com")
+
+        def _request(_m: str, url: str, **_kw):
+            if url.endswith("/api/v2/metadata/urn:orm:video:9780134567890/"):
+                return _json_resp(
+                    url,
+                    {
+                        "identifier": "9780134567890",
+                        "ourn": "urn:orm:video:9780134567890",
+                        "name": "Python Video Course",
+                        "type": "video",
+                    },
+                )
+            if url.endswith("/api/v1/videotocs/9780134567890/"):
+                return _json_resp(
+                    url,
+                    {
+                        "toc": [
+                            {
+                                "reference_id": "9780134567890-c1",
+                                "ourn": "urn:orm:video:9780134567890:video-clip:c1",
+                                "duration": 10,
+                                "kaltura_entry_id": "1_v1",
+                                "title": "Lesson 1",
+                            },
+                            {
+                                "reference_id": "9780134567890-c2",
+                                "ourn": "urn:orm:video:9780134567890:video-clip:c2",
+                                "duration": 10,
+                                "kaltura_entry_id": "1_v2",
+                                "title": "Lesson 2",
+                            },
+                        ]
+                    },
+                )
+            if "/api/v1/player/kaltura_session/" in url:
+                return _json_resp(url, {"session": "ks-abc", "partner_id": "1926081"})
+            return _json_resp(url, {}, status_code=404)
+
+        def _get(url: str, **_kw):
+            if url.endswith("/a.m3u8"):
+                return master_m3u8
+            if url.endswith("/video/1080p.m3u8"):
+                return video_m3u8
+            if "/covers/" in url:
+                return b"cover-bytes"
+            raise AssertionError(f"Unexpected GET {url}")
+
+        source.request = _request  # type: ignore[method-assign,assignment]
+        source.get = _get  # type: ignore[method-assign,assignment]
+
+    # Explicit `--media-type video` chooses video stream and resolves `.mp4` even with default/audio format
+    src_video = OReillySource(_opts(tmp_path, media_type="video"))
+    _wire(src_video)
+    res_video = src_video.download("https://learning.oreilly.com/videos/python-video-course/9780134567890/")
+    assert isinstance(res_video, Audiobook)
+    assert is_video(res_video) is True
+    assert len(res_video.files) == 4
+    assert all(f.url.endswith("/video/seg0.ts") or f.url.endswith("/video/seg1.ts") for f in res_video.files)
+    assert [f.chapter_index for f in res_video.files] == [0, 0, 1, 1]
+    assert resolve_audiobook_output_format(res_video, None) == "mp4"
+    assert resolve_audiobook_output_format(res_video, "m4b") == "mp4"
+    assert resolve_audiobook_output_format(res_video, "mkv") == "mkv"
+
+    # `-f mp4` with `media_type="auto"` on a video course also preserves video stream
+    opts_mp4 = _opts(tmp_path, media_type="auto")
+    opts_mp4.output_format = "mp4"
+    src_auto_mp4 = OReillySource(opts_mp4)
+    _wire(src_auto_mp4)
+    res_auto_mp4 = src_auto_mp4.download("https://learning.oreilly.com/videos/python-video-course/9780134567890/")
+    assert isinstance(res_auto_mp4, Audiobook)
+    assert is_video(res_auto_mp4) is True
+
+    # Requesting video mode on a book-only item raises a clear error
+    src_book = OReillySource(_opts(tmp_path, media_type="video"))
+    src_book.request = lambda _m, url, **_kw: (  # type: ignore[method-assign]
+        _json_resp(url, {"identifier": "555", "ourn": "urn:orm:book:555", "name": "Book Only", "type": "book"})
+        if url.endswith("/api/v2/metadata/urn:orm:book:555/")
+        else _json_resp(url, {}, status_code=404)
+    )
+    with pytest.raises(GenericAudiobookDLException):
+        src_book.download("https://learning.oreilly.com/library/view/-/555/")
+
+
+def test_real_ffmpeg_video_course_combines_and_merges_per_lesson_mp4(tmp_path):
+    import shutil
+    import subprocess
+    from unittest.mock import MagicMock
+    from mutagen.mp4 import MP4
+    from audiobookdl import AudiobookFile, AudiobookMetadata, Chapter, Cover
+    from audiobookdl.utils import find_executable, probe_audio_info
+
+    ffmpeg_bin = shutil.which("ffmpeg") or find_executable("ffmpeg")
+    ffprobe_bin = shutil.which("ffprobe") or find_executable("ffprobe")
+    if not ffmpeg_bin or not ffprobe_bin:
+        pytest.skip("ffmpeg/ffprobe unavailable")
+
+    def _make_ts(path, freq: int, duration: float = 1.0) -> bytes:
+        subprocess.run(
+            [
+                ffmpeg_bin,
+                "-y",
+                "-f", "lavfi", "-i", f"color=c=blue:s=160x120:d={duration}:r=15",
+                "-f", "lavfi", "-i", f"sine=frequency={freq}:duration={duration}",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-tune", "stillimage",
+                "-c:a", "aac", "-b:a", "64k",
+                "-f", "mpegts",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return path.read_bytes()
+
+    seg_bytes = [
+        _make_ts(tmp_path / "s0.ts", 440, 1.0),
+        _make_ts(tmp_path / "s1.ts", 554, 1.0),
+        _make_ts(tmp_path / "s2.ts", 659, 1.0),
+        _make_ts(tmp_path / "s3.ts", 880, 1.0),
+    ]
+    # 1x1 valid PNG cover
+    import base64
+    tiny_png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+    )
+
+    def _build_ab() -> Audiobook:
+        def _resp_for(payload: bytes):
+            r = MagicMock()
+            r.status_code = 200
+            r.headers = {"Content-Length": str(len(payload))}
+            r.iter_content.return_value = [payload]
+            return r
+
+        session = MagicMock()
+        session.get.side_effect = lambda url, **_kw: _resp_for(
+            seg_bytes[int(url.rsplit("_", 1)[-1].split(".")[0])]
+        )
+        files = [
+            AudiobookFile(url=f"https://cdn.example.com/seg_{i}.ts", ext="ts", chapter_index=i // 2)
+            for i in range(4)
+        ]
+        return Audiobook(
+            session=session,
+            files=files,
+            metadata=AudiobookMetadata(title="Video Course"),
+            chapters=[Chapter(start=0, title="Lesson One"), Chapter(start=2000, title="Lesson Two")],
+            cover=Cover(image=tiny_png, extension="png"),
+            media_kind="video",
+        )
+
+    # 1. Combined single `.mp4` output preserves H.264 video, AAC audio, chapters, cover, and no audiobook stik
+    combined_prefix = tmp_path / "out_combined" / "Video Course"
+    opts_comb = _opts(tmp_path, media_type="video")
+    opts_comb.combine = True
+    opts_comb.output_format = "mp4"
+    download_audiobook(_build_ab(), str(combined_prefix), opts_comb)
+
+    combined_mp4 = tmp_path / "out_combined" / "Video Course.mp4"
+    assert combined_mp4.is_file()
+    info = probe_audio_info(str(combined_mp4))
+    assert info.video_codec_name == "h264"
+    assert info.codec_name == "aac"
+    assert info.duration >= 3.5
+    chap_out = subprocess.run(
+        [ffprobe_bin, "-v", "error", "-show_chapters", "-of", "json", str(combined_mp4)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    chapters_json = json.loads(chap_out.stdout).get("chapters", [])
+    assert len(chapters_json) == 2
+    mp4_tags = MP4(str(combined_mp4))
+    assert "stik" not in mp4_tags
+    assert "covr" in mp4_tags
+
+    # 2. Per-lesson output (`combine=False`) merges each clip's segments directly into playable `.mp4` files
+    split_prefix = tmp_path / "out_lessons" / "Video Course"
+    opts_split = _opts(tmp_path, media_type="video")
+    opts_split.combine = False
+    opts_split.output_format = "mp4"
+    download_audiobook(_build_ab(), str(split_prefix), opts_split)
+
+    lesson1 = tmp_path / "out_lessons" / "Video Course" / "01 - Lesson One.mp4"
+    lesson2 = tmp_path / "out_lessons" / "Video Course" / "02 - Lesson Two.mp4"
+    assert lesson1.is_file() and lesson2.is_file()
+    for lesson_file in (lesson1, lesson2):
+        linfo = probe_audio_info(str(lesson_file))
+        assert linfo.video_codec_name == "h264"
+        assert linfo.codec_name == "aac"
+        assert 1.5 <= linfo.duration <= 2.5
+

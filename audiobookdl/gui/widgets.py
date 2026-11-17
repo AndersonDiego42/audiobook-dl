@@ -7,7 +7,7 @@ import sys
 import threading
 import tkinter as tk
 from tkinter import ttk
-from typing import Any
+from typing import Any, Literal
 from collections.abc import Callable, Sequence
 import weakref
 
@@ -29,6 +29,9 @@ _SORT_CHUNK_RE = re.compile(r"(\d+)")
 _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
 
+TreeAnchor = Literal["nw", "n", "ne", "w", "center", "e", "sw", "s", "se"]
+
+
 @dataclass(frozen=True)
 class TreeColumnSpec:
     """Declarative column definition for `ScrolledTreeview`."""
@@ -37,9 +40,17 @@ class TreeColumnSpec:
     heading: str
     width: int
     stretch: bool = True
-    anchor: str = "w"
+    anchor: TreeAnchor = "w"
     sortable: bool = True
     sort_kind: str = "text"  # "text" | "number" | "duration" | "date"
+
+
+def tree_item_values(tree: ttk.Treeview, iid: str) -> list[Any]:
+    """Return a mutable list of column values for ``iid`` in a ``ttk.Treeview``."""
+    raw: Any = tree.item(iid, "values")
+    if isinstance(raw, (list, tuple)):
+        return list(raw)
+    return []
 
 
 def _natural_text_sort_key(raw: str) -> tuple[Any, ...]:
@@ -241,7 +252,7 @@ class ScrolledTreeview(ttk.Frame):
                 )
             else:
                 self.tree.heading(spec.key, text=spec.heading)
-            self.tree.column(  # type: ignore[call-overload]
+            self.tree.column(
                 spec.key,
                 width=scale_px(self, spec.width),
                 stretch=spec.stretch,
@@ -1004,7 +1015,7 @@ class ModalDialog(tk.Toplevel):
         if not self._finalized:
             return
         try:
-            if self.winfo_exists() and self.grab_current() is None:
+            if self.winfo_exists() and self.grab_current() is None:  # type: ignore[no-untyped-call]
                 self.grab_set()
         except tk.TclError:
             pass
@@ -1070,7 +1081,7 @@ class ModalDialog(tk.Toplevel):
         opener = self._opener_focus
         self._opener_focus = None
         try:
-            if self.grab_current() is self:
+            if self.grab_current() is self:  # type: ignore[no-untyped-call]
                 self.grab_release()
         except tk.TclError:
             pass

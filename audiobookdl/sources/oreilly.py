@@ -1,4 +1,4 @@
-"""O'Reilly Learning (`learning.oreilly.com`) source adapter for audiobooks, video-course audio, and EPUBs."""
+"""O'Reilly Learning (`learning.oreilly.com`) source adapter for audiobooks, video courses (audio or MP4), and EPUBs."""
 
 from __future__ import annotations
 
@@ -14,16 +14,19 @@ import zipfile
 
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, Result, Series
+from audiobookdl.options_schema import MEDIA_TYPE_CHOICES
 from audiobookdl.exceptions import (
     BookHasNoAudiobook,
     BookHasNoEbook,
     BookNotFound,
+    GenericAudiobookDLException,
     NoFilesFound,
     RequestError,
     UserNotAuthorized,
 )
 from audiobookdl.utils.audiobook import (
     clean_html_description,
+    is_video_extension,
     parse_duration_ms,
     parse_language,
     parse_release_date,
@@ -132,7 +135,7 @@ class OReillySource(Source[str]):
     def _media_type(self) -> str:
         raw = getattr(self._options, "media_type", None) or "auto"
         cleaned = str(raw).strip().lower()
-        return cleaned if cleaned in ("auto", "audiobook", "ebook", "both") else "auto"
+        return cleaned if cleaned in MEDIA_TYPE_CHOICES else "auto"
 
     @staticmethod
     def _api_headers() -> dict[str, str]:
@@ -418,6 +421,8 @@ class OReillySource(Source[str]):
         self,
         urn: str,
         info: dict[str, Any],
+        *,
+        prefer_video: bool = False,
     ) -> tuple[list[AudiobookFile], list[Chapter]]:
         raw_chapters = self._fetch_chapters_raw(urn, info)
         entries: list[dict[str, Any]] = list(raw_chapters) if raw_chapters else [info]
@@ -446,14 +451,21 @@ class OReillySource(Source[str]):
             resolved_segment_files: list[AudiobookFile] = []
 
             if direct_url:
-                if ".m3u8" in direct_url.lower():
+                lower_direct = direct_url.lower()
+                if ".m3u8" in lower_direct:
                     resolved_segment_files = self.get_stream_files(
                         direct_url,
                         headers=stream_headers,
                         expected_content_type=_HLS_CONTENT_TYPES,
+                        prefer_video=prefer_video,
                     )
                 else:
-                    ext = "mp3" if ".mp3" in direct_url.lower() else "m4a"
+                    if ".mp4" in lower_direct:
+                        ext = "mp4"
+                    elif ".mp3" in lower_direct:
+                        ext = "mp3"
+                    else:
+                        ext = "m4a"
                     resolved_segment_files = [
                         AudiobookFile(
                             url=direct_url,
@@ -470,10 +482,14 @@ class OReillySource(Source[str]):
                         manifest_url,
                         headers=stream_headers,
                         expected_content_type=_HLS_CONTENT_TYPES,
+                        prefer_video=prefer_video,
                     )
 
             if not resolved_segment_files:
                 continue
+            chapter_idx = len(chapters)
+            for seg in resolved_segment_files:
+                seg.chapter_index = chapter_idx
             chapters.append(Chapter(start=offset_ms, title=title))
             offset_ms += dur_ms
             files.extend(resolved_segment_files)
@@ -482,14 +498,24 @@ class OReillySource(Source[str]):
             raise NoFilesFound
         return files, chapters
 
-    def _build_audio_audiobook(self, urn: str, info: dict[str, Any], *, url: str) -> Audiobook:
-        files, chapters = self._resolve_audio_files_and_chapters(urn, info)
+    def _build_stream_audiobook(
+        self,
+        urn: str,
+        info: dict[str, Any],
+        *,
+        url: str,
+        video: bool = False,
+    ) -> Audiobook:
+        files, chapters = self._resolve_audio_files_and_chapters(
+            urn, info, prefer_video=video
+        )
         return Audiobook(
             session=self._session,
             files=files,
             metadata=self._build_metadata(urn, info, url=url),
             cover=self._download_cover(urn, info),
             chapters=chapters,
+            media_kind="video" if video else "audio",
         )
 
     def _write_epub_archive(
@@ -608,6 +634,9 @@ class OReillySource(Source[str]):
         file_headers: MutableMapping[str, str | bytes] = {
             k: v for k, v in self._api_headers().items()
         }
+        def _write_epub(dest_path: str, u: str = urn, i: dict[str, Any] = info) -> None:
+            self._write_epub_archive(u, i, dest_path)
+
         return Audiobook(
             session=self._session,
             files=[
@@ -615,7 +644,7 @@ class OReillySource(Source[str]):
                     url=epubs_api_url,
                     ext="epub",
                     headers=file_headers,
-                    file_writer=lambda dest_path, u=urn, i=info: self._write_epub_archive(u, i, dest_path),
+                    file_writer=_write_epub,
                 )
             ],
             metadata=self._build_metadata(urn, info, url=url),
@@ -624,7 +653,7 @@ class OReillySource(Source[str]):
         )
 
     def download(self, url: str) -> Result:
-        """Download an O'Reilly audiobook, video-course audio stream, or EPUB ebook."""
+        """Download an O'Reilly audiobook, video course (video or audio track), or EPUB ebook."""
         urn, info = self._resolve_urn_and_info(url)
         kind = str(
             info.get("type")
@@ -644,15 +673,30 @@ class OReillySource(Source[str]):
         mode = self._media_type
         item_id = str(info.get("identifier") or urn.rsplit(":", 1)[-1]).strip()
         is_audio_kind = kind in ("audiobook", "video")
+        req_fmt = str(getattr(self._options, "output_format", "") or "").strip()
+        wants_video_by_format = (kind == "video") and is_video_extension(req_fmt)
+
+        if mode == "video":
+            if kind == "video":
+                return self._build_stream_audiobook(urn, info, url=url, video=True)
+            alt_urn = f"urn:orm:video:{item_id}"
+            try:
+                alt_info = self._fetch_work_info(alt_urn)
+                return self._build_stream_audiobook(alt_urn, alt_info, url=url, video=True)
+            except RequestError as exc:
+                raise GenericAudiobookDLException(
+                    "No video course available",
+                    f"'{info.get('title') or info.get('name') or urn}' does not have a video stream.",
+                ) from exc
 
         if mode == "audiobook":
             if is_audio_kind:
-                return self._build_audio_audiobook(urn, info, url=url)
+                return self._build_stream_audiobook(urn, info, url=url, video=False)
             for alt_kind in ("audiobook", "video"):
                 alt_urn = f"urn:orm:{alt_kind}:{item_id}"
                 try:
                     alt_info = self._fetch_work_info(alt_urn)
-                    return self._build_audio_audiobook(alt_urn, alt_info, url=url)
+                    return self._build_stream_audiobook(alt_urn, alt_info, url=url, video=False)
                 except RequestError:
                     continue
             raise BookHasNoAudiobook
@@ -670,7 +714,7 @@ class OReillySource(Source[str]):
         if mode == "both":
             items: list[Audiobook] = []
             if is_audio_kind:
-                items.append(self._build_audio_audiobook(urn, info, url=url))
+                items.append(self._build_stream_audiobook(urn, info, url=url, video=wants_video_by_format))
                 try:
                     alt_urn = f"urn:orm:book:{item_id}"
                     items.append(self._build_ebook_audiobook(alt_urn, self._fetch_work_info(alt_urn), url=url))
@@ -681,7 +725,12 @@ class OReillySource(Source[str]):
                 for alt_kind in ("audiobook", "video"):
                     try:
                         alt_urn = f"urn:orm:{alt_kind}:{item_id}"
-                        items.append(self._build_audio_audiobook(alt_urn, self._fetch_work_info(alt_urn), url=url))
+                        alt_video = (alt_kind == "video") and is_video_extension(req_fmt)
+                        items.append(
+                            self._build_stream_audiobook(
+                                alt_urn, self._fetch_work_info(alt_urn), url=url, video=alt_video
+                            )
+                        )
                         break
                     except RequestError:
                         continue
@@ -689,13 +738,14 @@ class OReillySource(Source[str]):
                 return items[0]
             return Series(title=items[0].metadata.title, books=items)
 
-        # Default "auto": audiobooks & video courses extract audio; books assemble EPUB.
+        # Default "auto": audiobooks & video courses extract audio (or video when `-f mp4`/`mkv`), books assemble EPUB.
         if is_audio_kind:
-            return self._build_audio_audiobook(urn, info, url=url)
+            return self._build_stream_audiobook(urn, info, url=url, video=wants_video_by_format)
         return self._build_ebook_audiobook(urn, info, url=url)
 
     def _catalog_book_from_item(self, entry: dict[str, Any]) -> CatalogBook | None:
-        item = entry.get("content") if isinstance(entry.get("content"), dict) else entry
+        raw_content = entry.get("content")
+        item = raw_content if isinstance(raw_content, dict) else entry
         urn = str(item.get("ourn") or item.get("archive_id") or item.get("urn") or "").strip()
         title = str(item.get("title") or item.get("name") or "").strip()
         if not title:
@@ -723,11 +773,9 @@ class OReillySource(Source[str]):
             or ""
         ).strip().lower()
         formats: tuple[str, ...]
-        if (
-            fmt_raw in ("audiobook", "video")
-            or ":audiobook:" in urn.lower()
-            or ":video:" in urn.lower()
-        ):
+        if fmt_raw == "video" or ":video:" in urn.lower():
+            formats = ("video", "audiobook")
+        elif fmt_raw == "audiobook" or ":audiobook:" in urn.lower():
             formats = ("audiobook",)
         elif fmt_raw == "book" or ":book:" in urn.lower():
             formats = ("ebook",)

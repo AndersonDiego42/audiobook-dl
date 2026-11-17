@@ -5,7 +5,6 @@ from dataclasses import fields as dataclass_fields
 from attrs import fields as attrs_fields
 import pytest
 
-from audiobookdl import args
 from audiobookdl.config import Config, GuiConfig, SourceConfig, save_output_preferences, structure_config
 from audiobookdl.options_schema import (
     CONFIG_OPTION_SPECS,
@@ -18,6 +17,8 @@ from audiobookdl.options_schema import (
     OPTION_REGISTRY,
     PERSISTED_GUI_OPTION_SPECS,
     SOURCE_CONFIG_KEYS,
+    DownloadOptions,
+    build_default_options,
     validate_config_value,
 )
 from audiobookdl.pipeline import apply_runtime_options
@@ -31,17 +32,15 @@ def test_registry_names_are_unique():
 
 def test_download_options_parity_with_schema():
     dl_fields = {
-        f.name for f in dataclass_fields(args.DownloadOptions) if not f.name.startswith("_")
+        f.name for f in dataclass_fields(DownloadOptions) if not f.name.startswith("_")
     }
     schema_names = {spec.name for spec in DOWNLOAD_OPTION_SPECS}
     assert schema_names == dl_fields
 
-    defaults = args.build_default_options()
-    parsed_defaults = args.parse_arguments([])
+    defaults = build_default_options()
     for spec in DOWNLOAD_OPTION_SPECS:
         expected = spec.resolve_default()
         assert getattr(defaults, spec.name) == expected, f"default mismatch for {spec.name}"
-        assert getattr(parsed_defaults, spec.name) == expected, f"CLI default mismatch for {spec.name}"
 
 
 def test_config_fields_parity_with_schema():
@@ -199,7 +198,7 @@ def test_schema_driven_merge_and_preset_precedence(tmp_path):
         },
         credential_store=None,
     )
-    opts = args.parse_arguments([])
+    opts = build_default_options()
     apply_runtime_options(opts, cfg)
     for spec in MERGEABLE_OPTION_SPECS:
         key = spec.config_key
@@ -208,7 +207,7 @@ def test_schema_driven_merge_and_preset_precedence(tmp_path):
         expected = spec.merge_cast(raw_val) if spec.merge_cast else raw_val
         assert getattr(opts, spec.name) == expected
 
-    preset_opts = args.parse_arguments(["--output-preset", "plex", "--no-combine"])
+    preset_opts = build_default_options(output_preset="plex", combine=False)
     apply_runtime_options(preset_opts, cfg)
     assert preset_opts.combine is False
     assert preset_opts.output_template != "{title} - cfg"
@@ -275,9 +274,6 @@ def test_gui_cli_parity_bindings_converters():
     assert impersonate_binding.init_value("chrome") == "chrome"
     assert impersonate_binding.read_option("  chrome  ") == "chrome"
     assert impersonate_binding.read_option("   ") is None
-
-    parsed = args.parse_arguments(["--impersonate", "chrome", "https://example.com/book"])
-    assert parsed.impersonate == "chrome"
 
 
 def test_persisted_gui_roundtrip_silence_offset_and_abs(tmp_path):

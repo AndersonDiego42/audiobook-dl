@@ -5,9 +5,9 @@ from typing import cast
 import pytest
 import requests
 
-from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, args
-from audiobookdl.__main__ import main as cli_main
+from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata
 from audiobookdl.gui.app import AudiobookDLApp
+from audiobookdl.options_schema import build_default_options
 from audiobookdl.pipeline import process_audiobook
 from audiobookdl.sources.source import CatalogBook, Source
 from audiobookdl.utils.archive import (
@@ -168,7 +168,7 @@ def test_skip_downloaded_uses_default_downloads_db_and_records_metadata(tmp_path
         ),
         files=[AudiobookFile(url="https://example.com/h.mp3", ext="mp3")],
     )
-    opts = args.build_default_options(
+    opts = build_default_options(
         database_directory=str(tmp_path),
         output_template=str(tmp_path / "{title}"),
         skip_downloaded=True,
@@ -188,47 +188,6 @@ def test_skip_downloaded_uses_default_downloads_db_and_records_metadata(tmp_path
     assert entry.narrator == "Victor Bevine"
     assert entry.isbn == "9780553283686"
     assert entry.asin == "B004G60EHS"
-
-
-def test_cli_library_subcommand_list_tag_hide_trash_restore(tmp_path, capsys):
-    db_path = tmp_path / "downloads.db"
-    cfg_path = tmp_path / "audiobook-dl.toml"
-    cfg_path.write_text("", encoding="utf-8")
-
-    archive = DownloadArchive(str(db_path))
-    entry_id = archive.record(
-        "librivox",
-        "https://librivox.org/book/1",
-        title="Moby Dick",
-        author="Herman Melville",
-        url="https://librivox.org/book/1",
-        output_path="/books/MobyDick.m4b",
-    )
-
-    with pytest.raises(SystemExit) as exc1:
-        cli_main(["library", "--config", str(cfg_path), "--download-archive", str(db_path), "tag", str(entry_id), "--add", "Classic", "Sea"])
-    assert exc1.value.code == 0
-
-    with pytest.raises(SystemExit) as exc2:
-        cli_main(["library", "--config", str(cfg_path), "--download-archive", str(db_path), "hide", str(entry_id)])
-    assert exc2.value.code == 0
-
-    with pytest.raises(SystemExit) as exc3:
-        cli_main(["library", "--config", str(cfg_path), "--download-archive", str(db_path), "list", "--query", "tag:classic"])
-    assert exc3.value.code == 0
-    out = capsys.readouterr().out
-    assert "Moby Dick" in out
-    assert "classic" in out and "hidden" in out
-
-    with pytest.raises(SystemExit):
-        cli_main(["library", "--config", str(cfg_path), "--download-archive", str(db_path), "trash", str(entry_id)])
-    trashed = archive.get_entry(entry_id)
-    assert trashed is not None and trashed.status == "trashed"
-
-    with pytest.raises(SystemExit):
-        cli_main(["library", "--config", str(cfg_path), "--download-archive", str(db_path), "restore", str(entry_id)])
-    restored = archive.get_entry(entry_id)
-    assert restored is not None and restored.status == "downloaded"
 
 
 @pytest.mark.gui

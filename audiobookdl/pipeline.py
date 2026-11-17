@@ -10,8 +10,7 @@ from collections.abc import Callable, Sequence
 
 import requests
 
-from . import __version__, args, logging, output
-from .args import DownloadOptions
+from . import __version__, logging, output
 from .config import (
     DEFAULT_PROFILE,
     Config,
@@ -21,7 +20,12 @@ from .config import (
     normalize_profile_name,
     resolve_effective_source_profile,
 )
-from .options_schema import MERGEABLE_OPTION_SPECS
+from .options_schema import (
+    MERGEABLE_OPTION_SPECS,
+    DownloadOptions,
+    build_default_options,
+    parse_series_selection,
+)
 from .exceptions import (
     AudiobookDLException,
     BookHasNoAudiobook,
@@ -35,7 +39,13 @@ from .output.download import download
 from .sources import find_compatible_source, find_source_by_name
 from .sources.source import CatalogBook, Source
 from .utils.archive import DownloadArchive, default_archive_path, make_book_key
-from .utils.audiobook import Audiobook, BookId, Result, Series, is_ebook
+from .utils.audiobook import (
+    Audiobook,
+    BookId,
+    Result,
+    Series,
+    resolve_audiobook_output_format,
+)
 from .utils.enrichment import (
     EnrichmentCandidate,
     EnrichmentResult,
@@ -167,7 +177,7 @@ def apply_runtime_options(
     config: Config,
 ) -> logging.JobContext:
     """Merge config defaults into `options` and build an isolated `JobContext`."""
-    explicit = getattr(options, "_explicit_fields", frozenset())
+    explicit: frozenset[str] = getattr(options, "_explicit_fields", frozenset())
     preset_requested = "output_template" not in explicit and bool(getattr(options, "output_preset", None))
     if preset_requested:
         preset_tpl = output.OUTPUT_TEMPLATE_PRESETS.get(options.output_preset or "")
@@ -236,13 +246,13 @@ class Downloader:
         if sink is not None and on_event is not None:
             raise ValueError("Specify either 'sink' or 'on_event', not both")
         self.options: DownloadOptions = (
-            options if options is not None else args.build_default_options()
+            options if options is not None else build_default_options()
         )
         self.config: Config = (
             config if config is not None else load_config(self.options.config_location)
         )
         self.interaction: logging.InteractionHandler = (
-            interaction if interaction is not None else logging.CliInteractionHandler()
+            interaction if interaction is not None else logging.NonInteractiveInteractionHandler()
         )
         self.cancel_event: threading.Event | None = cancel_event
         self.pause_event: threading.Event | None = pause_event
@@ -442,7 +452,7 @@ def prepare_source_result(
         source_class = find_compatible_source(url)
     source = source_class(options)
     try:
-        handler = interaction or logging.CliInteractionHandler()
+        handler = interaction or logging.NonInteractiveInteractionHandler()
         if source.requires_authentication and not source.authenticated:
             authenticate(url, source, options, config, interaction=handler)
         if cancel_event is not None and cancel_event.is_set():
@@ -480,8 +490,7 @@ def _audiobook_output_entry(audiobook: Audiobook, options: DownloadOptions) -> d
         audiobook.metadata,
         options.remove_chars,
     )
-    raw_ext = audiobook.files[0].ext if audiobook.files else None
-    fmt = raw_ext if is_ebook(audiobook) else (options.output_format or raw_ext)
+    fmt = resolve_audiobook_output_format(audiobook, options.output_format)
     candidate_file = f"{location}.{fmt}" if fmt else ""
     resolved_path = candidate_file if (candidate_file and os.path.isfile(candidate_file)) else location
     return {
@@ -495,89 +504,6 @@ def _audiobook_output_entry(audiobook: Audiobook, options: DownloadOptions) -> d
     }
 
 
-def _result_to_info_dict(
-    source: Source,
-    result: Result,
-    options: DownloadOptions,
-    *,
-    selected_indices: Sequence[int] | None = None,
-) -> dict[str, Any]:
-    if isinstance(result, Audiobook):
-        if not result.metadata.source:
-            result.metadata.source = source.name
-        info = _audiobook_output_entry(result, options)
-        info["series"] = result.metadata.series
-        info["series_order"] = result.metadata.series_order
-        info["isbn"] = result.metadata.isbn
-        info["asin"] = result.metadata.asin
-        return info
-    indices = (
-        list(selected_indices)
-        if selected_indices is not None
-        else list(range(len(result.books)))
-    )
-    return {
-        "title": result.title,
-        "source": source.name,
-        "kind": "series",
-        "total_books": len(result.books),
-        "selected_indices": [i + 1 for i in indices if 0 <= i < len(result.books)],
-        "books": [
-            entry.title if isinstance(entry, Audiobook) else str(entry)
-            for idx, entry in enumerate(result.books)
-            if idx in indices
-        ],
-    }
-
-
-def print_result_info(
-    source: Source,
-    result: Result,
-    options: DownloadOptions,
-    *,
-    selected_indices: Sequence[int] | None = None,
-) -> None:
-    """Display parsed metadata and resolved output path(s) without downloading media."""
-    logging.log(f"[magenta]{source.name}[/] info:")
-    if isinstance(result, Audiobook):
-        if not result.metadata.source:
-            result.metadata.source = source.name
-        location = output.gen_output_location(
-            options.output_template,
-            result.metadata,
-            options.remove_chars,
-        )
-        authors = ", ".join(result.metadata.authors) or "Unknown"
-        narrators = ", ".join(result.metadata.narrators)
-        raw_ext = result.files[0].ext if result.files else "unknown"
-        fmt = raw_ext if is_ebook(result) else (options.output_format or raw_ext)
-        logging.log(f"  Title:    {result.title}")
-        logging.log(f"  Authors:  {authors}")
-        if narrators:
-            logging.log(f"  Narrator: {narrators}")
-        if result.metadata.series:
-            order = f" #{result.metadata.series_order}" if result.metadata.series_order else ""
-            logging.log(f"  Series:   {result.metadata.series}{order}")
-        if result.metadata.isbn:
-            logging.log(f"  ISBN:     {result.metadata.isbn}")
-        if result.metadata.asin:
-            logging.log(f"  ASIN:     {result.metadata.asin}")
-        logging.log(f"  Parts:    {len(result.files)} | Chapters: {len(result.chapters)} | Format: {fmt}")
-        logging.log(f"  Output:   {location}")
-    elif isinstance(result, Series):
-        indices = (
-            list(selected_indices)
-            if selected_indices is not None
-            else list(range(len(result.books)))
-        )
-        logging.log(f"  Series: {result.title} ({len(result.books)} books, {len(indices)} selected)")
-        for idx in indices:
-            if 0 <= idx < len(result.books):
-                entry = result.books[idx]
-                label = entry.title if isinstance(entry, Audiobook) else str(entry)
-                logging.log(f"    [{idx + 1}] {label}")
-
-
 def download_result(
     source: Source,
     result: Result,
@@ -588,32 +514,20 @@ def download_result(
     summary: DownloadSummary | None = None,
     config: Config | None = None,
 ) -> None:
-    """Download (or inspect when `options.info_only`) a resolved `Audiobook` or `Series` `Result`."""
-    handler = interaction or logging.CliInteractionHandler()
+    """Download a resolved `Audiobook` or `Series` `Result`."""
+    handler = interaction or logging.NonInteractiveInteractionHandler()
     if (
         isinstance(result, Series)
         and selected_indices is None
         and getattr(options, "series_items", None)
     ):
         try:
-            selected_indices = args.parse_series_selection(
+            selected_indices = parse_series_selection(
                 options.series_items or "",
                 len(result.books),
             )
         except ValueError as exc:
             raise GenericAudiobookDLException(str(exc)) from exc
-
-    if getattr(options, "info_only", False):
-        if isinstance(result, Audiobook) and getattr(options, "enrich_metadata", False):
-            enrich_audiobook_with_options(result, options, source=source, interaction=handler)
-        if getattr(options, "json_output", False):
-            if summary is not None:
-                summary.outputs.append(
-                    _result_to_info_dict(source, result, options, selected_indices=selected_indices)
-                )
-        else:
-            print_result_info(source, result, options, selected_indices=selected_indices)
-        return
 
     logging.log("")  # Empty line
     if isinstance(result, Audiobook):
@@ -785,7 +699,7 @@ def get_or_ask(
     config_value = getattr(config, attr, None)
     value: str | None = getattr(options, attr, None) or config_value
     if value is None:
-        handler = interaction or logging.CliInteractionHandler()
+        handler = interaction or logging.NonInteractiveInteractionHandler()
         return handler.ask_input(attr.capitalize(), hidden=hidden)
     return value
 
@@ -880,7 +794,7 @@ def _init_service_source(
     """Instantiate `service_name` and authenticate when required."""
     source_class = find_source_by_name(service_name)
     source = source_class(options)
-    handler = interaction or logging.CliInteractionHandler()
+    handler = interaction or logging.NonInteractiveInteractionHandler()
     if source.requires_authentication and not source.authenticated:
         authenticate(url, source, options, config, interaction=handler)
     return source
@@ -1014,7 +928,7 @@ def enrich_audiobook_with_options(
     interactive = bool(getattr(options, "enrich_interactive", False))
     selector = None
     if interactive:
-        handler = interaction or logging.CliInteractionHandler()
+        handler = interaction or logging.NonInteractiveInteractionHandler()
         choose_fn = getattr(handler, "choose_index", None)
         if choose_fn is not None:
             def _select(provider_name: str, candidates: Sequence[EnrichmentCandidate]) -> int | None:
@@ -1061,9 +975,6 @@ def process_audiobook(
     """Operate on `audiobook` based on `options`. Return False if skipped via archive."""
     if not audiobook.metadata.source and source is not None:
         audiobook.metadata.source = source.name
-    if options.print_output:
-        print_output(audiobook, options)
-        return True
     if options.cover:
         download_cover(audiobook, options)
         return True
@@ -1112,8 +1023,7 @@ def process_audiobook(
         audiobook.metadata,
         options.remove_chars,
     )
-    raw_ext = audiobook.files[0].ext if audiobook.files else None
-    fmt = raw_ext if is_ebook(audiobook) else (options.output_format or raw_ext)
+    fmt = resolve_audiobook_output_format(audiobook, options.output_format)
     candidate_file = f"{location}.{fmt}" if fmt else ""
     resolved_output = candidate_file if (candidate_file and os.path.isfile(candidate_file)) else location
 
@@ -1162,13 +1072,6 @@ def process_audiobook(
         audio_format=fmt,
     )
     return True
-
-
-def print_output(audiobook: Audiobook, options: DownloadOptions) -> None:
-    """Print resolved output location."""
-    metadata = audiobook.metadata
-    location = output.gen_output_location(options.output_template, metadata, options.remove_chars)
-    print(location)
 
 
 def download_cover(audiobook: Audiobook, options: DownloadOptions) -> None:

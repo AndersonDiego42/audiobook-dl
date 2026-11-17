@@ -158,7 +158,7 @@ def _build_cookie(
     """Construct a standard `http.cookiejar.Cookie` ready for Netscape serialization."""
     domain_clean = domain.strip()
     initial_dot = domain_clean.startswith(".")
-    rest: dict[str, str | None] = {"HttpOnly": None} if http_only else {}
+    rest: dict[str, str] = {"HttpOnly": ""} if http_only else {}
     return http.cookiejar.Cookie(
         version=0,
         name=name,
@@ -170,7 +170,7 @@ def _build_cookie(
         domain_initial_dot=initial_dot,
         path=path or "/",
         path_specified=True,
-        secure=bool(secure),
+        secure=secure,
         expires=expires,
         discard=expires is None,
         comment=None,
@@ -182,7 +182,7 @@ def _build_cookie(
 
 def cookies_to_netscape_text(cookies: Sequence[http.cookiejar.Cookie]) -> str:
     """Serialize `cookies` to standard Netscape `cookies.txt` format."""
-    lines = [_NETSCAPE_HEADER.rstrip("\n")]
+    lines: list[str] = [_NETSCAPE_HEADER.rstrip("\n")]
     for cookie in cookies:
         domain = cookie.domain or ""
         if cookie.http_only if hasattr(cookie, "http_only") else ("HttpOnly" in getattr(cookie, "_rest", {})):
@@ -192,7 +192,7 @@ def cookies_to_netscape_text(cookies: Sequence[http.cookiejar.Cookie]) -> str:
         include_subdomains = "TRUE" if domain.startswith(".") else "FALSE"
         path = cookie.path or "/"
         secure = "TRUE" if cookie.secure else "FALSE"
-        expires = int(cookie.expires) if cookie.expires is not None else 0
+        expires = cookie.expires if cookie.expires is not None else 0
         lines.append(
             "\t".join(
                 (
@@ -507,7 +507,7 @@ def _chromium_expires_to_unix(expires_utc: int | None) -> int | None:
     if not expires_utc:
         return None
     try:
-        unix_ts = int(int(expires_utc) / 1_000_000 - _CHROMIUM_EPOCH_OFFSET_SECONDS)
+        unix_ts = int(expires_utc / 1_000_000 - _CHROMIUM_EPOCH_OFFSET_SECONDS)
     except (TypeError, ValueError, OverflowError):
         return None
     return unix_ts if unix_ts > 0 else None

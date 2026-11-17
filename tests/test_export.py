@@ -5,7 +5,6 @@ import tkinter as tk
 
 import pytest
 
-from audiobookdl.__main__ import main as cli_main
 from audiobookdl.exceptions import GenericAudiobookDLException
 from audiobookdl.gui.app import AudiobookDLApp
 from audiobookdl.utils.archive import DownloadArchive
@@ -41,27 +40,14 @@ def _seed_entries(db_path):
     return archive
 
 
-def test_export_csv_and_json_via_api_and_cli(tmp_path, capsys):
+def test_export_csv_and_json_via_api(tmp_path):
     db_path = tmp_path / "downloads.db"
-    cfg_path = tmp_path / "audiobook-dl.toml"
-    cfg_path.write_text("", encoding="utf-8")
-    _seed_entries(db_path)
+    archive = _seed_entries(db_path)
 
+    visible_entries = archive.list_entries(include_hidden=False)
     csv_path = tmp_path / "out" / "library.csv"
-    with pytest.raises(SystemExit) as exc_csv:
-        cli_main(
-            [
-                "export",
-                "--config",
-                str(cfg_path),
-                "--download-archive",
-                str(db_path),
-                "--no-hidden",
-                str(csv_path),
-            ]
-        )
-    assert exc_csv.value.code == 0
-    assert "Exported 1 book(s)" in capsys.readouterr().out
+    count_csv = export_library_entries(visible_entries, str(csv_path))
+    assert count_csv == 1
 
     with open(csv_path, encoding="utf-8", newline="") as f:
         rows = list(csv.DictReader(f))
@@ -71,21 +57,10 @@ def test_export_csv_and_json_via_api_and_cli(tmp_path, capsys):
     assert rows[0]["tags"] == "favorite scifi"
     assert rows[0]["asin"] == "B002V1OF70"
 
+    pending_entries = archive.list_entries(query="status:pending", include_hidden=True)
     json_path = tmp_path / "library.json"
-    with pytest.raises(SystemExit) as exc_json:
-        cli_main(
-            [
-                "export",
-                "--config",
-                str(cfg_path),
-                "--download-archive",
-                str(db_path),
-                "-q",
-                "status:pending",
-                str(json_path),
-            ]
-        )
-    assert exc_json.value.code == 0
+    count_json = export_library_entries(pending_entries, str(json_path))
+    assert count_json == 1
     data = json.loads(json_path.read_text(encoding="utf-8"))
     assert len(data) == 1
     assert data[0]["title"] == "Hidden Gem"

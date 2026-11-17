@@ -3,7 +3,8 @@ from unittest.mock import patch
 
 import pytest
 
-from audiobookdl import args, logging
+from audiobookdl import logging
+from audiobookdl.options_schema import build_default_options
 from audiobookdl.pipeline import run_downloads
 from audiobookdl.config import Config
 from audiobookdl.utils.concurrency import run_cancellable_pool
@@ -56,8 +57,8 @@ def test_concurrent_run_downloads_isolate_logging_sinks_and_flags():
             )
 
     cfg = Config(sources={}, output_template=None, database_directory=None, skip_downloaded=None)
-    opts_a = args.build_default_options(debug=True, quiet=False)
-    opts_b = args.build_default_options(debug=False, quiet=True)
+    opts_a = build_default_options(debug=True, quiet=False)
+    opts_b = build_default_options(debug=False, quiet=True)
 
     results = {}
 
@@ -159,7 +160,6 @@ def test_wait_if_paused_blocks_until_resumed_or_cancelled():
 
 def test_series_download_pauses_between_books(tmp_path):
     from types import SimpleNamespace
-    from audiobookdl import args
     from audiobookdl.config import Config
     from audiobookdl.pipeline import Downloader
     from audiobookdl.utils.audiobook import BookId, Series
@@ -192,7 +192,7 @@ def test_series_download_pauses_between_books(tmp_path):
     ):
         dl = Downloader(
             config=Config(sources={}, output_template=str(tmp_path / "{title}"), database_directory=None, skip_downloaded=False),
-            options=args.build_default_options(),
+            options=build_default_options(),
             cancel_event=cancel_ev,
             pause_event=pause_ev,
         )

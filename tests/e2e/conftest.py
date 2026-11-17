@@ -12,7 +12,7 @@ from audiobookdl import logging, utils
 from tests.e2e.config import E2EConfig
 from tests.e2e.diagnostics import E2EDiagnosticRecorder
 from tests.e2e.fixtures import MediaFixtureFactory
-from tests.e2e.harness import CliRunner, E2EWorkspace, GuiHarness, require_ffmpeg
+from tests.e2e.harness import E2EWorkspace, GuiHarness, GuiSelfTestRunner, require_ffmpeg
 from tests.e2e.server import LocalAudiobookServer
 
 
@@ -83,33 +83,17 @@ def e2e_server(
         yield server
 
 
-@pytest.fixture(scope="session")
-def cli_ready(
-    tmp_path_factory: pytest.TempPathFactory,
-    e2e_config: E2EConfig,
-) -> None:
-    """Verify CLI entry point readiness once per test session."""
-    probe_root = tmp_path_factory.mktemp("e2e_cli_probe")
-    workspace = E2EWorkspace(probe_root, e2e_config)
-    recorder = E2EDiagnosticRecorder("session:cli_readiness")
-    CliRunner(config=e2e_config, workspace=workspace, diagnostics=recorder).check_ready()
-
-
 @pytest.fixture
-def cli_runner(
-    cli_ready: None,
+def gui_self_test_runner(
     e2e_config: E2EConfig,
     e2e_workspace: E2EWorkspace,
     e2e_diagnostics: E2EDiagnosticRecorder,
-    e2e_server: LocalAudiobookServer,
-) -> CliRunner:
-    """CLI subprocess runner wired to the isolated workspace and local HTTP server."""
-    _ = cli_ready
-    return CliRunner(
+) -> GuiSelfTestRunner:
+    """Subprocess runner for `--self-test` verification in an isolated workspace."""
+    return GuiSelfTestRunner(
         config=e2e_config,
         workspace=e2e_workspace,
         diagnostics=e2e_diagnostics,
-        proxy_url=e2e_server.url,
     )
 
 

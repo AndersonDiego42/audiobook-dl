@@ -9,7 +9,7 @@ import pytest
 import requests
 
 from audiobookdl import Audiobook, AudiobookMetadata, BookId, Series
-from audiobookdl.args import build_default_options
+from audiobookdl.options_schema import build_default_options
 from audiobookdl.exceptions import (
     BookHasNoAudiobook,
     BookHasNoEbook,
@@ -578,31 +578,6 @@ def test_on_download_complete_writes_utf8_json(tmp_path):
     saved = Path(src._get_book_path("12345")).read_text(encoding="utf-8")
     assert unicode_title in saved
     assert json.loads(saved)["title"] == unicode_title
-
-
-def test_storytel_skips_playback_metadata_and_streams_on_print_output(tmp_path):
-    src = _make_source(tmp_path, print_output=True)
-    src._session.get = MagicMock(
-        return_value=_mock_resp(
-            200,
-            json_data={
-                "consumableId": "999",
-                "title": "Print Only Book",
-                "shareUrl": "https://www.storytel.com/se/sv/books/print-only-999",
-                "formats": [{"type": "abook", "isReleased": True}],
-                "authors": [{"name": "Author"}],
-                "narrators": [],
-                "cover": {"url": "https://example.com/cover.jpg"},
-            },
-        )
-    )
-    audiobook = src.download_book_from_book_id("999")
-    assert isinstance(audiobook, Audiobook)
-    assert audiobook.files == []
-    assert audiobook.cover is None
-    assert audiobook.chapters == []
-    assert src._session.get.call_count == 1
-    assert not Path(src._get_playback_metadata_path("999")).exists()
 
 
 def test_download_ebook_only_book_in_auto_mode(tmp_path):

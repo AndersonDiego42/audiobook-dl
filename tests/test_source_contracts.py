@@ -17,7 +17,8 @@ from PIL import Image
 import pycountry
 import pytest
 
-from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Series, args
+from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Series
+from audiobookdl.options_schema import build_default_options
 from audiobookdl.output import metadata as output_metadata
 from audiobookdl.output.metadata import reader as metadata_reader
 from audiobookdl.output.metadata import sidecars
@@ -87,7 +88,7 @@ def tag_templates(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path] |
 
 
 def _new_source(source_cls: type[Source]) -> Any:
-    return source_cls(args.build_default_options())
+    return source_cls(build_default_options())
 
 
 def _fake_session_with_cover(cover_bytes: bytes = _SAMPLE_COVER):
@@ -892,7 +893,7 @@ def _build_oreilly() -> tuple[Source, str]:
                 json=lambda: col_payload,
             )
         if "/bookmarks/" in url:
-            empty_bm = {"results": [], "next": None}
+            empty_bm: dict[str, Any] = {"results": [], "next": None}
             return SimpleNamespace(
                 status_code=200,
                 url=url,

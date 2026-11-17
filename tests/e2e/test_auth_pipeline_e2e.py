@@ -20,9 +20,9 @@ from audiobookdl import (
     DownloadSummary,
     Downloader,
     Series,
-    args,
     logging,
 )
+from audiobookdl.options_schema import build_default_options
 from audiobookdl.config import load_config, save_source_credentials
 from audiobookdl.credentials import PLAINTEXT_OPT_IN_ENV, get_credential_store
 from audiobookdl.sources.source import Source
@@ -41,6 +41,7 @@ class _E2EAuthHlsSource(Source):
     _authentication_methods = ["login"]
     login_data = ["username", "password"]
     create_storage_dir = True
+    _base_url: str = ""
 
     def _login(self, url: str, username: str, password: str) -> None:
         base_url = url.split("/series/", 1)[0]
@@ -225,7 +226,7 @@ def test_authenticated_login_credential_store_hls_aes_and_selective_series(
         assert loaded_cfg.sources["e2eauth"].password == "s3cr3t-pw!"
 
         monkeypatch.setattr("audiobookdl.sources.get_source_classes", lambda: [_E2EAuthHlsSource])
-        options = args.build_default_options(
+        options = build_default_options(
             config_location=str(e2e_workspace.config_path),
             output_template=str(e2e_workspace.output_dir / "{author}" / "{title}"),
             database_directory=str(e2e_workspace.db_dir),

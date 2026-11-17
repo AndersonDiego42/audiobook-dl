@@ -1,15 +1,9 @@
-import json
-from pathlib import Path
-import threading
 from unittest.mock import patch
 
-import pytest
-
-from audiobookdl import args
-from audiobookdl.__main__ import main as cli_main
 from audiobookdl.config import Config, SourceConfig
+from audiobookdl.options_schema import SyncOptions
 from audiobookdl.sources.source import CatalogBook
-from audiobookdl.sync import run_sync_loop, run_sync_once
+from audiobookdl.sync import run_sync_once
 from audiobookdl.utils.archive import DownloadArchive, make_catalog_book_key
 
 
@@ -59,8 +53,8 @@ def test_sync_once_downloads_pending_and_skips_hidden_trashed_and_downloaded(tmp
             s.books_completed = len(urls)
             return s
 
-    sync_opts = args.parse_sync_arguments(
-        ["--download-archive", str(db_path)]
+    sync_opts = SyncOptions(
+        archive_path=str(db_path),
     )
     with patch("audiobookdl.sync.list_service_library", return_value=[b1, b2, b3, b4]), patch(
         "audiobookdl.sync.Downloader", _DummyDownloader
@@ -76,56 +70,24 @@ def test_sync_once_downloads_pending_and_skips_hidden_trashed_and_downloaded(tmp
     assert downloaded_batches == [("us", ["https://storytel.com/b1"])]
 
 
-def test_sync_cli_scan_only_json_and_watch_loop(tmp_path, capsys):
+def test_sync_once_scan_only_updates_db_without_downloading(tmp_path):
     cfg_path = tmp_path / "audiobook-dl.toml"
     db_path = tmp_path / "downloads.db"
     cfg_path.write_text('[sources.storytel]\nusername = "demo"\n', encoding="utf-8")
 
     books = [CatalogBook(title="Sync Item", url="https://storytel.com/s1", author="Author")]
+    sync_opts = SyncOptions(
+        config_location=str(cfg_path),
+        archive_path=str(db_path),
+        scan_only=True,
+    )
     with patch("audiobookdl.sync.list_service_library", return_value=books), patch(
         "audiobookdl.sync.Downloader"
     ) as mock_dl:
-        with pytest.raises(SystemExit) as exc:
-            cli_main(
-                [
-                    "sync",
-                    "--config",
-                    str(cfg_path),
-                    "--download-archive",
-                    str(db_path),
-                    "--scan-only",
-                    "--json",
-                ]
-            )
-        assert exc.value.code == 0
+        cycle = run_sync_once(sync_opts)
         mock_dl.assert_not_called()
 
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["books_discovered"] == 1
-    assert payload["newly_added"] == 1
-    assert payload["pending_count"] == 1
-    assert payload["downloaded"] == 0
-
-    # Verify watch loop runs multiple cycles and stops cleanly on event
-    sync_opts = args.parse_sync_arguments(
-        ["--config", str(cfg_path), "--download-archive", str(db_path), "--scan-only", "--watch", "--interval", "1"]
-    )
-    cycles = []
-    stop_event = threading.Event()
-    with patch("audiobookdl.sync.list_service_library", return_value=books):
-        code = run_sync_loop(
-            sync_opts,
-            stop_event=stop_event,
-            max_cycles=2,
-            on_cycle=lambda c: (cycles.append(c), stop_event.set() if len(cycles) >= 2 else None),
-        )
-    assert code == 0
-    assert len(cycles) == 2
-
-
-def test_dockerfile_defines_non_root_entrypoint_and_volumes():
-    repo_root = Path(__file__).resolve().parent.parent
-    dockerfile = (repo_root / "Dockerfile").read_text(encoding="utf-8")
-    assert 'ENTRYPOINT ["audiobook-dl"]' in dockerfile
-    assert "USER audiobookdl" in dockerfile
-    assert 'VOLUME ["/config", "/audiobooks"]' in dockerfile
+    assert cycle.books_discovered == 1
+    assert cycle.newly_added == 1
+    assert cycle.pending_count == 1
+    assert cycle.downloaded == 0

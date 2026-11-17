@@ -41,7 +41,6 @@ class E2EConfig:
     """Runtime settings governing E2E execution across local and CI environments."""
 
     target_mode: str
-    cli_executable: Path | None
     gui_executable: Path | None
     timeout_seconds: float
     server_host: str
@@ -60,14 +59,12 @@ class E2EConfig:
                 f"Unsupported AUDIOBOOK_DL_E2E_TARGET={target_mode!r}; expected 'module' or 'executable'"
             )
 
-        cli_bin_raw = os.environ.get("AUDIOBOOK_DL_E2E_CLI_BIN", "").strip()
         gui_bin_raw = os.environ.get("AUDIOBOOK_DL_E2E_GUI_BIN", "").strip()
         ffmpeg_raw = os.environ.get("AUDIOBOOK_DL_E2E_FFMPEG_DIR", "").strip()
         artifacts_raw = os.environ.get("AUDIOBOOK_DL_E2E_ARTIFACTS_DIR", "").strip()
 
         return cls(
             target_mode=target_mode,
-            cli_executable=Path(cli_bin_raw) if cli_bin_raw else None,
             gui_executable=Path(gui_bin_raw) if gui_bin_raw else None,
             timeout_seconds=_env_float("AUDIOBOOK_DL_E2E_TIMEOUT", 30.0),
             server_host=os.environ.get("AUDIOBOOK_DL_E2E_SERVER_HOST", "127.0.0.1").strip() or "127.0.0.1",
@@ -77,14 +74,6 @@ class E2EConfig:
             require_gui=_env_bool("AUDIOBOOK_DL_E2E_REQUIRE_GUI", default=False),
             headless=_detect_headless(),
         )
-
-    def cli_command(self) -> list[str]:
-        """Return base argv used to launch the CLI entry point."""
-        if self.target_mode == "executable":
-            if self.cli_executable is not None:
-                return [str(self.cli_executable)]
-            return ["audiobook-dl"]
-        return [sys.executable, "-m", "audiobookdl"]
 
     def gui_self_test_command(self) -> list[str]:
         """Return argv used to invoke the GUI `--self-test` readiness check."""

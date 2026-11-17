@@ -62,7 +62,7 @@
           ];
 
           meta = {
-            description = "Audiobook CLI downloader";
+            description = "Desktop GUI audiobook downloader";
             homepage = "https://github.com/jo1gi/audiobook-dl";
             license = lib.licenses.gpl3Only;
             maintainers = with lib.maintainers; [ ];

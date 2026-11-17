@@ -156,8 +156,8 @@ class E2EWorkspace:
 
 
 @dataclass(frozen=True)
-class CliResult:
-    """Result returned by `CliRunner` subprocess execution."""
+class SubprocessResult:
+    """Result returned by `GuiSelfTestRunner` subprocess execution."""
 
     command: list[str]
     returncode: int | None
@@ -167,8 +167,8 @@ class CliResult:
     timed_out: bool
 
 
-class CliRunner:
-    """Subprocess runner for `audiobook-dl` CLI and `--self-test` entry points."""
+class GuiSelfTestRunner:
+    """Subprocess runner for the desktop GUI `--self-test` entry point."""
 
     def __init__(
         self,
@@ -190,7 +190,7 @@ class CliRunner:
         timeout: float | None = None,
         extra_env: dict[str, str] | None = None,
         stdin_text: str | None = None,
-    ) -> CliResult:
+    ) -> SubprocessResult:
         effective_timeout = timeout or self.config.timeout_seconds
         env, overrides = self.workspace.build_env(
             proxy_url=self.proxy_url if use_proxy else None,
@@ -239,7 +239,7 @@ class CliRunner:
             stderr=stderr,
             env_overrides=overrides,
         )
-        return CliResult(
+        return SubprocessResult(
             command=command,
             returncode=returncode,
             stdout=stdout,
@@ -248,35 +248,7 @@ class CliRunner:
             timed_out=timed_out,
         )
 
-    def check_ready(self) -> CliResult:
-        """Verify CLI entry point responds to `--version` cleanly."""
-        result = self._exec(self.config.cli_command() + ["--version"], use_proxy=False, timeout=10.0)
-        if result.timed_out or result.returncode != 0:
-            raise AssertionError(
-                f"CLI readiness check failed (rc={result.returncode}, timed_out={result.timed_out}): "
-                f"stdout={result.stdout!r}, stderr={result.stderr!r}"
-            )
-        return result
-
-    def run(
-        self,
-        args: Sequence[str],
-        *,
-        use_proxy: bool = True,
-        timeout: float | None = None,
-        extra_env: dict[str, str] | None = None,
-        stdin_text: str | None = None,
-    ) -> CliResult:
-        """Invoke `audiobook-dl` with `args` inside the isolated E2E workspace."""
-        return self._exec(
-            self.config.cli_command() + list(args),
-            use_proxy=use_proxy,
-            timeout=timeout,
-            extra_env=extra_env,
-            stdin_text=stdin_text,
-        )
-
-    def run_gui_self_test(self, *, timeout: float | None = None) -> CliResult:
+    def run_gui_self_test(self, *, timeout: float | None = None) -> SubprocessResult:
         """Invoke `audiobookdl.gui --self-test` in the isolated E2E workspace."""
         return self._exec(
             self.config.gui_self_test_command(),

@@ -169,10 +169,12 @@ def verify_audio_integrity(
     min_duration_ratio: float = 0.98,
     probe_cache: dict[str, AudioProbeInfo] | None = None,
     require_ffprobe: bool = False,
+    allow_video: bool = False,
 ) -> AudioProbeInfo:
     """
-    Validate that `path` exists, is non-empty, has a valid audio stream and positive duration,
-    and was not materially truncated relative to `expected_duration`.
+    Validate that `path` exists, is non-empty, has a valid audio (or video when
+    `allow_video=True`) stream and positive duration, and was not materially
+    truncated relative to `expected_duration`.
 
     Raises `FailedCombining` on verification failure.
     """
@@ -199,11 +201,12 @@ def verify_audio_integrity(
             message=f"Media file appears truncated ({info.duration:.1f}s vs {expected_duration:.1f}s)"
         )
 
-    if not info.codec_name or info.duration <= 0.0:
-        if ffprobe_available or info.duration > 0.0 or info.codec_name:
+    detected_codec = info.codec_name or (info.video_codec_name if allow_video else "")
+    if not detected_codec or info.duration <= 0.0:
+        if ffprobe_available or info.duration > 0.0 or detected_codec:
             logging.debug(
                 f"Media integrity check failed for '{os.path.basename(path)}': "
-                f"codec={info.codec_name!r}, duration={info.duration:.2f}s"
+                f"codec={detected_codec!r}, duration={info.duration:.2f}s"
             )
             raise FailedCombining(
                 message=f"Invalid or corrupt media output: {os.path.basename(path)}"
@@ -249,13 +252,20 @@ def _run_mpegts_part(
     ts_path: str,
     codec_args: Sequence[str],
     cancel_event: threading.Event | None = None,
+    *,
+    preserve_video: bool = False,
 ) -> bool:
     """Run an FFmpeg step producing a single MPEG-TS segment at `ts_path`."""
     ffmpeg = _require_executable("ffmpeg")
     capture = not logging.is_ffmpeg_output()
+    stream_args = (
+        ["-map", "0:v:0?", "-map", "0:a?", "-c:v", "copy"]
+        if preserve_video
+        else ["-vn"]
+    )
     try:
         result = run_cancellable_subprocess(
-            [ffmpeg, "-y", "-i", source, "-vn", *codec_args, "-f", "mpegts", ts_path],
+            [ffmpeg, "-y", "-i", source, *stream_args, *codec_args, "-f", "mpegts", ts_path],
             capture_output=capture,
             cancel_event=cancel_event,
         )
@@ -274,9 +284,11 @@ def _remux_to_mpegts(
     source: str,
     ts_path: str,
     cancel_event: threading.Event | None = None,
+    *,
+    preserve_video: bool = False,
 ) -> bool:
     """
-    Remux a single audio file into an MPEG-TS container.
+    Remux a single media file into an MPEG-TS container.
 
     Concatenating raw segments directly (e.g. ADTS-AAC) desyncs the decoder at
     segment boundaries and silently drops most of the audio. Remuxing each
@@ -285,7 +297,13 @@ def _remux_to_mpegts(
 
     :returns: `True` if a non-empty file was produced
     """
-    return _run_mpegts_part(source, ts_path, ("-c:a", "copy"), cancel_event=cancel_event)
+    return _run_mpegts_part(
+        source,
+        ts_path,
+        ("-c:a", "copy"),
+        cancel_event=cancel_event,
+        preserve_video=preserve_video,
+    )
 
 
 def _encode_to_aac_mpegts(
@@ -421,6 +439,9 @@ def _append_ffmetadata_and_cover_args(
     chapters_written: bool,
     meta_written: bool,
     cover_path: str | None,
+    *,
+    preserve_video: bool = False,
+    has_audio: bool = True,
 ) -> None:
     """Append `-i` and stream mapping flags for inline chapters, metadata tags, and cover art."""
     next_input = 1
@@ -430,21 +451,24 @@ def _append_ffmetadata_and_cover_args(
         command += ["-i", meta_file]
         meta_idx = next_input
         next_input += 1
-    if cover_path is not None:
+    if cover_path is not None and not preserve_video:
         command += ["-i", cover_path]
         cover_idx = next_input
         next_input += 1
-    if meta_idx is not None or cover_idx is not None:
+    if preserve_video:
+        command += ["-map", "0:v:0?", "-map", "0:a?"]
+    elif meta_idx is not None or cover_idx is not None:
         command += ["-map", "0:a"]
     if meta_idx is not None:
         if chapters_written:
             command += ["-map_chapters", str(meta_idx)]
         if meta_written:
             command += ["-map_metadata", str(meta_idx)]
-        command += ["-metadata:s:a:0", "title="]
+        if has_audio:
+            command += ["-metadata:s:a:0", "title="]
     if cover_idx is not None:
         command += ["-map", f"{cover_idx}:v", "-c:v", "copy", "-disposition:v:0", "attached_pic"]
-    else:
+    elif not preserve_video:
         command += ["-vn"]
 
 
@@ -457,6 +481,7 @@ def _build_reencode_codec_args(
     *,
     loudnorm: bool = False,
     mono: bool = False,
+    preserve_video: bool = False,
 ) -> list[str]:
     """Return FFmpeg codec/container flags forcing re-encode into `target_ext`."""
     explicit_bitrate = normalize_audio_bitrate(audio_bitrate)
@@ -465,10 +490,15 @@ def _build_reencode_codec_args(
         filter_args += ["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"]
     if mono:
         filter_args += ["-ac", "1"]
+    video_args = ["-c:v", "copy"] if preserve_video else []
+    video_only = preserve_video and not info.codec_name
 
     if target_ext in MP4_CONTAINERS:
-        target_bitrate = _resolve_aac_bitrate_from_info(source_path, info, explicit_bitrate)
-        args = [*filter_args, "-c:a", "aac", "-b:a", target_bitrate]
+        if video_only:
+            args = [*video_args]
+        else:
+            target_bitrate = _resolve_aac_bitrate_from_info(source_path, info, explicit_bitrate)
+            args = [*video_args, *filter_args, "-c:a", "aac", "-b:a", target_bitrate]
         if faststart:
             args += ["-movflags", "+faststart"]
         return args
@@ -478,10 +508,10 @@ def _build_reencode_codec_args(
             if info.bitrate and info.bitrate > 0
             else "192k"
         )
-        return [*filter_args, "-c:a", "libmp3lame", "-b:a", bitrate]
-    if explicit_bitrate is not None and target_ext not in ffmpeg_metadata.LOSSLESS_CONTAINERS:
-        return [*filter_args, "-b:a", explicit_bitrate]
-    return filter_args
+        return [*video_args, *filter_args, "-c:a", "libmp3lame", "-b:a", bitrate]
+    if explicit_bitrate is not None and target_ext not in ffmpeg_metadata.LOSSLESS_CONTAINERS and not video_only:
+        return [*video_args, *filter_args, "-b:a", explicit_bitrate]
+    return [*video_args, *filter_args]
 
 
 def _build_mux_codec_args(
@@ -494,6 +524,7 @@ def _build_mux_codec_args(
     *,
     loudnorm: bool = False,
     mono: bool = False,
+    preserve_video: bool = False,
 ) -> list[str]:
     """Return FFmpeg codec/container flags for muxing or transcoding to `target_ext`."""
     if loudnorm or mono:
@@ -505,25 +536,30 @@ def _build_mux_codec_args(
             faststart=faststart,
             loudnorm=loudnorm,
             mono=mono,
+            preserve_video=preserve_video,
         )
     explicit_bitrate = normalize_audio_bitrate(audio_bitrate)
     codec = info.codec_name
+    video_args = ["-c:v", "copy"] if preserve_video else []
+    video_only = preserve_video and not codec
     if target_ext in MP4_CONTAINERS:
-        if codec == "aac":
-            args = ["-c:a", "copy"]
+        if video_only:
+            args = [*video_args]
+        elif codec == "aac":
+            args = [*video_args, "-c:a", "copy"]
             if source_ext in ("ts", "aac"):
                 args += ["-bsf:a", "aac_adtstoasc"]
         else:
             target_bitrate = _resolve_aac_bitrate_from_info(source_path, info, explicit_bitrate)
-            args = ["-c:a", "aac", "-b:a", target_bitrate]
+            args = [*video_args, "-c:a", "aac", "-b:a", target_bitrate]
         if faststart:
             args += ["-movflags", "+faststart"]
         return args
     if target_ext == source_ext or target_ext in ("mka", "mkv") or (target_ext == "mp3" and codec == "mp3"):
-        return ["-c:a", "copy"]
-    if explicit_bitrate is not None and target_ext not in ffmpeg_metadata.LOSSLESS_CONTAINERS:
-        return ["-b:a", explicit_bitrate]
-    return []
+        return [*video_args] if video_only else [*video_args, "-c:a", "copy"]
+    if explicit_bitrate is not None and target_ext not in ffmpeg_metadata.LOSSLESS_CONTAINERS and not video_only:
+        return [*video_args, "-b:a", explicit_bitrate]
+    return video_args
 
 
 def apply_chapter_offset(chapters: Sequence[Chapter], offset_ms: int) -> list[Chapter]:
@@ -649,10 +685,12 @@ def combine_audiofiles(
     faststart: bool = True,
     loudnorm: bool = False,
     mono: bool = False,
+    preserve_video: bool = False,
+    show_progress: bool = True,
 ) -> bool:
     """
-    Combines the given audiofiles into `output_path` (optionally transcoding and
-    embedding `chapters`, `metadata` tags, and MP4 `cover` art in the primary
+    Combines the given audio/video files into `output_path` (optionally transcoding
+    and embedding `chapters`, `metadata` tags, and MP4 `cover` art in the primary
     FFmpeg pass).
 
     :returns: `True` if `chapters` were embedded during the combine pass.
@@ -677,7 +715,12 @@ def combine_audiofiles(
         all_mpegts = _all_inputs_mpegts(filepaths, probe_cache=cache)
         input_infos: list[AudioProbeInfo] | None = None
         mixed_non_mp4_params = False
-        if not all_mpegts and len(filepaths) > 1 and output_extension not in MP4_CONTAINERS:
+        if (
+            not all_mpegts
+            and not preserve_video
+            and len(filepaths) > 1
+            and output_extension not in MP4_CONTAINERS
+        ):
             input_infos = _probe_uncached_audio_info(filepaths, cache, cancel_event=cancel_event)
             codecs = {i.codec_name for i in input_infos if i.codec_name}
             sample_rates = {i.sample_rate for i in input_infos if i.sample_rate}
@@ -687,13 +730,14 @@ def combine_audiofiles(
             )
 
         all_mp3_uniform = (
-            output_extension == "mp3"
+            not preserve_video
+            and output_extension == "mp3"
             and all(get_extension(p) == "mp3" for p in filepaths)
             and not mixed_non_mp4_params
         )
         use_mpegts_pipeline = (
             all_mpegts
-            or output_extension in MP4_CONTAINERS
+            or (not preserve_video and output_extension in MP4_CONTAINERS)
             or all_mp3_uniform
         )
 
@@ -731,12 +775,7 @@ def combine_audiofiles(
                 verb = "Encoding parts" if parallel_aac_encoded else "Remuxing parts"
                 pool_workers = _transcode_pool_workers() if parallel_aac_encoded else COMBINE_REMUX_THREADS
 
-                with logging.progress([]) as remux_prog:
-                    remux_task = remux_prog.add_task(
-                        f"{verb} (0/{total_parts})",
-                        total=float(total_parts),
-                    )
-
+                def _run_remux_pool(remux_progress=None, remux_task=None) -> list[tuple[str, bool]]:
                     def remux(item):
                         nonlocal completed_parts
                         index, source = item
@@ -759,7 +798,12 @@ def combine_audiofiles(
                                 cancel_event=cancel_event,
                             )
                         else:
-                            ok = _remux_to_mpegts(source, ts_path, cancel_event=cancel_event)
+                            ok = _remux_to_mpegts(
+                                source,
+                                ts_path,
+                                cancel_event=cancel_event,
+                                preserve_video=preserve_video,
+                            )
                         if ok:
                             if src_info is None and len(filepaths) > 1:
                                 src_info = _get_cached_probe(source, cache)
@@ -776,16 +820,27 @@ def combine_audiofiles(
                                         )
                         with part_lock:
                             completed_parts += 1
-                            remux_prog.advance(remux_task, 1.0)
-                            logging.book_update(f"{verb} ({completed_parts}/{total_parts})")
+                            if remux_progress is not None and remux_task is not None:
+                                remux_progress.advance(remux_task, 1.0)
+                                logging.book_update(f"{verb} ({completed_parts}/{total_parts})")
                         return ts_path, ok
 
-                    remuxed = run_cancellable_pool(
+                    return run_cancellable_pool(
                         remux,
                         list(enumerate(filepaths)),
                         max_workers=pool_workers,
                         cancel_event=cancel_event,
                     )
+
+                if show_progress:
+                    with logging.progress([]) as remux_prog:
+                        remux_task = remux_prog.add_task(
+                            f"{verb} (0/{total_parts})",
+                            total=float(total_parts),
+                        )
+                        remuxed = _run_remux_pool(remux_prog, remux_task)
+                else:
+                    remuxed = _run_remux_pool()
                 ts_paths = []
                 for ts_path, ok in remuxed:
                     if not ok:
@@ -908,7 +963,12 @@ def combine_audiofiles(
             duration_sec=chapter_duration,
             metadata=metadata,
         )
-        cover_tmp_path = _prepare_ffmpeg_cover_file(cover, output_extension, cover_base_path)
+        cover_tmp_path = (
+            None
+            if preserve_video
+            else _prepare_ffmpeg_cover_file(cover, output_extension, cover_base_path)
+        )
+        has_audio = bool(sample_info.codec_name or not (preserve_video and sample_info.video_codec_name))
 
         command = [ffmpeg, "-y", *ffmpeg_input_flags, "-i", ffmpeg_input]
         if chapters_written:
@@ -920,6 +980,8 @@ def combine_audiofiles(
             chapters_written=chapters_written,
             meta_written=meta_written,
             cover_path=cover_tmp_path,
+            preserve_video=preserve_video,
+            has_audio=has_audio,
         )
         # Note: concat_demuxer_mode with mixed non-MP4 inputs converted via lossless FLAC still targets output_extension cleanly
         _ = concat_demuxer_mode
@@ -932,12 +994,13 @@ def combine_audiofiles(
             faststart=faststart,
             loudnorm=loudnorm,
             mono=mono,
+            preserve_video=preserve_video,
         )
         capture = not logging.is_ffmpeg_output()
-        if capture and expected > 0:
+        if show_progress and capture and expected > 0:
             command += ["-progress", "pipe:1", "-nostats"]
         command.append(output_path)
-        if capture and expected > 0:
+        if show_progress and capture and expected > 0:
             with logging.progress([]) as mux_prog:
                 mux_task = mux_prog.add_task(f"Combining to .{output_extension}", total=expected)
                 reported = 0.0
@@ -976,6 +1039,7 @@ def combine_audiofiles(
             output_path,
             expected_duration=expected,
             probe_cache=cache,
+            allow_video=preserve_video,
         )
         return chapters_embedded
     except (DownloadCancelled, FailedCombining, GenericAudiobookDLException):
@@ -1041,6 +1105,8 @@ def convert_single_file(
     faststart: bool = True,
     loudnorm: bool = False,
     mono: bool = False,
+    preserve_video: bool = False,
+    show_progress: bool = True,
 ) -> tuple[str, bool]:
     """
     Convert a single file to `output_format`, optionally embedding `chapters`,
@@ -1073,7 +1139,12 @@ def convert_single_file(
         duration_sec=info.duration,
         metadata=metadata,
     )
-    cover_tmp_path = _prepare_ffmpeg_cover_file(cover, target_format, f"{new_path}.cover.tmp")
+    cover_tmp_path = (
+        None
+        if preserve_video
+        else _prepare_ffmpeg_cover_file(cover, target_format, f"{new_path}.cover.tmp")
+    )
+    has_audio = bool(info.codec_name or not (preserve_video and info.video_codec_name))
 
     command = [ffmpeg, "-y", "-i", old_path]
     if chapters_written:
@@ -1085,6 +1156,8 @@ def convert_single_file(
         chapters_written=chapters_written,
         meta_written=meta_written,
         cover_path=cover_tmp_path,
+        preserve_video=preserve_video,
+        has_audio=has_audio,
     )
     command += _build_mux_codec_args(
         old_ext,
@@ -1095,8 +1168,9 @@ def convert_single_file(
         faststart=faststart,
         loudnorm=loudnorm,
         mono=mono,
+        preserve_video=preserve_video,
     )
-    if capture and info.duration > 0:
+    if show_progress and capture and info.duration > 0:
         command += ["-progress", "pipe:1", "-nostats"]
     new_dir = os.path.dirname(os.path.abspath(new_path)) or os.getcwd()
     os.makedirs(new_dir, exist_ok=True)
@@ -1107,7 +1181,7 @@ def convert_single_file(
     command.append(staged_path)
 
     try:
-        if capture and info.duration > 0:
+        if show_progress and capture and info.duration > 0:
             with logging.progress([]) as conv_prog:
                 conv_task = conv_prog.add_task(
                     f"Converting {os.path.basename(old_path)}",
@@ -1158,6 +1232,7 @@ def convert_single_file(
         verified_info = verify_audio_integrity(
             staged_path,
             expected_duration=info.duration,
+            allow_video=preserve_video,
         )
     except FailedCombining:
         if os.path.exists(staged_path):
@@ -1216,9 +1291,12 @@ def _split_single_chapter(
     capture: bool,
     cancel_event: threading.Event | None,
     probe_cache: dict[str, AudioProbeInfo] | None = None,
+    *,
+    preserve_video: bool = False,
 ) -> str:
     """Export one chapter slice from `master_path` to `out_path`."""
     duration_args = ["-t", f"{duration_sec:.3f}"] if duration_sec is not None else []
+    stream_args = ["-map", "0:v:0?", "-map", "0:a?"] if preserve_video else ["-vn"]
     if accurate:
         cmd = [
             ffmpeg,
@@ -1228,7 +1306,7 @@ def _split_single_chapter(
             "-ss",
             f"{start_sec:.3f}",
             *duration_args,
-            "-vn",
+            *stream_args,
             *reencode_codec_args,
             *format_args,
             out_path,
@@ -1244,7 +1322,7 @@ def _split_single_chapter(
             *duration_args,
             "-avoid_negative_ts",
             "make_zero",
-            "-vn",
+            *stream_args,
             *fast_codec_args,
             *format_args,
             out_path,
@@ -1275,7 +1353,7 @@ def _split_single_chapter(
             "-ss",
             f"{start_sec:.3f}",
             *duration_args,
-            "-vn",
+            *stream_args,
             *reencode_codec_args,
             *format_args,
             out_path,
@@ -1299,7 +1377,7 @@ def _split_single_chapter(
             f"Failed splitting chapter {chapter_index + 1}: '{chapter_title}'"
         )
     try:
-        verify_audio_integrity(out_path, probe_cache=probe_cache)
+        verify_audio_integrity(out_path, probe_cache=probe_cache, allow_video=preserve_video)
     except FailedCombining:
         if os.path.exists(out_path):
             os.remove(out_path)
@@ -1313,6 +1391,22 @@ def _split_single_chapter(
     return out_path
 
 
+def _chapter_output_filepath(
+    output_dir: str,
+    chapter_index: int,
+    total_chapters: int,
+    raw_title: str,
+    target_format: str,
+) -> str:
+    """Build zero-padded, filename-safe chapter/lesson output path inside `output_dir`."""
+    width = max(2, len(str(total_chapters)))
+    safe_title = _truncate_utf8(_fix_output(raw_title or "") or f"Chapter {chapter_index + 1}", 160)
+    if platform.system() == "Windows":
+        safe_title = _sanitize_windows_reserved_name(safe_title.rstrip(". ") or f"Chapter {chapter_index + 1}")
+    out_name = f"{chapter_index + 1:0{width}d} - {safe_title}.{target_format}"
+    return os.path.join(output_dir, out_name)
+
+
 def split_audio_by_chapters(
     master_path: str,
     output_dir: str,
@@ -1324,6 +1418,7 @@ def split_audio_by_chapters(
     probe_cache: dict[str, AudioProbeInfo] | None = None,
     loudnorm: bool = False,
     mono: bool = False,
+    preserve_video: bool = False,
 ) -> list[str]:
     """
     Split `master_path` into individual zero-padded chapter files inside `output_dir`.
@@ -1344,6 +1439,7 @@ def split_audio_by_chapters(
         audio_bitrate,
         loudnorm=loudnorm,
         mono=mono,
+        preserve_video=preserve_video,
     )
     reencode_codec_args = _build_reencode_codec_args(
         target_format,
@@ -1352,10 +1448,10 @@ def split_audio_by_chapters(
         audio_bitrate,
         loudnorm=loudnorm,
         mono=mono,
+        preserve_video=preserve_video,
     )
     format_args = ["-f", "mp4"] if target_format == "m4b" else []
     capture = not logging.is_ffmpeg_output()
-    is_windows = platform.system() == "Windows"
 
     if info.duration > 0:
         total_ms = max(1, round(info.duration * 1000))
@@ -1372,18 +1468,15 @@ def split_audio_by_chapters(
     if not spans:
         return [master_path]
 
-    width = max(2, len(str(len(spans))))
     tasks = []
     for idx, (start_ms, end_ms, raw_title) in enumerate(spans):
         start_sec = start_ms / 1000.0
         duration_sec: float | None = None
         if idx + 1 < len(spans) or (total_ms > 0 and end_ms < total_ms):
             duration_sec = max(0.05, (end_ms - start_ms) / 1000.0)
-        safe_title = _truncate_utf8(_fix_output(raw_title or "") or f"Chapter {idx + 1}", 160)
-        if is_windows:
-            safe_title = _sanitize_windows_reserved_name(safe_title.rstrip(". ") or f"Chapter {idx + 1}")
-        out_name = f"{idx + 1:0{width}d} - {safe_title}.{target_format}"
-        out_path = os.path.join(output_dir, out_name)
+        out_path = _chapter_output_filepath(
+            output_dir, idx, len(spans), raw_title or f"Chapter {idx + 1}", target_format
+        )
         tasks.append((idx, start_sec, duration_sec, out_path, raw_title or f"Chapter {idx + 1}"))
 
     batch_abort = threading.Event()
@@ -1420,6 +1513,7 @@ def split_audio_by_chapters(
                         capture=capture,
                         cancel_event=effective_cancel,
                         probe_cache=probe_cache,
+                        preserve_video=preserve_video,
                     )
                 except BaseException as exc:
                     with state_lock:
@@ -1432,13 +1526,13 @@ def split_audio_by_chapters(
                     split_prog.advance(task_bar, 1.0)
                 return exported
 
-            ordered = run_cancellable_pool(
+            exported_paths = run_cancellable_pool(
                 _run_task,
                 tasks,
                 max_workers=COMBINE_REMUX_THREADS,
                 cancel_event=effective_cancel,
             )
-            return list(ordered)
+            return list(exported_paths)
     except Exception:
         for path in created:
             if os.path.exists(path):
@@ -1451,6 +1545,130 @@ def split_audio_by_chapters(
         raise
 
 
+def merge_segment_groups_into_chapters(
+    segment_groups: Sequence[tuple[str, Sequence[str]]],
+    output_dir: str,
+    output_format: str | None = None,
+    cancel_event: threading.Event | None = None,
+    audio_bitrate: str | None = None,
+    probe_cache: dict[str, AudioProbeInfo] | None = None,
+    loudnorm: bool = False,
+    mono: bool = False,
+    preserve_video: bool = False,
+) -> list[str]:
+    """
+    Merge pre-grouped segment lists directly into per-chapter/per-lesson files in `output_dir`.
+    """
+    non_empty = [(title, list(paths)) for title, paths in segment_groups if paths]
+    if not non_empty:
+        return []
+    os.makedirs(output_dir, exist_ok=True)
+    cache: dict[str, AudioProbeInfo] = probe_cache if probe_cache is not None else {}
+    target_format = (output_format or get_extension(non_empty[0][1][0])).lstrip(".").lower()
+    total = len(non_empty)
+
+    batch_abort = threading.Event()
+    state_lock = threading.Lock()
+    created: list[str] = []
+    first_error: BaseException | None = None
+
+    class _CancelMonitor:
+        def is_set(self) -> bool:
+            return batch_abort.is_set() or (cancel_event is not None and cancel_event.is_set())
+
+    effective_cancel: Any = _CancelMonitor()
+    logging.book_update(f"Merging {total} chapters")
+    try:
+        with tempfile.TemporaryDirectory() as tmp_root:
+            with logging.progress([]) as merge_prog:
+                merge_task = merge_prog.add_task(f"Merging ({total} chapters)", total=total)
+
+                def _merge_one(item: tuple[int, tuple[str, list[str]]]) -> str:
+                    nonlocal first_error
+                    idx, (title, group_paths) = item
+                    out_path = _chapter_output_filepath(
+                        output_dir, idx, total, title, target_format
+                    )
+                    try:
+                        if len(group_paths) == 1:
+                            src = group_paths[0]
+                            if (
+                                not loudnorm
+                                and not mono
+                                and get_extension(src) == target_format
+                            ):
+                                shutil.copy2(src, out_path)
+                            else:
+                                convert_single_file(
+                                    src,
+                                    target_format,
+                                    cancel_event=effective_cancel,
+                                    audio_bitrate=audio_bitrate,
+                                    remove_source=False,
+                                    probe_cache=cache,
+                                    output_path=out_path,
+                                    faststart=True,
+                                    loudnorm=loudnorm,
+                                    mono=mono,
+                                    preserve_video=preserve_video,
+                                    show_progress=False,
+                                )
+                        else:
+                            group_tmp = os.path.join(tmp_root, f"grp_{idx}")
+                            os.makedirs(group_tmp, exist_ok=True)
+                            combine_audiofiles(
+                                group_paths,
+                                group_tmp,
+                                out_path,
+                                cancel_event=effective_cancel,
+                                audio_bitrate=audio_bitrate,
+                                probe_cache=cache,
+                                faststart=True,
+                                loudnorm=loudnorm,
+                                mono=mono,
+                                preserve_video=preserve_video,
+                                show_progress=False,
+                            )
+                    except BaseException as exc:
+                        with state_lock:
+                            if first_error is None:
+                                first_error = exc
+                        batch_abort.set()
+                        raise
+                    with state_lock:
+                        created.append(out_path)
+                        merge_prog.advance(merge_task, 1.0)
+                    return out_path
+
+                ordered = list(
+                    run_cancellable_pool(
+                        _merge_one,
+                        list(enumerate(non_empty)),
+                        max_workers=COMBINE_REMUX_THREADS,
+                        cancel_event=effective_cancel,
+                    )
+                )
+    except Exception:
+        for path in created:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        if first_error is not None and not (cancel_event is not None and cancel_event.is_set()):
+            raise first_error from None
+        raise
+
+    consumed = {p for _title, paths in non_empty for p in paths}
+    for part in consumed:
+        if part not in ordered and os.path.exists(part):
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+    return ordered
+
+
 def merge_hls_segments_into_chapters(
     filepaths: Sequence[str],
     output_dir: str,
@@ -1461,6 +1679,7 @@ def merge_hls_segments_into_chapters(
     probe_cache: dict[str, AudioProbeInfo] | None = None,
     loudnorm: bool = False,
     mono: bool = False,
+    preserve_video: bool = False,
 ) -> list[str]:
     """
     Combine fine-grained HLS segment files seamlessly and split cleanly by `chapters`.
@@ -1469,9 +1688,14 @@ def merge_hls_segments_into_chapters(
         return []
     cache: dict[str, AudioProbeInfo] = probe_cache if probe_cache is not None else {}
     target_format = (output_format or get_extension(filepaths[0])).lstrip(".").lower()
-    master_ext = "m4a" if get_extension(filepaths[0]) in ("ts", "aac") and target_format in MP4_CONTAINERS else target_format
+    fallback_master = "mp4" if preserve_video else "m4a"
+    master_ext = (
+        fallback_master
+        if get_extension(filepaths[0]) in ("ts", "aac") and target_format in MP4_CONTAINERS
+        else target_format
+    )
     if master_ext == "ts":
-        master_ext = "m4a"
+        master_ext = fallback_master
     with tempfile.TemporaryDirectory() as tmp_dir:
         combine_work = os.path.join(tmp_dir, "combine_work")
         os.makedirs(combine_work, exist_ok=True)
@@ -1485,6 +1709,7 @@ def merge_hls_segments_into_chapters(
             probe_cache=cache,
             loudnorm=loudnorm,
             mono=mono,
+            preserve_video=preserve_video,
         )
         split_paths = split_audio_by_chapters(
             master_path,
@@ -1494,6 +1719,7 @@ def merge_hls_segments_into_chapters(
             cancel_event=cancel_event,
             audio_bitrate=audio_bitrate,
             probe_cache=cache,
+            preserve_video=preserve_video,
         )
     for part in filepaths:
         if part not in split_paths and os.path.exists(part):
@@ -1512,9 +1738,9 @@ def convert_output(
     loudnorm: bool = False,
     mono: bool = False,
     probe_cache: dict[str, AudioProbeInfo] | None = None,
+    preserve_video: bool = False,
 ):
-    """Converts a list of audio files into another format and return new
-    files"""
+    """Converts a list of media files into another format and returns new files"""
     explicit_bitrate = normalize_audio_bitrate(audio_bitrate)
     if not filenames:
         return []
@@ -1530,6 +1756,7 @@ def convert_output(
             probe_cache=probe_cache,
             loudnorm=loudnorm,
             mono=mono,
+            preserve_video=preserve_video,
         )
         return [new_path]
 
@@ -1557,6 +1784,7 @@ def convert_output(
                 probe_cache=probe_cache,
                 loudnorm=loudnorm,
                 mono=mono,
+                preserve_video=preserve_video,
             )
         except BaseException as exc:
             with error_lock:

@@ -12,7 +12,7 @@ from .utils.audiobook import (
 )
 from .sources.source import Source
 from . import utils
-from .args import DownloadOptions
+from .options_schema import DownloadOptions
 from .config import Config
 from .pipeline import DownloadEvent, DownloadSummary, Downloader
 

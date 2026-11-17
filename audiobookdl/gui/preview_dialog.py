@@ -114,7 +114,7 @@ class ChoiceDialog(ModalDialog):
         self.finalize_modal(initial_focus=self._listbox)
 
     def _confirm(self) -> None:
-        sel = self._listbox.curselection()
+        sel = self._listbox.curselection()  # type: ignore[no-untyped-call]
         if sel:
             self.selected_index = int(sel[0])
         self.destroy()
@@ -702,9 +702,10 @@ class PreviewDialog(ModalDialog):
             except Exception as err:
                 exc = err
             finally:
-                self._cb_queue.post(
-                    lambda c=candidates, e=exc: self._on_enrichment_search_done(audiobook, c, e)
-                )
+                def _post_search() -> None:
+                    self._on_enrichment_search_done(audiobook, candidates, exc)
+
+                self._cb_queue.post(_post_search)
                 self._cb_queue.finish_worker()
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -768,11 +769,12 @@ class PreviewDialog(ModalDialog):
             except Exception as err:
                 err_exc = err
             finally:
-                self._cb_queue.post(
-                    lambda f=fields, cu=cover_updated, ch=chapters_updated, e=err_exc: self._on_enrichment_applied(
-                        audiobook, f, cu, ch, e
+                def _post_apply() -> None:
+                    self._on_enrichment_applied(
+                        audiobook, fields, cover_updated, chapters_updated, err_exc
                     )
-                )
+
+                self._cb_queue.post(_post_apply)
                 self._cb_queue.finish_worker()
 
         threading.Thread(target=_apply_worker, daemon=True).start()

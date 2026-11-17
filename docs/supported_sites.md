@@ -12,7 +12,7 @@
 | Libro.fm         |    ✓    |   ✓   |   ✓    |      ✓       |   ✗    | DRM-free `.m4b` / split `.mp3`; search filters purchased library    |
 | Librivox         |    ✗    |   ✗   |   ✓    |      ✗       |   ✗    | Public domain catalog (no user account or personal library)         |
 | Nextory          |    ✗    |   ✓   |   ✓    |      ✓       |   ✗    | Multi-profile selection (`--library`), locale routing, catalog URLs |
-| O'Reilly         |    ✓    |   ✗   |   ✓    |      ✓       |   ✓    | Audiobooks & video-course audio (Kaltura HLS) + EPUB assembly       |
+| O'Reilly         |    ✓    |   ✗   |   ✓    |      ✓       |   ✓    | Audiobooks, video courses (audio or `.mp4`/`.mkv`), and EPUB assembly |
 | Overdrive        |    ✓    |   ✗   |   ✗    |      ✓       |   ✗    | Supports `listen.overdrive.com` and Libby loan/shelf URLs           |
 | Podimo           |    ✗    |   ✓   |   ✓    |      ✓       |   ✗    | Audiobooks & podcast series; GraphQL catalog search & library sync  |
 | RSS              |    ✗    |   ✗   |   ✗    |      ✗       |   ✗    | Generic RSS 2.0 / Atom podcast & serialized audiobook `.xml` feeds  |

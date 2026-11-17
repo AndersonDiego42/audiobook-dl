@@ -7,7 +7,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from collections.abc import Callable
 
-from audiobookdl import args, logging
+from audiobookdl import logging
+from audiobookdl.options_schema import DownloadOptions
 from audiobookdl.gui.controller import GuiController
 from audiobookdl.utils import find_executable, validate_executable, validate_ffmpeg_dir
 from audiobookdl.utils.updater import winget_available
@@ -36,7 +37,7 @@ class FFmpegAssistant:
         self.locate_btn: ttk.Button | None = None
         self.is_available = True
 
-    def build_controls(self, parent: ttk.Frame) -> ttk.Frame:
+    def build_controls(self, parent: tk.Misc) -> ttk.Frame:
         """Build the header status label and Locate FFmpeg button inside `parent`."""
         box = ttk.Frame(parent)
         self._status_label = ttk.Label(
@@ -167,13 +168,18 @@ class FFmpegAssistant:
         self._status_var.set("FFmpeg folder reset to system PATH")
         self._on_log("Reset FFmpeg folder to system PATH")
 
-    def ensure_available(self, options: args.DownloadOptions) -> bool:
+    def ensure_available(self, options: DownloadOptions) -> bool:
         """Validate FFmpeg/FFprobe up front when combine, split, or format conversion is enabled."""
         if getattr(options, "cover", False):
             return True
         if getattr(options, "media_type", "auto") == "ebook":
             return True
-        needs_ffmpeg = bool(options.combine or options.output_format or options.split_chapters)
+        needs_ffmpeg = bool(
+            options.combine
+            or options.output_format
+            or options.split_chapters
+            or getattr(options, "media_type", "auto") == "video"
+        )
         ffmpeg_path, ffmpeg_err = self.check_tool("ffmpeg")
         ffprobe_path, ffprobe_err = self.check_tool("ffprobe")
         if not needs_ffmpeg:

@@ -168,7 +168,8 @@ class BlinkistSource(Source):
         for entry in raw_items:
             if not isinstance(entry, dict):
                 continue
-            item = entry.get("book") if isinstance(entry.get("book"), dict) else entry
+            raw_book = entry.get("book")
+            item = raw_book if isinstance(raw_book, dict) else entry
             slug_or_id = str(item.get("slug") or item.get("id") or "").strip()
             title = str(item.get("title") or slug_or_id).strip()
             if not slug_or_id or not title:

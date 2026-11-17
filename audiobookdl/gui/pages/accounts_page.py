@@ -7,7 +7,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from collections.abc import Callable, Sequence
 
-from audiobookdl import args
+from audiobookdl.options_schema import build_default_options
 from audiobookdl.config import (
     DEFAULT_PROFILE,
     list_source_profiles,
@@ -17,7 +17,7 @@ from audiobookdl.credentials import get_credential_store
 from audiobookdl.gui.auth_panel import ServiceAuthCoordinator, ServiceAuthPanel
 from audiobookdl.gui.controller import GuiController, GuiInteractionHandler
 from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, make_bold_font, scale_px
-from audiobookdl.gui.widgets import MainThreadCallbackQueue, ScrolledTreeview, TreeColumnSpec
+from audiobookdl.gui.widgets import MainThreadCallbackQueue, ScrolledTreeview, TreeColumnSpec, tree_item_values
 from audiobookdl.pipeline import verify_service_auth
 from audiobookdl.sources import ServiceInfo
 
@@ -261,7 +261,7 @@ class AccountsPage(ttk.Frame):
                 return
             iid = f"{svc_key}:{prof}"
             if self._tree.exists(iid):
-                vals = list(self._tree.item(iid, "values"))
+                vals = tree_item_values(self._tree, iid)
                 if len(vals) >= 6:
                     vals[5] = "Valid" if ok else (f"Failed: {err}" if err else "Failed")
                     self._tree.item(iid, values=tuple(vals), tags=("ok" if ok else "err",))
@@ -297,7 +297,7 @@ class AccountsPage(ttk.Frame):
                     if cancel_ev.is_set():
                         was_cancelled = True
                         break
-                    opts = args.build_default_options(
+                    opts = build_default_options(
                         config_location=self._controller.config_location,
                         profile=None if prof == DEFAULT_PROFILE else prof,
                     )

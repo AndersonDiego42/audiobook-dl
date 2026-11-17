@@ -1,12 +1,13 @@
 import json
 import tkinter as tk
 from datetime import date
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
 import requests
 
-from audiobookdl import args
+from audiobookdl.options_schema import build_default_options
 from audiobookdl.config import (
     AudiobookshelfConfig,
     Config,
@@ -24,6 +25,7 @@ from audiobookdl.output.download import add_metadata_to_file
 from audiobookdl.output.metadata.reader import read_sidecar_metadata
 from audiobookdl.output.metadata.sidecars import build_abs_metadata_dict
 from audiobookdl.pipeline import process_audiobook
+from audiobookdl.sources.source import Source
 from audiobookdl.utils.audiobook import Audiobook, AudiobookFile, AudiobookMetadata, Chapter
 
 
@@ -109,7 +111,7 @@ def test_abs_metadata_sidecar_roundtrips_with_reader_and_write_option(tmp_path):
     out_dir.mkdir()
     audio_path = out_dir / "Children of Time.m4b"
     audio_path.write_bytes(b"fake-audio")
-    opts = args.build_default_options(write_abs_metadata=True)
+    opts = build_default_options(write_abs_metadata=True)
     with patch("audiobookdl.output.download.metadata.add_metadata"):
         add_metadata_to_file(
             Audiobook(session=requests.Session(), metadata=meta, files=[], chapters=chapters),
@@ -155,7 +157,8 @@ def test_abs_config_persistence_and_client_upload_scan(tmp_path):
     (book_dir / "metadata.json").write_text("{}", encoding="utf-8")
 
     fake_session = _FakeAbsSession()
-    client = AudiobookshelfClient("https://abs.local/", "secret-token", session=fake_session)
+    typed_session = cast(requests.Session, fake_session)
+    client = AudiobookshelfClient("https://abs.local/", "secret-token", session=typed_session)
     assert client.ping() == "absadmin"
     assert client.list_libraries() == [("lib-1", "Audiobooks")]
 
@@ -164,7 +167,7 @@ def test_abs_config_persistence_and_client_upload_scan(tmp_path):
         str(m4b),
         meta,
         loaded.audiobookshelf,
-        session=fake_session,
+        session=typed_session,
     )
     assert did_sync is True
     upload_calls = [c for c in fake_session.calls if c[1].endswith("/api/upload")]
@@ -189,7 +192,7 @@ def test_pipeline_process_audiobook_triggers_abs_sync(tmp_path, monkeypatch):
     target_m4b = tmp_path / "MyBook.m4b"
     target_m4b.write_bytes(b"audio")
     book = Audiobook(
-        session=fake_session,
+        session=cast(requests.Session, fake_session),
         metadata=AudiobookMetadata(title="MyBook", authors=["Alice"], scrape_url="https://librivox.org/mybook"),
         files=[AudiobookFile(url="https://example.com/1.mp3", ext="mp3")],
     )
@@ -206,12 +209,12 @@ def test_pipeline_process_audiobook_triggers_abs_sync(tmp_path, monkeypatch):
             auto_scan=True,
         ),
     )
-    opts = args.build_default_options(
+    opts = build_default_options(
         output_template=str(tmp_path / "{title}"),
         output_format="m4b",
         database_directory=str(tmp_path),
     )
-    assert process_audiobook(_Src(), book, opts, config=cfg) is True
+    assert process_audiobook(cast(Source[Any], _Src()), book, opts, config=cfg) is True
     assert any(c[1].endswith("/api/upload") for c in fake_session.calls)
     assert any("/scan" in c[1] for c in fake_session.calls)
 
@@ -264,7 +267,7 @@ def test_abs_sidecar_sets_final_chapter_duration_and_avoids_clobbering(tmp_path)
     from audiobookdl.output.download import add_metadata_to_dir
     from audiobookdl.utils import AudioProbeInfo
 
-    opts_both = args.build_default_options(write_json_metadata=True, write_abs_metadata=True)
+    opts_both = build_default_options(write_json_metadata=True, write_abs_metadata=True)
     probe_cache = {str(part1): AudioProbeInfo(duration=42.5)}
     with patch("audiobookdl.output.download.metadata.add_metadata"):
         add_metadata_to_dir(
@@ -287,7 +290,7 @@ def test_abs_sidecar_sets_final_chapter_duration_and_avoids_clobbering(tmp_path)
     second.write_bytes(b"b")
     (flat_dir / "metadata.json").write_text('{"title": "First Book"}', encoding="utf-8")
 
-    opts_abs = args.build_default_options(write_abs_metadata=True)
+    opts_abs = build_default_options(write_abs_metadata=True)
     with patch("audiobookdl.output.download.metadata.add_metadata"):
         add_metadata_to_file(
             Audiobook(

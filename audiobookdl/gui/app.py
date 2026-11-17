@@ -13,7 +13,8 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any
 from collections.abc import Mapping, Sequence
 
-from audiobookdl import __version__, args, output
+from audiobookdl import __version__, output
+from audiobookdl.options_schema import DownloadOptions, SyncOptions, build_default_options
 from audiobookdl.config import (
     DEFAULT_PROFILE,
     is_portable_mode,
@@ -239,7 +240,7 @@ class AudiobookDLApp:
 
         self._automation = AutomationCoordinator(
             self.root,
-            is_clipboard_enabled=lambda: bool(self.clipboard_monitor_var.get()),
+            is_clipboard_enabled=lambda: self.clipboard_monitor_var.get(),
             append_urls=self._append_urls_to_input,
             save_clipboard_pref=lambda en: self._controller.save_gui_preferences(clipboard_monitor=en),
             set_status=self.status_var.set,
@@ -251,7 +252,7 @@ class AudiobookDLApp:
         )
         self._automation.auto_sync_enabled = bool(cfg_gui.auto_sync_enabled)
         self._automation.auto_sync_minutes = (
-            max(1, int(cfg_gui.auto_sync_minutes))
+            max(1, cfg_gui.auto_sync_minutes)
             if cfg_gui.auto_sync_minutes is not None
             else 30
         )
@@ -531,9 +532,9 @@ class AudiobookDLApp:
             )
             setattr(self, binding.var_attr, var)
         if cfg.gui.use_download_archive is not None:
-            self.download_archive_var.set(bool(cfg.gui.use_download_archive))
+            self.download_archive_var.set(cfg.gui.use_download_archive)
         self.m4b_var = tk.BooleanVar(value=(self.output_format_var.get() == "m4b"))
-        notify_default = True if cfg.gui.notify_on_complete is None else bool(cfg.gui.notify_on_complete)
+        notify_default = True if cfg.gui.notify_on_complete is None else cfg.gui.notify_on_complete
         self.notify_on_complete_var = tk.BooleanVar(value=notify_default)
 
         self.clipboard_monitor_var = tk.BooleanVar(value=bool(cfg.gui.clipboard_monitor))
@@ -602,6 +603,7 @@ class AudiobookDLApp:
             self.output_dir_var,
             self.template_var,
             self.output_format_var,
+            self.media_type_var,
             self.combine_var,
             self.remove_chars_var,
             self.cover_only_var,
@@ -626,9 +628,9 @@ class AudiobookDLApp:
 
     def _create_download_page(self, parent: ttk.Frame) -> DownloadPage:
         cfg_gui = self._controller.config.gui
-        options_collapsed = True if cfg_gui.options_collapsed is None else bool(cfg_gui.options_collapsed)
+        options_collapsed = True if cfg_gui.options_collapsed is None else cfg_gui.options_collapsed
         naming_collapsed = (
-            True if cfg_gui.output_naming_collapsed is None else bool(cfg_gui.output_naming_collapsed)
+            True if cfg_gui.output_naming_collapsed is None else cfg_gui.output_naming_collapsed
         )
         page = DownloadPage(
             parent,
@@ -653,6 +655,7 @@ class AudiobookDLApp:
             on_preview_metadata=self.preview_metadata,
             on_pack_local=lambda: self.navigate("pack"),
             on_retry_failed=self._retry_failed_queue_items,
+            on_retry_selected=self._retry_failed_queue_items,
             service_label_for_url=self._auth.service_label_for_url,
             on_preview_url=lambda u: self.preview_metadata(url_override=u),
             on_send_to_urls=self._send_urls_to_input,
@@ -886,17 +889,17 @@ class AudiobookDLApp:
         """Handle activity events without forcing lazy `DownloadPage` creation."""
         if isinstance(item, LogEvent):
             prefix = f"[{item.level}] " if item.level in ("DEBUG", "ERROR") else ""
-            self._append_log(f"{prefix}{item.message}", level=str(item.level))
-            if item.level == "INFO" and str(item.message).strip():
-                self.status_var.set(str(item.message).strip().splitlines()[0][:80])
+            self._append_log(f"{prefix}{item.message}", level=item.level)
+            if item.level == "INFO" and item.message.strip():
+                self.status_var.set(item.message.strip().splitlines()[0][:80])
             return True
         if isinstance(item, LogBatchEvent):
             last_info = ""
             for level, message in item.entries:
                 prefix = f"[{level}] " if level in ("DEBUG", "ERROR") else ""
-                self._append_log(f"{prefix}{message}", level=str(level))
-                if level == "INFO" and str(message).strip():
-                    last_info = str(message)
+                self._append_log(f"{prefix}{message}", level=level)
+                if level == "INFO" and message.strip():
+                    last_info = message
             if last_info:
                 self.status_var.set(last_info.strip().splitlines()[0][:80])
             return True
@@ -913,13 +916,13 @@ class AudiobookDLApp:
                 output_path=item.output_path or None,
             )
             if item.title:
-                self.active_job_var.set(str(item.title).strip()[:60])
+                self.active_job_var.set(item.title.strip()[:60])
             return True
         if isinstance(item, ProgressStartEvent):
             self.progress_var.set(0.0)
-            self.status_var.set(str(item.description)[:80])
-            if str(item.description).strip():
-                self.active_job_var.set(str(item.description).strip()[:60])
+            self.status_var.set(item.description[:80])
+            if item.description.strip():
+                self.active_job_var.set(item.description.strip()[:60])
             return True
         if isinstance(item, ProgressAdvanceEvent):
             pct = (item.completed / item.total * 100.0) if item.total > 0 else 0.0
@@ -980,9 +983,12 @@ class AudiobookDLApp:
         view_menu.add_cascade(label="Theme", menu=theme_menu)
         view_menu.add_separator()
         for spec in NAV_ITEMS:
+            def _make_nav_cb(page_id: str) -> Any:
+                return lambda: self.navigate(page_id)
+
             view_menu.add_command(
                 label=spec.label,
-                command=lambda pid=spec.page_id: self.navigate(pid),
+                command=_make_nav_cb(spec.page_id),
                 accelerator=spec.shortcut_hint,
             )
         menubar.add_cascade(label="View", menu=view_menu)
@@ -999,7 +1005,10 @@ class AudiobookDLApp:
         self.root.bind("<Control-p>", lambda _e: self.preview_metadata())
         self.root.bind("<F5>", lambda _e: self.start_download())
         for idx, spec in enumerate(NAV_ITEMS, start=1):
-            self.root.bind(f"<Control-Key-{idx}>", lambda _e, pid=spec.page_id: self.navigate(pid))
+            def _make_shortcut_cb(page_id: str) -> Any:
+                return lambda _e: self.navigate(page_id)
+
+            self.root.bind(f"<Control-Key-{idx}>", _make_shortcut_cb(spec.page_id))
 
     def _on_ffmpeg_status_changed(self, available: bool, status_text: str) -> None:
         self._last_ffmpeg_available = available
@@ -1061,7 +1070,7 @@ class AudiobookDLApp:
         self._automation.apply_clipboard_monitor(quiet=False, persist=True)
 
     def _toggle_check_updates(self) -> None:
-        enabled = bool(self.check_updates_var.get())
+        enabled = self.check_updates_var.get()
         try:
             self._controller.set_check_updates(enabled)
         except OSError:
@@ -1174,17 +1183,17 @@ class AudiobookDLApp:
                 cfg_val = getattr(cfg, spec.config_key, None)
                 getattr(self, binding.var_attr).set(binding.init_value(cfg_val))
             if cfg.gui.use_download_archive is not None:
-                self.download_archive_var.set(bool(cfg.gui.use_download_archive))
+                self.download_archive_var.set(cfg.gui.use_download_archive)
             if cfg.gui.notify_on_complete is not None:
-                self.notify_on_complete_var.set(bool(cfg.gui.notify_on_complete))
+                self.notify_on_complete_var.set(cfg.gui.notify_on_complete)
             if cfg.gui.clipboard_monitor is not None:
-                self.clipboard_monitor_var.set(bool(cfg.gui.clipboard_monitor))
+                self.clipboard_monitor_var.set(cfg.gui.clipboard_monitor)
                 self._automation.apply_clipboard_monitor(quiet=True, persist=False)
             self.check_updates_var.set(cfg.check_updates is not False)
             if cfg.gui.auto_sync_enabled is not None:
-                self._automation.auto_sync_enabled = bool(cfg.gui.auto_sync_enabled)
+                self._automation.auto_sync_enabled = cfg.gui.auto_sync_enabled
             if cfg.gui.auto_sync_minutes is not None:
-                self._automation.auto_sync_minutes = max(1, int(cfg.gui.auto_sync_minutes))
+                self._automation.auto_sync_minutes = max(1, cfg.gui.auto_sync_minutes)
             if cfg.gui.auto_sync_mode in ("enqueue", "scan_only", "dry_run"):
                 self._automation.auto_sync_mode = cfg.gui.auto_sync_mode
             if cfg.gui.auto_sync_targets is not None:
@@ -1295,7 +1304,11 @@ class AudiobookDLApp:
         tpl = self.template_var.get().strip() or "{title}"
         full_tpl = os.path.join(folder, tpl)
         fmt = self.output_format_var.get().strip()
-        ext = "m4b" if fmt in ("", "Original") else fmt
+        if fmt in ("", "Original"):
+            media = self.media_type_var.get().strip().lower()
+            ext = "mp4" if media == "video" else "m4b"
+        else:
+            ext = fmt
         remove_chars = self.remove_chars_var.get()
         try:
             rendered_series = output.gen_output_location(
@@ -1349,7 +1362,7 @@ class AudiobookDLApp:
         except tk.TclError:
             self.status_var.set("Clipboard is empty")
             return []
-        lines = [ln.strip() for ln in str(raw).splitlines() if ln.strip()]
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
         local_paths, _url_candidates = partition_input_tokens(lines)
         pasted = [
             u
@@ -1379,8 +1392,8 @@ class AudiobookDLApp:
         base_opts = self._try_build_options(urls_override=[])
         if base_opts is None:
             return
-        dl_specs: list[tuple[str, args.DownloadOptions, list[int] | None, None]] = []
-        pack_specs: list[tuple[PackJobRequest, args.DownloadOptions]] = []
+        dl_specs: list[tuple[str, DownloadOptions, list[int] | None, None]] = []
+        pack_specs: list[tuple[PackJobRequest, DownloadOptions]] = []
         for rec in items:
             job_kind = str(rec.get("job_kind") or "download")
             if job_kind == "pack" and isinstance(rec.get("pack_request"), dict):
@@ -1529,7 +1542,7 @@ class AudiobookDLApp:
         self,
         urls_override: Sequence[str] | None = None,
         parent: tk.Misc | None = None,
-    ) -> args.DownloadOptions | None:
+    ) -> DownloadOptions | None:
         """Build `DownloadOptions`, displaying a validation dialog on invalid numeric/text input."""
         try:
             return self.build_options(urls_override=urls_override)
@@ -1542,7 +1555,7 @@ class AudiobookDLApp:
             )
             return None
 
-    def build_options(self, urls_override: Sequence[str] | None = None) -> args.DownloadOptions:
+    def build_options(self, urls_override: Sequence[str] | None = None) -> DownloadOptions:
         """Build `DownloadOptions` from current UI field values."""
         output_dir = self.output_dir_var.get().strip() or default_output_dir()
         template = self.template_var.get().strip() or "{title}"
@@ -1566,7 +1579,7 @@ class AudiobookDLApp:
             config_loc if (config_loc and os.path.exists(config_loc)) else None
         )
 
-        return args.build_default_options(
+        return build_default_options(
             urls=urls,
             output_template=output_template,
             download_archive=download_archive,
@@ -1589,7 +1602,7 @@ class AudiobookDLApp:
                 continue
         return prefs
 
-    def _save_run_preferences(self, options: args.DownloadOptions) -> None:
+    def _save_run_preferences(self, options: DownloadOptions) -> None:
         if self.remember_login_var.get():
             self.save_current_credentials(quiet=True)
         self._controller.save_run_preferences(
@@ -1602,7 +1615,7 @@ class AudiobookDLApp:
     def _start_new_run(
         self,
         job_specs: Sequence[
-            tuple[str, args.DownloadOptions, list[int] | None, tuple[Source, Result] | None]
+            tuple[str, DownloadOptions, list[int] | None, tuple[Source, Result] | None]
         ],
     ) -> None:
         """Initialize UI and queue state for a fresh download run."""
@@ -1631,7 +1644,7 @@ class AudiobookDLApp:
         if self._try_build_options(urls_override=[]) is None:
             return True
 
-        def _build_for_url(u: str) -> args.DownloadOptions:
+        def _build_for_url(u: str) -> DownloadOptions:
             opts = self.build_options(urls_override=[u])
             if profile_override:
                 opts.profile = profile_override
@@ -1694,9 +1707,9 @@ class AudiobookDLApp:
 
     def _build_retry_download_spec(
         self,
-        base_opts: args.DownloadOptions,
+        base_opts: DownloadOptions,
         rec: dict[str, Any],
-    ) -> tuple[str, args.DownloadOptions, list[int] | None, None]:
+    ) -> tuple[str, DownloadOptions, list[int] | None, None]:
         url = str(rec.get("url") or "").strip()
         opts = self.build_options(urls_override=[url])
         profile = str(rec.get("profile") or "").strip()
@@ -1712,7 +1725,7 @@ class AudiobookDLApp:
             opts._explicit_fields = frozenset(explicit)
         raw_indices = rec.get("selected_indices")
         selected_indices = (
-            [int(i) for i in raw_indices if isinstance(i, int) and not isinstance(i, bool)]
+            [i for i in raw_indices if isinstance(i, int) and not isinstance(i, bool)]
             if isinstance(raw_indices, list)
             else None
         )
@@ -1720,9 +1733,9 @@ class AudiobookDLApp:
 
     @staticmethod
     def _build_retry_pack_options(
-        base_opts: args.DownloadOptions,
+        base_opts: DownloadOptions,
         req: PackJobRequest,
-    ) -> args.DownloadOptions:
+    ) -> DownloadOptions:
         fmt = req.output_format or base_opts.output_format or "m4b"
         opts = dataclasses.replace(base_opts, output_format=fmt)
         opts._explicit_fields = frozenset(base_opts._explicit_fields | {"output_format"})
@@ -1750,7 +1763,7 @@ class AudiobookDLApp:
                 prof = str(rec.get("profile") or "").strip()
                 raw_idx = rec.get("selected_indices")
                 idx_key = (
-                    tuple(int(i) for i in raw_idx if isinstance(i, int))
+                    tuple(i for i in raw_idx if isinstance(i, int))
                     if isinstance(raw_idx, list)
                     else None
                 )
@@ -1847,7 +1860,7 @@ class AudiobookDLApp:
         mode: str,
         targets: list[tuple[str, str]],
     ) -> None:
-        norm_minutes = max(1, int(minutes))
+        norm_minutes = max(1, minutes)
         norm_mode = mode if mode in ("enqueue", "scan_only", "dry_run") else "enqueue"
         self._automation.auto_sync_mode = norm_mode
         self._automation.auto_sync_targets = list(targets)
@@ -1855,7 +1868,7 @@ class AudiobookDLApp:
         serialized_targets = [make_source_profile_key(s, p) for s, p in targets]
         try:
             self._controller.save_gui_preferences(
-                auto_sync_enabled=bool(enabled),
+                auto_sync_enabled=enabled,
                 auto_sync_minutes=norm_minutes,
                 auto_sync_mode=norm_mode,
                 auto_sync_targets=serialized_targets,
@@ -1881,7 +1894,7 @@ class AudiobookDLApp:
         self._set_syncing_state(True)
         self.status_var.set("Scanning libraries for pending books...")
         self._append_log("--- Scanning libraries for pending books ---")
-        sync_opts = args.SyncOptions(
+        sync_opts = SyncOptions(
             services=[s for s, _p in targets],
             scan_only=True,
             output_template=options.output_template,
@@ -1911,7 +1924,7 @@ class AudiobookDLApp:
         self._set_syncing_state(True)
         self.status_var.set("Syncing libraries...")
         self._append_log("--- Starting library sync ---")
-        sync_opts = args.SyncOptions(
+        sync_opts = SyncOptions(
             services=list(services),
             scan_only=scan_only,
             dry_run=dry_run,
@@ -1960,7 +1973,7 @@ class AudiobookDLApp:
         if base_opts is None:
             return
         self._save_run_preferences(base_opts)
-        pairs: list[tuple[PackJobRequest, args.DownloadOptions]] = []
+        pairs: list[tuple[PackJobRequest, DownloadOptions]] = []
         for req in requests_list:
             fmt = output_format or req.output_format or "m4b"
             opts = dataclasses.replace(base_opts, output_format=fmt)
@@ -2008,7 +2021,7 @@ class AudiobookDLApp:
 
         unique_urls = list(dict.fromkeys(urls))
         job_specs: list[
-            tuple[str, args.DownloadOptions, list[int] | None, tuple[Source, Result] | None]
+            tuple[str, DownloadOptions, list[int] | None, tuple[Source, Result] | None]
         ] = []
         for u in unique_urls:
             job_opts = self.build_options(urls_override=[u])
@@ -2439,7 +2452,7 @@ class AudiobookDLApp:
             return
         if not self._ffmpeg_assistant.ensure_available(base_opts):
             return
-        dl_specs: list[tuple[str, args.DownloadOptions, list[int] | None, None]] = []
+        dl_specs: list[tuple[str, DownloadOptions, list[int] | None, None]] = []
         for _svc, prof, urls in pending_groups:
             for u in urls:
                 opts = self.build_options(urls_override=[u])
@@ -2560,59 +2573,9 @@ def _enable_high_dpi_awareness() -> None:
     enable_high_dpi_awareness()
 
 
-def _is_gui_invocation(raw_argv: Sequence[str]) -> bool:
-    """
-    Return `True` when `raw_argv` only targets the desktop GUI launcher.
-
-    Any URL, CLI subcommand (`pack`, `library`, `scan`, `export`, `sync`),
-    or CLI option (such as `--version`, `--help`, `--search`, `-o`) routes
-    through `audiobookdl.__main__.main()` instead.
-    """
-    if not raw_argv:
-        return True
-    idx = 0
-    while idx < len(raw_argv):
-        token = raw_argv[idx]
-        if token in ("--self-test", "--gui"):
-            idx += 1
-            continue
-        if token in ("-c", "--config"):
-            if idx + 1 >= len(raw_argv):
-                return True
-            idx += 2
-            continue
-        if token.startswith("--config=") or (token.startswith("-c") and len(token) > 2):
-            idx += 1
-            continue
-        return False
-    return True
-
-
-def _attach_parent_console_windows() -> None:
-    """Attach a Windows GUI-subsystem binary to its parent console when invoked from CLI."""
-    if os.name != "nt":
-        return
-    if sys.stdout is not None and sys.stderr is not None:
-        return
-    try:
-        import ctypes
-
-        kernel32 = ctypes.windll.kernel32
-        if not kernel32.AttachConsole(-1):
-            return
-        if sys.stdout is None:
-            sys.stdout = open("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)
-        if sys.stderr is None:
-            sys.stderr = open("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)
-        if sys.stdin is None:
-            sys.stdin = open("CONIN$", encoding="utf-8", errors="replace")
-    except Exception:
-        pass
-
-
 def parse_gui_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    """Parse CLI arguments supported by the desktop GUI launcher."""
-    parser = argparse.ArgumentParser(prog="audiobook-dl-gui")
+    """Parse startup arguments supported by the desktop GUI application."""
+    parser = argparse.ArgumentParser(prog="audiobook-dl")
     parser.add_argument(
         "--gui",
         action="store_true",
@@ -2639,9 +2602,6 @@ def run_self_test(check_gui: bool = True) -> None:
     import pycountry
     from audiobookdl.config import tomllib
 
-    help_text = read_asset_file("assets/simple_help.txt")
-    if not help_text.strip():
-        raise RuntimeError("Missing assets/simple_help.txt")
     chapter_tpl = read_asset_file("assets/ffmpeg_chapter_template.txt")
     if "{title}" not in chapter_tpl:
         raise RuntimeError("Invalid assets/ffmpeg_chapter_template.txt")
@@ -2672,14 +2632,8 @@ def run_self_test(check_gui: bool = True) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    """Launch the audiobook-dl desktop GUI, or dispatch CLI invocations."""
+    """Launch the audiobook-dl desktop GUI."""
     raw_argv = list(sys.argv[1:] if argv is None else argv)
-    if not _is_gui_invocation(raw_argv):
-        _attach_parent_console_windows()
-        from audiobookdl.__main__ import main as cli_main
-
-        cli_main(raw_argv)
-        return
     parsed = parse_gui_args(raw_argv)
     if parsed.self_test:
         run_self_test(check_gui=True)

@@ -24,9 +24,9 @@ from audiobookdl import (
     DownloadEvent,
     DownloadSummary,
     Downloader,
-    args,
     logging,
 )
+from audiobookdl.options_schema import build_default_options
 from audiobookdl.config import load_config
 from audiobookdl.output.download import add_metadata_to_file
 from audiobookdl.sources.source import Source
@@ -258,7 +258,7 @@ def test_downloader_hls_aes_combine_and_metadata_integration(tmp_path, monkeypat
     server_thread.start()
     try:
         config = load_config(str(cfg_path))
-        options = args.build_default_options(
+        options = build_default_options(
             config_location=str(cfg_path),
             output_template=str(out_dir / "{author}" / "{title}"),
             database_directory=str(db_dir),
@@ -383,7 +383,7 @@ def test_add_metadata_to_file_preserves_mp3_chapters_tags_and_cover(tmp_path):
         cover=Cover(image=_make_jpeg_bytes(), extension="jpg"),
     )
 
-    add_metadata_to_file(audiobook, str(mp3_path), args.build_default_options())
+    add_metadata_to_file(audiobook, str(mp3_path), build_default_options())
 
     tags = ID3(str(mp3_path))
     assert str(tags["TIT2"]) == "MP3 Integration Book"
@@ -486,7 +486,7 @@ def test_downloader_multipart_convert_output_m4b_integration(tmp_path):
         cfg_path = tmp_path / "audiobook-dl.toml"
         cfg_path.write_text("", encoding="utf-8")
         cfg = load_config(str(cfg_path))
-        opts = args.build_default_options(
+        opts = build_default_options(
             urls=[f"{base}/mp/1"],
             combine=True,
             output_format="m4b",

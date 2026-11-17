@@ -716,14 +716,18 @@ def structure_config(
         for key in abs_dict:
             if key not in {"url", "api_key", "library_id", "auto_upload", "auto_scan"}:
                 logging.log(f"Warning: unknown key '{key}' in '[audiobookshelf]' ignored")
-        abs_url = abs_dict.get("url").strip().rstrip("/") if isinstance(abs_dict.get("url"), str) else None
+        raw_url = abs_dict.get("url")
+        abs_url = raw_url.strip().rstrip("/") if isinstance(raw_url, str) else None
         if abs_url == "":
             abs_url = None
-        abs_lib = abs_dict.get("library_id").strip() if isinstance(abs_dict.get("library_id"), str) else None
+        raw_lib = abs_dict.get("library_id")
+        abs_lib = raw_lib.strip() if isinstance(raw_lib, str) else None
         if abs_lib == "":
             abs_lib = None
-        abs_auto_upload = abs_dict.get("auto_upload") if isinstance(abs_dict.get("auto_upload"), bool) else False
-        abs_auto_scan = abs_dict.get("auto_scan") if isinstance(abs_dict.get("auto_scan"), bool) else True
+        raw_upload = abs_dict.get("auto_upload")
+        abs_auto_upload = raw_upload if isinstance(raw_upload, bool) else False
+        raw_scan = abs_dict.get("auto_scan")
+        abs_auto_scan = raw_scan if isinstance(raw_scan, bool) else True
         abs_key_raw = abs_dict.get("api_key")
         abs_key: str | None = abs_key_raw.strip() if isinstance(abs_key_raw, str) and abs_key_raw.strip() else None
         abs_account = abs_url or "api"
@@ -1056,7 +1060,8 @@ def save_source_credentials(
             prev_entry = service_table
         else:
             profiles_dict = dict(service_table.get("profiles") or {})
-            prev_entry = profiles_dict.get(norm_profile) if isinstance(profiles_dict.get(norm_profile), dict) else {}
+            raw_profile = profiles_dict.get(norm_profile)
+            prev_entry = raw_profile if isinstance(raw_profile, dict) else {}
         prev_username = prev_entry.get("username") if isinstance(prev_entry, dict) else None
 
         entry: dict[str, Any] = {
@@ -1270,11 +1275,8 @@ def save_audiobookshelf_config(
     with file_lock(config_location):
         config_dict = read_config(config_location)
         prev_section = config_dict.get("audiobookshelf")
-        prev_url = (
-            prev_section.get("url").strip().rstrip("/")
-            if isinstance(prev_section, dict) and isinstance(prev_section.get("url"), str)
-            else None
-        )
+        raw_prev_url = prev_section.get("url") if isinstance(prev_section, dict) else None
+        prev_url = raw_prev_url.strip().rstrip("/") if isinstance(raw_prev_url, str) else None
         abs_dict = dict(prev_section) if isinstance(prev_section, dict) else {}
 
         if url is not None:

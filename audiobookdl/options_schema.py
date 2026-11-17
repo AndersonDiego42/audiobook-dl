@@ -1,7 +1,6 @@
-"""Declarative runtime option registry shared by CLI, Config, Pipeline, and GUI."""
+"""Declarative runtime option registry shared by Config, Pipeline, and Desktop GUI."""
 
-import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import os
 from typing import Any
@@ -10,10 +9,10 @@ from collections.abc import Callable, Mapping
 from audiobookdl.utils import normalize_audio_bitrate
 
 
-MEDIA_TYPE_CHOICES: tuple[str, ...] = ("auto", "audiobook", "ebook", "both")
+MEDIA_TYPE_CHOICES: tuple[str, ...] = ("auto", "audiobook", "ebook", "video", "both")
 OUTPUT_PRESET_CHOICES: tuple[str, ...] = ("default", "audiobookshelf", "plex", "kavita")
-GUI_OUTPUT_FORMATS: tuple[str, ...] = ("Original", "m4b", "mp3", "m4a", "flac", "opus")
-GUI_MEDIA_TYPE_OPTIONS: tuple[str, ...] = ("Auto", "Audiobook", "Ebook", "Both")
+GUI_OUTPUT_FORMATS: tuple[str, ...] = ("Original", "m4b", "mp3", "m4a", "mp4", "mkv", "flac", "opus")
+GUI_MEDIA_TYPE_OPTIONS: tuple[str, ...] = ("Auto", "Audiobook", "Ebook", "Video", "Both")
 GUI_OVERWRITE_OPTIONS: tuple[str, ...] = ("Ask", "Overwrite", "Keep existing")
 
 GUI_CONFIG_KEYS: frozenset[str] = frozenset(
@@ -38,8 +37,6 @@ GUI_CONFIG_KEYS: frozenset[str] = frozenset(
 )
 SOURCE_CONFIG_KEYS: frozenset[str] = frozenset({"username", "password", "library", "cookie_file"})
 
-_MISSING: Any = object()
-
 
 def default_database_directory() -> str:
     """Return the default directory for sources to store data."""
@@ -48,45 +45,46 @@ def default_database_directory() -> str:
     return os.path.join(config_dir(), "db")
 
 
-def parse_audio_bitrate_arg(value: str) -> str:
-    """Validate `--audio-bitrate` CLI argument, preserving explicit `'auto'` override."""
-    if value.strip().lower() == "auto":
-        return "auto"
-    try:
-        normalized = normalize_audio_bitrate(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(str(exc)) from exc
-    return normalized or "auto"
-
-
-def parse_positive_int_arg(value: str) -> int:
-    try:
-        parsed = int(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"Expected integer, got '{value}'") from exc
-    if parsed < 1:
-        raise argparse.ArgumentTypeError("Expected integer >= 1")
-    return parsed
-
-
-def parse_positive_float_arg(value: str) -> float:
-    try:
-        parsed = float(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"Expected number, got '{value}'") from exc
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("Expected number > 0")
-    return parsed
-
-
-def parse_non_negative_float_arg(value: str) -> float:
-    try:
-        parsed = float(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"Expected number, got '{value}'") from exc
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("Expected number >= 0")
-    return parsed
+def parse_series_selection(spec: str, total: int) -> list[int]:
+    """
+    Parse a 1-based comma/range selection string (e.g. `'1,3-5'`) into unique
+    ordered 0-based indices bounded by `[0, total)`.
+    """
+    if total < 0:
+        raise ValueError("total must be >= 0")
+    cleaned = spec.strip()
+    if not cleaned:
+        raise ValueError("Series item selection cannot be empty")
+    selected: list[int] = []
+    seen: set[int] = set()
+    for token in cleaned.split(","):
+        part = token.strip()
+        if not part:
+            raise ValueError(f"Empty token in selection '{spec}'")
+        if "-" in part:
+            bounds = part.split("-", 1)
+            if not bounds[0].strip().isdigit() or not bounds[1].strip().isdigit():
+                raise ValueError(f"Invalid range '{part}' in '{spec}'")
+            start_1 = int(bounds[0].strip())
+            end_1 = int(bounds[1].strip())
+            if start_1 < 1 or end_1 < start_1 or end_1 > total:
+                raise ValueError(f"Range '{part}' out of bounds for 1..{total}")
+            for one_based in range(start_1, end_1 + 1):
+                zero_based = one_based - 1
+                if zero_based not in seen:
+                    seen.add(zero_based)
+                    selected.append(zero_based)
+        else:
+            if not part.isdigit():
+                raise ValueError(f"Invalid index '{part}' in '{spec}'")
+            one_based = int(part)
+            if one_based < 1 or one_based > total:
+                raise ValueError(f"Index '{part}' out of bounds for 1..{total}")
+            zero_based = one_based - 1
+            if zero_based not in seen:
+                seen.add(zero_based)
+                selected.append(zero_based)
+    return selected
 
 
 def _validate_str(key: str, raw: Any) -> tuple[str | None, str | None]:
@@ -133,27 +131,6 @@ def _validate_audio_bitrate(key: str, raw: Any) -> tuple[str | None, str | None]
         return normalize_audio_bitrate(val), None
     except ValueError:
         return None, f"Warning: invalid '{key}' in config ('{val}'); ignoring"
-
-
-def parse_enrich_providers_arg(value: str) -> str:
-    """Validate and normalize `--enrich-providers` comma-separated provider list."""
-    from audiobookdl.utils.enrichment import parse_provider_list
-
-    try:
-        return ",".join(parse_provider_list(value))
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(str(exc)) from exc
-
-
-def parse_limit_rate_arg(value: str) -> str:
-    """Validate and normalize `--limit-rate` bandwidth specification."""
-    from audiobookdl.utils.http import parse_byte_rate
-
-    try:
-        parsed = parse_byte_rate(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(str(exc)) from exc
-    return value.strip() if parsed else ""
 
 
 def _validate_enrich_providers(key: str, raw: Any) -> tuple[str | None, str | None]:
@@ -280,6 +257,7 @@ def _gui_init_media_type(cfg_val: Any) -> str:
         "auto": "Auto",
         "audiobook": "Audiobook",
         "ebook": "Ebook",
+        "video": "Video",
         "both": "Both",
     }.get(normalized, "Auto")
 
@@ -448,19 +426,6 @@ def _gui_read_timeout(raw: Any) -> float | None:
 
 
 @dataclass(frozen=True)
-class CliFlag:
-    """Single argparse flag or positional argument definition bound to an `OptionSpec`."""
-
-    flags: tuple[str, ...]
-    action: str | None = None
-    const: Any = _MISSING
-    nargs: str | None = None
-    choices: tuple[str, ...] | None = None
-    arg_type: Callable[[str], Any] | None = None
-    help: str | Callable[[], str] | None = None
-
-
-@dataclass(frozen=True)
 class GuiBinding:
     """Declarative binding between a runtime option and a Tkinter variable."""
 
@@ -488,13 +453,13 @@ class GuiBinding:
 
 @dataclass(frozen=True)
 class OptionSpec:
-    """Single source of truth describing a runtime option across CLI, Config, Pipeline, and GUI."""
+    """Single source of truth describing a runtime option across Config, Pipeline, and Desktop GUI."""
 
     name: str
     default: Any = None
     default_factory: Callable[[], Any] | None = None
     in_download_options: bool = True
-    cli_flags: tuple[CliFlag, ...] = ()
+    help: str | Callable[[], str] | None = None
     config_key: str | None = None
     config_kind: str | None = None
     toml_serializer: Callable[[Any], tuple[bool, Any]] | None = None
@@ -509,45 +474,28 @@ class OptionSpec:
             return self.default_factory()
         return self.default
 
-    def add_cli_arguments(self, parser: argparse.ArgumentParser) -> None:
-        for cli in self.cli_flags:
-            kwargs: dict[str, Any] = {}
-            is_positional = not any(f.startswith("-") for f in cli.flags)
-            if not is_positional:
-                kwargs["dest"] = self.name
-            if cli.action is not None:
-                kwargs["action"] = cli.action
-            if cli.const is not _MISSING:
-                kwargs["const"] = cli.const
-            if cli.nargs is not None:
-                kwargs["nargs"] = cli.nargs
-            if cli.choices is not None:
-                kwargs["choices"] = cli.choices
-            if cli.arg_type is not None:
-                kwargs["type"] = cli.arg_type
-            if cli.help is not None:
-                kwargs["help"] = cli.help() if callable(cli.help) else cli.help
-            parser.add_argument(*cli.flags, **kwargs)
+    def get_help(self) -> str:
+        """Return resolved help/tooltip description for this option."""
+        if self.help is None:
+            return ""
+        return self.help() if callable(self.help) else str(self.help)
 
 
 OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="urls",
         default_factory=list,
-        cli_flags=(CliFlag(("urls",), nargs="*", help="Urls to download from"),),
+        help="Urls to download from",
     ),
     OptionSpec(
         name="cookie_file",
         default=None,
-        cli_flags=(CliFlag(("-c", "--cookies"), help="Path to Netscape cookie file"),),
+        help="Path to Netscape cookie file",
     ),
     OptionSpec(
         name="combine",
         default=False,
-        cli_flags=(
-            CliFlag(("--combine",), action="store_true", help="Combine output files into a single file"),
-            CliFlag(("--no-combine",), action="store_false", help="Keep multi-part files separate (overrides config)"),
-        ),
+        help="Combine output files into a single file",
         config_key="combine",
         config_kind="bool",
         toml_serializer=_serialize_bool,
@@ -563,7 +511,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="output_template",
         default="{title}",
-        cli_flags=(CliFlag(("-o", "--output"), help="Output location template (default: {title})"),),
+        help="Output location template (default: {title})",
         config_key="output_template",
         config_kind="str",
         merge_from_config=True,
@@ -573,20 +521,12 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="output_preset",
         default=None,
-        cli_flags=(
-            CliFlag(
-                ("--output-preset",),
-                choices=OUTPUT_PRESET_CHOICES,
-                help="Named output folder/filename template preset (overridden by -o/--output)",
-            ),
-        ),
+        help="Named output folder/filename template preset",
     ),
     OptionSpec(
         name="remove_chars",
         default="",
-        cli_flags=(
-            CliFlag(("--remove-chars",), help="List of characters that will be removed from output path"),
-        ),
+        help="List of characters that will be removed from output path",
         config_key="remove_chars",
         config_kind="str",
         toml_serializer=_serialize_non_empty_str,
@@ -605,7 +545,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="debug",
         default=False,
-        cli_flags=(CliFlag(("--debug", "-d"), action="store_true", help="Debug mode"),),
+        help="Debug mode",
         config_key="debug",
         config_kind="bool",
         toml_serializer=_serialize_bool,
@@ -621,19 +561,12 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="quiet",
         default=False,
-        cli_flags=(CliFlag(("--quiet", "-q"), action="store_true", help="Quiet mode"),),
-    ),
-    OptionSpec(
-        name="print_output",
-        default=False,
-        cli_flags=(
-            CliFlag(("--print-output",), action="store_true", help="Prints the output locations instead of downloading"),
-        ),
+        help="Quiet mode",
     ),
     OptionSpec(
         name="cover",
         default=False,
-        cli_flags=(CliFlag(("--cover",), action="store_true", help="Download only cover"),),
+        help="Download only cover",
         config_key="cover",
         config_kind="bool",
         toml_serializer=_serialize_bool,
@@ -649,9 +582,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="no_chapters",
         default=False,
-        cli_flags=(
-            CliFlag(("--no-chapters",), action="store_true", help="Don't include chapters in final file"),
-        ),
+        help="Don't include chapters in final file",
         config_key="no_chapters",
         config_kind="bool",
         toml_serializer=_serialize_bool,
@@ -667,13 +598,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="split_chapters",
         default=False,
-        cli_flags=(
-            CliFlag(
-                ("--split-chapters",),
-                action="store_true",
-                help="Split downloaded audiobook into separate per-chapter files",
-            ),
-        ),
+        help="Split downloaded audiobook into separate per-chapter files",
         config_key="split_chapters",
         config_kind="bool",
         toml_serializer=_serialize_bool,
@@ -689,7 +614,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="output_format",
         default=None,
-        cli_flags=(CliFlag(("-f", "--output-format"), help="Output file format"),),
+        help="Output file format",
         config_key="output_format",
         config_kind="str",
         toml_serializer=_serialize_non_empty_str,
@@ -708,13 +633,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="media_type",
         default="auto",
-        cli_flags=(
-            CliFlag(
-                ("--media-type",),
-                choices=MEDIA_TYPE_CHOICES,
-                help="Media format to download when sources offer both audiobooks and ebooks (auto, audiobook, ebook, both)",
-            ),
-        ),
+        help="Media format to download when sources offer multiple formats (auto, audiobook, ebook, video, both)",
         config_key="media_type",
         config_kind="media_type",
         toml_serializer=_serialize_media_type,
@@ -732,55 +651,32 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="ffmpeg_output",
         default=False,
-        cli_flags=(
-            CliFlag(("--verbose-ffmpeg",), action="store_true", help="Show ffmpeg output in terminal"),
-        ),
-    ),
-    OptionSpec(
-        name="input_file",
-        default=None,
-        cli_flags=(CliFlag(("--input-file",), help="File with one url to download per line"),),
+        help="Include verbose ffmpeg output in logs",
     ),
     OptionSpec(
         name="username",
         default=None,
-        cli_flags=(CliFlag(("--username",), help="Username for source"),),
+        help="Username for source",
     ),
     OptionSpec(
         name="password",
         default=None,
-        cli_flags=(CliFlag(("--password",), help="Password for source"),),
+        help="Password for source",
     ),
     OptionSpec(
         name="library",
         default=None,
-        cli_flags=(CliFlag(("--library",), help="Library for source"),),
+        help="Library for source",
     ),
     OptionSpec(
         name="profile",
         default=None,
-        cli_flags=(
-            CliFlag(
-                ("--profile",),
-                help="Named service account profile from config (default: 'default')",
-            ),
-        ),
+        help="Named service account profile from config (default: 'default')",
     ),
     OptionSpec(
         name="skip_downloaded",
         default=False,
-        cli_flags=(
-            CliFlag(
-                ("--skip-downloaded",),
-                action="store_true",
-                help="Skip downloading books if the output file or directory already exists",
-            ),
-            CliFlag(
-                ("--no-skip-downloaded",),
-                action="store_false",
-                help="Do not skip already downloaded books (overrides config)",
-            ),
-        ),
+        help="Skip downloading books if the output file or directory already exists",
         config_key="skip_downloaded",
         config_kind="bool",
         toml_serializer=_serialize_bool,
@@ -795,12 +691,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="download_archive",
         default=None,
-        cli_flags=(
-            CliFlag(
-                ("--download-archive",),
-                help="Path to SQLite download archive file to record and skip previously downloaded books",
-            ),
-        ),
+        help="Path to SQLite download archive file to record and skip previously downloaded books",
         config_key="download_archive",
         config_kind="str",
         merge_from_config=True,
@@ -816,23 +707,12 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="no_download_archive",
         default=False,
-        cli_flags=(
-            CliFlag(
-                ("--no-download-archive",),
-                action="store_true",
-                help="Disable reading and recording entries in the SQLite download archive (downloads.db)",
-            ),
-        ),
+        help="Disable reading and recording entries in the SQLite download archive (downloads.db)",
     ),
     OptionSpec(
         name="database_directory",
         default_factory=default_database_directory,
-        cli_flags=(
-            CliFlag(
-                ("--database-directory", "--database_directory"),
-                help=lambda: f"Directory for sources to store data (default: {default_database_directory()})",
-            ),
-        ),
+        help=lambda: f"Directory for sources to store data (default: {default_database_directory()})",
         config_key="database_directory",
         config_kind="str",
         merge_from_config=True,
@@ -842,9 +722,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="write_json_metadata",
         default=False,
-        cli_flags=(
-            CliFlag(("--write-json-metadata",), action="store_true", help="Write metadata in a separate json file"),
-        ),
+        help="Write metadata in a separate json file",
         config_key="write_json_metadata",
         config_kind="bool",
         toml_serializer=_serialize_bool,
@@ -860,9 +738,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="write_cover",
         default=False,
-        cli_flags=(
-            CliFlag(("--write-cover",), action="store_true", help="Save cover artwork as a separate sidecar image file"),
-        ),
+        help="Save cover artwork as a separate sidecar image file",
         config_key="write_cover",
         config_kind="bool",
         toml_serializer=_serialize_bool,
@@ -878,13 +754,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="write_opf",
         default=False,
-        cli_flags=(
-            CliFlag(
-                ("--write-opf",),
-                action="store_true",
-                help="Write metadata as an OPF XML sidecar file (Audiobookshelf/Calibre)",
-            ),
-        ),
+        help="Write metadata as an OPF XML sidecar file (Audiobookshelf/Calibre)",
         config_key="write_opf",
         config_kind="bool",
         toml_serializer=_serialize_bool,
@@ -900,13 +770,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="write_abs_metadata",
         default=False,
-        cli_flags=(
-            CliFlag(
-                ("--write-abs-metadata",),
-                action="store_true",
-                help="Write Audiobookshelf-compatible metadata.json sidecar alongside downloaded files",
-            ),
-        ),
+        help="Write Audiobookshelf-compatible metadata.json sidecar alongside downloaded files",
         config_key="write_abs_metadata",
         config_kind="bool",
         toml_serializer=_serialize_bool,
@@ -922,13 +786,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="upload_to_abs",
         default=False,
-        cli_flags=(
-            CliFlag(
-                ("--upload-to-abs",),
-                action="store_true",
-                help="Upload completed audiobooks to the configured Audiobookshelf server",
-            ),
-        ),
+        help="Upload completed audiobooks to the configured Audiobookshelf server",
         config_key="upload_to_abs",
         config_kind="bool",
         toml_serializer=_serialize_bool,
@@ -944,9 +802,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="write_cue",
         default=False,
-        cli_flags=(
-            CliFlag(("--write-cue",), action="store_true", help="Write chapter timestamps as a CUE sheet sidecar file"),
-        ),
+        help="Write chapter timestamps as a CUE sheet sidecar file",
         config_key="write_cue",
         config_kind="bool",
         toml_serializer=_serialize_bool,
@@ -962,23 +818,12 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="config_location",
         default=None,
-        cli_flags=(CliFlag(("--config",), help="Alternative location of config file"),),
+        help="Alternative location of config file",
     ),
     OptionSpec(
         name="resume",
         default=False,
-        cli_flags=(
-            CliFlag(
-                ("--resume",),
-                action="store_true",
-                help="Resume interrupted downloads using existing parts and HTTP Range requests",
-            ),
-            CliFlag(
-                ("--no-resume",),
-                action="store_false",
-                help="Disable resume for this run (overrides config)",
-            ),
-        ),
+        help="Resume interrupted downloads using existing parts and HTTP Range requests",
         config_key="resume",
         config_kind="bool",
         toml_serializer=_serialize_bool,
@@ -993,13 +838,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="audio_bitrate",
         default=None,
-        cli_flags=(
-            CliFlag(
-                ("--audio-bitrate", "--m4b-bitrate"),
-                arg_type=parse_audio_bitrate_arg,
-                help="Target AAC bitrate when converting to .m4b/.m4a (auto, 64k, 128k, 192k, etc.)",
-            ),
-        ),
+        help="Target AAC bitrate when converting to .m4b/.m4a (auto, 64k, 128k, 192k, etc.)",
         config_key="audio_bitrate",
         config_kind="audio_bitrate",
         toml_serializer=_serialize_audio_bitrate,
@@ -1018,20 +857,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="overwrite",
         default=None,
-        cli_flags=(
-            CliFlag(
-                ("-y", "--yes", "--overwrite"),
-                action="store_const",
-                const=True,
-                help="Overwrite existing files or directories without prompting",
-            ),
-            CliFlag(
-                ("--no-overwrite",),
-                action="store_const",
-                const=False,
-                help="Refuse to overwrite existing files without prompting",
-            ),
-        ),
+        help="Overwrite policy for existing files or directories",
         config_key="overwrite",
         config_kind="bool",
         toml_serializer=_serialize_optional_bool,
@@ -1047,43 +873,14 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         ),
     ),
     OptionSpec(
-        name="list_sources",
-        default=False,
-        cli_flags=(
-            CliFlag(("--list-sources",), action="store_true", help="List all supported audiobook services and exit"),
-        ),
-    ),
-    OptionSpec(
-        name="info_only",
-        default=False,
-        cli_flags=(
-            CliFlag(
-                ("--info", "--dry-run"),
-                action="store_true",
-                help="Inspect metadata and output paths without downloading files",
-            ),
-        ),
-    ),
-    OptionSpec(
         name="series_items",
         default=None,
-        cli_flags=(
-            CliFlag(
-                ("--series-items",),
-                help="1-based comma/range selection of series books to download (e.g. 1,3-5)",
-            ),
-        ),
+        help="1-based comma/range selection of series books to download (e.g. 1,3-5)",
     ),
     OptionSpec(
         name="max_workers",
         default=None,
-        cli_flags=(
-            CliFlag(
-                ("--max-workers",),
-                arg_type=parse_positive_int_arg,
-                help="Maximum concurrent download/processing worker threads",
-            ),
-        ),
+        help="Maximum concurrent download/processing worker threads",
         config_key="max_workers",
         config_kind="positive_int",
         toml_serializer=_serialize_positive_int,
@@ -1101,13 +898,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="book_delay",
         default=0.0,
-        cli_flags=(
-            CliFlag(
-                ("--rate-limit", "--book-delay"),
-                arg_type=parse_non_negative_float_arg,
-                help="Seconds to pause between consecutive books in a batch or series",
-            ),
-        ),
+        help="Seconds to pause between consecutive books in a batch or series",
         config_key="book_delay",
         config_kind="non_negative_float",
         toml_serializer=_serialize_positive_float,
@@ -1126,13 +917,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="limit_rate",
         default=None,
-        cli_flags=(
-            CliFlag(
-                ("--limit-rate",),
-                arg_type=parse_limit_rate_arg,
-                help="Maximum aggregate download speed (e.g. 500K, 2M)",
-            ),
-        ),
+        help="Maximum aggregate download speed (e.g. 500K, 2M)",
         config_key="limit_rate",
         config_kind="limit_rate",
         toml_serializer=_serialize_non_empty_str,
@@ -1149,25 +934,9 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         ),
     ),
     OptionSpec(
-        name="json_output",
-        default=False,
-        cli_flags=(
-            CliFlag(
-                ("--json",),
-                action="store_true",
-                help="Emit machine-readable JSON summary on stdout",
-            ),
-        ),
-    ),
-    OptionSpec(
         name="post_exec",
         default=None,
-        cli_flags=(
-            CliFlag(
-                ("--post-exec",),
-                help="Shell command to execute after each completed audiobook (sets AUDIOBOOK_DL_* env vars)",
-            ),
-        ),
+        help="Shell command to execute after each completed audiobook (sets AUDIOBOOK_DL_* env vars)",
         config_key="post_exec",
         config_kind="str",
         toml_serializer=_serialize_non_empty_str,
@@ -1186,13 +955,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="loudnorm",
         default=False,
-        cli_flags=(
-            CliFlag(
-                ("--loudnorm",),
-                action="store_true",
-                help="Apply EBU R128 loudness normalization during audio processing",
-            ),
-        ),
+        help="Apply EBU R128 loudness normalization during audio processing",
         config_key="loudnorm",
         config_kind="bool",
         toml_serializer=_serialize_bool,
@@ -1208,13 +971,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="mono",
         default=False,
-        cli_flags=(
-            CliFlag(
-                ("--mono",),
-                action="store_true",
-                help="Downmix audio to mono (1 channel) for voice-optimized size",
-            ),
-        ),
+        help="Downmix audio to mono (1 channel) for voice-optimized size",
         config_key="mono",
         config_kind="bool",
         toml_serializer=_serialize_bool,
@@ -1230,13 +987,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="chapters_from_silence",
         default=False,
-        cli_flags=(
-            CliFlag(
-                ("--chapters-from-silence",),
-                action="store_true",
-                help="Detect long pauses via FFmpeg silencedetect when no chapter markers exist",
-            ),
-        ),
+        help="Detect long pauses via FFmpeg silencedetect when no chapter markers exist",
         config_key="chapters_from_silence",
         config_kind="bool",
         toml_serializer=_serialize_bool,
@@ -1252,13 +1003,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="chapter_offset_ms",
         default=0,
-        cli_flags=(
-            CliFlag(
-                ("--chapter-offset",),
-                arg_type=int,
-                help="Shift non-initial chapter timestamps by N milliseconds",
-            ),
-        ),
+        help="Shift non-initial chapter timestamps by N milliseconds",
         config_key="chapter_offset_ms",
         config_kind="int",
         toml_serializer=_serialize_int,
@@ -1276,13 +1021,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="square_cover",
         default=False,
-        cli_flags=(
-            CliFlag(
-                ("--square-cover",),
-                action="store_true",
-                help="Pad cover artwork to a 1:1 square aspect ratio",
-            ),
-        ),
+        help="Pad cover artwork to a 1:1 square aspect ratio",
         config_key="square_cover",
         config_kind="bool",
         toml_serializer=_serialize_bool,
@@ -1298,13 +1037,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="max_cover_size",
         default=None,
-        cli_flags=(
-            CliFlag(
-                ("--max-cover-size",),
-                arg_type=parse_positive_int_arg,
-                help="Downscale oversized cover artwork so width and height do not exceed N pixels",
-            ),
-        ),
+        help="Downscale oversized cover artwork so width and height do not exceed N pixels",
         config_key="max_cover_size",
         config_kind="positive_int",
         toml_serializer=_serialize_positive_int,
@@ -1322,9 +1055,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="proxy",
         default=None,
-        cli_flags=(
-            CliFlag(("--proxy",), help="HTTP/HTTPS proxy URL for requests (e.g. http://127.0.0.1:8080)"),
-        ),
+        help="HTTP/HTTPS proxy URL for requests (e.g. http://127.0.0.1:8080)",
         config_key="proxy",
         config_kind="str",
         toml_serializer=_serialize_non_empty_str,
@@ -1343,9 +1074,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="timeout",
         default=None,
-        cli_flags=(
-            CliFlag(("--timeout",), arg_type=parse_positive_float_arg, help="HTTP read timeout in seconds"),
-        ),
+        help="HTTP read timeout in seconds",
         config_key="timeout",
         config_kind="positive_float",
         toml_serializer=_serialize_positive_float,
@@ -1364,12 +1093,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="impersonate",
         default=None,
-        cli_flags=(
-            CliFlag(
-                ("--impersonate",),
-                help="TLS/HTTP2 browser fingerprint to impersonate via optional curl_cffi (e.g. chrome, edge, safari)",
-            ),
-        ),
+        help="TLS/HTTP2 browser fingerprint to impersonate via optional curl_cffi (e.g. chrome, edge, safari)",
         config_key="impersonate",
         config_kind="str",
         toml_serializer=_serialize_non_empty_str,
@@ -1388,45 +1112,12 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="service",
         default=None,
-        cli_flags=(
-            CliFlag(("--service",), help="Target service name for --search, --library-list, or --verify-auth"),
-        ),
-    ),
-    OptionSpec(
-        name="search_query",
-        default=None,
-        cli_flags=(
-            CliFlag(("--search",), help="Search a service catalog (e.g. librivox) and list matching audiobooks"),
-        ),
-    ),
-    OptionSpec(
-        name="library_list",
-        default=False,
-        cli_flags=(
-            CliFlag(("--library-list",), action="store_true", help="List books from the configured service library/bookshelf"),
-        ),
-    ),
-    OptionSpec(
-        name="verify_auth",
-        default=False,
-        cli_flags=(
-            CliFlag(
-                ("--verify-auth",),
-                action="store_true",
-                help="Verify credentials/cookies for --service and persist session cookies",
-            ),
-        ),
+        help="Target service key",
     ),
     OptionSpec(
         name="enrich_metadata",
         default=False,
-        cli_flags=(
-            CliFlag(
-                ("--enrich", "--enrich-metadata"),
-                action="store_true",
-                help="Fill missing metadata, cover art, and chapters via Audnexus, iTunes, Google Books, and OpenLibrary",
-            ),
-        ),
+        help="Fill missing metadata, cover art, and chapters via Audnexus, iTunes, Google Books, and OpenLibrary",
         config_key="enrich_metadata",
         config_kind="bool",
         toml_serializer=_serialize_bool,
@@ -1442,13 +1133,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="enrich_providers",
         default=None,
-        cli_flags=(
-            CliFlag(
-                ("--enrich-providers",),
-                arg_type=parse_enrich_providers_arg,
-                help="Comma-separated enrichment providers in priority order (audnexus,itunes,google,openlibrary)",
-            ),
-        ),
+        help="Comma-separated enrichment providers in priority order (audnexus,itunes,google,openlibrary)",
         config_key="enrich_providers",
         config_kind="enrich_providers",
         toml_serializer=_serialize_non_empty_str,
@@ -1467,13 +1152,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="enrich_interactive",
         default=False,
-        cli_flags=(
-            CliFlag(
-                ("--enrich-interactive",),
-                action="store_true",
-                help="Prompt interactively to select from ranked enrichment matches",
-            ),
-        ),
+        help="Prompt interactively to select from ranked enrichment matches",
         config_key="enrich_interactive",
         config_kind="bool",
         toml_serializer=_serialize_bool,
@@ -1489,29 +1168,18 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="no_enrich_cache",
         default=False,
-        cli_flags=(
-            CliFlag(
-                ("--no-enrich-cache",),
-                action="store_true",
-                help="Bypass reading cached enrichment responses and fetch fresh metadata",
-            ),
-        ),
+        help="Bypass reading cached enrichment responses and fetch fresh metadata",
     ),
+    # Config-only top-level keys (not part of DownloadOptions)
     OptionSpec(
         name="check_updates",
         default=False,
-        cli_flags=(
-            CliFlag(
-                ("--check-updates",),
-                action="store_true",
-                help="Check whether a newer release of audiobook-dl is available and exit",
-            ),
-        ),
+        in_download_options=False,
+        help="Check whether a newer release of audiobook-dl is available at startup",
         config_key="check_updates",
         config_kind="bool",
         toml_serializer=_serialize_bool,
     ),
-    # Config-only top-level keys (not part of DownloadOptions)
     OptionSpec(
         name="ffmpeg_dir",
         default=None,
@@ -1541,3 +1209,89 @@ KNOWN_TOP_LEVEL_CONFIG_KEYS: frozenset[str] = frozenset(
     {"sources", "gui", "audiobookshelf"}
     | {spec.config_key for spec in CONFIG_OPTION_SPECS if spec.config_key is not None}
 )
+
+
+@dataclass
+class DownloadOptions:
+    """Typed runtime options shared across Desktop GUI, pipeline, and sources."""
+
+    urls: list[str] = field(default_factory=list)
+    cookie_file: str | None = None
+    combine: bool = False
+    output_template: str = "{title}"
+    output_preset: str | None = None
+    remove_chars: str = ""
+    debug: bool = False
+    quiet: bool = False
+    cover: bool = False
+    no_chapters: bool = False
+    split_chapters: bool = False
+    output_format: str | None = None
+    media_type: str = "auto"
+    ffmpeg_output: bool = False
+    username: str | None = None
+    password: str | None = None
+    library: str | None = None
+    profile: str | None = None
+    skip_downloaded: bool = False
+    download_archive: str | None = None
+    no_download_archive: bool = False
+    database_directory: str = field(default_factory=default_database_directory)
+    write_json_metadata: bool = False
+    write_cover: bool = False
+    write_opf: bool = False
+    write_abs_metadata: bool = False
+    upload_to_abs: bool = False
+    write_cue: bool = False
+    config_location: str | None = None
+    resume: bool = False
+    audio_bitrate: str | None = None
+    overwrite: bool | None = None
+    series_items: str | None = None
+    max_workers: int | None = None
+    book_delay: float = 0.0
+    limit_rate: str | None = None
+    post_exec: str | None = None
+    loudnorm: bool = False
+    mono: bool = False
+    chapters_from_silence: bool = False
+    chapter_offset_ms: int = 0
+    square_cover: bool = False
+    max_cover_size: int | None = None
+    proxy: str | None = None
+    timeout: float | None = None
+    impersonate: str | None = None
+    service: str | None = None
+    enrich_metadata: bool = False
+    enrich_providers: str | None = None
+    enrich_interactive: bool = False
+    no_enrich_cache: bool = False
+    _explicit_fields: frozenset[str] = field(
+        default_factory=frozenset,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
+
+def build_default_options(**overrides: Any) -> DownloadOptions:
+    """Build a `DownloadOptions` instance with defaults and optional explicit overrides."""
+    opts = DownloadOptions(**overrides)
+    opts._explicit_fields = frozenset(overrides.keys())
+    return opts
+
+
+@dataclass
+class SyncOptions:
+    """Options controlling library synchronization runs."""
+
+    services: list[str] = field(default_factory=list)
+    profile: str | None = None
+    scan_only: bool = False
+    dry_run: bool = False
+    watch: bool = False
+    interval_seconds: int = 3600
+    output_template: str | None = None
+    output_format: str | None = None
+    archive_path: str | None = None
+    config_location: str | None = None

@@ -58,11 +58,14 @@ def add_mp4_metadata(
     metadata: AudiobookMetadata,
     cover: Cover | None = None,
     track_context: TrackTagContext | None = None,
+    *,
+    is_video: bool = False,
 ) -> bool:
     """Add mp4 metadata tags (and optional cover art) in a single save pass."""
     mp4_cover = _build_mp4_cover(cover) if cover is not None else None
     audio = MP4(filepath)
-    audio["stik"] = [MP4_MEDIA_KIND_AUDIOBOOK]
+    if not is_video:
+        audio["stik"] = [MP4_MEDIA_KIND_AUDIOBOOK]
     for key, value in metadata.all_properties(allow_duplicate_keys=None):
         if key == "release_date":
             release_date: date = value

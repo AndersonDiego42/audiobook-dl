@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from audiobookdl import args
+from audiobookdl.options_schema import build_default_options
 from audiobookdl.exceptions import BookNotFound, UserNotAuthorized
 from audiobookdl.sources import find_compatible_source
 from audiobookdl.sources.archiveorg import ArchiveOrgSource
@@ -15,7 +15,7 @@ from audiobookdl.sources.rss import RssSource
 
 
 def _opts(tmp_path):
-    return args.build_default_options(database_directory=str(tmp_path))
+    return build_default_options(database_directory=str(tmp_path))
 
 
 def test_source_url_matching_prioritizes_dedicated_adapters_before_rss():

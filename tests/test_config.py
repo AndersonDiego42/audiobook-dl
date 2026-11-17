@@ -4,7 +4,7 @@ import sys
 
 import pytest
 
-from audiobookdl import args, logging, utils
+from audiobookdl import logging, options_schema, utils
 from audiobookdl.config import (
     config_dir,
     get_config_location,
@@ -103,7 +103,7 @@ def test_portable_config_mode_stores_config_and_db_beside_frozen_exe(tmp_path, m
     assert is_portable_mode() is True
     assert config_dir() == str(exe_dir)
     assert get_config_location(None) == os.path.join(str(exe_dir), "audiobook-dl.toml")
-    assert args.default_database_directory() == os.path.join(str(exe_dir), "db")
+    assert options_schema.default_database_directory() == os.path.join(str(exe_dir), "db")
 
     # Also activates if audiobook-dl.toml exists beside exe without .portable
     marker.unlink()
@@ -382,9 +382,13 @@ def test_multi_profile_source_config_round_trip_and_migration(tmp_path):
 
     loaded = load_config(str(cfg_path), credential_store=store)
     assert list_source_profiles(loaded, "storytel") == ["default", "family"]
-    assert get_source_config(loaded, "storytel").username == "default@example.com"
-    assert get_source_config(loaded, "storytel", "family").username == "family@example.com"
-    assert get_source_config(loaded, "storytel", "family").library == "se"
+    default_cfg = get_source_config(loaded, "storytel")
+    assert default_cfg is not None
+    assert default_cfg.username == "default@example.com"
+    family_cfg = get_source_config(loaded, "storytel", "family")
+    assert family_cfg is not None
+    assert family_cfg.username == "family@example.com"
+    assert family_cfg.library == "se"
     assert get_source_config(loaded, "storytel", "missing") is None
     assert [(s, p) for s, p, _ in list_configured_source_profiles(loaded)] == [
         ("storytel", "default"),
@@ -396,7 +400,9 @@ def test_multi_profile_source_config_round_trip_and_migration(tmp_path):
     reloaded = load_config(str(cfg_path), credential_store=store)
     assert list_source_profiles(reloaded, "storytel") == ["family"]
     assert get_source_config(reloaded, "storytel") is None
-    assert get_source_config(reloaded, "storytel", "family").username == "family@example.com"
+    reloaded_family = get_source_config(reloaded, "storytel", "family")
+    assert reloaded_family is not None
+    assert reloaded_family.username == "family@example.com"
 
     # Legacy plaintext password inside [sources.<svc>.profiles.<name>] migrates cleanly
     cfg_path.write_text(
@@ -425,7 +431,7 @@ def test_env_config_var_overrides_config_dir_and_location(tmp_path, monkeypatch)
     monkeypatch.setenv("AUDIOBOOK_DL_CONFIG", str(custom_cfg))
     assert config_dir() == str(custom_dir)
     assert get_config_location(None) == str(custom_cfg)
-    assert args.default_database_directory() == os.path.join(str(custom_dir), "db")
+    assert options_schema.default_database_directory() == os.path.join(str(custom_dir), "db")
 
     # Also supports legacy AUDIOBOOKDL_CONFIG spelling
     monkeypatch.delenv("AUDIOBOOK_DL_CONFIG", raising=False)
@@ -503,8 +509,8 @@ def test_env_config_overrides_portable_mode_in_config_dir(tmp_path, monkeypatch)
 
 
 def test_debug_and_cover_keys_merge_from_config(tmp_path):
-    from audiobookdl import args
     from audiobookdl.config import structure_config
+    from audiobookdl.options_schema import build_default_options
     from audiobookdl.pipeline import apply_runtime_options
 
     cfg = structure_config(
@@ -512,7 +518,7 @@ def test_debug_and_cover_keys_merge_from_config(tmp_path):
         {"debug": True, "cover": True},
         credential_store=None,
     )
-    opts = args.parse_arguments([])
+    opts = build_default_options()
     apply_runtime_options(opts, cfg)
     assert opts.debug is True
     assert opts.cover is True

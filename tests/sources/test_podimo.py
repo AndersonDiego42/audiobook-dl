@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from audiobookdl import Audiobook, BookId, Series
-from audiobookdl.args import build_default_options
+from audiobookdl.options_schema import build_default_options
 from audiobookdl.exceptions import DataNotPresent, NoSourceFound, RequestError
 from audiobookdl.sources import find_compatible_source
 from audiobookdl.sources.podimo import PodimoSource

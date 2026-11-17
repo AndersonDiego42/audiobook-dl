@@ -300,7 +300,8 @@ class EverandSource(Source[str]):
         for entry in raw_items:
             if not isinstance(entry, dict):
                 continue
-            doc = entry.get("document") if isinstance(entry.get("document"), dict) else entry
+            raw_doc = entry.get("document")
+            doc = raw_doc if isinstance(raw_doc, dict) else entry
             doc_id = doc.get("id")
             title = str(doc.get("title") or "").strip()
             book_url = doc.get("url") or (f"https://www.everand.com/audiobook/{doc_id}/" if doc_id else "")

@@ -106,18 +106,21 @@ class SidebarShell(ttk.Frame):
             row_frame.grid(row=idx, column=0, sticky="ew", pady=1)
             row_frame.columnconfigure(0, weight=1)
 
+            def _bind_nav(button: ttk.Button, row_idx: int, page_id: str) -> None:
+                button.configure(command=lambda: self.navigate(page_id))
+                button.bind("<Up>", lambda _e: self._move_nav_focus(row_idx, -1))
+                button.bind("<Down>", lambda _e: self._move_nav_focus(row_idx, 1))
+                button.bind("<Return>", lambda _e: self._activate_from_key(page_id))
+                button.bind("<space>", lambda _e: self._activate_from_key(page_id))
+
             btn = ttk.Button(
                 row_frame,
                 text=f"{spec.glyph}  {spec.label}",
                 style="SidebarNav.TButton",
-                command=lambda pid=spec.page_id: self.navigate(pid),
                 takefocus=True,
             )
             btn.grid(row=0, column=0, sticky="ew")
-            btn.bind("<Up>", lambda _e, i=idx: self._move_nav_focus(i, -1))
-            btn.bind("<Down>", lambda _e, i=idx: self._move_nav_focus(i, 1))
-            btn.bind("<Return>", lambda _e, pid=spec.page_id: self._activate_from_key(pid))
-            btn.bind("<space>", lambda _e, pid=spec.page_id: self._activate_from_key(pid))
+            _bind_nav(btn, idx, spec.page_id)
             self._nav_buttons[spec.page_id] = btn
 
             if spec.page_id == "download":

@@ -3,7 +3,7 @@
 ![GitHub top language](https://img.shields.io/github/languages/top/jo1gi/audiobook-dl)
 ![License](https://img.shields.io/github/license/jo1gi/audiobook-dl)
 
-CLI tool, Python library, headless Web UI, and desktop GUI for downloading audiobooks from online sources.
+Desktop GUI application and Python library for downloading audiobooks from online sources.
 
 ## Maintainers
 I'm currently looking for maintainers to support the different services. I
@@ -66,11 +66,13 @@ pip install ".[build]"    # PyInstaller
 Combining parts, format conversion (e.g. `.m4b`), chapter embedding, silence chapter detection, and audio verification require [ffmpeg](https://ffmpeg.org/) (`ffmpeg` and `ffprobe`), which can be installed through most package managers or from [ffmpeg.org/download.html](https://ffmpeg.org/download.html).
 
 ## Desktop GUI
-audiobook-dl includes a Tkinter desktop interface (`audiobook-dl-gui`):
+Launch the Tkinter desktop application:
 ```shell
+audiobook-dl
+# or
 audiobook-dl-gui
 # or
-python -m audiobookdl.gui
+python -m audiobookdl
 ```
 
 Key GUI features:
@@ -85,97 +87,15 @@ Key GUI features:
 ## Authentication
 
 ### Cookies
-audiobook-dl uses Netscape cookie files for authentication on several services. You can use [this](https://github.com/rotemdan/ExportCookies) browser extension to export cookies (or import them interactively via the Desktop GUI).
-
-Cookies can be placed in the current directory as `cookies.txt` or passed with `-c` / `--cookies`.
+audiobook-dl uses Netscape cookie files for authentication on several services. You can use [this](https://github.com/rotemdan/ExportCookies) browser extension to export cookies, or import them interactively via the **Accounts** page in the Desktop GUI.
 
 ### Login
-[Some sources](./docs/supported_sites.md) support authentication through username and password (and sometimes library). Use `--username`, `--password`, and `--library`, enter them interactively when prompted, or save them via the GUI / configuration file. Successful logins also cache session cookies per source/profile under `<database_directory>/<service>/` so subsequent runs reuse active sessions.
+[Some sources](./docs/supported_sites.md) support authentication through username and password (and sometimes library). Configure credentials and named profiles via the **Accounts** page or `audiobook-dl.toml`, or enter them interactively when prompted by the GUI. Successful logins also cache session cookies per source/profile under `<database_directory>/<service>/` so subsequent runs reuse active sessions.
 
-## Downloading audiobooks (CLI)
-```shell
-audiobook-dl -c <cookie file> <url>
-```
-To combine multi-part streams into a single chaptered `.m4b`:
-```shell
-audiobook-dl --combine -f m4b <url>
-```
-To list supported service keys, test credentials, search, or browse your library:
-```shell
-audiobook-dl --list-sources
-audiobook-dl --service librivox --search "moby dick"
-audiobook-dl --service storytel --profile family --verify-auth
-audiobook-dl --service storytel --library-list
-```
-To launch the headless Web UI dashboard and JSON API (ideal for NAS/Docker setups):
-```shell
-audiobook-dl serve --host 0.0.0.0 --port 8080
-```
 **Most sites require you to provide the listening page, not just the book information page.**
 
-## Arguments
-
-| Argument | Description |
-|---|---|
-| `urls` | One or more book, series, or feed URLs to download |
-| `-v`, `--version` | Show program version and exit |
-| `-c`, `--cookies` | Path to a Netscape cookie file |
-| `--combine`, `--no-combine` | Combine output files into a single file (requires `ffmpeg`), or keep separate (`--no-combine` overrides config) |
-| `--split-chapters` | Split a continuous book into separate per-chapter audio files |
-| `-o`, `--output` | Output path template (default: `{title}`) |
-| `--output-preset` | Named layout preset (`default`, `audiobookshelf`, `plex`, `kavita`; overridden by `-o`/`--output`) |
-| `--remove-chars` | List of characters to remove from metadata values in output paths |
-| `-f`, `--output-format` | Output file format (e.g. `m4b`, `mp3`, `m4a`, `flac`, `opus`) |
-| `--media-type` | Media format preference (`auto`, `audiobook`, `ebook`, `both`) |
-| `--audio-bitrate`, `--m4b-bitrate` | Target AAC bitrate when converting to `.m4b`/`.m4a` (`auto`, `64k`, `128k`, `192k`, etc.) |
-| `--loudnorm` | Apply EBU R128 loudness normalization during `ffmpeg` combine/conversion |
-| `--mono` | Downmix audio to mono (`-ac 1`) during `ffmpeg` combine/conversion |
-| `--resume`, `--no-resume` | Resume interrupted downloads using existing parts and HTTP `Range` requests (or override config) |
-| `--skip-downloaded`, `--no-skip-downloaded` | Skip books already downloaded on disk or in SQLite `downloads.db` (or force re-download) |
-| `--download-archive` | Custom SQLite path for library ledger (`downloads.db`) |
-| `--no-download-archive` | Disable reading/writing the SQLite download archive ledger |
-| `--no-chapters` | Don't include chapters in output file |
-| `--chapters-from-silence` | Detect silence pauses on single-file inputs to synthesize chapters when none exist |
-| `--chapter-offset` | Shift non-initial chapter timestamps by `N` milliseconds |
-| `--cover` | Download only the cover image |
-| `--square-cover` | Pad cover artwork to a `1:1` square canvas |
-| `--max-cover-size` | Downscale cover artwork exceeding `N` pixels |
-| `--write-cover` | Save cover artwork as a sidecar image file |
-| `--write-json-metadata` | Write raw metadata JSON (`<file>.json` in single-file mode; `metadata.json` in directory mode, or `audiobook.json` when paired with `--write-abs-metadata`) |
-| `--write-abs-metadata` | Write Audiobookshelf-compatible `metadata.json` sidecar (`<stem>.metadata.json` if sharing a flat directory) |
-| `--write-opf` | Write OPF XML sidecar metadata |
-| `--write-cue` | Write CUE chapter sheet sidecar |
-| `--upload-to-abs` | Upload completed book to configured Audiobookshelf server |
-| `-y`, `--yes`, `--overwrite` / `--no-overwrite` | Non-interactive file replacement policy |
-| `--enrich`, `--enrich-metadata` | Fill missing metadata/cover/chapters via Audnexus, iTunes, Google Books, and OpenLibrary |
-| `--enrich-providers` | Ordered enrichment provider list (`audnexus,itunes,google,openlibrary`) |
-| `--enrich-interactive` | Choose interactively from ranked enrichment matches |
-| `--no-enrich-cache` | Bypass enrichment SQLite cache |
-| `--max-workers` | Maximum concurrent worker threads (`>= 1`; downloads default to `6`, capped at `20`) |
-| `--limit-rate` | Aggregate bandwidth limit (e.g. `500K`, `2M`) |
-| `--rate-limit`, `--book-delay` | Delay in seconds between consecutive books |
-| `--proxy` | HTTP/HTTPS proxy URL |
-| `--timeout` | HTTP read timeout in seconds |
-| `--impersonate` | Browser TLS/HTTP2 fingerprint to impersonate via optional `curl_cffi` (e.g. `chrome`, `edge`, `safari`; install `audiobook-dl[impersonate]`) |
-| `--service`, `--profile` | Target service key and named account profile |
-| `--search`, `--library-list`, `--verify-auth` | Search catalog (`--service` defaults to `librivox`), list library books, or test credentials (`--service` required for library/auth) |
-| `--list-sources` | List supported audiobook services |
-| `--info`, `--dry-run` | Inspect metadata and output path without downloading |
-| `--series-items` | Select 1-based range/indices in a series (e.g. `1,3-5`) |
-| `--post-exec` | Shell command run after each book completes (`AUDIOBOOK_DL_*` env vars) |
-| `--json` | Emit structured JSON output on stdout |
-| `--print-output` | Print resolved output locations instead of downloading |
-| `--input-file` | File containing URLs (whitespace/newline separated) |
-| `--username`, `--password`, `--library` | Account credentials for login-based sources |
-| `--database-directory`, `--database_directory` | Directory for SQLite databases and per-source state |
-| `--config` | Alternative location of `audiobook-dl.toml` (defaults to `$AUDIOBOOK_DL_CONFIG` if set) |
-| `--check-updates` | Check GitHub Releases (falling back to PyPI) for a newer version and exit |
-| `-d`, `--debug` | Enable debug logging |
-| `-q`, `--quiet` | Suppress non-essential output |
-| `--verbose-ffmpeg` | Show `ffmpeg` output in terminal |
-
 ## Output
-By default, audiobook-dl saves audiobooks to `{title}` relative to the current directory. This can be customized with `-o` / `--output` or `--output-preset` using metadata fields:
+By default, audiobook-dl saves audiobooks to `{title}` inside the chosen output folder. Output templates can be customized in the **Output & Naming** section using metadata fields:
 - `title`, `author`, `narrator`
 - `series`, `series_order`, `series_order_padded`
 - `genre`, `publisher`, `isbn`, `asin`, `language`
@@ -187,7 +107,7 @@ Templates also support conditional blocks `{key?true_branch}` and `{key?true_bra
 {author}/{series?{series}/}{series_order?Book {series_order_padded} - }{title}
 ```
 
-Built-in `--output-preset` layouts:
+Built-in naming presets:
 - `default`: `{title}`
 - `audiobookshelf`: `{author}/{series?{series}/}{series_order?Book {series_order_padded} - }{title}`
 - `plex`: `{author}/{title}/{title}`
@@ -195,7 +115,7 @@ Built-in `--output-preset` layouts:
 
 Not all fields are available for every audiobook. Metadata values are sanitized for filesystem safety (removing invalid characters, normalizing Windows reserved filenames, bounding path/component length, and preventing path traversal).
 
-The output container can be changed with `-f` / `--output-format` (for example `-f m4b`). When converting non-AAC audio to `.m4b`/`.m4a`, `--audio-bitrate` defaults to `auto` (probing source bitrate with `ffprobe`, clamped to `64k`–`192k`).
+The output container can be changed in **Options -> General** (for example `m4b`, `mp3`, `mp4`). When converting non-AAC audio to `.m4b`/`.m4a`, **M4B Quality** defaults to `Auto` (probing source bitrate with `ffprobe`, clamped to `64k`–`192k`).
 
 ## Configuration
 audiobook-dl can be configured via `audiobook-dl.toml` at:
@@ -251,10 +171,9 @@ auto_scan = true
 |---|---|
 | `AUDIOBOOK_DL_CONFIG` (or `AUDIOBOOKDL_CONFIG`) | Default path to `audiobook-dl.toml` when `--config` is not passed |
 | `AUDIOBOOK_DL_ALLOW_PLAINTEXT_CREDENTIALS` | Set to `1` / `true` to opt in when running without an OS keyring |
-| `AUDIOBOOK_DL_WEB_TOKEN` | Default Bearer/`X-API-Token` secret for `audiobook-dl serve` |
 | `AUDIOBOOK_DL_NO_UPDATE_CHECK` | Set to `1` / `true` to disable automatic background update checks |
 | `AUDIOBOOK_DL_SAXO_APP_OS`, `AUDIOBOOK_DL_SAXO_APP_VERSION` | Override Saxo client request headers |
-| `AUDIOBOOK_DL_PATH`, `AUDIOBOOK_DL_TITLE`, `AUDIOBOOK_DL_AUTHOR`, `AUDIOBOOK_DL_SOURCE`, `AUDIOBOOK_DL_FORMAT` | Populated in the child environment when running `--post-exec` commands |
+| `AUDIOBOOK_DL_PATH`, `AUDIOBOOK_DL_TITLE`, `AUDIOBOOK_DL_AUTHOR`, `AUDIOBOOK_DL_SOURCE`, `AUDIOBOOK_DL_FORMAT` | Populated in the child environment when running post-execution commands |
 
 ## Python Library API
 `audiobookdl` also exposes a programmatic client (`Downloader`, `DownloadOptions`, `DownloadSummary`, `DownloadEvent`):
@@ -276,68 +195,10 @@ python scripts/build_exe.py
 ```
 
 Useful build flags:
-- `--onedir`: Build a fast-startup portable folder (`dist/audiobook-dl/`) containing `audiobook-dl.exe` and the console companion `audiobook-dl-cli.exe` instead of a single `--onefile` binary.
+- `--onedir`: Build a fast-startup portable folder (`dist/audiobook-dl/`) containing `audiobook-dl.exe` instead of a single `--onefile` binary.
 - `--copy-ffmpeg`: Copy `ffmpeg` and `ffprobe` from `PATH` alongside the built executable.
 - `--bundle-ffmpeg`: Embed `ffmpeg` and `ffprobe` inside the executable bundle.
 - `--no-verify`: Skip the post-build `--self-test` smoke check (enabled by default).
-
-## Docker & Headless Auto-Sync
-Run automated periodic library synchronization in Docker or headless environments:
-
-```yaml
-services:
-  audiobook-dl:
-    build: .
-    container_name: audiobook-dl
-    restart: unless-stopped
-    volumes:
-      - ./config:/config
-      - ./audiobooks:/audiobooks
-    command: ["sync", "--watch", "--interval", "3600"]
-```
-
-To run the headless Web UI dashboard in Docker instead, override `command` with `["serve", "--host", "0.0.0.0", "--port", "8080"]` (optionally setting `AUDIOBOOK_DL_WEB_TOKEN`) and expose port `8080`.
-
-## Subcommands & Headless Web API
-
-- **`pack`**: Repackage local audio folders/tracks (`mp3`, `m4a`, `m4b`, `mp4`, `aac`, `ogg`, `opus`, `flac`, `wav`, `wma`) offline into chaptered `.m4b` audiobooks, automatically reading embedded tags and sidecar files (`metadata.json`, `audiobook.json`, `*.opf`, `*.cue`, `cover.*`/`folder.*`):
-  ```shell
-  audiobook-dl pack <paths...> [--recursive] [--delete-source] [--dry-run] [--json] \
-    [--output-dir DIR] [--output-template TPL] [--title ...] [--author ...] [--narrator ...] \
-    [--series ...] [--series-order N] [--isbn ...] [--asin ...] [--cover FILE]
-  ```
-- **`library`**: Query and manage persistent entries, tags, hidden items, and trash in `downloads.db` (note that `--config` and `--download-archive` go before the action subcommand):
-  ```shell
-  audiobook-dl library [--config FILE] [--download-archive FILE] list [-q/--query QUERY] [--limit 100] [--include-trashed] [--no-hidden] [--json]
-  audiobook-dl library [--config FILE] [--download-archive FILE] tag <entry_ids...> [--add TAG...] [--remove TAG...]
-  audiobook-dl library [--config FILE] [--download-archive FILE] hide|unhide|trash|restore <entry_ids...>
-  ```
-  Queries (`-q`/`--query`) support bare search terms, field prefixes (`author:`, `title:`, `narrator:`, `series:`, `source:`, `profile:`, `tag:`, `status:`, `isbn:`, `asin:`), negation (`-tag:hidden`, `-status:trashed`), and quoted phrases (`author:"Brandon Sanderson"`).
-- **`scan`**: Discover existing local audiobooks, match them against `downloads.db`, and optionally mark missing files back to `pending`:
-  ```shell
-  audiobook-dl scan <paths...> [--profile NAME] [--verify-missing] [--dry-run] [--json] [--config FILE] [--download-archive FILE]
-  ```
-- **`export`**: Export the library ledger to CSV, JSON, or Excel (`.xlsx` requires `audiobook-dl[export]`):
-  ```shell
-  audiobook-dl export <output_path> [-f/--format {csv,json,xlsx}] [-q/--query QUERY] [--limit 100000] [--include-trashed] [--no-hidden]
-  ```
-- **`sync`**: Poll configured authenticated libraries (`supports_library`) and download unseen `pending` items (skipping `downloaded` and `trashed` entries):
-  ```shell
-  audiobook-dl sync [--service SERVICE...] [--profile PROFILE] [--scan-only] [--dry-run] [--watch] [--interval 3600] [-o TEMPLATE] [-f FORMAT] [--json]
-  ```
-- **`serve`**: Launch the headless Web UI (`http://<host>:<port>/`) and JSON API:
-  ```shell
-  audiobook-dl serve [--host 127.0.0.1] [--port 8080] [--output-dir DIR] [-o TEMPLATE] [-f FORMAT] [--token SECRET]
-  ```
-  When `--token` (or `$AUDIOBOOK_DL_WEB_TOKEN`) is configured, all `/api/*` endpoints except `/api/health` require `Authorization: Bearer <token>` or `X-API-Token: <token>`. Endpoints:
-  - `GET /api/health` — liveness/version check
-  - `GET /api/status` — queue state, progress, speed, ETA, and recent logs
-  - `GET /api/services` — available service definitions and capabilities
-  - `GET /api/library?q=...&limit=100` — query `downloads.db`
-  - `POST /api/download` — queue `{urls, output_format?, combine?, output_dir?, output_template?, profile?}`
-  - `POST /api/pause`, `POST /api/cancel`, `POST /api/queue/clear` — control active queue/run
-  - `POST /api/catalog` — `{service, mode: "search"|"library", query?, profile?}`
-  - `POST /api/sync` — trigger an immediate library sync cycle
 
 ## Documentation
 All additional technical and developer documentation lives in [`docs/`](./docs/README.md):

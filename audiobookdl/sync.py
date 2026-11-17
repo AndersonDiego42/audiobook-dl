@@ -1,14 +1,11 @@
-"""Headless auto-sync daemon and single-pass library synchronization."""
+"""Single-pass library synchronization used by the desktop GUI."""
 
 from dataclasses import dataclass, field
-import json
-import signal
-import sys
 import threading
 from typing import Any
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 
-from audiobookdl import args, logging
+from audiobookdl import logging
 from audiobookdl.config import (
     DEFAULT_PROFILE,
     Config,
@@ -18,6 +15,7 @@ from audiobookdl.config import (
     normalize_source_key,
 )
 from audiobookdl.exceptions import NoSourceFound
+from audiobookdl.options_schema import DownloadOptions, SyncOptions, build_default_options
 from audiobookdl.pipeline import (
     Downloader,
     apply_runtime_options,
@@ -141,12 +139,12 @@ def _resolve_sync_targets(
 
 
 def _build_sync_download_options(
-    sync_opts: args.SyncOptions,
+    sync_opts: SyncOptions,
     config: Config,
     archive_path: str,
     profile: str,
-) -> args.DownloadOptions:
-    base_opts = args.build_default_options(
+) -> DownloadOptions:
+    base_opts = build_default_options(
         config_location=sync_opts.config_location,
         download_archive=archive_path,
         skip_downloaded=True,
@@ -159,7 +157,7 @@ def _build_sync_download_options(
 
 
 def run_sync_once(
-    sync_opts: args.SyncOptions,
+    sync_opts: SyncOptions,
     *,
     config: Config | None = None,
     cancel_event: threading.Event | None = None,
@@ -244,68 +242,3 @@ def run_sync_once(
             break
 
     return cycle
-
-
-def _emit_cycle_output(cycle: SyncCycleResult, *, json_output: bool) -> None:
-    if json_output:
-        print(json.dumps(cycle.to_dict(), indent=2, ensure_ascii=False))
-        return
-    for d in cycle.details:
-        print(
-            f"[{d.service}:{d.profile}] discovered={d.discovered} new={d.newly_added} "
-            f"pending={d.pending_count} downloaded={d.downloaded} skipped={d.skipped} failed={d.failed}"
-        )
-    for err in cycle.errors:
-        print(f"Sync warning: {err}", file=sys.stderr)
-
-
-def run_sync_loop(
-    sync_opts: args.SyncOptions,
-    *,
-    stop_event: threading.Event | None = None,
-    max_cycles: int | None = None,
-    on_cycle: Callable[[SyncCycleResult], None] | None = None,
-) -> int:
-    """Run one sync pass or poll continuously when `sync_opts.watch` is True."""
-    cancel = stop_event if stop_event is not None else threading.Event()
-    installed_handlers: list[tuple[int, Any]] = []
-    if threading.current_thread() is threading.main_thread() and stop_event is None:
-        def _handle_sig(_signum: int, _frame: Any) -> None:
-            cancel.set()
-
-        for sig_name in ("SIGINT", "SIGTERM"):
-            sig = getattr(signal, sig_name, None)
-            if sig is not None:
-                try:
-                    prev = signal.signal(sig, _handle_sig)
-                    installed_handlers.append((sig, prev))
-                except (OSError, ValueError):
-                    pass
-
-    last_code = 0
-    cycle_num = 0
-    try:
-        while not cancel.is_set():
-            cycle_num += 1
-            cycle = run_sync_once(sync_opts, cancel_event=cancel)
-            if on_cycle is not None:
-                on_cycle(cycle)
-            else:
-                _emit_cycle_output(cycle, json_output=sync_opts.json_output)
-            if cycle.cancelled:
-                last_code = 130
-                break
-            if cycle.errors or cycle.failed > 0:
-                last_code = 1
-            if not sync_opts.watch or (max_cycles is not None and cycle_num >= max_cycles):
-                break
-            logging.debug(f"Auto-sync sleeping {sync_opts.interval_seconds}s before next poll")
-            if cancel.wait(max(1, int(sync_opts.interval_seconds))):
-                break
-    finally:
-        for sig, prev in installed_handlers:
-            try:
-                signal.signal(sig, prev)
-            except (OSError, ValueError):
-                pass
-    return last_code

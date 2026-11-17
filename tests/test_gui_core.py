@@ -12,7 +12,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
-from audiobookdl import args, logging, utils
+from audiobookdl import logging, utils
+from audiobookdl.options_schema import DownloadOptions, build_default_options
 from audiobookdl.pipeline import DownloadSummary, fetch_metadata, run_downloads
 from audiobookdl.config import Config, load_config, save_source_credentials
 from audiobookdl.exceptions import BookNotFound, DownloadCancelled
@@ -22,6 +23,7 @@ from audiobookdl.gui.app import (
     run_self_test,
 )
 from audiobookdl.gui.controller import GuiInteractionHandler, QueuedJob
+from audiobookdl.gui.widgets import tree_item_values
 from audiobookdl.gui.events import (
     AuthVerifiedEvent,
     BatchItemEvent,
@@ -105,11 +107,9 @@ class _FakeInteraction:
         return default
 
 
-def test_build_default_options_matches_cli_defaults(monkeypatch):
-    monkeypatch.setattr(sys, "argv", ["audiobook-dl"])
-    cli_opts = vars(args.parse_arguments())
-    default_opts = vars(args.build_default_options())
-    assert default_opts == cli_opts
+def test_build_default_options_matches_schema_defaults():
+    default_opts = vars(build_default_options())
+    assert default_opts == vars(DownloadOptions())
 
 
 def test_logging_ui_sink_and_progress():
@@ -175,7 +175,7 @@ def test_setup_download_dir_decline_does_not_delete_existing(tmp_path):
 def test_run_downloads_stops_on_cancel_event():
     cancel_event = threading.Event()
     cancel_event.set()
-    options = args.build_default_options()
+    options = build_default_options()
     config = Config(sources={}, output_template=None, database_directory=None, skip_downloaded=None)
 
     summary = run_downloads(
@@ -189,7 +189,7 @@ def test_run_downloads_stops_on_cancel_event():
 
 
 def test_run_downloads_records_error_summary():
-    options = args.build_default_options()
+    options = build_default_options()
     config = Config(sources={}, output_template=None, database_directory=None, skip_downloaded=None)
     with patch("audiobookdl.pipeline.process_url", side_effect=BookNotFound()):
         summary = run_downloads(["https://example.com/missing"], options, config)
@@ -823,7 +823,7 @@ def test_fetch_metadata_and_selective_series_download(monkeypatch):
         lambda _src, ab, _opts, **_kw: downloaded_titles.append(ab.title),
     )
 
-    options = args.build_default_options()
+    options = build_default_options()
     config = Config(sources={}, output_template=None, database_directory=None, skip_downloaded=None)
 
     fetched = fetch_metadata("https://example.com/series", options, config)
@@ -2431,8 +2431,8 @@ def test_gui_persistent_queue_and_pause_resume_toggle(tmp_path):
         app1._set_running_state(False)
 
         # Simulate unresolved & completed queue records before restart
-        j1 = QueuedJob(job_id="j_pend", run_id=1, url="https://librivox.org/pending", options=args.build_default_options(), interaction=MagicMock())
-        j2 = QueuedJob(job_id="j_done", run_id=1, url="https://librivox.org/done", options=args.build_default_options(), interaction=MagicMock())
+        j1 = QueuedJob(job_id="j_pend", run_id=1, url="https://librivox.org/pending", options=build_default_options(), interaction=MagicMock())
+        j2 = QueuedJob(job_id="j_done", run_id=1, url="https://librivox.org/done", options=build_default_options(), interaction=MagicMock())
         app1._queue_panel.register_queue_job(j1)
         app1._queue_panel.register_queue_job(j2)
         app1._queue_panel.update_queue_row("j_done", "Completed", "1 ok")
@@ -2662,7 +2662,7 @@ def test_gui_remove_paused_job_does_not_execute_and_unexpected_exception_continu
     monkeypatch.setattr("audiobookdl.gui.controller.run_downloads", fake_run_downloads)
 
     try:
-        opts = args.build_default_options(database_directory=str(tmp_path))
+        opts = build_default_options(database_directory=str(tmp_path))
         _run_id, jobs = ctrl.start_new_run(
             [
                 ("https://example.com/gate", opts, None, None),
@@ -3485,7 +3485,7 @@ def test_gui_sync_cancel_and_auth_panel_preserves_profile(tmp_path, monkeypatch)
             if not app._is_syncing:
                 break
             threading.Event().wait(0.02)
-        assert app._is_syncing is False
+        assert not app._is_syncing
     finally:
         app.controller.shutdown(is_running=False, is_previewing=False)
         root.destroy()
@@ -3526,7 +3526,7 @@ def test_gui_m2_sorting_collapsible_dependencies_log_batch_and_tokens(tmp_path):
         assert app.download_page.options_section.is_collapsed is True
         assert app.download_page.naming_section.is_collapsed is True
         assert app.download_page.options_section.toggle(False) is False
-        assert app.download_page.options_section.is_collapsed is False
+        assert not app.download_page.options_section.is_collapsed
         assert app.download_page.options_section.toggle(True) is True
 
         app.template_var.set("{series?{series}/}{title}")
@@ -3610,7 +3610,7 @@ def test_gui_m3_chapter_editor_preview_diff_and_pack_extended_overrides(tmp_path
             [Chapter(0, "Ch 1"), Chapter(10_000, "Ch 2"), Chapter(20_000, "Ch 3")],
             source_label=".cue",
         )
-        assert editor.tree.item("0", "values")[4] == ".cue"
+        assert tree_item_values(editor.tree, "0")[4] == ".cue"
         editor.tree.selection_set("0")
         editor.merge_with_next()
         assert [(c.start, c.title) for c in editor.get_chapters()] == [(0, "Ch 1"), (20_000, "Ch 3")]
@@ -3654,6 +3654,8 @@ def test_gui_m3_chapter_editor_preview_diff_and_pack_extended_overrides(tmp_path
         preview._publisher_var.set("Penguin Audio")
         preview._release_date_var.set("2020-03-04")
         preview._language_var.set("en")
+        assert preview._desc_text is not None
+        assert preview._chapter_editor is not None
         preview._desc_text.delete("1.0", tk.END)
         preview._desc_text.insert("1.0", "Custom synopsis")
         preview._chapter_editor.set_chapters([Chapter(0, "Prelude"), Chapter(30_000, "Chapter 1")])
@@ -3674,8 +3676,8 @@ def test_gui_m3_chapter_editor_preview_diff_and_pack_extended_overrides(tmp_path
         assert [(c.start, c.title) for c in ab.chapters] == [(0, "Prelude"), (30_000, "Chapter 1")]
 
         # 3. PackPage accepts initial_paths and preserves extended overrides & chapters
-        from audiobookdl import args as _args
         from audiobookdl.gui.controller import GuiController
+        from audiobookdl.options_schema import build_default_options as _build_default_options
 
         folder = tmp_path / "Local Book"
         folder.mkdir()
@@ -3686,7 +3688,7 @@ def test_gui_m3_chapter_editor_preview_diff_and_pack_extended_overrides(tmp_path
             pack_page = PackPage(
                 root,
                 ctrl_pack,
-                options_provider=lambda: _args.build_default_options(output_format="m4b"),
+                options_provider=lambda: _build_default_options(output_format="m4b"),
                 output_dir_provider=lambda: str(tmp_path),
                 ensure_ffmpeg=lambda _opts: True,
                 on_submit=lambda reqs, fmt: submitted_reqs.append((reqs, fmt)),
@@ -3971,7 +3973,7 @@ def test_gui_download_splitter_fit_to_content_and_minimum_queue_height(tmp_path)
         assert recollapsed_sash is not None
         assert recollapsed_sash == collapsed_sash
         dl.top_scroll.sync_layout(SimpleNamespace(width=700, height=recollapsed_sash))
-        assert dl.top_scroll.vscroll_visible is False
+        assert not dl.top_scroll.vscroll_visible
     finally:
         app.controller.shutdown(is_running=False, is_previewing=False)
         root.destroy()
@@ -4239,8 +4241,8 @@ def test_gui_catalog_displays_covers_and_ebook_formats(tmp_path):
                 ),
             ]
             tab.populate_items(books)
-            assert tab._tree.item("book-0", "values")[4] == "Audiobook + Ebook"
-            assert tab._tree.item("book-1", "values")[4] == "Audiobook"
+            assert tree_item_values(tab._tree, "book-0")[4] == "Audiobook + Ebook"
+            assert tree_item_values(tab._tree, "book-1")[4] == "Audiobook"
             assert "1 with ebook" in tab._status_var.get()
 
             # Wait briefly for background cover fetch + PhotoImage update
@@ -4453,7 +4455,7 @@ def test_gui04_pack_page_per_book_chapters_and_overrides_in_batch(tmp_path):
         pack_page = PackPage(
             root,
             app.controller,
-            options_provider=lambda: args.build_default_options(output_format="m4b"),
+            options_provider=lambda: build_default_options(output_format="m4b"),
             output_dir_provider=lambda: str(tmp_path),
             ensure_ffmpeg=lambda _opts: True,
             on_submit=lambda reqs, fmt: submitted.append((reqs, fmt)),
@@ -4801,12 +4803,14 @@ def test_gui_08_debounced_filters_and_coalesced_log_inserts(tmp_path, monkeypatc
         try:
             dlg._filter_var.set("Beta")
             assert dlg._filter_after_id is not None
-            assert list(dlg._tree.get_children()) == ["0", "1"]  # not yet filtered synchronously
+            dlg_tree = dlg._tree
+            assert dlg_tree is not None
+            assert list(dlg_tree.get_children()) == ["0", "1"]  # not yet filtered synchronously
             deadline = time.monotonic() + 1.0
             while dlg._filter_after_id is not None and time.monotonic() < deadline:
                 root.update()
                 time.sleep(0.01)
-            assert list(dlg._tree.get_children()) == ["1"]
+            assert list(dlg_tree.get_children()) == ["1"]
         finally:
             dlg.destroy()
     finally:
@@ -4864,7 +4868,7 @@ def test_gui_09_preview_dialog_metadata_tab_uses_scrollable_frame(tmp_path):
             dlg._meta_scroll.sync_layout(SimpleNamespace(width=520, height=200))
             assert dlg._meta_scroll.vscroll_visible is True
             dlg._meta_scroll.sync_layout(SimpleNamespace(width=520, height=req_h + 40))
-            assert dlg._meta_scroll.vscroll_visible is False
+            assert not dlg._meta_scroll.vscroll_visible
         finally:
             dlg.destroy()
     finally:
@@ -5277,7 +5281,7 @@ def test_gui_18_preview_series_book_inspect_and_chapter_editor_ops(tmp_path):
             dlg._series_title_var.set("Renamed Series")
             sub = dlg._open_series_book_subdialog(0, resolved_book)
             try:
-                assert closed_flag["closed"] is False
+                assert not closed_flag["closed"]
                 sub._title_var.set("Book 1 Customized")
                 assert sub._apply_audiobook_edits(resolved_book) is True
                 sub._source_transferred = True
@@ -5290,7 +5294,7 @@ def test_gui_18_preview_series_book_inspect_and_chapter_editor_ops(tmp_path):
             finally:
                 if sub.winfo_exists():
                     sub.destroy()
-            assert closed_flag["closed"] is False
+            assert not closed_flag["closed"]
             assert isinstance(series.books[0], Audiobook)
             assert series.books[0].title == "Book 1 Customized"
 
@@ -5418,8 +5422,8 @@ def test_gui_22_catalog_cover_width_series_order_filter_and_details():
         root.update_idletasks()
         try:
             assert tab._MAX_COVER_CACHE >= 2000
-            assert int(tab._tree.column("#0", "width")) >= scale_px(tab, 102)
-            assert int(tab._tree.column("#0", "minwidth")) >= scale_px(tab, 84)
+            assert tab._tree.column("#0", "width") >= scale_px(tab, 102)
+            assert tab._tree.column("#0", "minwidth") >= scale_px(tab, 84)
 
             books = [
                 CatalogBook(
@@ -5455,7 +5459,7 @@ def test_gui_22_catalog_cover_width_series_order_filter_and_details():
             roots = tab._tree.get_children("")
             assert len(roots) == 2
             group_iid = roots[0]
-            group_vals = tab._tree.item(group_iid, "values")
+            group_vals = tree_item_values(tab._tree, group_iid)
             assert "Guerra do Velho (2 items)" == group_vals[0]
             assert group_vals[1] == "John Scalzi"
             assert group_vals[2] == ""
@@ -5465,14 +5469,14 @@ def test_gui_22_catalog_cover_width_series_order_filter_and_details():
             # Series items are ordered by series_order (#1 before #4) and display #order
             children = tab._tree.get_children(group_iid)
             assert list(children) == ["book-1", "book-0"]
-            assert tab._tree.item("book-1", "values")[2] == "Guerra do Velho #1"
-            assert tab._tree.item("book-0", "values")[2] == "Guerra do Velho #4"
+            assert tree_item_values(tab._tree, "book-1")[2] == "Guerra do Velho #1"
+            assert tree_item_values(tab._tree, "book-0")[2] == "Guerra do Velho #4"
 
             # Collapse All / Expand All controls
             tab.collapse_all_groups()
-            assert not bool(tab._tree.item(group_iid, "open"))
+            assert not tab._tree.item(group_iid, "open")
             tab.expand_all_groups()
-            assert bool(tab._tree.item(group_iid, "open"))
+            assert tab._tree.item(group_iid, "open")
 
             # Book Details pane updates on single leaf selection and fetches detail cover
             tab._tree.selection_set(("book-0",))
@@ -5514,16 +5518,16 @@ def test_gui_22_catalog_cover_width_series_order_filter_and_details():
             # Flat mode tightens #0 cover width while keeping minwidth >= 84
             tab._group_var.set(False)
             tab._on_group_toggled()
-            assert int(tab._tree.column("#0", "width")) >= scale_px(tab, 84)
+            assert tab._tree.column("#0", "width") >= scale_px(tab, 84)
             assert len(tab._tree.get_children("")) == 3
 
             # Details pane toggle
-            assert tab._details_visible is True
+            assert tab._details_visible
             tab._toggle_details_pane()
-            assert tab._details_visible is False
+            assert not tab._details_visible
             assert tab._details_toggle_btn.cget("text") == "Show Details"
             tab._toggle_details_pane()
-            assert tab._details_visible is True
+            assert tab._details_visible
             assert tab._details_toggle_btn.cget("text") == "Hide Details"
         finally:
             if tab.winfo_exists():

@@ -11,15 +11,15 @@ import pytest
 from audiobookdl.config import load_config
 from audiobookdl.utils import ffprobe_duration
 from tests.e2e.fixtures import MediaFixtureFactory, build_librivox_html
-from tests.e2e.harness import CliRunner, E2EWorkspace, GuiHarness
+from tests.e2e.harness import E2EWorkspace, GuiHarness, GuiSelfTestRunner
 from tests.e2e.server import LocalAudiobookServer
 
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gui]
 
 
-def test_gui_self_test_subprocess(cli_runner: CliRunner) -> None:
-    res = cli_runner.run_gui_self_test()
+def test_gui_self_test_subprocess(gui_self_test_runner: GuiSelfTestRunner) -> None:
+    res = gui_self_test_runner.run_gui_self_test()
     assert res.returncode == 0, res.stderr
     assert not res.timed_out
 

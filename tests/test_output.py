@@ -204,7 +204,11 @@ def test_gen_output_location_enforces_utf8_component_limit_and_windows_max_path(
 @pytest.mark.no_worker_cap
 def test_combine_audiofiles_sizes_remux_pool_dynamically(tmp_path, monkeypatch):
     monkeypatch.setattr(output, "_require_executable", lambda name: name)
-    monkeypatch.setattr(output, "_remux_to_mpegts", lambda src, dst, cancel_event=None: open(dst, "wb").write(b"ts") > 0)
+    monkeypatch.setattr(
+        output,
+        "_remux_to_mpegts",
+        lambda src, dst, cancel_event=None, *, preserve_video=False: open(dst, "wb").write(b"ts") > 0,
+    )
     def fake_probe(path: str) -> AudioProbeInfo:
         if path.endswith("out3.mp3"):
             return AudioProbeInfo(duration=30.0, codec_name="mp3")
@@ -311,7 +315,11 @@ def test_convert_combine_and_chapters_clean_partial_output_on_cancel(tmp_path, m
     part.write_bytes(b"a")
     tmp_dir = tmp_path / "combine_tmp"
     out_m4b = tmp_path / "combined.m4b"
-    monkeypatch.setattr(output, "_remux_to_mpegts", lambda s, d, cancel_event=None: open(d, "wb").write(b"ts") > 0)
+    monkeypatch.setattr(
+        output,
+        "_remux_to_mpegts",
+        lambda s, d, cancel_event=None, *, preserve_video=False: open(d, "wb").write(b"ts") > 0,
+    )
     with pytest.raises(DownloadCancelled):
         combine_audiofiles([str(part)], str(tmp_dir), str(out_m4b), cancel_event=cancel_event)
     assert not out_m4b.exists()
@@ -350,7 +358,11 @@ def test_combine_audiofiles_isolates_work_dir_and_cleans_on_failure(tmp_path, mo
     out_m4b = tmp_path / "Book.m4b"
 
     monkeypatch.setattr(output, "_require_executable", lambda name: name)
-    monkeypatch.setattr(output, "_remux_to_mpegts", lambda s, d, cancel_event=None: open(d, "wb").write(b"ts") > 0)
+    monkeypatch.setattr(
+        output,
+        "_remux_to_mpegts",
+        lambda s, d, cancel_event=None, *, preserve_video=False: open(d, "wb").write(b"ts") > 0,
+    )
     monkeypatch.setattr(
         output,
         "_probe_audio_info",
@@ -1231,7 +1243,7 @@ def test_combine_audiofiles_exceeding_max_concat_files_uses_binary_ts(tmp_path, 
     monkeypatch.setattr(
         output,
         "_remux_to_mpegts",
-        lambda src, dst, cancel_event=None: open(dst, "wb").write(b"ts") > 0,
+        lambda src, dst, cancel_event=None, *, preserve_video=False: open(dst, "wb").write(b"ts") > 0,
     )
     monkeypatch.setattr(
         output,

@@ -280,7 +280,10 @@ class CookieImportDialog(ModalDialog):
             except Exception as exc:
                 err = exc
             finally:
-                self._cb_queue.post(lambda r=result, e=err: self._on_scan_finished(r, e))
+                def _post_finish() -> None:
+                    self._on_scan_finished(result, err)
+
+                self._cb_queue.post(_post_finish)
                 self._cb_queue.finish_worker()
 
         threading.Thread(target=_worker, daemon=True, name="abdl-cookie-scan").start()

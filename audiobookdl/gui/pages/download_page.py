@@ -75,6 +75,7 @@ class DownloadPage(ttk.Frame):
         on_progress_mode_changed: Callable[[str], None],
         progress_var: tk.DoubleVar,
         active_job_var: tk.StringVar,
+        on_retry_selected: Callable[[Sequence[str]], None] | None = None,
     ) -> None:
         super().__init__(parent, padding=(scale_px(parent, 12), scale_px(parent, 8)))
         self._window = root
@@ -251,9 +252,8 @@ class DownloadPage(ttk.Frame):
         ).grid(row=2, column=1, sticky="w")
 
         tpl_spec = OPTIONS_BY_NAME.get("output_template")
-        if tpl_spec and tpl_spec.cli_flags:
-            raw_help = tpl_spec.cli_flags[0].help
-            tpl_help = raw_help() if callable(raw_help) else str(raw_help or "")
+        if tpl_spec:
+            tpl_help = tpl_spec.get_help()
             if tpl_help:
                 attach_tooltip(self.tpl_entry, tpl_help, palette_provider=palette_provider)
 
@@ -297,7 +297,7 @@ class DownloadPage(ttk.Frame):
             on_open_folder=on_open_folder,
             on_retry_failed=on_retry_failed,
             service_label_for_url=service_label_for_url,
-            on_retry_selected=on_retry_failed,
+            on_retry_selected=on_retry_selected or (lambda _ids: on_retry_failed()),
             on_preview_url=on_preview_url,
             on_send_to_urls=on_send_to_urls,
             on_open_path=on_open_path,
@@ -367,13 +367,13 @@ class DownloadPage(ttk.Frame):
         """Resize the vertical splitter so top content fits without shrinking queue below minimum."""
         try:
             self.update_idletasks()
-            total_h = int(total_height) if total_height is not None else int(self.paned.winfo_height())
+            total_h = total_height if total_height is not None else self.paned.winfo_height()
             if total_h <= 1:
                 return None
-            top_req = int(self.top_scroll.content_frame.winfo_reqheight()) + scale_px(self, 4)
+            top_req = self.top_scroll.content_frame.winfo_reqheight() + scale_px(self, 4)
             min_top, max_top = self._splitter_bounds(total_h)
             target = max(min_top, min(top_req, max_top))
-            self.paned.sashpos(0, target)
+            self.paned.sashpos(0, target)  # type: ignore[no-untyped-call]
             self._split_ratio = target / total_h
             self.top_scroll.sync_layout()
             return target
@@ -406,7 +406,7 @@ class DownloadPage(ttk.Frame):
         min_top, max_top = self._splitter_bounds(total_h)
         if self._user_dragged_split and self._split_ratio is not None:
             target = max(min_top, min(round(total_h * self._split_ratio), max_top))
-            self.paned.sashpos(0, target)
+            self.paned.sashpos(0, target)  # type: ignore[no-untyped-call]
             self.top_scroll.sync_layout()
         else:
             self.fit_splitter_to_top_content()
@@ -424,14 +424,14 @@ class DownloadPage(ttk.Frame):
             try:
                 if not self.winfo_exists():
                     return
-                total_h = int(self.paned.winfo_height())
+                total_h = self.paned.winfo_height()
                 if total_h <= 1:
                     return
-                pos = int(self.paned.sashpos(0))
+                pos = int(self.paned.sashpos(0))  # type: ignore[no-untyped-call]
                 min_top, max_top = self._splitter_bounds(total_h)
                 clamped = max(min_top, min(pos, max_top))
                 if clamped != pos:
-                    self.paned.sashpos(0, clamped)
+                    self.paned.sashpos(0, clamped)  # type: ignore[no-untyped-call]
                 self._split_ratio = clamped / total_h
                 self._user_dragged_split = True
                 self.top_scroll.sync_layout()
@@ -443,9 +443,9 @@ class DownloadPage(ttk.Frame):
     def get_split_ratio(self) -> float | None:
         """Return current download splitter ratio `(0..1)` for persistence."""
         try:
-            total_h = int(self.paned.winfo_height())
+            total_h = self.paned.winfo_height()
             if total_h > 10:
-                pos = int(self.paned.sashpos(0))
+                pos = int(self.paned.sashpos(0))  # type: ignore[no-untyped-call]
                 ratio = pos / total_h
                 if 0.0 < ratio < 1.0:
                     return ratio

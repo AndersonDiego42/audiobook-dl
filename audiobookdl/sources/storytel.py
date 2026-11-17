@@ -3,7 +3,7 @@ from requests.models import Response
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from audiobookdl.args import DownloadOptions
+    from audiobookdl.options_schema import DownloadOptions
 from .source import CatalogBook, Source
 from audiobookdl import (
     AudiobookFile,
@@ -183,7 +183,7 @@ class StorytelSource(Source):
             raise UserNotAuthorized(detail="Storytel login returned invalid JSON") from exc
         account_info = user_data.get("accountInfo") if isinstance(user_data, dict) else None
         jwt = account_info.get("jwt") if isinstance(account_info, dict) else None
-        if not jwt:
+        if not isinstance(account_info, dict) or not jwt:
             raise UserNotAuthorized(detail="Storytel login response missing session token")
         self._language = account_info.get("lang") or "en"
         self._session.headers.update({"authorization": f"Bearer {jwt}"})
@@ -387,16 +387,15 @@ class StorytelSource(Source):
         book_details: dict[str, Any],
         format_type: str,
         *,
-        print_only: bool,
         cover_only: bool,
         no_chapters: bool,
         cover: Cover | None,
     ) -> Audiobook:
         metadata = self.get_metadata(book_details, format_type=format_type)
-        files = [] if (print_only or cover_only) else self.get_files(book_details, format_type=format_type)
+        files = [] if cover_only else self.get_files(book_details, format_type=format_type)
         chapters = (
             []
-            if (print_only or cover_only or no_chapters or format_type != "abook")
+            if (cover_only or no_chapters or format_type != "abook")
             else self.get_chapters(book_details)
         )
         source_data = dict(book_details)
@@ -426,10 +425,9 @@ class StorytelSource(Source):
                 selected_formats = remaining
 
         options = getattr(self, "_options", None)
-        print_only = bool(options and getattr(options, "print_output", False))
         cover_only = bool(options and getattr(options, "cover", False))
         no_chapters = bool(options and getattr(options, "no_chapters", False))
-        cover = None if print_only else self.download_cover(book_details)
+        cover = self.download_cover(book_details)
 
         built_books: list[Audiobook] = []
         for idx, fmt in enumerate(selected_formats):
@@ -440,7 +438,6 @@ class StorytelSource(Source):
                     consumableId,
                     book_details,
                     fmt,
-                    print_only=print_only,
                     cover_only=cover_only,
                     no_chapters=no_chapters,
                     cover=cover,

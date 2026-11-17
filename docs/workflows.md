@@ -4,11 +4,11 @@ This guide documents the primary runtime execution pipelines and build/release a
 
 ## 1. End-to-End Download Pipeline
 
-Triggered by CLI URLs (`audiobookdl/__main__.py`), `Downloader.download()`, GUI jobs, `sync`, or `POST /api/download`:
+Triggered by GUI download jobs, `Downloader.download()`, or GUI library sync:
 
 ```mermaid
 sequenceDiagram
-    participant Caller as CLI / GUI / API Caller
+    participant Caller as Desktop GUI / API Caller
     participant DL as Downloader (pipeline.py)
     participant Src as Source Adapter
     participant Auth as CredentialStore / Cookies
@@ -46,38 +46,33 @@ sequenceDiagram
 
 ---
 
-## 2. Offline Local Repackaging (`audiobook-dl pack`)
+## 2. Offline Local Repackaging (`PackPage`)
 
-[`audiobookdl/pack.py`](../audiobookdl/pack.py) converts local audio folders or track lists into chaptered `.m4b` (or configured `--output-format`) files without contacting a remote source:
+[`audiobookdl/pack.py`](../audiobookdl/pack.py) converts local audio folders or track lists into chaptered `.m4b` (or configured output format) files without contacting a remote source:
 
 ```mermaid
 flowchart LR
     In["Input Folders / Tracks"] --> Discover["discover_pack_groups()"]
     Discover --> Sort["sort_track_paths() by (disc, track) or natural filename"]
     Sort --> ReadMeta["Extract track tags + sidecars (metadata.json, audiobook.json, *.opf, *.cue, cover.*/folder.*)"]
-    ReadMeta --> Merge["Merge CLI Overrides (--title, --author, --series, --cover)"]
-    Merge --> Enrich["Optional --enrich Metadata & Cover Lookup"]
-    Enrich --> DryRun{"--dry-run?"}
-    DryRun -- Yes --> Report["Preview / --json Summary"]
-    DryRun -- No --> Render["Combine/Convert via FFmpeg + Apply Loudnorm/Mono + Chapter Offset + Embed Metadata/Sidecars"]
-    Render --> Post["Optional --post-exec & --delete-source"]
+    ReadMeta --> Merge["Merge GUI Overrides (Title, Author, Series, Cover, Chapters)"]
+    Merge --> Enrich["Optional Metadata & Cover Enrichment"]
+    Enrich --> Render["Combine/Convert via FFmpeg + Apply Loudnorm/Mono + Chapter Offset + Embed Metadata/Sidecars"]
+    Render --> Post["Optional post-exec & delete source"]
 ```
 
 ---
 
-## 3. Headless `sync` & `serve` Automation
+## 3. GUI Library Sync
 
-- **`audiobook-dl sync`** ([`audiobookdl/sync.py`](../audiobookdl/sync.py)):
-  1. `_resolve_sync_targets()` selects configured `(service, profile)` pairs whose adapter has `supports_library = True` (or specific `--service` / `--profile` targets).
-  2. `run_sync_once()` authenticates and calls `list_library()`, upserts discovered items into `downloads.db` (`upsert_catalog_items()`), filters out `downloaded`, `trashed`, and `hidden`-tagged entries, and downloads remaining `pending` URLs unless `--scan-only` or `--dry-run` is active.
-  3. `run_sync_loop()` repeats on `--interval <seconds>` when `--watch` is enabled and handles `SIGINT`/`SIGTERM` gracefully.
-
-- **`audiobook-dl serve`** ([`audiobookdl/web.py`](../audiobookdl/web.py)):
-  Runs `WebDashboardState` + `ThreadingHTTPServer` bound to `--host` / `--port`, exposing the dark-mode Web UI at `/` and JSON endpoints (`/api/health`, `/api/status`, `/api/services`, `/api/library`, `/api/download`, `/api/pause`, `/api/cancel`, `/api/queue/clear`, `/api/catalog`, `/api/sync`).
+- **`run_sync_once()`** ([`audiobookdl/sync.py`](../audiobookdl/sync.py)):
+  1. `_resolve_sync_targets()` selects configured `(service, profile)` pairs whose adapter has `supports_library = True` (or specific selected targets).
+  2. Authenticates and calls `list_library()`, upserts discovered items into `downloads.db` (`upsert_catalog_items()`), filters out `downloaded`, `trashed`, and `hidden`-tagged entries, and downloads remaining `pending` URLs unless `scan_only` or `dry_run` is active.
+  3. The Desktop GUI schedules periodic sync passes via `AutomationCoordinator` when enabled on the **Library -> Sync** tab.
 
 ---
 
-## 4. CI, Release & Container Packaging
+## 4. CI & Release Packaging
 
 ```mermaid
 flowchart TD
@@ -89,8 +84,6 @@ flowchart TD
 
     Tag["Git Tag v*"] --> Rel[".github/workflows/release.yml"]
     Rel --> WinJob["Windows Job: pytest + build_exe.py (--onefile & --onedir) + --self-test"]
-    Rel --> DockerJob["Docker Job: multi-arch linux/amd64 & linux/arm64 to ghcr.io"]
 ```
 
-- **Windows Portable Builds** ([`scripts/build_exe.py`](../scripts/build_exe.py)): Packages [`audiobookdl/gui/app.py`](../audiobookdl/gui/app.py) (`audiobook-dl.exe`) with PyInstaller (`--onefile` or `--onedir`, plus `audiobook-dl-cli.exe` console companion in `--onedir` mode), optionally copies or bundles `ffmpeg`/`ffprobe`, and verifies builds via `--self-test`.
-- **Docker Image** ([`Dockerfile`](../Dockerfile)): Based on `python:3.12-slim` with `ffmpeg`, non-root user `audiobookdl`, volumes `/config` and `/audiobooks`, and default `CMD ["sync", "--watch", "--interval", "3600"]`.
+- **Windows Portable Builds** ([`scripts/build_exe.py`](../scripts/build_exe.py)): Packages [`audiobookdl/gui/app.py`](../audiobookdl/gui/app.py) (`audiobook-dl.exe`) with PyInstaller (`--onefile` or `--onedir`), optionally copies or bundles `ffmpeg`/`ffprobe`, and verifies builds via `--self-test`.

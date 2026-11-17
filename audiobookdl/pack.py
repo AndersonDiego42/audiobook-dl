@@ -17,7 +17,8 @@ import uuid
 
 import requests
 
-from audiobookdl import Audiobook, AudiobookMetadata, Chapter, Cover, args, logging
+from audiobookdl import Audiobook, AudiobookMetadata, Chapter, Cover, logging
+from audiobookdl.options_schema import DownloadOptions
 from audiobookdl.utils.audiobook import parse_language, parse_release_date
 from audiobookdl.config import Config, load_config
 from audiobookdl.exceptions import AudiobookDLException, DownloadCancelled, GenericAudiobookDLException
@@ -467,7 +468,7 @@ def _build_pack_chapters(
 
 def resolve_pack_output_path(
     metadata: AudiobookMetadata,
-    options: args.DownloadOptions,
+    options: DownloadOptions,
     output_format: str,
     *,
     output_dir: str | None = None,
@@ -490,7 +491,7 @@ def resolve_pack_output_path(
 def inspect_local_book(
     source_root: str,
     raw_paths: Sequence[str],
-    options: args.DownloadOptions,
+    options: DownloadOptions,
     *,
     output_dir: str | None = None,
     overrides: PackOverrides | None = None,
@@ -558,7 +559,7 @@ def _pack_single_track(
     src_path: str,
     staged_path: str,
     spec: PackBookSpec,
-    options: args.DownloadOptions,
+    options: DownloadOptions,
     *,
     cancel_event: threading.Event | None,
     probe_cache: dict[str, AudioProbeInfo],
@@ -619,7 +620,7 @@ def _remove_source_tracks(track_paths: Sequence[str], source_root: str) -> None:
 
 def pack_book(
     spec: PackBookSpec,
-    options: args.DownloadOptions,
+    options: DownloadOptions,
     *,
     output_dir: str | None = None,
     delete_source: bool = False,
@@ -791,7 +792,7 @@ def scope_overrides_for_batch(
 
 def run_pack(
     paths: Sequence[str],
-    options: args.DownloadOptions,
+    options: DownloadOptions,
     config: Config | None = None,
     *,
     output_dir: str | None = None,
@@ -807,7 +808,7 @@ def run_pack(
     """Discover, inspect, and repackage local audiobooks with isolated `JobContext`."""
     resolved_config = config if config is not None else load_config(options.config_location)
     ctx = apply_runtime_options(options, resolved_config)
-    ctx.interaction = interaction if interaction is not None else logging.CliInteractionHandler()
+    ctx.interaction = interaction if interaction is not None else logging.NonInteractiveInteractionHandler()
     ctx.cancel_event = cancel_event
     ctx.pause_event = pause_event
     ctx.sink = sink if sink is not None else logging.get_ui_sink()

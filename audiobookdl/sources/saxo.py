@@ -186,7 +186,8 @@ class SaxoSource(Source):
         for item in items or ():
             if not isinstance(item, dict):
                 continue
-            meta = item.get("bookMetadata") if isinstance(item.get("bookMetadata"), dict) else item
+            raw_meta = item.get("bookMetadata")
+            meta = raw_meta if isinstance(raw_meta, dict) else item
             book_id = item.get("bookId") or meta.get("bookId") or meta.get("id")
             isbn = meta.get("isbn13") or meta.get("isbn") or item.get("isbn") or book_id
             title = str(meta.get("title") or item.get("title") or isbn or "").strip()

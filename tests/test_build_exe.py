@@ -92,26 +92,19 @@ def test_build_exe_copy_ffmpeg_targets_exe_directory(tmp_path, monkeypatch):
     assert (exe_path.parent / "ffprobe.exe").is_file()
 
 
-def test_gui_launcher_dispatches_cli_subcommands_and_flags():
-    from audiobookdl.gui.app import _is_gui_invocation, main as gui_main
+def test_gui_launcher_parses_gui_args_and_launches_self_test():
+    from audiobookdl.gui.app import main as gui_main, parse_gui_args
 
-    assert _is_gui_invocation([]) is True
-    assert _is_gui_invocation(["--self-test"]) is True
-    assert _is_gui_invocation(["--config", "foo.toml"]) is True
-    assert _is_gui_invocation(["--gui", "-cfoo.toml"]) is True
+    parsed = parse_gui_args(["--self-test", "--config", "foo.toml"])
+    assert parsed.self_test is True
+    assert parsed.config_location == "foo.toml"
 
-    assert _is_gui_invocation(["--version"]) is False
-    assert _is_gui_invocation(["--help"]) is False
-    assert _is_gui_invocation(["pack", "C:/Books"]) is False
-    assert _is_gui_invocation(["https://librivox.org/book"]) is False
-    assert _is_gui_invocation(["--config", "foo.toml", "sync"]) is False
-
-    with patch("audiobookdl.__main__.main") as mock_cli_main:
-        gui_main(["--version"])
-        mock_cli_main.assert_called_once_with(["--version"])
+    with patch("audiobookdl.gui.app.run_self_test") as mock_self_test:
+        gui_main(["--self-test"])
+        mock_self_test.assert_called_once_with(check_gui=True)
 
 
-def test_build_exe_onedir_builds_console_cli_companion(tmp_path, monkeypatch):
+def test_build_exe_onedir_builds_gui_only_without_cli_companion(tmp_path, monkeypatch):
     build_exe = _load_build_exe()
     dist_dir = tmp_path / "dist"
     monkeypatch.setattr(build_exe, "DIST_DIR", dist_dir)
@@ -130,49 +123,8 @@ def test_build_exe_onedir_builds_console_cli_companion(tmp_path, monkeypatch):
     with patch.object(build_exe.subprocess, "run", side_effect=fake_run):
         exe_path = build_exe.build(onedir=True)
 
-    assert len(captured_cmds) == 2
+    assert len(captured_cmds) == 1
     assert "--windowed" in captured_cmds[0]
-    assert "--console" in captured_cmds[1]
-    assert str(build_exe.CLI_ENTRY_POINT) == captured_cmds[1][-1]
+    assert str(build_exe.ENTRY_POINT) == captured_cmds[0][-1]
     cli_suffix = ".exe" if os.name == "nt" else ""
-    assert (exe_path.parent / f"audiobook-dl-cli{cli_suffix}").is_file()
-
-
-def test_build_exe_onedir_merges_cli_internal_and_bundles_ffmpeg_for_cli(tmp_path, monkeypatch):
-    build_exe = _load_build_exe()
-    dist_dir = tmp_path / "dist"
-    fake_bin_dir = tmp_path / "tools"
-    fake_bin_dir.mkdir()
-    exe_ext = ".exe" if os.name == "nt" else ""
-    (fake_bin_dir / f"ffmpeg{exe_ext}").write_text("ff")
-    (fake_bin_dir / f"ffprobe{exe_ext}").write_text("fp")
-
-    monkeypatch.setattr(build_exe, "DIST_DIR", dist_dir)
-    monkeypatch.setattr(build_exe, "BUILD_DIR", tmp_path / "build")
-    monkeypatch.setattr(
-        build_exe.shutil,
-        "which",
-        lambda name: str(fake_bin_dir / f"{name}{exe_ext}"),
-    )
-
-    captured_cmds = []
-
-    def fake_run(cmd, cwd, check):
-        captured_cmds.append(cmd)
-        name = cmd[cmd.index("--name") + 1]
-        out_dir = dist_dir / name
-        internal = out_dir / "_internal" / "nested"
-        internal.mkdir(parents=True, exist_ok=True)
-        suffix = ".exe" if os.name == "nt" else ""
-        (out_dir / f"{name}{suffix}").write_text("stub")
-        (out_dir / "_internal" / f"{name}_dep.dll").write_text("dll")
-        if name == "audiobook-dl-cli":
-            (internal / "cli_only.pyd").write_text("pyd")
-
-    with patch.object(build_exe.subprocess, "run", side_effect=fake_run):
-        exe_path = build_exe.build(bundle_ffmpeg=True, onedir=True)
-
-    assert "--add-binary" in captured_cmds[1]
-    assert (exe_path.parent / "_internal" / "audiobook-dl-cli_dep.dll").is_file()
-    assert (exe_path.parent / "_internal" / "nested" / "cli_only.pyd").is_file()
-    assert not (dist_dir / "audiobook-dl-cli").exists()
+    assert not (exe_path.parent / f"audiobook-dl-cli{cli_suffix}").exists()

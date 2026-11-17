@@ -91,7 +91,7 @@ class NextorySource(Source):
                 return _TLD_LOCALES[path_parts[0].lower()]
         return self.LOCALE
 
-    def get_compatible_app_version(self):
+    def get_compatible_app_version(self) -> str:
         today = date.today()
         month_idx = today.year * 12 + (today.month - 1) - 2
         year, month_zero = divmod(month_idx, 12)
@@ -413,9 +413,9 @@ class NextorySource(Source):
             for index, ch in enumerate(raw_chapters):
                 if not isinstance(ch, dict):
                     continue
-                start_val = ch.get("start_at", ch.get("start", 0))
+                start_val = ch.get("start_at") if ch.get("start_at") is not None else ch.get("start", 0)
                 ch_title = str(ch.get("title") or ch.get("name") or f"Chapter {index + 1}").strip()
-                chapters.append(Chapter(title=ch_title, start=int(start_val)))
+                chapters.append(Chapter(title=ch_title, start=int(start_val or 0)))
             if chapters:
                 return chapters
 

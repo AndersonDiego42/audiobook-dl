@@ -118,7 +118,7 @@ def _safe_url_label(url: str) -> str:
 
 
 def _raise_for_failed_response(url: str, resp: requests.Response) -> None:
-    logging.debug(f"Failed to download data from: {url}\nResponse:\n{resp.content}")
+    logging.debug(f"Failed to download data from: {url}\nResponse:\n{resp.content!r}")
     detail = f"HTTP {resp.status_code} from {_safe_url_label(url)}"
     if resp.status_code in (401, 403):
         raise exceptions.UserNotAuthorized(detail=detail)
@@ -189,12 +189,18 @@ def _decode_key_data_uri(uri: str) -> bytes | None:
     return unquote_to_bytes(payload)
 
 
-def _select_variant_playlist_uri(playlist: m3u8.M3U8) -> str | None:
-    """Select the preferred audio rendition URI if present, else the highest-bandwidth variant URI."""
+def _select_variant_playlist_uri(
+    playlist: m3u8.M3U8,
+    *,
+    prefer_video: bool = False,
+) -> str | None:
+    """Select the preferred audio rendition URI (unless `prefer_video`) else highest-bandwidth variant."""
     best = max(
         playlist.playlists,
         key=lambda p: (p.stream_info.bandwidth or 0) if p.stream_info else 0,
     )
+    if prefer_video:
+        return best.absolute_uri
     stream_info = getattr(best, "stream_info", None)
     audio_group = getattr(stream_info, "audio", None) if stream_info else None
     media_list = getattr(playlist, "media", None) or []
@@ -223,16 +229,18 @@ def get_stream_files(
     headers: dict[str, str] | None = None,
     extension=None,
     expected_content_type="application/octet-stream",
+    *,
+    prefer_video: bool = False,
 ) -> list[AudiobookFile]:
-    """Creates a list of audio files from an m3u8 file"""
+    """Creates a list of stream segment files from an m3u8 playlist"""
     base_headers = dict(headers) if headers else {}
     content = self.get(url, headers=base_headers).decode("utf-8")
     playlist = m3u8.loads(content, uri=url)
 
-    # Resolve master/variant playlists to the preferred audio rendition or highest-bandwidth stream.
+    # Resolve master/variant playlists to the preferred audio or highest-bandwidth video stream.
     seen_urls = {url}
     while playlist.is_variant and playlist.playlists:
-        next_url = _select_variant_playlist_uri(playlist)
+        next_url = _select_variant_playlist_uri(playlist, prefer_video=prefer_video)
         if not next_url or next_url in seen_urls:
             break
         seen_urls.add(next_url)

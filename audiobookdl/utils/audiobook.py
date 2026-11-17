@@ -58,6 +58,8 @@ class AudiobookFile:
     file_writer: Callable[[str], None] | None = None
     # Optional HLS fMP4 initialization section (#EXT-X-MAP) prepended before segment frames
     init_section: bytes | None = None
+    # Optional 0-based chapter/lesson index for grouping fine-grained stream segments
+    chapter_index: int | None = None
 
 
 _LANGUAGE_ALIASES: dict[str, str] = {
@@ -429,6 +431,7 @@ class Audiobook:
     chapters: list[Chapter] = Factory(list)
     cover: Cover | None = None
     source_data: Any = None
+    media_kind: str = "audio"
 
     @property
     def title(self) -> str:
@@ -451,6 +454,7 @@ class Series(Generic[T]):
 Result = Audiobook | Series
 
 EBOOK_EXTENSIONS = frozenset({"epub", "pdf", "mobi", "azw3", "cbz", "cbr"})
+VIDEO_EXTENSIONS = frozenset({"mp4", "mkv", "mov", "m4v"})
 
 
 def is_ebook_extension(ext: str | None) -> bool:
@@ -463,3 +467,29 @@ def is_ebook_extension(ext: str | None) -> bool:
 def is_ebook(audiobook: Audiobook) -> bool:
     """Return True when `audiobook` consists only of ebook file(s) (e.g. `.epub`)."""
     return bool(audiobook.files) and all(is_ebook_extension(f.ext) for f in audiobook.files)
+
+
+def is_video_extension(ext: str | None) -> bool:
+    """Return True when `ext` represents a video container extension."""
+    if not ext:
+        return False
+    return ext.lstrip(".").lower() in VIDEO_EXTENSIONS
+
+
+def is_video(audiobook: Audiobook) -> bool:
+    """Return True when `audiobook` represents video content whose video stream should be preserved."""
+    return getattr(audiobook, "media_kind", "audio") == "video"
+
+
+def resolve_audiobook_output_format(
+    audiobook: Audiobook,
+    requested_format: str | None,
+) -> str | None:
+    """Resolve the effective output extension/format for `audiobook` given `requested_format`."""
+    raw_ext = audiobook.files[0].ext.lstrip(".").lower() if audiobook.files else None
+    if is_ebook(audiobook):
+        return raw_ext
+    req = requested_format.lstrip(".").lower() if requested_format else None
+    if is_video(audiobook):
+        return req if req in VIDEO_EXTENSIONS else "mp4"
+    return req or raw_ext

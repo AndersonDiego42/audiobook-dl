@@ -3,7 +3,6 @@ from unittest.mock import MagicMock
 
 import requests
 
-from audiobookdl import __main__ as cli_main
 from audiobookdl.utils.updater import (
     UpdateInfo,
     check_for_updates,
@@ -93,14 +92,3 @@ def test_winget_helpers(monkeypatch):
     assert winget_available() is False
     ok_missing, _ = install_ffmpeg_via_winget()
     assert ok_missing is False
-
-
-def test_cli_check_updates_prints_status(monkeypatch, capsys):
-    monkeypatch.setattr(sys, "argv", ["audiobook-dl", "--check-updates"])
-    monkeypatch.setattr(
-        "audiobookdl.__main__.check_for_updates",
-        lambda **_kw: UpdateInfo(current_version="0.7.7", latest_version="0.9.0", has_update=True),
-    )
-    cli_main.main()
-    captured = capsys.readouterr()
-    assert "Update available: v0.9.0" in captured.out

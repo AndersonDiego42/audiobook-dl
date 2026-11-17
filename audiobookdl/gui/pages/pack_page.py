@@ -10,13 +10,13 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any
 from collections.abc import Callable, Sequence
 
-from audiobookdl import args
+from audiobookdl.options_schema import DownloadOptions
 from audiobookdl.exceptions import AudiobookDLException
 from audiobookdl.gui.chapter_editor import ChapterEditorFrame
 from audiobookdl.gui.controller import GuiController, PackJobRequest
 from audiobookdl.gui.formatting import format_duration
 from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, make_bold_font, scale_px
-from audiobookdl.gui.widgets import MainThreadCallbackQueue, ModalDialog, ScrolledTreeview, TreeColumnSpec
+from audiobookdl.gui.widgets import MainThreadCallbackQueue, ModalDialog, ScrolledTreeview, TreeColumnSpec, tree_item_values
 from audiobookdl.pack import PackBookSpec, PackOverrides, scope_overrides_for_batch
 from audiobookdl.utils.audiobook import Chapter, parse_language, parse_release_date
 
@@ -120,9 +120,9 @@ class PackPage(ttk.Frame):
         parent: tk.Misc,
         controller: GuiController,
         *,
-        options_provider: Callable[[], args.DownloadOptions | None],
+        options_provider: Callable[[], DownloadOptions | None],
         output_dir_provider: Callable[[], str],
-        ensure_ffmpeg: Callable[[args.DownloadOptions], bool],
+        ensure_ffmpeg: Callable[[DownloadOptions], bool],
         on_submit: Callable[[list[PackJobRequest], str], None],
         initial_paths: Sequence[str] = (),
         palette: ThemePalette | None = None,
@@ -467,7 +467,7 @@ class PackPage(ttk.Frame):
         self._preview_specs[idx].chapters_source = "edited"
         iid = str(idx)
         if self._tree.exists(iid):
-            vals = list(self._tree.item(iid, "values"))
+            vals = tree_item_values(self._tree, iid)
             if len(vals) >= 4:
                 vals[3] = len(ch_copy)
                 self._tree.item(iid, values=tuple(vals))
@@ -512,7 +512,7 @@ class PackPage(ttk.Frame):
             self.series_order_var.set("" if order_val is None else str(order_val))
         iid = str(idx)
         if self._tree.exists(iid):
-            vals = list(self._tree.item(iid, "values"))
+            vals = tree_item_values(self._tree, iid)
             if len(vals) >= 2:
                 vals[0] = spec.audiobook.title
                 vals[1] = spec.audiobook.metadata.author or "(Unknown)"
@@ -525,7 +525,7 @@ class PackPage(ttk.Frame):
             self._invalidate_preview("Add one or more local folders or audio tracks to preview.")
 
     def _remove_selected_paths(self) -> None:
-        selected = list(self._paths_listbox.curselection())
+        selected = list(self._paths_listbox.curselection())  # type: ignore[no-untyped-call]
         if not selected:
             return
         for idx in reversed(selected):
@@ -634,7 +634,7 @@ class PackPage(ttk.Frame):
                 merged.series_order = int(book_ov["series_order"])
         return merged
 
-    def _clone_options_for_pack(self) -> args.DownloadOptions | None:
+    def _clone_options_for_pack(self) -> DownloadOptions | None:
         base = self._options_provider()
         if base is None:
             return None
@@ -670,7 +670,7 @@ class PackPage(ttk.Frame):
         self._loading_bar.start(12)
         self.status_var.set("Scanning tracks and reading metadata...")
         paths_snapshot = list(self._paths)
-        recursive = bool(self.recursive_var.get())
+        recursive = self.recursive_var.get()
         output_dir = self._output_dir_provider()
         self._output_label_var.set(f"Output folder: {output_dir}")
         def _apply(s: list[PackBookSpec] | None, e: str | None) -> None:
@@ -737,7 +737,10 @@ class PackPage(ttk.Frame):
             except Exception as exc:
                 err = str(exc)
             finally:
-                self._cb_queue.post(lambda s=specs, e=err: _apply(s, e))
+                def _post_scan() -> None:
+                    _apply(specs, err)
+
+                self._cb_queue.post(_post_scan)
                 self._cb_queue.finish_worker()
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -761,8 +764,8 @@ class PackPage(ttk.Frame):
             return
         output_dir = self._output_dir_provider()
         fmt = self.format_var.get().strip().lower() or "m4b"
-        recursive = bool(self.recursive_var.get())
-        delete_source = bool(self.delete_source_var.get())
+        recursive = self.recursive_var.get()
+        delete_source = self.delete_source_var.get()
         if delete_source:
             confirm = messagebox.askyesno(
                 "Confirm Source Deletion",

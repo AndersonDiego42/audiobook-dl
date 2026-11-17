@@ -8,7 +8,8 @@ import tkinter as tk
 from typing import Any
 from collections.abc import Callable, Sequence
 
-from audiobookdl import args, output
+from audiobookdl import output
+from audiobookdl.options_schema import DownloadOptions
 from audiobookdl.gui.formatting import parse_url_text
 from audiobookdl.pack import SUPPORTED_PACK_EXTENSIONS
 from audiobookdl.sources import detect_service_key
@@ -53,7 +54,7 @@ def partition_input_tokens(tokens: Sequence[str]) -> tuple[list[str], list[str]]
 def series_book_exists(
     book: BookId[Any] | Audiobook,
     *,
-    options: args.DownloadOptions,
+    options: DownloadOptions,
     dir_stems_cache: dict[str, set[str]] | None = None,
     archive_titles_cache: set[str] | None = None,
     series_title: str | None = None,

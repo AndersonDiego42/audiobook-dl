@@ -91,12 +91,18 @@ class SettingsPage(ttk.Frame):
         theme_row = ttk.Frame(app_frame)
         theme_row.grid(row=0, column=1, sticky="w", pady=2)
         for mode in THEME_MODES:
+            def _make_theme_cb(selected_mode: str) -> Callable[[], None]:
+                def _cb() -> None:
+                    on_theme_changed(selected_mode)
+
+                return _cb
+
             ttk.Radiobutton(
                 theme_row,
                 text=THEME_LABELS[mode],
                 variable=theme_var,
                 value=mode,
-                command=lambda m=mode: on_theme_changed(m),
+                command=_make_theme_cb(mode),
             ).pack(side=tk.LEFT, padx=(0, 12))
 
         ttk.Checkbutton(
@@ -286,9 +292,18 @@ class SettingsPage(ttk.Frame):
             try:
                 username = client.ping()
                 libs = client.list_libraries()
-                self._cb_queue.post(lambda u=username, l=libs: _done(u, l, None))
+
+                def _post_ok() -> None:
+                    _done(username, libs, None)
+
+                self._cb_queue.post(_post_ok)
             except Exception as exc:
-                self._cb_queue.post(lambda err=str(exc): _done("", [], err))
+                err_msg = str(exc)
+
+                def _post_err() -> None:
+                    _done("", [], err_msg)
+
+                self._cb_queue.post(_post_err)
             finally:
                 client.close()
                 self._cb_queue.finish_worker()

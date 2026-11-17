@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from audiobookdl import Audiobook, BookId, Series
-from audiobookdl.args import build_default_options
+from audiobookdl.options_schema import build_default_options
 from audiobookdl.exceptions import (
     AudiobookDLException,
     BookHasNoAudiobook,

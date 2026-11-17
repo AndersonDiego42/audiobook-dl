@@ -13,6 +13,8 @@ def add_metadata(
     cover: Cover | None = None,
     chapters: Sequence[Chapter] | None = None,
     track_context: TrackTagContext | None = None,
+    *,
+    is_video: bool = False,
 ) -> bool:
     """Adds metadata (and optional cover art / ID3 chapters where supported inline) to `filepath`.
 
@@ -27,7 +29,13 @@ def add_metadata(
             track_context=track_context,
         )
     elif mp4.is_mp4_file(filepath):
-        return mp4.add_mp4_metadata(filepath, metadata, cover=cover, track_context=track_context)
+        return mp4.add_mp4_metadata(
+            filepath,
+            metadata,
+            cover=cover,
+            track_context=track_context,
+            is_video=is_video,
+        )
     elif vorbis.is_vorbis_file(filepath):
         return vorbis.add_vorbis_metadata(filepath, metadata, cover=cover, track_context=track_context)
     else:

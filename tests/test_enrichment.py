@@ -7,7 +7,8 @@ import pycountry
 import pytest
 import requests
 
-from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, args
+from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover
+from audiobookdl.options_schema import OPTIONS_BY_NAME, build_default_options
 from audiobookdl.utils.enrichment import (
     DEFAULT_CONFIDENCE_THRESHOLD,
     DEFAULT_PROVIDERS,
@@ -432,21 +433,23 @@ def test_interactive_selector_chooses_candidate_or_skips():
     assert book_skip.metadata.publisher is None
 
 
-def test_cli_parses_new_enrichment_flags():
-    opts = args.parse_arguments([
-        "--enrich",
-        "--enrich-providers",
-        "apple,google_books",
-        "--enrich-interactive",
-        "--no-enrich-cache",
-    ])
+def test_enrichment_providers_validation_and_options():
+    binding = OPTIONS_BY_NAME["enrich_providers"].gui
+    assert binding is not None
+    assert binding.read_option("apple,google_books") == "itunes,google"
+    with pytest.raises(ValueError):
+        binding.read_option("invalid_provider")
+
+    opts = build_default_options(
+        enrich_metadata=True,
+        enrich_providers="itunes,google",
+        enrich_interactive=True,
+        no_enrich_cache=True,
+    )
     assert opts.enrich_metadata is True
     assert opts.enrich_providers == "itunes,google"
     assert opts.enrich_interactive is True
     assert opts.no_enrich_cache is True
-
-    with pytest.raises(SystemExit):
-        args.parse_arguments(["--enrich-providers", "invalid_provider"])
 
 
 def test_enrichment_skips_incapable_providers_for_missing_fields():

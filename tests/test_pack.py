@@ -13,11 +13,12 @@ from mutagen.id3 import APIC, ID3, TALB, TIT2, TPE1, TPOS, TRCK
 from mutagen.mp4 import MP4
 import pytest
 
-from audiobookdl import AudiobookMetadata, Chapter, Cover, args
-from audiobookdl.__main__ import main as cli_main
+from audiobookdl import AudiobookMetadata, Chapter, Cover
+from audiobookdl.options_schema import build_default_options
 from audiobookdl.config import Config
 from audiobookdl.exceptions import GenericAudiobookDLException
 from audiobookdl.gui.controller import GuiController, PackJobRequest
+from audiobookdl.gui.widgets import tree_item_values
 from audiobookdl.output.metadata import id3, mp4, sidecars, vorbis
 from audiobookdl.output.metadata.reader import (
     infer_metadata_from_path,
@@ -266,7 +267,7 @@ def test_inspect_local_book_chapters_metadata_and_overrides(tmp_path: Path):
         tags.save(str(p))
 
     out_dir = tmp_path / "packed"
-    opts = args.build_default_options(output_template="{author}/{title}")
+    opts = build_default_options(output_template="{author}/{title}")
 
     def _fake_probe(path: str) -> AudioProbeInfo:
         dur = 12.5 if Path(path).name.startswith("01") else 7.5
@@ -324,7 +325,7 @@ def test_run_pack_dry_run_delete_source_and_failure_safety(tmp_path: Path):
         _create_empty_id3_mp3(p)
 
     out_dir = tmp_path / "out"
-    opts = args.build_default_options(output_template="{author} - {title}", overwrite=True)
+    opts = build_default_options(output_template="{author} - {title}", overwrite=True)
 
     fake_probe = AudioProbeInfo(duration=5.0, bitrate=128_000, codec_name="mp3", format_name="mp3")
 
@@ -366,7 +367,7 @@ def test_run_pack_dry_run_delete_source_and_failure_safety(tmp_path: Path):
         ):
             keep_summary = run_pack(
                 [str(src_dir)],
-                args.build_default_options(output_template="{author} - {title}", overwrite=True),
+                build_default_options(output_template="{author} - {title}", overwrite=True),
                 _empty_config(),
                 output_dir=str(out_dir),
                 delete_source=False,
@@ -380,7 +381,7 @@ def test_run_pack_dry_run_delete_source_and_failure_safety(tmp_path: Path):
 
             del_summary = run_pack(
                 [str(src_dir)],
-                args.build_default_options(output_template="{author} - {title}", overwrite=True),
+                build_default_options(output_template="{author} - {title}", overwrite=True),
                 _empty_config(),
                 output_dir=str(out_dir),
                 delete_source=True,
@@ -404,7 +405,7 @@ def test_run_pack_respects_overwrite_false(tmp_path: Path):
     with patch("audiobookdl.pack.probe_audio_info", return_value=fake_probe):
         summary = run_pack(
             [str(src_dir)],
-            args.build_default_options(overwrite=False),
+            build_default_options(overwrite=False),
             _empty_config(),
             output_dir=str(tmp_path),
         )
@@ -431,7 +432,7 @@ def test_run_pack_enrichment_updates_output_template(tmp_path: Path):
         Path(out_path).write_bytes(b"m4b")
         return True
 
-    opts = args.build_default_options(
+    opts = build_default_options(
         output_template="{author}/{title}",
         enrich_metadata=True,
         overwrite=True,
@@ -466,7 +467,7 @@ def test_pack_end_to_end_real_ffmpeg(tmp_path: Path):
     _ffmpeg_silent_file(t2, ["-c:a", "libmp3lame", "-b:a", "64k"], seconds=1.2)
 
     out_dir = tmp_path / "library"
-    opts = args.build_default_options(
+    opts = build_default_options(
         output_template="{author}/{title}",
         write_json_metadata=True,
         write_opf=True,
@@ -509,59 +510,34 @@ def test_pack_end_to_end_real_ffmpeg(tmp_path: Path):
     assert [c["tags"]["title"] for c in chapters_payload] == ["First Part", "Second Part"]
 
 
-def test_parse_pack_arguments_and_cli_dispatch(tmp_path: Path):
+def test_run_pack_dry_run_and_overrides(tmp_path: Path):
     src_dir = tmp_path / "Local Book"
     src_dir.mkdir()
     _create_empty_id3_mp3(src_dir / "01.mp3")
 
-    dl_opts, pack_opts = args.parse_pack_arguments([
-        str(src_dir),
-        "-r",
-        "--delete-source",
-        "--dry-run",
-        "--output-dir",
-        str(tmp_path / "dest"),
-        "--output-template",
-        "{author}/{title}",
-        "--title",
-        "My Book",
-        "--author",
-        "Alice",
-        "--author",
-        "Bob",
-        "--series",
-        "Saga",
-        "--series-order",
-        "2",
-        "--asin",
-        "B012345678",
-        "--enrich",
-        "-y",
-    ])
-    assert pack_opts.paths == [str(src_dir)]
-    assert pack_opts.recursive is True
-    assert pack_opts.delete_source is True
-    assert pack_opts.dry_run is True
-    assert pack_opts.output_dir == str(tmp_path / "dest")
-    assert pack_opts.title == "My Book"
-    assert pack_opts.authors == ["Alice", "Bob"]
-    assert pack_opts.series == "Saga"
-    assert pack_opts.series_order == 2
-    assert pack_opts.asin == "B012345678"
-    assert dl_opts.output_template == "{author}/{title}"
-    assert dl_opts.enrich_metadata is True
-    assert dl_opts.overwrite is True
-
-    # CLI entrypoint dispatches cleanly on dry-run
+    dl_opts = build_default_options(
+        output_template="{author}/{title}",
+        enrich_metadata=True,
+        overwrite=True,
+    )
+    overrides = PackOverrides(
+        title="My Book",
+        authors=["Alice", "Bob"],
+        series="Saga",
+        series_order=2,
+        asin="B012345678",
+    )
     fake_probe = AudioProbeInfo(duration=2.0, bitrate=128_000, codec_name="mp3", format_name="mp3")
     with patch("audiobookdl.pack.probe_audio_info", return_value=fake_probe):
-        cli_main([
-            "pack",
-            str(src_dir),
-            "--dry-run",
-            "--output-dir",
-            str(tmp_path / "dest"),
-        ])
+        summary = run_pack(
+            [str(src_dir)],
+            dl_opts,
+            output_dir=str(tmp_path / "dest"),
+            dry_run=True,
+            overrides=overrides,
+        )
+    assert summary.books_completed == 1
+    assert summary.books_failed == 0
 
 
 def test_gui_controller_executes_pack_job(tmp_path: Path):
@@ -572,7 +548,7 @@ def test_gui_controller_executes_pack_job(tmp_path: Path):
     out_dir = tmp_path / "gui-out"
 
     controller = GuiController()
-    opts = args.build_default_options(output_format="m4b", output_template="{author}/{title}", overwrite=True)
+    opts = build_default_options(output_format="m4b", output_template="{author}/{title}", overwrite=True)
     req = PackJobRequest(
         paths=[str(src_dir)],
         recursive=False,
@@ -587,7 +563,9 @@ def test_gui_controller_executes_pack_job(tmp_path: Path):
         Path(out_path).write_bytes(b"fake-gui-m4b")
         return True
 
-    events: list[tuple] = []
+    from audiobookdl.gui.events import ControllerEvent
+
+    events: list[ControllerEvent] = []
     with (
         patch("audiobookdl.pack.probe_audio_info", return_value=fake_probe),
         patch("audiobookdl.pack.output.combine_audiofiles", side_effect=_fake_combine),
@@ -635,7 +613,7 @@ def test_pack_dialog_renders_and_submits(tmp_path: Path):
     page: PackPage | None = None
     submitted: list = []
     controller = GuiController()
-    opts = args.build_default_options(output_format="m4b")
+    opts = build_default_options(output_format="m4b")
     try:
         page = PackPage(
             root,
@@ -704,7 +682,7 @@ def test_app_wires_pack_button_and_submission(tmp_path: Path):
             root.update()
         children = app.queue_tree.get_children()
         assert len(children) == 1
-        row_values = app.queue_tree.item(children[0], "values")
+        row_values = tree_item_values(app.queue_tree, children[0])
         assert row_values[0] == "Local Pack"
         assert app.queue_tree.set(children[0], "status") == "Completed", (
             f"row={row_values}, running={app._is_running}, "
@@ -732,7 +710,7 @@ def test_pack_single_track_direct_staging_and_cached_chapter_probing(tmp_path: P
         out_p.write_bytes(b"packed-m4b")
         return str(out_p), False
 
-    opts = args.build_default_options(output_format="m4b", output_template="{title}", overwrite=True)
+    opts = build_default_options(output_format="m4b", output_template="{title}", overwrite=True)
     with (
         patch("audiobookdl.pack.probe_audio_info", side_effect=AssertionError("should reuse probe_cache")),
         patch("audiobookdl.pack.output.convert_single_file", side_effect=fake_convert),
@@ -770,7 +748,7 @@ def test_pack_book_runs_silence_detection_when_chapters_from_silence_enabled(tmp
             probe_cache[output_path] = cached_info
         return output_path, True
 
-    opts = args.build_default_options(
+    opts = build_default_options(
         output_format="m4b",
         output_template="{title}",
         overwrite=True,
@@ -833,7 +811,7 @@ def test_pack_dialog_preserves_explicit_fields_passes_output_dir_and_keeps_globa
     app = AudiobookDLApp(root, config_location=str(cfg_path))
     app.output_format_var.set("mp3")
     submitted: list[tuple[list[PackJobRequest], str]] = []
-    base_opts = args.build_default_options(output_format="mp3")
+    base_opts = build_default_options(output_format="mp3")
     page: PackPage | None = None
     try:
         page = PackPage(
@@ -936,7 +914,7 @@ def test_pack_job_persistence_and_retry_across_restart(tmp_path: Path, monkeypat
             label="Persisted Book",
             output_format="m4b",
         )
-        pack_opts = args.build_default_options(output_format="m4b")
+        pack_opts = build_default_options(output_format="m4b")
         j_pending = QueuedJob(
             job_id="p_pend",
             run_id=1,
@@ -968,7 +946,7 @@ def test_pack_job_persistence_and_retry_across_restart(tmp_path: Path, monkeypat
         children = app2.queue_tree.get_children()
         assert len(children) == 1
         restored_id = children[0]
-        row_values = app2.queue_tree.item(restored_id, "values")
+        row_values = tree_item_values(app2.queue_tree, restored_id)
         assert row_values[0] == "Local Pack"
         assert app2.queue_tree.set(restored_id, "url") == "Persisted Book"
         assert app2.queue_tree.set(restored_id, "status") == "Interrupted"
@@ -1023,7 +1001,7 @@ def test_pack_extended_metadata_and_chapter_overrides(tmp_path: Path):
     _create_empty_id3_mp3(t2)
 
     out_dir = tmp_path / "out"
-    opts = args.build_default_options(output_template="{author}/{title}")
+    opts = build_default_options(output_template="{author}/{title}")
     custom_chapters = [Chapter(0, "Prelude"), Chapter(45_000, "Chapter One"), Chapter(120_000, "Finale")]
     overrides = PackOverrides(
         title="Custom Extended",

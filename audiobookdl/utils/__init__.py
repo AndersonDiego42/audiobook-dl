@@ -20,7 +20,8 @@ DEFAULT_M4B_BITRATE = "128k"
 MIN_AUTO_M4B_BITRATE_KBPS = 64
 MAX_AUTO_M4B_BITRATE_KBPS = 192
 AUDIO_BITRATE_PRESETS = ("Auto", "64k", "96k", "128k", "192k", "256k")
-MP4_CONTAINERS = ("mp4", "m4a", "m4b", "mov")
+MP4_CONTAINERS = ("mp4", "m4a", "m4b", "mov", "m4v")
+VIDEO_CONTAINERS = ("mp4", "mkv", "mov", "m4v")
 _BITRATE_RE = re.compile(r"^(\d+)k?$", re.IGNORECASE)
 
 
@@ -229,6 +230,7 @@ class AudioProbeInfo:
     sample_rate: int | None = None
     channels: int | None = None
     probe_error: str | None = None
+    video_codec_name: str = ""
 
 
 def _parse_positive_int(raw: Any) -> int | None:
@@ -262,10 +264,8 @@ def probe_audio_info(path: str) -> AudioProbeInfo:
                 ffprobe,
                 "-v",
                 "error",
-                "-select_streams",
-                "a:0",
                 "-show_entries",
-                "format=duration,bit_rate,format_name:stream=codec_name,bit_rate,duration,sample_rate,channels",
+                "format=duration,bit_rate,format_name:stream=codec_type,codec_name,bit_rate,duration,sample_rate,channels:stream_disposition=attached_pic",
                 "-of",
                 "json",
                 path,
@@ -289,10 +289,29 @@ def probe_audio_info(path: str) -> AudioProbeInfo:
         return AudioProbeInfo()
     fmt = payload.get("format") or {}
     streams = payload.get("streams") or []
-    stream = streams[0] if streams else {}
-    duration = _parse_positive_float(fmt.get("duration")) or _parse_positive_float(stream.get("duration"))
+    audio_stream = next(
+        (s for s in streams if str(s.get("codec_type") or "").lower() == "audio"),
+        None,
+    )
+    video_stream = next(
+        (
+            s
+            for s in streams
+            if str(s.get("codec_type") or "").lower() == "video"
+            and not bool((s.get("disposition") or {}).get("attached_pic"))
+        ),
+        None,
+    )
+    # Fall back to the first stream when mocked/legacy payloads omit `codec_type`.
+    stream = audio_stream if audio_stream is not None else (streams[0] if streams and video_stream is None else {})
+    duration = (
+        _parse_positive_float(fmt.get("duration"))
+        or _parse_positive_float(stream.get("duration"))
+        or (_parse_positive_float(video_stream.get("duration")) if video_stream is not None else 0.0)
+    )
     bitrate = _parse_positive_int(stream.get("bit_rate")) or _parse_positive_int(fmt.get("bit_rate"))
     codec_name = str(stream.get("codec_name") or "").strip()
+    video_codec_name = str((video_stream or {}).get("codec_name") or "").strip()
     format_name = str(fmt.get("format_name") or "").strip()
     sample_rate = _parse_positive_int(stream.get("sample_rate"))
     channels = _parse_positive_int(stream.get("channels"))
@@ -303,6 +322,7 @@ def probe_audio_info(path: str) -> AudioProbeInfo:
         format_name=format_name,
         sample_rate=sample_rate,
         channels=channels,
+        video_codec_name=video_codec_name,
     )
 
 

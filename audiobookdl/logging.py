@@ -3,27 +3,17 @@ from contextlib import contextmanager
 import contextvars
 from dataclasses import dataclass
 from rich.text import Text
-from rich.style import Style
-from rich.markup import render
-from rich.console import Console
-from rich.progress import Progress, ProgressColumn
-from rich.prompt import Confirm, Prompt
 from typing import Any, Protocol
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Sequence
 from audiobookdl.utils import read_asset_file
-import io
 import sys
 import threading
 import time
 import traceback
 
-console = Console(stderr=True) if sys.stderr is not None else Console(file=io.StringIO())
-DEBUG_PREFIX = render("[yellow bold]DEBUG[/]")
-INFO_PREFIX = render("[cyan bold] INFO[/]")
-
 
 class LogSink(Protocol):
-    """Receives log and progress events when running outside a terminal (e.g. GUI)."""
+    """Receives log and progress events for the desktop GUI or headless consumers."""
 
     def on_log(self, level: str, message: str) -> None: ...
     def on_progress_start(self, description: str, total: float) -> None: ...
@@ -32,7 +22,7 @@ class LogSink(Protocol):
 
 
 class InteractionHandler(Protocol):
-    """Handles user prompts (credentials, overwrite confirmation) for CLI or GUI."""
+    """Handles user prompts (credentials, overwrite confirmation, choices) for the GUI."""
 
     def ask_input(self, prompt: str, hidden: bool = False) -> str: ...
     def confirm(self, message: str) -> bool: ...
@@ -44,14 +34,14 @@ class InteractionHandler(Protocol):
     ) -> int | None: ...
 
 
-class CliInteractionHandler:
-    """Default terminal prompt handler using Rich."""
+class NonInteractiveInteractionHandler:
+    """Fallback interaction handler when no GUI prompt bridge is attached."""
 
     def ask_input(self, prompt: str, hidden: bool = False) -> str:
-        return Prompt.ask(prompt, password=hidden)
+        raise RuntimeError(f"Interactive prompt required ({prompt}), but no UI interaction handler is active")
 
     def confirm(self, message: str) -> bool:
-        return Confirm.ask(message)
+        return False
 
     def choose_index(
         self,
@@ -59,22 +49,7 @@ class CliInteractionHandler:
         choices: Sequence[str],
         default: int | None = None,
     ) -> int | None:
-        if not choices:
-            return None
-        console.print(f"\n[bold]{title}[/]")
-        console.print("  [0] Skip")
-        for idx, label in enumerate(choices, start=1):
-            console.print(f"  [{idx}] {label}")
-        default_str = str(default + 1) if default is not None and 0 <= default < len(choices) else "0"
-        while True:
-            raw = Prompt.ask(f"Select [0-{len(choices)}]", default=default_str).strip()
-            if raw == "0" or raw == "":
-                return None
-            if raw.isdigit():
-                picked = int(raw) - 1
-                if 0 <= picked < len(choices):
-                    return picked
-            console.print(f"[red]Please enter a number between 0 and {len(choices)}.[/]")
+        return default if default is not None and 0 <= default < len(choices) else None
 
 
 @dataclass
@@ -115,7 +90,7 @@ def reset_job_context(token: contextvars.Token[JobContext | None]) -> None:
 
 
 @contextmanager
-def job_context(ctx: JobContext) -> Iterator[JobContext]:
+def job_context(ctx: JobContext) -> Generator[JobContext]:
     """Context manager binding `ctx` for the duration of a download job."""
     token = _job_context.set(ctx)
     try:
@@ -127,7 +102,7 @@ def job_context(ctx: JobContext) -> Iterator[JobContext]:
 def is_debug_mode() -> bool:
     """Return whether debug logging is enabled in the active `JobContext`."""
     ctx = _job_context.get()
-    return bool(ctx.debug) if ctx is not None else False
+    return ctx.debug if ctx is not None else False
 
 
 def wait_if_paused(
@@ -158,13 +133,13 @@ def wait_if_paused(
 def is_quiet_mode() -> bool:
     """Return whether quiet mode is enabled in the active `JobContext`."""
     ctx = _job_context.get()
-    return bool(ctx.quiet) if ctx is not None else False
+    return ctx.quiet if ctx is not None else False
 
 
 def is_ffmpeg_output() -> bool:
     """Return whether verbose FFmpeg output is enabled in the active `JobContext`."""
     ctx = _job_context.get()
-    return bool(ctx.ffmpeg_output) if ctx is not None else False
+    return ctx.ffmpeg_output if ctx is not None else False
 
 
 def get_ui_sink() -> LogSink | None:
@@ -289,8 +264,8 @@ class _SinkProgressAdapter:
                 return
             task = self.tasks[task_id]
             now = time.monotonic()
-            task.bytes_downloaded += int(num_bytes)
-            task.byte_samples.append((now, int(num_bytes)))
+            task.bytes_downloaded += num_bytes
+            task.byte_samples.append((now, num_bytes))
             cutoff = now - _SPEED_WINDOW_SECONDS
             while task.byte_samples and task.byte_samples[0][0] < cutoff:
                 task.byte_samples.popleft()
@@ -342,33 +317,28 @@ def mask_secret(value: str | None) -> str:
     """Return a redacted representation of a secret/token for debug logging."""
     if not value:
         return "<empty>"
-    text = str(value)
-    if len(text) <= 8:
-        return f"<redacted len={len(text)}>"
-    return f"<redacted len={len(text)} tail=...{text[-4:]}>"
+    if len(value) <= 8:
+        return f"<redacted len={len(value)}>"
+    return f"<redacted len={len(value)} tail=...{value[-4:]}>"
 
 
 def debug(msg: str, remove_styling=False):
-    """Print debug msg"""
+    """Emit debug message to the active UI sink or stderr."""
     if is_debug_mode():
         if _emit_to_sink("DEBUG", msg):
             return
-        if remove_styling:
-            rendered_msg = render(msg, style=Style(bold=False, color="white"))
-            console.print(DEBUG_PREFIX, rendered_msg)
-        else:
-            console.print(DEBUG_PREFIX, msg)
+        if sys.stderr is not None:
+            print(f"DEBUG {strip_markup(msg)}", file=sys.stderr)
 
 
 def log(msg: str):
-    """Display msg in log"""
+    """Emit informational message to the active UI sink or stderr."""
     if not is_quiet_mode():
         if _emit_to_sink("INFO", msg):
             return
-        if is_debug_mode():
-            console.print(INFO_PREFIX, msg)
-        else:
-            console.print(msg)
+        if sys.stderr is not None:
+            prefix = "INFO " if is_debug_mode() else ""
+            print(f"{prefix}{strip_markup(msg)}", file=sys.stderr)
 
 
 def book_update(msg: str):
@@ -382,7 +352,8 @@ def book_update(msg: str):
 def error(msg: str):
     if _emit_to_sink("ERROR", msg):
         return
-    console.print(msg)
+    if sys.stderr is not None:
+        print(strip_markup(msg), file=sys.stderr)
 
 
 def print_error_file(name: str, **kwargs):
@@ -397,92 +368,62 @@ def print_asset_file(path: str):
     content = read_asset_file(path)
     if _emit_to_sink("INFO", content):
         return
-    console.print(content)
+    if sys.stderr is not None:
+        print(strip_markup(content), file=sys.stderr)
 
 
-def simple_help() -> None:
-    """Print basic help information"""
-    print_asset_file("assets/simple_help.txt")
-
-
-def _format_cli_bytes(num_bytes: float) -> str:
-    units = ("B", "KiB", "MiB", "GiB")
-    val = float(max(0.0, num_bytes))
-    for unit in units[:-1]:
-        if val < 1024.0:
-            return f"{val:.0f} {unit}" if unit == "B" else f"{val:.1f} {unit}"
-        val /= 1024.0
-    return f"{val:.2f} {units[-1]}"
-
-
-class _CliByteMetricsColumn(ProgressColumn):
-    """Display downloaded bytes and rolling transfer speed when byte metrics are recorded."""
-
-    def __init__(self, tracker: "_CliProgressAdapter") -> None:
-        super().__init__()
-        self._tracker = tracker
-
-    def render(self, task: Any) -> Text:
-        stats = self._tracker.get_byte_metrics(task.id)
-        if stats is None:
-            return Text("")
-        total_bytes, speed_bps = stats
-        if total_bytes <= 0:
-            return Text("")
-        if speed_bps > 0:
-            return Text(
-                f"{_format_cli_bytes(total_bytes)} ({_format_cli_bytes(speed_bps)}/s)",
-                style="cyan",
-            )
-        return Text(_format_cli_bytes(total_bytes), style="cyan")
-
-
-class _CliProgressAdapter:
-    """Wrap Rich `Progress` so CLI downloads also track byte counts, speed, and ETA."""
-
-    def __init__(self, progress_format: Sequence[str | ProgressColumn]) -> None:
-        self._lock = threading.Lock()
-        self._bytes_total: dict[Any, int] = {}
-        self._samples: dict[Any, deque[tuple[float, int]]] = {}
-        columns = list(progress_format)
-        if columns:
-            columns.append(_CliByteMetricsColumn(self))
-        self._progress = Progress(*columns, console=console)
+@dataclass
+class _HeadlessTask:
+    total: float
+    completed: float = 0.0
 
     @property
-    def tasks(self) -> Any:
-        return self._progress.tasks
+    def remaining(self) -> float:
+        return max(0.0, self.total - self.completed)
 
-    def __enter__(self) -> "_CliProgressAdapter":
-        self._progress.__enter__()
+
+class _HeadlessProgressAdapter:
+    """In-memory progress adapter used when no UI `LogSink` is bound."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.tasks: list[_HeadlessTask] = []
+        self._bytes_total: dict[int, int] = {}
+        self._samples: dict[int, deque[tuple[float, int]]] = {}
+
+    def __enter__(self) -> "_HeadlessProgressAdapter":
         return self
 
-    def __exit__(self, *args: Any) -> Any:
-        return self._progress.__exit__(*args)
+    def __exit__(self, *args: Any) -> None:
+        return None
 
-    def add_task(self, description: str, total: float | None = 100.0, **kwargs: Any) -> Any:
-        task_id = self._progress.add_task(description, total=total, **kwargs)
+    def add_task(self, _description: str, total: float | None = 100.0, **_kwargs: Any) -> int:
         with self._lock:
+            task_id = len(self.tasks)
+            self.tasks.append(_HeadlessTask(total=float(total or 0.0)))
             self._bytes_total[task_id] = 0
             self._samples[task_id] = deque()
-        return task_id
+            return task_id
 
-    def advance(self, task_id: Any, advance: float = 1.0) -> None:
-        self._progress.advance(task_id, advance)
+    def advance(self, task_id: int, advance: float = 1.0) -> None:
+        with self._lock:
+            if 0 <= task_id < len(self.tasks):
+                task = self.tasks[task_id]
+                task.completed = max(0.0, min(task.total, task.completed + float(advance)))
 
-    def record_bytes(self, task_id: Any, num_bytes: int) -> None:
+    def record_bytes(self, task_id: int, num_bytes: int) -> None:
         if num_bytes <= 0:
             return
         now = time.monotonic()
         cutoff = now - _SPEED_WINDOW_SECONDS
         with self._lock:
-            self._bytes_total[task_id] = self._bytes_total.get(task_id, 0) + int(num_bytes)
+            self._bytes_total[task_id] = self._bytes_total.get(task_id, 0) + num_bytes
             bucket = self._samples.setdefault(task_id, deque())
-            bucket.append((now, int(num_bytes)))
+            bucket.append((now, num_bytes))
             while bucket and bucket[0][0] < cutoff:
                 bucket.popleft()
 
-    def get_byte_metrics(self, task_id: Any) -> tuple[int, float] | None:
+    def get_byte_metrics(self, task_id: int) -> tuple[int, float] | None:
         now = time.monotonic()
         cutoff = now - _SPEED_WINDOW_SECONDS
         with self._lock:
@@ -500,11 +441,11 @@ class _CliProgressAdapter:
             return total, speed_bps
 
 
-def progress(progress_format: list[str | ProgressColumn]) -> Any:
+def progress(_progress_format: Sequence[Any] = ()) -> Any:
     sink = get_ui_sink()
     if sink is not None:
         return _SinkProgressAdapter(sink)
-    return _CliProgressAdapter(progress_format)
+    return _HeadlessProgressAdapter()
 
 
 def print_traceback() -> None:
@@ -513,6 +454,4 @@ def print_traceback() -> None:
     if sink is not None:
         sink.on_log("ERROR", traceback.format_exc().strip())
         return
-    console.print()
-    console.print("[underline white bold]Traceback[/]")
     traceback.print_exc()

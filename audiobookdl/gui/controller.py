@@ -1,7 +1,7 @@
 """State, queue, background worker, and event-bridge controller for the desktop GUI."""
 
 from collections import deque
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 import json
@@ -11,7 +11,8 @@ import threading
 from typing import Any
 import uuid
 
-from audiobookdl import args, logging
+from audiobookdl import logging
+from audiobookdl.options_schema import PERSISTED_GUI_OPTION_SPECS, DownloadOptions, SyncOptions
 from audiobookdl.config import (
     Config,
     config_dir,
@@ -50,7 +51,6 @@ from audiobookdl.gui.events import (
     UpdateCheckedEvent,
 )
 from audiobookdl.gui.formatting import format_failed_job_detail
-from audiobookdl.options_schema import PERSISTED_GUI_OPTION_SPECS
 from audiobookdl.pack import (
     PackBookSpec,
     PackOverrides,
@@ -119,8 +119,8 @@ class PackJobRequest:
         fmt = output_format if output_format is not None else self.output_format
         return {
             "paths": list(self.paths),
-            "recursive": bool(self.recursive),
-            "delete_source": bool(self.delete_source),
+            "recursive": self.recursive,
+            "delete_source": self.delete_source,
             "output_dir": self.output_dir,
             "label": self.label,
             "output_format": fmt,
@@ -135,7 +135,7 @@ class PackJobRequest:
         raw_paths = raw.get("paths")
         if not isinstance(raw_paths, list):
             return None
-        paths = [str(p).strip() for p in raw_paths if isinstance(p, str) and p.strip()]
+        paths = [p.strip() for p in raw_paths if isinstance(p, str) and p.strip()]
         if not paths:
             return None
         overrides: PackOverrides | None = None
@@ -188,9 +188,9 @@ class PackJobRequest:
             )):
                 overrides = cand
         raw_out_dir = raw.get("output_dir")
-        output_dir = str(raw_out_dir).strip() if isinstance(raw_out_dir, str) and raw_out_dir.strip() else None
+        output_dir = raw_out_dir.strip() if isinstance(raw_out_dir, str) and raw_out_dir.strip() else None
         raw_fmt = raw.get("output_format")
-        output_format = str(raw_fmt).strip().lower() if isinstance(raw_fmt, str) and raw_fmt.strip() else None
+        output_format = raw_fmt.strip().lower() if isinstance(raw_fmt, str) and raw_fmt.strip() else None
         return cls(
             paths=paths,
             recursive=bool(raw.get("recursive", False)),
@@ -209,7 +209,7 @@ class QueuedJob:
     job_id: str
     run_id: int
     url: str
-    options: args.DownloadOptions
+    options: DownloadOptions
     interaction: "GuiInteractionHandler"
     selected_indices: list[int] | None = None
     prefetched: tuple[Source, Result] | None = None
@@ -273,7 +273,7 @@ class GuiLogSink:
                 title=title,
             )
         )
-        cleaned = str(title or "").strip()
+        cleaned = (title or "").strip()
         if not self._active_job_id or not cleaned:
             return
         if total > 1 and current == 0:
@@ -472,7 +472,7 @@ class GuiController:
 
     def save_run_preferences(
         self,
-        options: args.DownloadOptions,
+        options: DownloadOptions,
         *,
         output_dir: str,
         output_template: str,
@@ -553,7 +553,7 @@ class GuiController:
 
     def set_check_updates(self, enabled: bool) -> Config:
         """Persist `check_updates` in `audiobook-dl.toml` and reload `self.config`."""
-        save_check_updates(bool(enabled), overwrite=self.config_location)
+        save_check_updates(enabled, overwrite=self.config_location)
         return self.reload_config()
 
     def get_http_session(self) -> Any:
@@ -677,7 +677,7 @@ class GuiController:
                 entry["profile"] = profile
             selected_indices = rec.get("selected_indices")
             if isinstance(selected_indices, list):
-                entry["selected_indices"] = [int(i) for i in selected_indices if isinstance(i, int)]
+                entry["selected_indices"] = [i for i in selected_indices if isinstance(i, int)]
             job_overrides = rec.get("job_overrides")
             if isinstance(job_overrides, dict) and job_overrides:
                 entry["job_overrides"] = dict(job_overrides)
@@ -768,7 +768,7 @@ class GuiController:
                 raw_indices = item.get("selected_indices")
                 if isinstance(raw_indices, list):
                     rec["selected_indices"] = [
-                        int(i) for i in raw_indices if isinstance(i, int) and not isinstance(i, bool)
+                        i for i in raw_indices if isinstance(i, int) and not isinstance(i, bool)
                     ]
                 raw_overrides = item.get("job_overrides")
                 if isinstance(raw_overrides, dict) and raw_overrides:
@@ -827,7 +827,7 @@ class GuiController:
         if job.prefetched is not None:
             initial_title = str(getattr(job.prefetched[1], "title", "") or "").strip()
         elif job.pack_request is not None:
-            initial_title = str(job.pack_request.label or "").strip()
+            initial_title = (job.pack_request.label or "").strip()
         rec: dict[str, Any] = {
             "job_id": job.job_id,
             "run_id": job.run_id,
@@ -843,7 +843,7 @@ class GuiController:
         if isinstance(profile, str) and profile.strip():
             rec["profile"] = profile.strip()
         if job.selected_indices is not None:
-            rec["selected_indices"] = [int(i) for i in job.selected_indices]
+            rec["selected_indices"] = list(job.selected_indices)
         job_overrides: dict[str, Any] = {}
         for attr in ("output_format", "combine", "output_template", "split_chapters", "media_type"):
             val = getattr(job.options, attr, None)
@@ -891,8 +891,8 @@ class GuiController:
             rec = self.queue_records.get(job_id)
             if rec is None:
                 return None
-            cleaned_title = str(title or "").strip()
-            cleaned_path = str(output_path or "").strip()
+            cleaned_title = (title or "").strip()
+            cleaned_path = (output_path or "").strip()
             if cleaned_title and rec.get("title") != cleaned_title:
                 rec["title"] = cleaned_title
                 changed = True
@@ -975,7 +975,7 @@ class GuiController:
 
     def start_new_run(
         self,
-        job_specs: Sequence[tuple[str, args.DownloadOptions, list[int] | None, tuple[Source, Result] | None]],
+        job_specs: Sequence[tuple[str, DownloadOptions, list[int] | None, tuple[Source, Result] | None]],
     ) -> tuple[int, list[QueuedJob]]:
         """Initialize queue state for a fresh download run and ensure the worker is running."""
         self.cancel_event.clear()
@@ -1010,7 +1010,7 @@ class GuiController:
     def enqueue_additional_urls(
         self,
         urls: Sequence[str],
-        build_job_options: Callable[[str], args.DownloadOptions],
+        build_job_options: Callable[[str], DownloadOptions],
         *,
         allow_existing: bool = False,
         selected_indices: list[int] | None = None,
@@ -1052,7 +1052,7 @@ class GuiController:
     def enqueue_from_preview(
         self,
         url: str,
-        options: args.DownloadOptions,
+        options: DownloadOptions,
         prefetched: tuple[Source, Result],
         selected_indices: list[int] | None,
     ) -> tuple[QueuedJob, int] | None:
@@ -1082,9 +1082,9 @@ class GuiController:
         self,
         *,
         download_specs: Sequence[
-            tuple[str, args.DownloadOptions, list[int] | None, tuple[Source, Result] | None]
+            tuple[str, DownloadOptions, list[int] | None, tuple[Source, Result] | None]
         ] = (),
-        pack_requests: Sequence[tuple[PackJobRequest, args.DownloadOptions]] = (),
+        pack_requests: Sequence[tuple[PackJobRequest, DownloadOptions]] = (),
     ) -> tuple[bool, int, list[QueuedJob], int]:
         """Queue download and/or pack jobs onto the active run, or start a new run when idle.
 
@@ -1142,7 +1142,7 @@ class GuiController:
 
     def start_or_enqueue_pack_jobs(
         self,
-        requests_with_options: Sequence[tuple[PackJobRequest, args.DownloadOptions]],
+        requests_with_options: Sequence[tuple[PackJobRequest, DownloadOptions]],
     ) -> tuple[bool, int, list[QueuedJob], int]:
         """Queue local pack jobs on the active run or start a new run when idle.
 
@@ -1153,7 +1153,7 @@ class GuiController:
     def inspect_local_pack_preview(
         self,
         paths: Sequence[str],
-        options: args.DownloadOptions,
+        options: DownloadOptions,
         *,
         recursive: bool = False,
         output_dir: str | None = None,
@@ -1421,6 +1421,7 @@ class GuiController:
                 active_job: QueuedJob | None = current_job
                 next_job: QueuedJob | None = None
                 skipped_job: QueuedJob | None = None
+                item_total = 0
                 with self.queue_cond:
                     if current_job.job_id in self.cancelled_job_ids:
                         self.cancelled_job_ids.discard(current_job.job_id)
@@ -1613,7 +1614,7 @@ class GuiController:
         if self.preview_interaction is not None:
             self.preview_interaction.release_all()
 
-    def start_preview(self, url: str, options: args.DownloadOptions) -> int:
+    def start_preview(self, url: str, options: DownloadOptions) -> int:
         """Fetch metadata and resolved `Result` for `url` on a background thread."""
         self.preview_request_id += 1
         request_id = self.preview_request_id
@@ -1674,7 +1675,7 @@ class GuiController:
             handler.release_all()
 
     @contextmanager
-    def auxiliary_interaction(self) -> Iterator[tuple[GuiInteractionHandler, threading.Event]]:
+    def auxiliary_interaction(self) -> Generator[tuple[GuiInteractionHandler, threading.Event]]:
         """Yield a registered `(GuiInteractionHandler, cancel_event)` pair for an auxiliary worker."""
         cancel_ev = threading.Event()
         interaction = GuiInteractionHandler(self.event_queue, cancel_ev)
@@ -1690,7 +1691,7 @@ class GuiController:
         self,
         service_key: str,
         service_label: str,
-        options: args.DownloadOptions,
+        options: DownloadOptions,
     ) -> None:
         """Verify credentials for `service_key` on a background thread."""
         cfg = self.config_snapshot()
@@ -1735,7 +1736,7 @@ class GuiController:
         mode: str,
         service_key: str,
         query_text: str,
-        options: args.DownloadOptions,
+        options: DownloadOptions,
         dialog: Any,
         *,
         archive_path: str | None = None,
@@ -1814,7 +1815,7 @@ class GuiController:
         if self.sync_interaction is not None:
             self.sync_interaction.release_all()
 
-    def start_library_sync(self, sync_opts: args.SyncOptions) -> None:
+    def start_library_sync(self, sync_opts: SyncOptions) -> None:
         """Run one library synchronization cycle (`audiobookdl.sync.run_sync_once`) on a worker thread."""
         from audiobookdl.sync import run_sync_once
 
@@ -1856,7 +1857,7 @@ class GuiController:
     def start_sync_enqueue_discovery(
         self,
         targets: Sequence[tuple[str, str]],
-        sync_opts: args.SyncOptions,
+        sync_opts: SyncOptions,
     ) -> None:
         """Discover pending library URLs across `targets` and emit `sync_enqueue_ready`."""
         from audiobookdl.config import DEFAULT_PROFILE
@@ -1994,7 +1995,7 @@ class GuiController:
     def search_enrichment_for_audiobook(
         self,
         audiobook: Audiobook,
-        options: args.DownloadOptions,
+        options: DownloadOptions,
     ) -> list[EnrichmentCandidate]:
         """Query configured metadata enrichment providers for `audiobook`."""
         raw_providers = getattr(options, "enrich_providers", None)
@@ -2013,7 +2014,7 @@ class GuiController:
         self,
         audiobook: Audiobook,
         candidate: EnrichmentCandidate,
-        options: args.DownloadOptions,
+        options: DownloadOptions,
     ) -> tuple[list[str], bool, bool]:
         """Apply `candidate` onto `audiobook` using controller session and cache."""
         db_dir = getattr(options, "database_directory", None)

@@ -5,7 +5,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from collections.abc import Callable, Sequence
 
-from audiobookdl import args
+from audiobookdl.options_schema import DownloadOptions
 from audiobookdl.config import (
     DEFAULT_PROFILE,
     SourceConfig,
@@ -41,7 +41,7 @@ class ServiceAuthCoordinator:
         show_password_var: tk.BooleanVar,
         remember_login_var: tk.BooleanVar,
         palette_provider: Callable[[], ThemePalette],
-        build_verify_options: Callable[[], args.DownloadOptions | None],
+        build_verify_options: Callable[[], DownloadOptions | None],
         is_running_provider: Callable[[], bool],
         on_log: Callable[[str], None],
         on_credentials_changed: Callable[[], None] | None = None,
@@ -79,7 +79,7 @@ class ServiceAuthCoordinator:
         if panel is not None:
             panel.bind(
                 "<Destroy>",
-                lambda ev, p=panel: self._on_panel_destroyed(ev, p),
+                lambda ev: self._on_panel_destroyed(ev, panel),
                 add="+",
             )
             self.load_service_into_form()

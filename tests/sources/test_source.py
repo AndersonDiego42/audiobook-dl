@@ -216,11 +216,12 @@ def test_create_unauthenticated_session_is_pooled_and_isolated(tmp_path):
 def test_source_retries_transient_429_and_connection_errors_with_proxy_and_timeout(tmp_path, monkeypatch):
     import threading
     import requests
-    from audiobookdl import args, logging
+    from audiobookdl import logging
     from audiobookdl.exceptions import DownloadCancelled
+    from audiobookdl.options_schema import build_default_options
 
     monkeypatch.setattr("audiobookdl.sources.source.networking.time.sleep", lambda _: None)
-    opts = args.build_default_options(
+    opts = build_default_options(
         database_directory=str(tmp_path),
         proxy="http://127.0.0.1:8888",
         timeout=42.0,
@@ -243,6 +244,7 @@ def test_source_retries_transient_429_and_connection_errors_with_proxy_and_timeo
     source._session.get = MagicMock(side_effect=fake_get)
     assert source.get("https://example.com/retry") == b"success"
     assert len(captured_timeouts) == 3
+    # pyrefly: ignore[unsupported-operation]
     assert captured_timeouts[0][1] == 42.0
     resp_429.close.assert_called_once()
 
@@ -458,6 +460,39 @@ def test_download_file_invokes_lazy_encryption_resolver(tmp_path):
     assert resolved_calls == 1
     with open(out_path, "rb") as fh:
         assert fh.read() == plaintext
+
+
+def test_get_stream_files_prefer_video_selects_highest_bandwidth_variant(tmp_path):
+    master_m3u8 = (
+        b"#EXTM3U\n"
+        b'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",DEFAULT=YES,URI="audio/prog.m3u8"\n'
+        b'#EXT-X-STREAM-INF:BANDWIDTH=600000,AUDIO="aud"\n'
+        b"video/360p.m3u8\n"
+        b'#EXT-X-STREAM-INF:BANDWIDTH=2400000,AUDIO="aud"\n'
+        b"video/1080p.m3u8\n"
+    )
+    video_m3u8 = (
+        b"#EXTM3U\n"
+        b"#EXTINF:5.0,\n"
+        b"seg0.ts\n"
+        b"#EXT-X-ENDLIST\n"
+    )
+    source = _make_source(tmp_path)
+    source._session.get = MagicMock(
+        side_effect=[
+            MagicMock(status_code=200, content=master_m3u8),
+            MagicMock(status_code=200, content=video_m3u8),
+        ]
+    )
+
+    files = source.get_stream_files(
+        "https://cdn.example.com/master.m3u8",
+        prefer_video=True,
+    )
+    assert len(files) == 1
+    assert files[0].ext == "ts"
+    assert files[0].url == "https://cdn.example.com/video/1080p.m3u8".replace("1080p.m3u8", "seg0.ts")
+
 
 
 

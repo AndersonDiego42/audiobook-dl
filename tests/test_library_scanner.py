@@ -4,7 +4,6 @@ from unittest.mock import patch
 
 import pytest
 
-from audiobookdl.__main__ import main as cli_main
 from audiobookdl.gui.app import AudiobookDLApp
 from audiobookdl.output.metadata.reader import TrackTagInfo
 from audiobookdl.utils.archive import CatalogBook, DownloadArchive
@@ -91,7 +90,7 @@ def test_scan_local_library_matches_pending_registers_new_and_checks_missing(tmp
     assert archive.get_entry(gone_entry_id).status == "pending"
 
 
-def test_cli_scan_subcommand_json_and_gui_scan_folder(tmp_path, capsys):
+def test_gui_scan_folder(tmp_path):
     lib_root = tmp_path / "Audiobooks"
     book_dir = lib_root / "Alice - Odyssey"
     book_dir.mkdir(parents=True)
@@ -102,26 +101,7 @@ def test_cli_scan_subcommand_json_and_gui_scan_folder(tmp_path, capsys):
     cfg_path = tmp_path / "audiobook-dl.toml"
     cfg_path.write_text("", encoding="utf-8")
 
-    with patch("audiobookdl.pack.read_track_tags", return_value=TrackTagInfo()):
-        with pytest.raises(SystemExit) as exc:
-            cli_main(
-                [
-                    "scan",
-                    "--config",
-                    str(cfg_path),
-                    "--download-archive",
-                    str(db_path),
-                    "--json",
-                    str(lib_root),
-                ]
-            )
-    assert exc.value.code == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["scanned_books"] == 1
-    assert payload["registered"] == 1
-    assert payload["items"][0]["title"] == "Odyssey"
-
-    # GUI ArchiveLedgerDialog scan_folder integration
+    # GUI ArchiveTab scan_folder integration
     try:
         root = tk.Tk()
     except tk.TclError as exc:
@@ -134,7 +114,7 @@ def test_cli_scan_subcommand_json_and_gui_scan_folder(tmp_path, capsys):
         with patch("audiobookdl.pack.read_track_tags", return_value=TrackTagInfo()):
             res = tab.scan_folder(str(lib_root), background=False)
         assert res is not None
-        assert res.matched == 1
+        assert res.registered == 1
         assert len(tab._tree.get_children()) == 1
     finally:
         root.destroy()

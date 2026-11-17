@@ -1,22 +1,20 @@
 # System Architecture
 
-`audiobook-dl` is structured around a shared configuration/option schema and an isolated job execution pipeline (`Downloader` + `JobContext`) consumed by the CLI, Desktop GUI, Headless Web UI, and automation subcommands.
+`audiobook-dl` is structured around a shared configuration/option schema and an isolated job execution pipeline (`Downloader` + `JobContext`) consumed by the Tkinter Desktop GUI (`audiobookdl/gui/`).
 
 ## Layered Module Overview
 
 ```mermaid
 flowchart TD
     subgraph Entrypoints["Entrypoints & Interfaces"]
-        CLI["audiobookdl/__main__.py (CLI & Subcommands)"]
+        ENTRY["audiobookdl/__main__.py / audiobookdl/gui/__main__.py"]
         GUI["audiobookdl/gui/app.py (Tkinter Desktop GUI)"]
-        WEB["audiobookdl/web.py (ThreadingHTTPServer Web UI)"]
         PACK["audiobookdl/pack.py (Offline Repackager)"]
         SYNC["audiobookdl/sync.py (Bookshelf Auto-Sync)"]
     end
 
     subgraph Control["Shared State, Config & Options"]
-        SCHEMA["audiobookdl/options_schema.py (OPTION_REGISTRY)"]
-        ARGS["audiobookdl/args.py (Parsers & DownloadOptions)"]
+        SCHEMA["audiobookdl/options_schema.py (OPTION_REGISTRY & DownloadOptions)"]
         CFG["audiobookdl/config.py (Comment-Preserving TOML)"]
         CRED["audiobookdl/credentials.py (DPAPI / Keyring / Fallback)"]
         CTRL["audiobookdl/gui/controller.py (GuiController Queue & Worker)"]
@@ -28,7 +26,7 @@ flowchart TD
     end
 
     subgraph Sources["Source Registry & Networking"]
-        SREG["audiobookdl/sources/__init__.py (16 Built-in + Entry Points)"]
+        SREG["audiobookdl/sources/__init__.py (Built-in + Entry Points)"]
         SBASE["audiobookdl/sources/source/__init__.py (Source Base & Cookie Jar)"]
         SNET["audiobookdl/sources/source/networking.py (HTTP & curl_cffi)"]
     end
@@ -48,17 +46,13 @@ flowchart TD
         ABS["audiobookdl/integrations/audiobookshelf.py (AudiobookshelfClient)"]
     end
 
-    CLI --> ARGS
-    CLI --> PACK
-    CLI --> SYNC
-    CLI --> WEB
+    ENTRY --> GUI
     GUI --> CTRL
-    WEB --> CTRL
     CTRL --> PIPE
-    ARGS --> SCHEMA
+    CTRL --> PACK
+    CTRL --> SYNC
     CFG --> SCHEMA
     CFG --> CRED
-    CLI --> PIPE
     SYNC --> PIPE
     PIPE --> LOG
     PIPE --> SREG
@@ -80,26 +74,25 @@ flowchart TD
 ## Key Architectural Design Patterns
 
 ### 1. Single-Source Option Registry (`OPTION_REGISTRY`)
-All runtime flags shared across CLI parsing, TOML loading/saving, pipeline option merging, and Tkinter GUI state bindings are declared once in [`audiobookdl/options_schema.py`](../audiobookdl/options_schema.py) (`OPTION_REGISTRY`):
-- `CliFlag` declarations generate `argparse` arguments in [`audiobookdl/args.py`](../audiobookdl/args.py).
+All runtime options shared across TOML loading/saving, pipeline option merging, and Tkinter GUI state bindings are declared once in [`audiobookdl/options_schema.py`](../audiobookdl/options_schema.py) (`OPTION_REGISTRY` and `DownloadOptions`):
 - `config_key`, `config_kind`, and `toml_serializer` drive validation and round-trip serialization in [`audiobookdl/config.py`](../audiobookdl/config.py).
-- `merge_from_config` rules control how `apply_runtime_options()` in [`audiobookdl/pipeline.py`](../audiobookdl/pipeline.py) merges TOML defaults into `DownloadOptions` without overriding explicit CLI flags (`_explicit_fields`).
+- `merge_from_config` rules control how `apply_runtime_options()` in [`audiobookdl/pipeline.py`](../audiobookdl/pipeline.py) merges TOML defaults into `DownloadOptions` without overriding explicit overrides (`_explicit_fields`).
 - `GuiBinding` maps options declaratively onto Tkinter variables in [`audiobookdl/gui/options_panel.py`](../audiobookdl/gui/options_panel.py) and [`audiobookdl/gui/controller.py`](../audiobookdl/gui/controller.py).
 
 ### 2. Per-Job Context Isolation (`JobContext`)
 `Downloader` (and `run_downloads`) execute inside a `contextvars`-backed `logging.job_context(ctx)` ([`audiobookdl/logging.py`](../audiobookdl/logging.py)). Each `JobContext` encapsulates:
 - `debug`, `quiet`, and `ffmpeg_output` flags
 - `ffmpeg_dir` (custom FFmpeg directory override without global mutation)
-- `sink` (`_EventLogSink` emitting structured `DownloadEvent`s, `GuiLogSink`, or rich CLI console output)
-- `interaction` (`CliInteractionHandler` or GUI prompt synchronization)
+- `sink` (`_EventLogSink` emitting structured `DownloadEvent`s or `GuiLogSink`)
+- `interaction` (`GuiInteractionHandler` prompt synchronization or `NonInteractiveInteractionHandler`)
 - `cancel_event` (`threading.Event`)
+- `pause_event` (`threading.Event`)
 
 This guarantees concurrent or embedded `Downloader` instances do not leak state across runs.
 
-### 3. Shared Controller for Desktop GUI & Headless Web UI
-Both the Tkinter desktop app ([`audiobookdl/gui/app.py`](../audiobookdl/gui/app.py)) and the stdlib HTTP server ([`audiobookdl/web.py`](../audiobookdl/web.py)) delegate queue persistence (`gui_queue.json`), pause/resume/cancel orchestration, catalog browsing, and background download workers to `GuiController` ([`audiobookdl/gui/controller.py`](../audiobookdl/gui/controller.py)):
-- **Desktop GUI**: [`audiobookdl/gui/app.py`](../audiobookdl/gui/app.py) hosts a left-sidebar navigation shell ([`audiobookdl/gui/shell.py`](../audiobookdl/gui/shell.py)) with persistent footer status and lazy-built pages under [`audiobookdl/gui/pages/`](../audiobookdl/gui/pages/) (`download_page.py`, `library_page.py`, `pack_page.py`, `accounts_page.py`, `settings_page.py`), standardized modal dialogs (`ModalDialog`), monitor-clamped window geometry/maximized/splitter persistence, and drains `GuiController` event tuples (`log`, `batch_item`, `job_status`, `progress_*`, `prompt_*`, `done`) via Tkinter timers.
-- **Headless Web UI**: `WebDashboardState` drains `GuiController` events on a daemon thread, serves a single-page HTML dashboard at `/`, and exposes JSON endpoints behind optional Bearer / `X-API-Token` authentication (`$AUDIOBOOK_DL_WEB_TOKEN`).
+### 3. Desktop GUI & `GuiController`
+The Tkinter desktop app ([`audiobookdl/gui/app.py`](../audiobookdl/gui/app.py)) delegates queue persistence (`gui_queue.json`), pause/resume/cancel orchestration, catalog browsing, and background download/pack/sync workers to `GuiController` ([`audiobookdl/gui/controller.py`](../audiobookdl/gui/controller.py)):
+- **Desktop GUI**: [`audiobookdl/gui/app.py`](../audiobookdl/gui/app.py) hosts a left-sidebar navigation shell ([`audiobookdl/gui/shell.py`](../audiobookdl/gui/shell.py)) with persistent footer status and lazy-built pages under [`audiobookdl/gui/pages/`](../audiobookdl/gui/pages/) (`download_page.py`, `library_page.py`, `pack_page.py`, `accounts_page.py`, `settings_page.py`), standardized modal dialogs (`ModalDialog`), monitor-clamped window geometry/maximized/splitter persistence, and drains typed `GuiController` `ControllerEvent` objects via Tkinter timers.
 
 ### 4. Extensible Source Adapters & Cookie Persistence
 Source adapters subclass `Source` ([`audiobookdl/sources/source/__init__.py`](../audiobookdl/sources/source/__init__.py)) and declare:

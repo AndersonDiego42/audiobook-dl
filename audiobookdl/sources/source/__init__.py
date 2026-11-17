@@ -26,7 +26,7 @@ from ssl import SSLContext
 import urllib3
 
 if TYPE_CHECKING:
-    from audiobookdl.args import DownloadOptions
+    from audiobookdl.options_schema import DownloadOptions
 
 T = TypeVar("T")
 
@@ -74,6 +74,11 @@ class CatalogBook:
     def has_ebook(self) -> bool:
         """Return `True` when this entry advertises an ebook format."""
         return "ebook" in self.formats
+
+    @property
+    def has_video(self) -> bool:
+        """Return `True` when this entry advertises a video format."""
+        return "video" in self.formats
 
 
 class Source(Generic[T]):

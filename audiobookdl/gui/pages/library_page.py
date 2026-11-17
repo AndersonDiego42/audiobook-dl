@@ -1084,9 +1084,18 @@ class ArchiveTab(ttk.Frame):
             worker_ledger = DownloadArchive(self._archive_path, persistent=True)
             try:
                 res = scan_local_library([folder], worker_ledger, verify_missing=True)
-                self._cb_queue.post(lambda r=res: _finish(r, None))
+
+                def _post_ok() -> None:
+                    _finish(res, None)
+
+                self._cb_queue.post(_post_ok)
             except Exception as exc:
-                self._cb_queue.post(lambda err=str(exc): _finish(None, err))
+                err_msg = str(exc)
+
+                def _post_err() -> None:
+                    _finish(None, err_msg)
+
+                self._cb_queue.post(_post_err)
             finally:
                 worker_ledger.close()
                 self._cb_queue.finish_worker()
@@ -1890,9 +1899,10 @@ class CatalogTab(ttk.Frame):
             raw = fetcher(url)
             png_bytes = resize_cover_thumbnail_bytes(raw, size=thumb_size) if raw else None
             if token == self._cover_fetch_token:
-                self._cb_queue.post(
-                    lambda u=url, b=png_bytes, t=token: self._on_cover_bytes_ready(t, u, b)
-                )
+                def _post_cover() -> None:
+                    self._on_cover_bytes_ready(token, url, png_bytes)
+
+                self._cb_queue.post(_post_cover)
 
         def _dispatcher() -> None:
             try:
@@ -2192,11 +2202,10 @@ class CatalogTab(ttk.Frame):
                     resize_cover_bytes_aspect_thumbnail(raw, max_size=detail_size) if raw else None
                 )
                 if token == self._detail_token:
-                    self._cb_queue.post(
-                        lambda t=token, u=cover_url, b=png_bytes: self._apply_detail_cover(
-                            t, u, b, cache_result=True
-                        )
-                    )
+                    def _post_detail() -> None:
+                        self._apply_detail_cover(token, cover_url, png_bytes, cache_result=True)
+
+                    self._cb_queue.post(_post_detail)
             finally:
                 self._cb_queue.finish_worker()
 
@@ -2700,7 +2709,7 @@ class LibraryPage(ttk.Frame):
     def select_tab(self, tab_key: str) -> None:
         tab = self._tabs_by_key.get(tab_key)
         if tab is not None:
-            self.notebook.select(tab)
+            self.notebook.select(tab)  # type: ignore[no-untyped-call]
 
     def on_show(self) -> None:
         """Refresh archive, catalog statuses, and sync targets whenever Library is opened."""

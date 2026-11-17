@@ -70,15 +70,15 @@ def _build_fallback_codec_args(
     filepath: str,
     audio_bitrate: str | None = None,
 ) -> list[str]:
-    """Return FFmpeg audio encoding flags matching `filepath`'s container and `audio_bitrate`."""
+    """Return FFmpeg encoding flags matching `filepath`'s container and `audio_bitrate`."""
     ext = os.path.splitext(filepath)[1].lstrip(".").lower()
     if not ext or ext in utils.MP4_CONTAINERS:
         bitrate = utils.resolve_audio_bitrate(filepath, audio_bitrate)
-        return ["-c:a", "aac", "-b:a", bitrate]
+        return ["-c:v", "copy", "-c:a", "aac", "-b:a", bitrate]
     explicit_bitrate = utils.normalize_audio_bitrate(audio_bitrate)
     if explicit_bitrate is not None and ext not in LOSSLESS_CONTAINERS:
-        return ["-b:a", explicit_bitrate]
-    return []
+        return ["-c:v", "copy", "-b:a", explicit_bitrate]
+    return ["-c:v", "copy"]
 
 
 def add_chapters_ffmpeg(

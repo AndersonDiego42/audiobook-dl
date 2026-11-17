@@ -17,10 +17,7 @@ OptionWidget = ttk.Entry | ttk.Checkbutton | ttk.Combobox | ttk.Spinbox
 
 def _option_help(name: str) -> str:
     spec = OPTIONS_BY_NAME.get(name)
-    if spec is None or not spec.cli_flags:
-        return ""
-    raw_help = spec.cli_flags[0].help
-    return raw_help() if callable(raw_help) else str(raw_help or "")
+    return spec.get_help() if spec is not None else ""
 
 
 class OptionsPanel(ttk.LabelFrame):
@@ -127,6 +124,7 @@ class OptionsPanel(ttk.LabelFrame):
             width=10,
         )
         media_combo.grid(row=2, column=1, sticky="w", padx=(0, 12), pady=(4, 0))
+        media_combo.bind("<<ComboboxSelected>>", self._on_media_selected)
 
         ttk.Label(general_tab, text="M4B Quality:").grid(
             row=2, column=2, sticky="w", padx=(0, 4), pady=(4, 0)
@@ -473,6 +471,14 @@ class OptionsPanel(ttk.LabelFrame):
         ):
             entry.bind("<KeyRelease>", lambda _e: self._validate_inline_fields(), add="+")
             entry.bind("<FocusOut>", lambda _e: self._validate_inline_fields(), add="+")
+
+    def _on_media_selected(self, _event: tk.Event | None = None) -> None:
+        if self._vars.media_type_var.get().strip().lower() == "video":
+            cur_fmt = self._vars.output_format_var.get().strip().lower()
+            if cur_fmt in ("", "original", "m4b"):
+                self._vars.output_format_var.set("mp4")
+                self._vars.m4b_var.set(False)
+        self.sync_dependency_states()
 
     def _on_split_chapters_clicked(self) -> None:
         if self._vars.split_chapters_var.get() and self._vars.combine_var.get():
