@@ -20,7 +20,12 @@ _CUE_INDEX01_RE = re.compile(r"^\s*INDEX\s+0?1\s+(\d+):(\d{2}):(\d{2})\s*$", re.
 
 
 def parse_chapters_from_file(path: str) -> list[Chapter]:
-    """Parse chapters from a `.json` or `.cue` sidecar file."""
+    """Parse chapters from a `.json` or `.cue` sidecar file.
+
+    JSON items with `start_ms` are treated as milliseconds; Audiobookshelf
+    `metadata.json` payloads (float `start`, `end`, or top-level ABS keys) and
+    `start_seconds` are converted from seconds to milliseconds.
+    """
     ext = os.path.splitext(path)[1].lower()
     with open(path, encoding="utf-8-sig") as fh:
         content = fh.read()
@@ -29,6 +34,14 @@ def parse_chapters_from_file(path: str) -> list[Chapter]:
         items = raw.get("chapters") if isinstance(raw, dict) else raw
         if not isinstance(items, list):
             raise ValueError("JSON file must contain a list of chapters or {'chapters': [...]}.")
+        is_abs_seconds = (
+            isinstance(raw, dict)
+            and any(k in raw for k in ("mediaMetadata", "duration", "tags", "authors"))
+        ) or any(
+            isinstance(entry, dict)
+            and ("end" in entry or isinstance(entry.get("start"), float))
+            for entry in items
+        )
         out: list[Chapter] = []
         for idx, item in enumerate(items, start=1):
             if not isinstance(item, dict):
@@ -36,10 +49,14 @@ def parse_chapters_from_file(path: str) -> list[Chapter]:
             title = str(item.get("title") or f"Chapter {idx}").strip()
             if "start_ms" in item:
                 start_ms = int(item["start_ms"])
-            elif "start" in item:
-                start_ms = int(item["start"])
             elif "start_seconds" in item:
                 start_ms = round(float(item["start_seconds"]) * 1000)
+            elif "start" in item:
+                start_val = item["start"]
+                if is_abs_seconds or isinstance(start_val, float):
+                    start_ms = round(float(start_val) * 1000)
+                else:
+                    start_ms = int(start_val)
             else:
                 continue
             out.append(Chapter(start=max(0, start_ms), title=title))

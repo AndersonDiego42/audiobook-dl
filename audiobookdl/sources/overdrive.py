@@ -169,11 +169,12 @@ class OverdriveSource(Source):
                 metadata.add_narrator(creator["name"])
         return metadata
 
-    def get_cover(self, prefix: str, book_info) -> Cover:
-        cover_uri = book_info["-odread-furbish-uri"]
+    def get_cover(self, prefix: str, book_info) -> Cover | None:
+        cover_uri = book_info.get("-odread-furbish-uri")
+        if not cover_uri:
+            return None
         cover_url = urljoin(f"{prefix}/", cover_uri)
-        cover_data = self.get(cover_url)
-        return Cover(cover_data, "jpg")
+        return self.fetch_cover_safe(cover_url)
 
     def _compute_part_offsets(self, book_info) -> list[float]:
         """Return cumulative start offsets in seconds for each spine part."""

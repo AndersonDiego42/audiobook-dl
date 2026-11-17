@@ -11,18 +11,18 @@
 | Everand          |    ✓    |   ✗   |   ✓    |      ✓       |   ✗    | Formerly Scribd                                                     |
 | Libro.fm         |    ✓    |   ✓   |   ✓    |      ✓       |   ✗    | DRM-free `.m4b` / split `.mp3`; search filters purchased library    |
 | Librivox         |    ✗    |   ✗   |   ✓    |      ✗       |   ✗    | Public domain catalog (no user account or personal library)         |
-| Nextory          |    ✗    |   ✓   |   ✓    |      ✓       |   ✗    | Multi-profile selection (`--library`), locale routing, catalog URLs |
+| Nextory          |    ✗    |   ✓   |   ✓    |      ✓       |   ✗    | Multi-profile selection (`library`), locale routing, catalog URLs |
 | O'Reilly         |    ✓    |   ✗   |   ✓    |      ✓       |   ✓    | Audiobooks, video courses (audio or `.mp4`/`.mkv`), and EPUB assembly |
 | Overdrive        |    ✓    |   ✗   |   ✗    |      ✓       |   ✗    | Supports `listen.overdrive.com` and Libby loan/shelf URLs           |
 | Podimo           |    ✗    |   ✓   |   ✓    |      ✓       |   ✗    | Audiobooks & podcast series; GraphQL catalog search & library sync  |
 | RSS              |    ✗    |   ✗   |   ✗    |      ✗       |   ✗    | Generic RSS 2.0 / Atom podcast & serialized audiobook `.xml` feeds  |
 | Saxo             |    ✗    |   ✓   |   ✓    |      ✓       |   ✗    | AES-encrypted streams with searchable premium catalog               |
-| Storytel         |    ✗    |   ✓   |   ✓    |      ✓       |   ✓    | Full `--media-type` audiobook/ebook/both and bookshelf sync         |
+| Storytel         |    ✗    |   ✓   |   ✓    |      ✓       |   ✓    | Full `media_type` audiobook/ebook/both and bookshelf sync           |
 | YourCloudLibrary |    ✓    |   ✓   |   ✗    |      ✓       |   ✗    | Findaway v4 streams + library shelf listing                         |
 
 ## Service Keys & Aliases
 
-When passing `--service <name>` on the CLI or configuring `[sources.<name>]` in `audiobook-dl.toml`, the following aliases are automatically normalized to their canonical service key:
+When configuring `[sources.<name>]` in `audiobook-dl.toml` or selecting a service in the GUI/`DownloadOptions`, the following aliases are automatically normalized to their canonical service key:
 
 - `internet archive` -> `archive.org`
 - `audiobooksdotcom` -> `audiobooks.com`

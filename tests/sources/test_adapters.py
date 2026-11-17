@@ -1436,3 +1436,87 @@ def test_section23_adapter_scraping_routing_and_auth_fixes(tmp_path):
     assert [b.id for b in ev_series.books] == [11, 22]
     assert "https://www.everand.com/series/12345/data" in ev._session.get.call_args_list[1].args[0]
 
+
+def test_auth_sources_verify_auth_rejects_expired_and_unauthenticated(tmp_path):
+    from audiobookdl.sources.audiobooksdotcom import AudiobooksdotcomSource
+    from audiobookdl.sources.bookbeat import BookBeatSource
+    from audiobookdl.sources.chirp import ChirpSource
+    from audiobookdl.sources.everand import EverandSource
+    from audiobookdl.sources.librofm import LibrofmSource
+    from audiobookdl.sources.nextory import NextorySource
+    from audiobookdl.sources.podimo import PodimoSource
+    from audiobookdl.sources.saxo import SaxoSource
+    from audiobookdl.sources.storytel import StorytelSource
+    from audiobookdl.sources.yourcloudlibrary import YourCloudLibrarySource
+
+    opts = _opts(tmp_path)
+
+    # 1. Cookie sources with empty cookie jar return False cleanly
+    for cls in (AudiobooksdotcomSource, ChirpSource, EverandSource, YourCloudLibrarySource):
+        s = cls(opts)
+        assert s.verify_auth() is False
+
+    # 2. Rejected 401/302/error probe responses return False cleanly even when cookies/tokens exist
+    ab = AudiobooksdotcomSource(opts)
+    ab._session.cookies.set("ci_session", "stale", domain="www.audiobooks.com")
+    ab._session.get = MagicMock(return_value=MagicMock(status_code=200, url="https://www.audiobooks.com/login", content=b"<form>Log In</form>"))
+    assert ab.verify_auth() is False
+
+    ch = ChirpSource(opts)
+    ch._session.cookies.set("_session", "stale", domain="www.chirpbooks.com")
+    ch._session.post = MagicMock(return_value=_json_resp({"data": {"currentUser": None}}))
+    assert ch.verify_auth() is False
+
+    ev = EverandSource(opts)
+    ev._session.cookies.set("_scribd_session", "stale", domain="www.everand.com")
+    ev._session.get = MagicMock(return_value=MagicMock(status_code=401, content=b""))
+    assert ev.verify_auth() is False
+
+    ycl = YourCloudLibrarySource(opts)
+    ycl._session.cookies.set("auth", "stale", domain="ebook.yourcloudlibrary.com")
+    ycl._session.get = MagicMock(return_value=MagicMock(status_code=401, content=b""))
+    assert ycl.verify_auth() is False
+
+    for cls, setup_fn in [
+        (BookBeatSource, lambda s: s._session.headers.update({"Authorization": "Bearer expired"})),
+        (StorytelSource, lambda s: s._session.headers.update({"Authorization": "Bearer expired"})),
+        (NextorySource, lambda s: s._session.headers.update({"X-Profile-Token": "expired"})),
+        (PodimoSource, lambda s: setattr(s, "_token", "expired")),
+        (LibrofmSource, lambda s: setattr(s, "_access_token", "expired")),
+        (SaxoSource, lambda s: s._session.headers.update({"Authorization": "Bearer expired"})),
+    ]:
+        s = cls(opts)
+        assert s.verify_auth() is False
+        setup_fn(s)
+        s._session.get = MagicMock(return_value=MagicMock(status_code=401, content=b""))
+        s._session.post = MagicMock(return_value=MagicMock(status_code=401, content=b""))
+        assert s.verify_auth() is False
+
+
+def test_everand_yourcloudlibrary_and_nextory_hardening(tmp_path):
+    import pytest
+    from audiobookdl.exceptions import GenericAudiobookDLException, UserNotAuthorized
+    from audiobookdl.sources.everand import EverandSource
+    from audiobookdl.sources.nextory import NextorySource
+    from audiobookdl.sources.yourcloudlibrary import YourCloudLibrarySource
+
+    # Everand missing authors does not raise IndexError
+    ev = EverandSource(_opts(tmp_path))
+    meta = ev.format_metadata({"title": "Solo Title", "authors": []}, url="https://www.everand.com/book/1")
+    assert meta.title == "Solo Title"
+    assert meta.authors == []
+
+    # YourCloudLibrary invalid JSON on login raises UserNotAuthorized, missing library raises actionable error
+    ycl = YourCloudLibrarySource(_opts(tmp_path))
+    ycl._session.post = MagicMock(return_value=MagicMock(status_code=200, content=b"<html>Login error</html>"))
+    with pytest.raises(UserNotAuthorized):
+        ycl._login("https://ebook.yourcloudlibrary.com/library/demo/MyBooks", "user", "pw", "demo")
+    ycl_no_lib = YourCloudLibrarySource(_opts(tmp_path))
+    with pytest.raises(GenericAudiobookDLException, match="library"):
+        ycl_no_lib.list_library()
+
+    # Nextory respects configured locale over domain fallback
+    nx = NextorySource(_opts(tmp_path))
+    nx._configured_locale = "de_DE"
+    assert nx._resolve_locale("https://www.nextory.com/book/1") == "de_DE"
+

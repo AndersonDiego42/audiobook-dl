@@ -1,6 +1,6 @@
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover
-from audiobookdl.exceptions import BookNotFound, DataNotPresent
+from audiobookdl.exceptions import BookNotFound, DataNotPresent, RequestError, UserNotAuthorized
 
 import base64
 from Crypto.Cipher import AES
@@ -22,6 +22,24 @@ class ChirpSource(Source):
     headers = {
         "content-type": "application/json"
     }
+
+    def verify_auth(self, url: str = "") -> bool:
+        if not self._session.cookies and not self.authenticated:
+            return False
+        try:
+            payload = self.post_json(
+                "https://www.chirpbooks.com/api/graphql",
+                json={
+                    "operationName": "verifyUserAuth",
+                    "query": "query verifyUserAuth{currentUser{id}}",
+                    "variables": {},
+                },
+                headers=self.headers,
+            )
+        except (RequestError, UserNotAuthorized, ValueError):
+            return False
+        user = (payload or {}).get("data", {}).get("currentUser") if isinstance(payload, dict) else None
+        return bool(isinstance(user, dict) and user.get("id"))
 
     def _resolve_player_url(self, url: str) -> str:
         """Resolve `/audiobooks/...` catalog URLs to `/player/<id>`."""
@@ -87,10 +105,12 @@ class ChirpSource(Source):
                 metadata.add_narrator(text[12:].strip())
         return metadata
 
-    def get_cover(self, url: str) -> Cover:
-        cover_url = self.find_elem_in_page(url, "img.cover-image", data="src")
-        cover_data = self.get(cover_url)
-        return Cover(cover_data, "jpg")
+    def get_cover(self, url: str) -> Cover | None:
+        try:
+            cover_url = self.find_elem_in_page(url, "img.cover-image", data="src")
+        except DataNotPresent:
+            return None
+        return self.fetch_cover_safe(cover_url)
 
     def get_audio_url(self, book_id: int, key: bytes, iv: bytes, track):
         url_resp = self.post_json(

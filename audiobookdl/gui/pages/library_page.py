@@ -15,7 +15,14 @@ import webbrowser
 
 import requests
 
-from audiobookdl.config import DEFAULT_PROFILE, Config, list_configured_source_profiles
+from audiobookdl.config import (
+    DEFAULT_AUTO_SYNC_MODE,
+    DEFAULT_PROFILE,
+    VALID_AUTO_SYNC_MODES,
+    Config,
+    list_configured_source_profiles,
+)
+from audiobookdl.utils.http import create_configured_http_session, resolve_http_timeout
 from audiobookdl.gui.formatting import (
     create_placeholder_cover_thumbnail,
     format_catalog_formats,
@@ -1185,6 +1192,7 @@ class CatalogTab(ttk.Frame):
         status_resolver: Callable[[str, Sequence[CatalogBook]], Sequence[str]] | None = None,
         cover_fetcher: Callable[[str], bytes | None] | None = None,
         on_cancel_fetch: Callable[[], object] | None = None,
+        config_provider: Callable[[], Config] | None = None,
         selected_profile: str = "default",
         palette: ThemePalette | None = None,
     ) -> None:
@@ -1200,6 +1208,10 @@ class CatalogTab(ttk.Frame):
         self._status_resolver = status_resolver
         self._cover_fetcher = cover_fetcher
         self._on_cancel_fetch = on_cancel_fetch
+        self._config_provider = config_provider
+        self._cover_thread_local = threading.local()
+        self._cover_sessions_lock = threading.Lock()
+        self._cover_sessions: list[requests.Session] = []
         self._loaded_books: list[CatalogBook] = []
         self._book_statuses: list[str] = []
         self._visible_count = 0
@@ -1381,14 +1393,15 @@ class CatalogTab(ttk.Frame):
         detail_actions.columnconfigure(1, weight=1)
         self._detail_download_btn: ttk.Button | None = None
         if self._on_download_urls is not None:
-            self._detail_download_btn = ttk.Button(
+            detail_download_btn = ttk.Button(
                 detail_actions,
                 text="Download",
                 command=self.download_selected,
                 style="Accent.TButton",
                 state="disabled",
             )
-            self._detail_download_btn.grid(row=0, column=0, sticky="ew", padx=(0, 3), pady=(0, 4))
+            detail_download_btn.grid(row=0, column=0, sticky="ew", padx=(0, 3), pady=(0, 4))
+            self._detail_download_btn = detail_download_btn
         self._detail_add_btn = ttk.Button(
             detail_actions,
             text="Add to URLs",
@@ -1447,25 +1460,27 @@ class CatalogTab(ttk.Frame):
         self._select_all_btn.pack(side=tk.LEFT)
         self._download_btn: ttk.Button | None = None
         if self._on_download_urls is not None:
-            self._download_btn = ttk.Button(
+            download_btn = ttk.Button(
                 btn_bar,
                 text="Download Selected",
                 command=self.download_selected,
                 style="Accent.TButton",
             )
-            self._download_btn.pack(side=tk.RIGHT)
+            download_btn.pack(side=tk.RIGHT)
+            self._download_btn = download_btn
         ttk.Button(btn_bar, text="Add Selected to URLs", command=self.add_selected).pack(
             side=tk.RIGHT, padx=(0, 6)
         )
         self._save_lib_btn: ttk.Button | None = None
         if self._on_save_to_library is not None:
-            self._save_lib_btn = ttk.Button(
+            save_lib_btn = ttk.Button(
                 btn_bar,
                 text="Save to Library DB",
                 command=self.save_to_library,
                 state="disabled",
             )
-            self._save_lib_btn.pack(side=tk.RIGHT, padx=(0, 6))
+            save_lib_btn.pack(side=tk.RIGHT, padx=(0, 6))
+            self._save_lib_btn = save_lib_btn
         if self._on_sync_libraries is not None:
             ttk.Button(
                 btn_bar,
@@ -1518,6 +1533,14 @@ class CatalogTab(ttk.Frame):
         self._url_photos.clear()
         self._detail_cover_photo = None
         self._placeholder_photo = None
+        with self._cover_sessions_lock:
+            sessions = list(self._cover_sessions)
+            self._cover_sessions.clear()
+        for session in sessions:
+            try:
+                session.close()
+            except Exception:
+                pass
 
     def _build_context_menu(self) -> None:
         menu = tk.Menu(self._tree, tearoff=0)
@@ -1844,13 +1867,38 @@ class CatalogTab(ttk.Frame):
                         return photo
         return self._placeholder_photo
 
+    def _get_cover_http_session(self, cfg: Config | None) -> requests.Session:
+        desired_proxy = (getattr(cfg, "proxy", None) or "").strip() or None
+        session: requests.Session | None = getattr(self._cover_thread_local, "session", None)
+        if session is None:
+            session = create_configured_http_session(
+                cfg,
+                proxy=desired_proxy,
+                pool_connections=8,
+                pool_maxsize=8,
+            )
+            self._cover_thread_local.session = session
+            with self._cover_sessions_lock:
+                self._cover_sessions.append(session)
+        else:
+            if desired_proxy:
+                session.proxies["http"] = desired_proxy
+                session.proxies["https"] = desired_proxy
+            else:
+                session.proxies.pop("http", None)
+                session.proxies.pop("https", None)
+        return session
+
     def _default_fetch_cover_bytes(self, url: str) -> bytes | None:
         if not url.lower().startswith(("http://", "https://")):
             return None
+        cfg = self._config_provider() if self._config_provider is not None else None
+        session = self._get_cover_http_session(cfg)
+        timeout = resolve_http_timeout(cfg, default=10)
         try:
-            with requests.get(
+            with session.get(
                 url,
-                timeout=10,
+                timeout=timeout,
                 headers={"User-Agent": "audiobook-dl"},
                 stream=True,
             ) as resp:
@@ -2400,7 +2448,7 @@ class SyncTab(ttk.Frame):
         *,
         auto_sync_enabled: bool = False,
         auto_sync_minutes: int = 30,
-        auto_sync_mode: str = "enqueue",
+        auto_sync_mode: str = DEFAULT_AUTO_SYNC_MODE,
         auto_sync_targets: Sequence[tuple[str, str]] | None = None,
         on_run_sync: Callable[[list[tuple[str, str]], str], None],
         on_auto_sync_changed: Callable[[bool, int], None] | None = None,
@@ -2439,7 +2487,7 @@ class SyncTab(ttk.Frame):
         mode_frame = ttk.LabelFrame(self, text="Sync Mode", padding=scale_px(self, 8))
         mode_frame.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         initial_mode = (
-            auto_sync_mode if auto_sync_mode in ("enqueue", "scan_only", "dry_run") else "enqueue"
+            auto_sync_mode if auto_sync_mode in VALID_AUTO_SYNC_MODES else DEFAULT_AUTO_SYNC_MODE
         )
         self.mode_var = tk.StringVar(value=initial_mode)
         ttk.Radiobutton(
@@ -2631,7 +2679,7 @@ class LibraryPage(ttk.Frame):
         on_catalog_cancel: Callable[[], object] | None = None,
         auto_sync_enabled: bool = False,
         auto_sync_minutes: int = 30,
-        auto_sync_mode: str = "enqueue",
+        auto_sync_mode: str = DEFAULT_AUTO_SYNC_MODE,
         auto_sync_targets: Sequence[tuple[str, str]] | None = None,
         on_run_sync: Callable[[list[tuple[str, str]], str], None],
         on_auto_sync_changed: Callable[[bool, int], None],
@@ -2681,6 +2729,7 @@ class LibraryPage(ttk.Frame):
             status_resolver=status_resolver,
             cover_fetcher=cover_fetcher,
             on_cancel_fetch=on_catalog_cancel,
+            config_provider=config_provider,
             selected_profile=selected_profile_provider(),
             palette=palette,
         )

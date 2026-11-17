@@ -1,5 +1,6 @@
 [red]ERROR: User not authorized[/red]
 
-Make sure you have given the correct cookies with the [green]-c[/green]/[green]--cookies[/green]
-argument or with [green]--username[/green] and [green]--password[/green], and
-have all the right permissions to access the book you are trying to download.
+Make sure you have configured valid session cookies ([green]cookie_file[/green] or imported
+browser cookies) or valid [green]username[/green] and [green]password[/green] on the Accounts page (or in
+audiobook-dl.toml / DownloadOptions), and have all the right permissions to
+access the book you are trying to download.

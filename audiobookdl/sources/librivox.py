@@ -1,6 +1,6 @@
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover
-from audiobookdl.exceptions import RequestError
+from audiobookdl.exceptions import DataNotPresent, RequestError
 from audiobookdl.utils.audiobook import (
     clean_html_description,
     parse_duration_ms,
@@ -154,14 +154,16 @@ class LibrivoxSource(Source):
                 offset_ms += dur_ms
         return chapters
 
-    def get_cover(self, url: str) -> Cover:
-        cover_url = self.find_elem_in_page(
-            url,
-            ".book-page-book-cover img",
-            data="src",
-        )
-        cover_data = self.get(cover_url)
-        return Cover(cover_data, "jpg")
+    def get_cover(self, url: str) -> Cover | None:
+        try:
+            cover_url = self.find_elem_in_page(
+                url,
+                ".book-page-book-cover img",
+                data="src",
+            )
+        except DataNotPresent:
+            return None
+        return self.fetch_cover_safe(cover_url)
 
     def get_files(self, url: str) -> list[AudiobookFile]:
         parts = self.find_elems_in_page(url, ".chapter-download .chapter-name")

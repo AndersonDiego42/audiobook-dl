@@ -44,10 +44,9 @@ class BlinkistSource(Source):
             chapters=self.get_chapters(book_info),
         )
 
-    def download_cover(self, book_info: dict) -> Cover:
-        cover_url = book_info["book"]["cover"]["default"]["src"]
-        cover_data = self.get(cover_url)
-        return Cover(cover_data, "jpg")
+    def download_cover(self, book_info: dict) -> Cover | None:
+        cover_url = ((book_info.get("book") or {}).get("cover") or {}).get("default", {}).get("src")
+        return self.fetch_cover_safe(cover_url)
 
     @staticmethod
     def format_metadata(book_info: dict) -> AudiobookMetadata:

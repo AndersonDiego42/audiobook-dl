@@ -6,6 +6,7 @@ import time
 from typing import Any
 from urllib.parse import urljoin
 import requests
+from requests.adapters import HTTPAdapter
 
 from audiobookdl.exceptions import DownloadCancelled, GenericAudiobookDLException
 
@@ -89,6 +90,44 @@ class TokenBucketRateLimiter:
                 time.sleep(wait_seconds)
 
 
+def resolve_http_timeout(
+    config_or_options: Any = None,
+    *,
+    default: float | tuple[int, int] = DEFAULT_HTTP_TIMEOUT,
+) -> float | tuple[int, int]:
+    """Return a validated positive HTTP timeout from `config_or_options`, or `default`."""
+    raw = getattr(config_or_options, "timeout", None) if config_or_options is not None else None
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
+        return float(raw)
+    return default
+
+
+def create_configured_http_session(
+    config_or_options: Any = None,
+    *,
+    proxy: str | None = None,
+    pool_connections: int | None = None,
+    pool_maxsize: int | None = None,
+) -> requests.Session:
+    """Build a `requests.Session` configured with `HTTPAdapter` pool sizing and optional proxy."""
+    raw_proxy = proxy if proxy is not None else (
+        getattr(config_or_options, "proxy", None) if config_or_options is not None else None
+    )
+    resolved_proxy = str(raw_proxy).strip() if raw_proxy else ""
+    workers = getattr(config_or_options, "max_workers", None) if config_or_options is not None else None
+    default_pool = max(16, (int(workers) if isinstance(workers, int) and workers > 0 else 6) * 2)
+    conns = max(1, int(pool_connections)) if pool_connections is not None else default_pool
+    maxsize = max(1, int(pool_maxsize)) if pool_maxsize is not None else default_pool
+
+    session = requests.Session()
+    adapter = HTTPAdapter(pool_connections=conns, pool_maxsize=maxsize)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    if resolved_proxy:
+        session.proxies.update({"http": resolved_proxy, "https": resolved_proxy})
+    return session
+
+
 def create_impersonated_session(
     browser: str,
     *,
@@ -106,7 +145,7 @@ def create_impersonated_session(
         curl_requests = importlib.import_module("curl_cffi.requests")
     except ImportError as exc:
         raise GenericAudiobookDLException(
-            f"TLS impersonation (--impersonate {target!r}) requires the optional 'curl_cffi' package. "
+            f"TLS impersonation (impersonate={target!r}) requires the optional 'curl_cffi' package. "
             "Install it with: pip install \"audiobook-dl[impersonate]\""
         ) from exc
 

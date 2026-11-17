@@ -231,6 +231,8 @@ class AudioProbeInfo:
     channels: int | None = None
     probe_error: str | None = None
     video_codec_name: str = ""
+    chapters: tuple[tuple[int, str], ...] = ()
+    chapters_probed: bool = False
 
 
 def _parse_positive_int(raw: Any) -> int | None:
@@ -254,7 +256,7 @@ def _parse_positive_float(raw: Any) -> float:
 
 
 def probe_audio_info(path: str) -> AudioProbeInfo:
-    """Probe duration, bitrate, codec, and container format in one `ffprobe` call."""
+    """Probe duration, bitrate, codec, container format, and chapters in one `ffprobe` call."""
     ffprobe = find_executable("ffprobe")
     if ffprobe is None:
         return AudioProbeInfo()
@@ -264,6 +266,7 @@ def probe_audio_info(path: str) -> AudioProbeInfo:
                 ffprobe,
                 "-v",
                 "error",
+                "-show_chapters",
                 "-show_entries",
                 "format=duration,bit_rate,format_name:stream=codec_type,codec_name,bit_rate,duration,sample_rate,channels:stream_disposition=attached_pic",
                 "-of",
@@ -315,6 +318,17 @@ def probe_audio_info(path: str) -> AudioProbeInfo:
     format_name = str(fmt.get("format_name") or "").strip()
     sample_rate = _parse_positive_int(stream.get("sample_rate"))
     channels = _parse_positive_int(stream.get("channels"))
+    parsed_chapters: list[tuple[int, str]] = []
+    for idx, ch in enumerate(payload.get("chapters") or (), start=1):
+        if not isinstance(ch, dict):
+            continue
+        try:
+            start_ms = max(0, round(float(ch["start_time"]) * 1000))
+        except (KeyError, TypeError, ValueError):
+            continue
+        tags = ch.get("tags") or {}
+        ch_title = str(tags.get("title") or "").strip() if isinstance(tags, dict) else ""
+        parsed_chapters.append((start_ms, ch_title or f"Chapter {idx}"))
     return AudioProbeInfo(
         duration=duration,
         bitrate=bitrate,
@@ -323,6 +337,8 @@ def probe_audio_info(path: str) -> AudioProbeInfo:
         sample_rate=sample_rate,
         channels=channels,
         video_codec_name=video_codec_name,
+        chapters=tuple(parsed_chapters),
+        chapters_probed=True,
     )
 
 

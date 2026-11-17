@@ -9,6 +9,7 @@ from typing import Any
 from collections.abc import Callable, Sequence
 
 from audiobookdl import output
+from audiobookdl.config import DEFAULT_AUTO_SYNC_MODE, VALID_AUTO_SYNC_MODES
 from audiobookdl.options_schema import DownloadOptions
 from audiobookdl.gui.formatting import parse_url_text
 from audiobookdl.pack import SUPPORTED_PACK_EXTENSIONS
@@ -129,8 +130,22 @@ class AutomationCoordinator:
         self.auto_sync_after_id: str | None = None
         self.auto_sync_enabled: bool = False
         self.auto_sync_minutes: int = 60
-        self.auto_sync_mode: str = "download_missing"
+        self._auto_sync_mode: str = DEFAULT_AUTO_SYNC_MODE
         self.auto_sync_targets: list[tuple[str, str]] = []
+
+    @property
+    def auto_sync_mode(self) -> str:
+        """Return the configured auto-sync mode (`enqueue`, `scan_only`, or `dry_run`)."""
+        return self._auto_sync_mode
+
+    @auto_sync_mode.setter
+    def auto_sync_mode(self, mode: str) -> None:
+        normalized = str(mode or "").strip().lower()
+        if normalized not in VALID_AUTO_SYNC_MODES:
+            raise ValueError(
+                f"Invalid auto_sync_mode {mode!r}; expected one of {VALID_AUTO_SYNC_MODES}"
+            )
+        self._auto_sync_mode = normalized
 
     def cancel_clipboard(self) -> None:
         if self.clipboard_after_id is not None:

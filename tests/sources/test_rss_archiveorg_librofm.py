@@ -216,3 +216,62 @@ def test_archiveorg_select_audio_files_deduplicates_derivatives_and_m4b_chapters
     selected_mixed = src._select_audio_files(mixed_files)
     assert [f["name"] for f in selected_mixed] == ["FullBook.m4b"]
 
+
+def test_rss_atom_iso8601_and_podcast_chapters(tmp_path):
+    from audiobookdl.sources.rss import RssSource
+
+    atom_xml = b"""<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"
+      xmlns:podcast="https://podcastindex.org/namespace/1.0">
+  <title>Serialized Story</title>
+  <subtitle>Great serialized fiction.</subtitle>
+  <author><name>Jane Author</name></author>
+  <entry>
+    <title>Episode 2</title>
+    <updated>2024-03-16T10:30:00Z</updated>
+    <itunes:duration>00:02:00</itunes:duration>
+    <link rel="enclosure" type="audio/mpeg" href="https://cdn.example.com/ep2.mp3" />
+  </entry>
+  <entry>
+    <title>Episode 1</title>
+    <published>2024-03-15T10:30:00Z</published>
+    <itunes:duration>00:01:00</itunes:duration>
+    <link rel="enclosure" type="audio/mpeg" href="https://cdn.example.com/ep1.mp3" />
+    <podcast:chapters url="https://cdn.example.com/chapters.json" type="application/json+chapters" />
+  </entry>
+</feed>
+"""
+    chapters_json = {
+        "version": "1.2.0",
+        "chapters": [
+            {"startTime": 0.0, "title": "Opening"},
+            {"startTime": 42.5, "title": "Plot Twist"},
+        ],
+    }
+
+    src = RssSource(_opts(tmp_path))
+
+    def _fake_get(url, **_kwargs):
+        if url.endswith("feed.atom"):
+            return MagicMock(status_code=200, content=atom_xml, headers={"Content-Type": "application/atom+xml"})
+        if url.endswith("chapters.json"):
+            resp = MagicMock(status_code=200, content=json.dumps(chapters_json).encode("utf-8"), headers={"Content-Type": "application/json"})
+            resp.json.return_value = chapters_json
+            return resp
+        return MagicMock(status_code=404, content=b"", headers={})
+
+    src._session.get = MagicMock(side_effect=_fake_get)
+    book = src.download("https://substack.com/feed.atom")
+    assert book.metadata.title == "Serialized Story"
+    assert book.metadata.authors == ["Jane Author"]
+    assert [f.url for f in book.files] == [
+        "https://cdn.example.com/ep1.mp3",
+        "https://cdn.example.com/ep2.mp3",
+    ]
+    assert [(c.start, c.title) for c in book.chapters] == [
+        (0, "Opening"),
+        (42500, "Plot Twist"),
+        (60000, "Episode 2"),
+    ]
+

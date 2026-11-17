@@ -61,8 +61,12 @@ def _dpapi_entropy(service_key: str, username: str | None) -> bytes:
 
 
 def _dpapi_protect(plaintext: bytes, entropy: bytes) -> bytes:
-    crypt32 = ctypes.windll.crypt32  # type: ignore[attr-defined]
-    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    windll: Any = getattr(ctypes, "windll", None)
+    if windll is None:
+        raise OSError("Windows DPAPI is unavailable on this platform")
+    crypt32 = windll.crypt32
+    kernel32 = windll.kernel32
+    win_error: Any = getattr(ctypes, "WinError", OSError)
     crypt32.CryptProtectData.argtypes = [
         ctypes.POINTER(_DataBlob),
         wintypes.LPCWSTR,
@@ -89,7 +93,7 @@ def _dpapi_protect(plaintext: bytes, entropy: bytes) -> bytes:
         ctypes.byref(out_blob),
     )
     if not ok:
-        raise ctypes.WinError()  # type: ignore[attr-defined]
+        raise win_error()
     try:
         return bytes(
             ctypes.cast(
@@ -102,8 +106,12 @@ def _dpapi_protect(plaintext: bytes, entropy: bytes) -> bytes:
 
 
 def _dpapi_unprotect(ciphertext: bytes, entropy: bytes) -> bytes:
-    crypt32 = ctypes.windll.crypt32  # type: ignore[attr-defined]
-    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    windll: Any = getattr(ctypes, "windll", None)
+    if windll is None:
+        raise OSError("Windows DPAPI is unavailable on this platform")
+    crypt32 = windll.crypt32
+    kernel32 = windll.kernel32
+    win_error: Any = getattr(ctypes, "WinError", OSError)
     crypt32.CryptUnprotectData.argtypes = [
         ctypes.POINTER(_DataBlob),
         ctypes.POINTER(wintypes.LPWSTR),
@@ -130,7 +138,7 @@ def _dpapi_unprotect(ciphertext: bytes, entropy: bytes) -> bytes:
         ctypes.byref(out_blob),
     )
     if not ok:
-        raise ctypes.WinError()  # type: ignore[attr-defined]
+        raise win_error()
     try:
         return bytes(
             ctypes.cast(
@@ -386,7 +394,7 @@ def get_credential_store(
     if os.name == "nt":
         return DpapiCredentialStore(get_vault_path(config_location))
     try:
-        import keyring  # type: ignore[import-not-found]
+        import keyring
     except ImportError:
         keyring = None
     if keyring is not None and _is_usable_keyring_backend(keyring):

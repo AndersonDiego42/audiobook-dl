@@ -1,6 +1,7 @@
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, Result, Series
-from audiobookdl.exceptions import BookHasNoAudiobook, BookHasNoEbook, MissingBookAccess
+from audiobookdl.exceptions import BookHasNoAudiobook, BookHasNoEbook, MissingBookAccess, RequestError, UserNotAuthorized
+from audiobookdl.options_schema import DownloadOptions
 from audiobookdl.utils.audiobook import parse_language, parse_release_date
 from audiobookdl.utils.fs import atomic_write_text
 
@@ -23,9 +24,19 @@ class BookBeatSource(Source):
     supports_search = True
     book_info: dict
 
-    def __init__(self, options):
+    def __init__(self, options: DownloadOptions) -> None:
         super().__init__(options)
         self._saved_books_cache: dict[str, Any] | None = None
+
+    def verify_auth(self, url: str = "") -> bool:
+        has_auth = any(k.lower() == "authorization" for k in self._session.headers)
+        if not self.authenticated and not has_auth:
+            return False
+        try:
+            payload = self.get_json("https://api.bookbeat.com/api/my/books/saved?offset=0&limit=1")
+            return isinstance(payload, dict)
+        except (RequestError, UserNotAuthorized, ValueError):
+            return False
 
     @property
     def saved_books(self) -> dict[str, Any]:
@@ -289,10 +300,9 @@ class BookBeatSource(Source):
             chapters.append(Chapter(track["start"], ch_title))
         return chapters
 
-    def get_cover(self, book_info: dict) -> Cover:
-        cover_url = book_info["metadata"]["cover"]
-        cover_data = self.get(cover_url)
-        return Cover(cover_data, "jpg")
+    def get_cover(self, book_info: dict) -> Cover | None:
+        cover_url = (book_info.get("metadata") or {}).get("cover")
+        return self.fetch_cover_safe(cover_url)
 
     def find_book_info(self, book_id: str) -> dict:
         """Find book metadata by id, checking cached `saved_books` if loaded, else catalog API."""

@@ -267,7 +267,7 @@ def test_gui_startup_non_download_page_restores_queue_without_duplication(
         f'output_dir = "{e2e_workspace.output_dir.as_posix()}"\n'
         'output_template = "{title}"\n'
     )
-    queue_dir = e2e_workspace.config_dir / "db"
+    queue_dir = e2e_workspace.db_dir
     queue_dir.mkdir(parents=True, exist_ok=True)
     queue_file = queue_dir / "gui_queue.json"
     queue_file.write_text(

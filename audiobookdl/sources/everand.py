@@ -1,6 +1,6 @@
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, BookId, Chapter, Cover, Result, Series, logging
-from audiobookdl.exceptions import BookNotFound, RequestError
+from audiobookdl.exceptions import BookNotFound, RequestError, UserNotAuthorized
 from audiobookdl.utils.audiobook import (
     clean_html_description,
     parse_language,
@@ -24,6 +24,27 @@ class EverandSource(Source[str]):
     names = ["Everand", "Scribd"]
     supports_search = True
     supports_library = True
+
+    def verify_auth(self, url: str = "") -> bool:
+        if not self._session.cookies and not self.authenticated:
+            return False
+        try:
+            resp = self.request(
+                "GET",
+                "https://www.everand.com/saved/data",
+                headers={"X-Requested-With": "XMLHttpRequest"},
+            )
+        except (RequestError, UserNotAuthorized):
+            return False
+        if resp.status_code in (401, 403) or resp.status_code != 200:
+            return False
+        if "/login" in (getattr(resp, "url", "") or "").lower():
+            return False
+        try:
+            payload = json.loads(resp.content.decode("utf-8", errors="replace"))
+        except (ValueError, TypeError):
+            return False
+        return isinstance(payload, (dict, list))
 
     def download(self, url: str) -> Result:
         # Matches series url
@@ -182,11 +203,7 @@ class EverandSource(Source[str]):
         :param metadata: Metadata dictionary containing `cover_url`
         :returns: Cover of book
         """
-        cover_url = metadata["cover_url"]
-        raw_cover = self.get(cover_url)
-        if raw_cover is None:
-            return None
-        return Cover(raw_cover, "jpg")
+        return self.fetch_cover_safe(metadata.get("cover_url"))
 
     @staticmethod
     def clean_title(title: str):
@@ -240,10 +257,29 @@ class EverandSource(Source[str]):
             book_info.get("publish_date") or book_info.get("release_date")
         )
 
+        authors: list[str] = []
+        raw_author = book_info.get("author")
+        if isinstance(raw_author, dict) and raw_author.get("name"):
+            authors.append(str(raw_author["name"]).strip())
+        elif isinstance(raw_author, str) and raw_author.strip():
+            authors.append(raw_author.strip())
+        raw_authors = book_info.get("authors")
+        if isinstance(raw_authors, list):
+            for entry in raw_authors:
+                name = entry.get("name") if isinstance(entry, dict) else entry
+                cleaned_name = str(name or "").strip()
+                if cleaned_name and cleaned_name not in authors:
+                    authors.append(cleaned_name)
+        narrators = [
+            str(narrator["name"]).strip()
+            for narrator in (book_info.get("narrators") or [])
+            if isinstance(narrator, dict) and narrator.get("name")
+        ]
+
         return AudiobookMetadata(
             title=EverandSource.clean_title(book_info["title"]),
-            authors=[book_info["author"]["name"]],
-            narrators=[narrator["name"] for narrator in book_info.get("narrators", [])],
+            authors=authors,
+            narrators=narrators,
             description=description,
             series=series_name,
             series_order=series_order,

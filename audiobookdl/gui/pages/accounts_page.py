@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -292,42 +293,64 @@ class AccountsPage(ttk.Frame):
             valid = 0
             checked = 0
             was_cancelled = False
-            try:
-                for svc_key, prof in targets:
-                    if cancel_ev.is_set():
-                        was_cancelled = True
-                        break
-                    opts = build_default_options(
-                        config_location=self._controller.config_location,
-                        profile=None if prof == DEFAULT_PROFILE else prof,
+            counter_lock = threading.Lock()
+
+            def _check_one(svc_key: str, prof: str) -> None:
+                nonlocal valid, checked, was_cancelled
+                if cancel_ev.is_set():
+                    return
+                opts = build_default_options(
+                    config_location=self._controller.config_location,
+                    profile=None if prof == DEFAULT_PROFILE else prof,
+                )
+                ok = False
+                err: str | None = None
+                try:
+                    ok = verify_service_auth(
+                        svc_key,
+                        opts,
+                        cfg,
+                        interaction=interaction,
                     )
-                    ok = False
-                    err: str | None = None
-                    try:
-                        ok = verify_service_auth(
-                            svc_key,
-                            opts,
-                            cfg,
-                            interaction=interaction,
-                        )
-                    except Exception as exc:
-                        err = str(exc) or type(exc).__name__
-                    if cancel_ev.is_set():
+                except Exception as exc:
+                    err = str(exc) or type(exc).__name__
+                if cancel_ev.is_set():
+                    with counter_lock:
                         was_cancelled = True
-                        break
+                    return
+                with counter_lock:
                     checked += 1
                     if ok:
                         valid += 1
 
-                    def _emit_row(
-                        sk: str = svc_key,
-                        pf: str = prof,
-                        res: bool = ok,
-                        er: str | None = err,
-                    ) -> None:
-                        _update_row(sk, pf, res, er)
+                def _emit_row(
+                    sk: str = svc_key,
+                    pf: str = prof,
+                    res: bool = ok,
+                    er: str | None = err,
+                ) -> None:
+                    _update_row(sk, pf, res, er)
 
-                    self._cb_queue.post(_emit_row)
+                self._cb_queue.post(_emit_row)
+
+            try:
+                max_workers = min(4, len(targets))
+                if max_workers <= 1:
+                    for svc_key, prof in targets:
+                        if cancel_ev.is_set():
+                            was_cancelled = True
+                            break
+                        _check_one(svc_key, prof)
+                else:
+                    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                        futures = [pool.submit(_check_one, svc_key, prof) for svc_key, prof in targets]
+                        for fut in as_completed(futures):
+                            if cancel_ev.is_set():
+                                was_cancelled = True
+                                for pending_fut in futures:
+                                    pending_fut.cancel()
+                                break
+                            fut.result()
             finally:
                 cancel_ev.set()
                 interaction.release_all()

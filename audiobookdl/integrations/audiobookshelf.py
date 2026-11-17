@@ -13,7 +13,7 @@ from audiobookdl.utils.audiobook import AudiobookMetadata
 from audiobookdl.utils.http import DEFAULT_HTTP_TIMEOUT
 
 ABS_CREDENTIAL_KEY = "integration:audiobookshelf"
-_UPLOADABLE_EXTENSIONS = frozenset({
+_AUDIO_MEDIA_EXTENSIONS = frozenset({
     ".m4b",
     ".m4a",
     ".mp3",
@@ -23,6 +23,8 @@ _UPLOADABLE_EXTENSIONS = frozenset({
     ".aac",
     ".wav",
     ".wma",
+})
+_UPLOADABLE_EXTENSIONS = _AUDIO_MEDIA_EXTENSIONS | frozenset({
     ".epub",
     ".pdf",
     ".jpg",
@@ -279,18 +281,43 @@ class AudiobookshelfClient:
         if os.path.isfile(abs_path):
             files = [abs_path]
             stem = os.path.splitext(abs_path)[0]
+            stem_name = os.path.splitext(os.path.basename(abs_path))[0]
             parent = os.path.dirname(abs_path)
-            for candidate in (
+            stem_metadata_path = f"{stem}.metadata.json"
+            candidates: list[str] = [
                 f"{abs_path}.json",
+                stem_metadata_path,
                 f"{stem}.opf",
                 f"{stem}.cue",
                 f"{stem}.jpg",
                 f"{stem}.jpeg",
                 f"{stem}.png",
-                os.path.join(parent, "metadata.json"),
-                os.path.join(parent, "cover.jpg"),
-                os.path.join(parent, "cover.png"),
-            ):
+                f"{stem}.webp",
+            ]
+            has_sibling_audio = False
+            try:
+                for entry_name in os.listdir(parent):
+                    entry_stem, entry_ext = os.path.splitext(entry_name)
+                    if (
+                        entry_ext.lower() in _AUDIO_MEDIA_EXTENSIONS
+                        and entry_stem.lower() != stem_name.lower()
+                        and os.path.isfile(os.path.join(parent, entry_name))
+                    ):
+                        has_sibling_audio = True
+                        break
+            except OSError:
+                has_sibling_audio = False
+            if not has_sibling_audio and not os.path.isfile(stem_metadata_path):
+                candidates.extend(
+                    [
+                        os.path.join(parent, "metadata.json"),
+                        os.path.join(parent, "cover.jpg"),
+                        os.path.join(parent, "cover.jpeg"),
+                        os.path.join(parent, "cover.png"),
+                        os.path.join(parent, "cover.webp"),
+                    ]
+                )
+            for candidate in candidates:
                 if os.path.isfile(candidate) and candidate not in files:
                     files.append(candidate)
             return files

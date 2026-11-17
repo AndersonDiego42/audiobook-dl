@@ -14,35 +14,35 @@ sequenceDiagram
     participant Auth as CredentialStore / Cookies
     participant IO as download.py / output.py
     participant DB as DownloadArchive (downloads.db)
-    participant Hook as ABS & --post-exec
+    participant Hook as ABS & post_exec
 
     Caller->>DL: download(urls) inside JobContext
     DL->>Src: find_compatible_source(url) (or resolve_redirect_url)
     alt requires_authentication
-        DL->>Auth: Check -c/--cookies, config cookie_file, ./cookies.txt, or cached session_cookies
+        DL->>Auth: Check cookie_file, ./cookies.txt, or cached session_cookies
         Auth-->>Src: Load Netscape jar or authenticate via _login()
         Src->>Auth: save_cookie_file() (0600 permissions)
     end
     DL->>Src: source.download(url) -> Audiobook or Series
-    DL->>DB: Skip if --skip-downloaded / ledger contains book_key
-    opt --enrich / --enrich-metadata
+    DL->>DB: Skip if skip_downloaded / ledger contains book_key
+    opt enrich_metadata
         DL->>DL: Query Audnexus, iTunes, Google Books, OpenLibrary (with SQLite cache)
     end
     DL->>IO: download_audiobook() (staged temp dir + Range resume + 429/5xx backoff)
     IO->>IO: Decrypt AES-CBC if encrypted + verify_audio_integrity(ffprobe)
     IO->>IO: Combine/convert/split via FFmpeg + embed MP4/ID3/Vorbis tags & sidecars
     IO->>DB: archive.record(..., status="downloaded")
-    opt Audiobookshelf auto_upload / auto_scan / --upload-to-abs
+    opt Audiobookshelf auto_upload / auto_scan / upload_to_abs
         DL->>Hook: upload_book() / scan_library()
     end
-    opt --post-exec
-        DL->>Hook: Run command with AUDIOBOOK_DL_* env vars
+    opt post_exec
+        DL->>Hook: Run trusted command with AUDIOBOOK_DL_* env vars (300s timeout)
     end
 ```
 
 ### Staging & Integrity Guarantees
 - **Multi-part & chapter-split safety**: [`audiobookdl/output/download.py`](../audiobookdl/output/download.py) downloads multi-file books into a sibling temporary `.staging-*` directory and verifies audio integrity with `ffprobe` (`output.verify_audio_integrity()`) before atomically committing targets or updating `downloads.db`.
-- **Resumable transfers**: With `--resume`, partial segments stay in `.tmp` files and resume via HTTP `Range` requests (`Content-Range` validated; stale temp files are reset automatically when servers ignore ranges).
+- **Resumable transfers**: With `resume` enabled, partial segments stay in `.tmp` files and resume via HTTP `Range` requests (`Content-Range` validated; stale temp files are reset automatically when servers ignore ranges).
 
 ---
 

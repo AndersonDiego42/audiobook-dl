@@ -2,9 +2,10 @@ from __future__ import annotations
 
 # Internal imports
 from . import networking
-from audiobookdl import logging, Result, Audiobook
+from audiobookdl import logging, Result, Audiobook, Cover
 from audiobookdl.exceptions import DataNotPresent, GenericAudiobookDLException
 from audiobookdl.utils import CustomSSLContextHTTPAdapter
+from audiobookdl.utils.audiobook import detect_image_extension
 from audiobookdl.utils.http import (
     create_impersonated_session,
     extract_session_cookies,
@@ -12,6 +13,10 @@ from audiobookdl.utils.http import (
 )
 
 # External imports
+from collections import OrderedDict
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 import requests
 from requests.adapters import HTTPAdapter
 import lxml.html
@@ -30,12 +35,33 @@ if TYPE_CHECKING:
 
 T = TypeVar("T")
 
+_ACTIVE_POOLED_SESSION: ContextVar[Any | None] = ContextVar(
+    "audiobookdl_active_pooled_session",
+    default=None,
+)
+
+
+@contextmanager
+def bind_pooled_session(session: Any | None) -> Iterator[None]:
+    """Temporarily bind `session` so `Source.__init__` reuses it without taking ownership."""
+    if session is None:
+        yield
+        return
+    token = _ACTIVE_POOLED_SESSION.set(session)
+    try:
+        yield
+    finally:
+        _ACTIVE_POOLED_SESSION.reset(token)
+
 
 def _close_sessions(
-    primary: requests.Session | None,
+    primary_ref: list[Any],
     children: list[requests.Session] | None,
 ) -> None:
-    """Close `primary` and all child sessions without raising."""
+    """Close owned `primary_ref[0]` and all child sessions without raising."""
+    primary = primary_ref[0] if primary_ref else None
+    if primary_ref:
+        primary_ref[0] = None
     if primary is not None and hasattr(primary, "close"):
         try:
             primary.close()
@@ -99,31 +125,48 @@ class Source(Generic[T]):
     supports_search: bool = False
     supports_library: bool = False
 
+    _MAX_PAGE_CACHE_ENTRIES = 64
+    _MAX_PAGE_CACHE_BYTES = 32 * 1024 * 1024
+
     def __init__(self, options: DownloadOptions):
         self.__authenticated: bool = False
-        self.__pages: dict[str, bytes] = {}
+        self.__pages: OrderedDict[str, bytes] = OrderedDict()
+        self.__pages_bytes: int = 0
         self._options: DownloadOptions = options
         self.database_directory = os.path.join(options.database_directory, self.name)
         self.skip_downloaded = options.skip_downloaded
-        self._session: requests.Session = self.create_session(options)
+        pooled = _ACTIVE_POOLED_SESSION.get()
+        if pooled is not None:
+            self._session = pooled
+            self._owns_session = False
+        else:
+            self._session = self.create_session(options)
+            self._owns_session = True
+        self._session_close_target: list[Any] = [self._session if self._owns_session else None]
         self._child_sessions: list[requests.Session] = []
         self._session_finalizer = weakref.finalize(
             self,
             _close_sessions,
-            self._session,
+            self._session_close_target,
             self._child_sessions,
         )
         if self.create_storage_dir:
             os.makedirs(self.database_directory, exist_ok=True)
 
+    def release_session_ownership(self) -> None:
+        """Detach ownership of `self._session` so an external session pool manages its lifecycle."""
+        self._owns_session = False
+        if hasattr(self, "_session_close_target") and self._session_close_target:
+            self._session_close_target[0] = None
+
     def close(self) -> None:
-        """Close the HTTP session and any unauthenticated CDN sessions held by this source."""
+        """Close the HTTP session (if owned) and any unauthenticated CDN child sessions."""
         finalizer = getattr(self, "_session_finalizer", None)
         if finalizer is not None:
             finalizer()
             return
         _close_sessions(
-            getattr(self, "_session", None),
+            [self._session] if getattr(self, "_owns_session", True) else [None],
             getattr(self, "_child_sessions", None),
         )
 
@@ -205,10 +248,35 @@ class Source(Generic[T]):
         raise NotImplementedError(f"{self.name} does not support library listing")
 
     def verify_auth(self, url: str = "") -> bool:
-        """Return True if authentication credentials/cookies appear valid."""
+        """Probe whether the active session is authenticated against the service.
+
+        Sources that require authentication should override this method to issue a
+        lightweight authenticated request (and return `False` on 401/403 or login
+        redirects) rather than relying solely on local cookie-file presence.
+        """
         if not self.requires_authentication:
             return True
         return self.authenticated
+
+    def fetch_cover_safe(
+        self,
+        url: str | None,
+        *,
+        default_ext: str = "jpg",
+        headers: Mapping[str, str] | None = None,
+    ) -> Cover | None:
+        """Download cover bytes from `url` non-fatally and sniff the true image extension."""
+        cleaned = (url or "").strip()
+        if not cleaned:
+            return None
+        try:
+            data = self.get(cleaned, headers=headers) if headers is not None else self.get(cleaned)
+        except Exception as exc:
+            logging.debug(f"Could not download cover from {cleaned}: {exc}")
+            return None
+        if not data:
+            return None
+        return Cover(image=data, extension=detect_image_extension(data, default=default_ext))
 
 
     @property
@@ -244,13 +312,30 @@ class Source(Generic[T]):
         pass
 
 
+    def clear_page_cache(self) -> None:
+        """Drop cached HTML/JSON page payloads held by this source instance."""
+        self.__pages.clear()
+        self.__pages_bytes = 0
+
     def _get_page(self, url: str, use_cache: bool = True, **kwargs) -> bytes:
-        """Download a page and caches it"""
+        """Download a page and cache it in a bounded LRU cache."""
         if not use_cache:
             return self.get(url, **kwargs)
-        if url not in self.__pages:
-            self.__pages[url] = self.get(url, **kwargs)
-        return self.__pages[url]
+        cached = self.__pages.get(url)
+        if cached is not None:
+            self.__pages.move_to_end(url)
+            return cached
+        data = self.get(url, **kwargs)
+        if len(data) <= self._MAX_PAGE_CACHE_BYTES:
+            self.__pages[url] = data
+            self.__pages_bytes += len(data)
+            while (
+                len(self.__pages) > self._MAX_PAGE_CACHE_ENTRIES
+                or self.__pages_bytes > self._MAX_PAGE_CACHE_BYTES
+            ) and len(self.__pages) > 1:
+                _evicted_url, evicted_bytes = self.__pages.popitem(last=False)
+                self.__pages_bytes = max(0, self.__pages_bytes - len(evicted_bytes))
+        return data
 
 
     def find_elem_in_page(self, url: str, selector: str, data=None, **kwargs):
@@ -277,7 +362,7 @@ class Source(Generic[T]):
         """
         sel = CSSSelector(selector)
         page: bytes = self._get_page(url, **kwargs)
-        tree = lxml.html.fromstring(page.decode("utf8"))
+        tree = lxml.html.fromstring(page.decode("utf-8", errors="replace"))
         results = sel(tree)
         return results
 
@@ -287,7 +372,7 @@ class Source(Generic[T]):
         Find some text in a page based on a regex.
         Will cache the page.
         """
-        page = self._get_page(url, **kwargs).decode("utf8")
+        page = self._get_page(url, **kwargs).decode("utf-8", errors="replace")
         m = re.search(regex, page)
         if m is None:
             logging.debug(f"Could not find match from {url} with {regex}")
@@ -300,7 +385,7 @@ class Source(Generic[T]):
         Find all places in a page that matches the regex.
         Will cache the page.
         """
-        return re.findall(regex, self._get_page(url, **kwargs).decode("utf8"))
+        return re.findall(regex, self._get_page(url, **kwargs).decode("utf-8", errors="replace"))
 
     # Networking
     request = networking.request
@@ -312,7 +397,7 @@ class Source(Generic[T]):
 
     def create_ssl_context(self, options: DownloadOptions | None = None) -> SSLContext:
         try:
-            ssl_context: SSLContext = urllib3.util.create_urllib3_context()  # type: ignore[attr-defined]
+            ssl_context: SSLContext = urllib3.util.create_urllib3_context()
 
             # Workaround for regression in requests version 2.32.3
             # https://github.com/psf/requests/issues/6730
@@ -333,15 +418,17 @@ class Source(Generic[T]):
         impersonate = (getattr(options, "impersonate", None) or "").strip() if options is not None else ""
         if impersonate:
             return create_impersonated_session(impersonate, proxy=proxy)
+        workers = getattr(options, "max_workers", None) if options is not None else None
+        pool_size = max(20, (int(workers) if isinstance(workers, int) and workers > 0 else 6) * 2)
         session = requests.Session()
         ssl_context: SSLContext = self.create_ssl_context(options)
         session.mount(
             "https://",
-            CustomSSLContextHTTPAdapter(ssl_context, pool_connections=20, pool_maxsize=20),
+            CustomSSLContextHTTPAdapter(ssl_context, pool_connections=pool_size, pool_maxsize=pool_size),
         )
         session.mount(
             "http://",
-            HTTPAdapter(pool_connections=20, pool_maxsize=20),
+            HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size),
         )
         if proxy:
             session.proxies.update({"http": proxy, "https": proxy})

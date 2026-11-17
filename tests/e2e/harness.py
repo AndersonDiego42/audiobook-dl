@@ -1,4 +1,4 @@
-"""Reusable E2E execution harnesses for CLI subprocesses, FFmpeg, and Desktop GUI."""
+"""Reusable E2E execution harnesses for GUI subprocesses, FFmpeg, and Desktop GUI."""
 
 from __future__ import annotations
 

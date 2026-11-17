@@ -14,7 +14,7 @@
 ## Pytest Markers & Common Commands
 
 Custom markers are defined in [`pyproject.toml`](../pyproject.toml):
-- `e2e` — End-to-end tests exercising real CLI/GUI processes, HTTP servers, and media pipelines
+- `e2e` — End-to-end tests exercising real GUI subprocesses, HTTP servers, and media pipelines
 - `gui` — Tests requiring a Tkinter display
 - `ffmpeg` — Tests requiring `ffmpeg` and `ffprobe` executables
 - `real_integrity` — Tests exercising real `ffprobe` media integrity verification without stubbing

@@ -259,7 +259,7 @@ def test_abs_sidecar_sets_final_chapter_duration_and_avoids_clobbering(tmp_path)
         {"id": 1, "start": 10.0, "end": 42.5, "title": "Part 2"},
     ]
 
-    # Co-existing --write-json-metadata and --write-abs-metadata in dir output should not clobber
+    # Co-existing write_json_metadata and write_abs_metadata in dir output should not clobber
     book_dir = tmp_path / "Dune"
     book_dir.mkdir()
     part1 = book_dir / "01.mp3"
@@ -343,3 +343,34 @@ def test_multipart_upload_stream_computes_exact_length_and_streams_chunks(tmp_pa
     assert payload1 in assembled
     assert payload2 in assembled
     assert b"--test-boundary-123--\r\n" in assembled
+
+
+def test_collect_upload_files_shared_directory_uses_stem_sidecars_only(tmp_path):
+    client = AudiobookshelfClient("https://abs.example.com", "tok")
+
+    shared = tmp_path / "shared_dir"
+    shared.mkdir()
+    book_a = shared / "Book A.m4b"
+    book_a_meta = shared / "Book A.metadata.json"
+    book_a_webp = shared / "Book A.webp"
+    book_b = shared / "Book B.m4b"
+    foreign_meta = shared / "metadata.json"
+    foreign_cover = shared / "cover.jpg"
+    for p in (book_a, book_a_meta, book_a_webp, book_b, foreign_meta, foreign_cover):
+        p.write_bytes(b"data")
+
+    collected = client._collect_upload_files(str(book_a))
+    collected_names = {p.split("\\")[-1].split("/")[-1] for p in collected}
+    assert collected_names == {"Book A.m4b", "Book A.metadata.json", "Book A.webp"}
+
+    isolated = tmp_path / "single_book_dir"
+    isolated.mkdir()
+    solo = isolated / "Solo Book.m4b"
+    solo_meta = isolated / "metadata.json"
+    solo_cover = isolated / "cover.jpg"
+    for p in (solo, solo_meta, solo_cover):
+        p.write_bytes(b"data")
+
+    solo_collected = client._collect_upload_files(str(solo))
+    solo_names = {p.split("\\")[-1].split("/")[-1] for p in solo_collected}
+    assert solo_names == {"Solo Book.m4b", "metadata.json", "cover.jpg"}

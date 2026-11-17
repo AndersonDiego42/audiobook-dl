@@ -15,6 +15,7 @@ import sqlite3
 import sys
 import tempfile
 from collections.abc import Callable, Sequence
+from typing import Any
 from urllib.parse import urlparse
 
 from platformdirs import user_data_dir
@@ -404,8 +405,11 @@ def _dpapi_unprotect(encrypted_bytes: bytes) -> bytes:
     class _DataBlob(ctypes.Structure):
         _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
 
-    crypt32 = ctypes.windll.crypt32  # type: ignore[attr-defined]
-    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    windll: Any = getattr(ctypes, "windll", None)
+    if windll is None:
+        raise BrowserCookieError("DPAPI decryption is only available on Windows.")
+    crypt32 = windll.crypt32
+    kernel32 = windll.kernel32
     in_buf = ctypes.create_string_buffer(encrypted_bytes, len(encrypted_bytes))
     blob_in = _DataBlob(len(encrypted_bytes), ctypes.cast(in_buf, ctypes.POINTER(ctypes.c_char)))
     blob_out = _DataBlob()
@@ -593,8 +597,10 @@ def read_chromium_cookies(
 
 def _try_browser_cookie3(browser: str, target_domains: Sequence[str]) -> list[http.cookiejar.Cookie] | None:
     """Use optional `browser_cookie3` package when installed."""
+    import importlib
+
     try:
-        import browser_cookie3  # type: ignore[import-not-found]
+        browser_cookie3 = importlib.import_module("browser_cookie3")
     except ImportError:
         return None
     loader = getattr(browser_cookie3, browser.lower(), None)

@@ -64,7 +64,7 @@ class LocalAudiobookServer:
 
     Routes can be keyed by `(method, host, path)` or `(method, None, path)`.
     Static byte routes automatically honor HTTP `Range` requests (`206` / `416`)
-    for deterministic `--resume` testing.
+    for deterministic `resume=True` testing.
     """
 
     def __init__(
@@ -87,13 +87,13 @@ class LocalAudiobookServer:
             def log_message(self, format: str, *args: object) -> None:
                 return
 
-            def do_GET(self) -> None:  # noqa: N802
+            def do_GET(self) -> None:
                 parent._dispatch(self, "GET")
 
-            def do_POST(self) -> None:  # noqa: N802
+            def do_POST(self) -> None:
                 parent._dispatch(self, "POST")
 
-            def do_HEAD(self) -> None:  # noqa: N802
+            def do_HEAD(self) -> None:
                 parent._dispatch(self, "HEAD")
 
         self._httpd = ThreadingHTTPServer((host, port), _RequestHandler)

@@ -1,6 +1,6 @@
 from .source import CatalogBook, Source
 from audiobookdl import logging
-from audiobookdl.exceptions import DataNotPresent, NoSourceFound, RequestError
+from audiobookdl.exceptions import DataNotPresent, NoSourceFound, RequestError, UserNotAuthorized
 from audiobookdl.utils import http, read_asset_file
 from audiobookdl.utils.audiobook import (
     Audiobook,
@@ -11,6 +11,7 @@ from audiobookdl.utils.audiobook import (
     Cover,
     Result,
     Series,
+    detect_image_extension,
     parse_language,
     parse_release_date,
 )
@@ -32,6 +33,25 @@ class PodimoSource(Source[dict]):
     _authentication_methods = ["login"]
     supports_search = True
     supports_library = True
+
+    def verify_auth(self, url: str = "") -> bool:
+        has_auth = any(k.lower() == "authorization" for k in self._session.headers)
+        if not self.authenticated and not has_auth:
+            return False
+        try:
+            payload = self.post_json(
+                "https://podimo.com/graphql",
+                headers={"User-Agent": "JS GraphQL"},
+                json={
+                    "operationName": "LibraryQuery",
+                    "query": "query LibraryQuery{userLibrary{audiobooks{id}}}",
+                    "variables": {},
+                },
+            )
+            data = (payload or {}).get("data") if isinstance(payload, dict) else None
+            return isinstance(data, dict) and data.get("userLibrary") is not None
+        except (RequestError, UserNotAuthorized, ValueError):
+            return False
 
     def _login(self, url: str, username: str, password: str) -> None:
         data = self.graphql_request(
@@ -269,7 +289,13 @@ class PodimoSource(Source[dict]):
                 return None
             if response.status_code != 200:
                 raise RequestError
-            return Cover(image=response.content, extension="png")
+            headers = getattr(response, "headers", None) or {}
+            ext = detect_image_extension(
+                response.content,
+                headers.get("Content-Type"),
+                default="png",
+            )
+            return Cover(image=response.content, extension=ext)
         finally:
             session.close()
 

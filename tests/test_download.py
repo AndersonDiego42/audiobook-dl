@@ -706,7 +706,7 @@ def test_single_file_conversion_resume_honors_existing_target_and_intermediate(t
     )
 
     # 1. Final .m4b already exists (non-empty) and intermediate .mp3 was deleted after conversion:
-    #    --resume without --skip-downloaded must NOT prompt, re-download, or reconvert.
+    #    resume=True without skip_downloaded must NOT prompt, re-download, or reconvert.
     final_m4b.write_bytes(b"existing-m4b")
     session_done = MagicMock()
     with (
@@ -725,7 +725,7 @@ def test_single_file_conversion_resume_honors_existing_target_and_intermediate(t
     assert final_m4b.read_bytes() == b"existing-m4b"
 
     # 2. Final .m4b does not exist, intermediate .mp3 already finished downloading:
-    #    --resume skips HTTP download and converts existing .mp3 -> .m4b without prompts.
+    #    resume=True skips HTTP download and converts existing .mp3 -> .m4b without prompts.
     final_m4b.unlink()
     intermediate_mp3.write_bytes(b"cached-mp3")
     session_cached_mp3 = MagicMock()
@@ -753,7 +753,7 @@ def test_single_file_conversion_resume_honors_existing_target_and_intermediate(t
     assert final_m4b.read_bytes() == b"converted-from-cached"
     assert not intermediate_mp3.exists()
 
-    # 3. Empty (0-byte) final .m4b is NOT treated as complete under --resume
+    # 3. Empty (0-byte) final .m4b is NOT treated as complete under resume=True
     final_m4b.write_bytes(b"")
     session_empty = MagicMock()
     session_empty.get.return_value = _mock_response(
@@ -1829,6 +1829,25 @@ def test_download_split_silence_fallback_preserves_probe_cache(tmp_path, monkeyp
     assert str(final_mp3) not in probed_paths
     abs_meta = json.loads((tmp_path / "metadata.json").read_text(encoding="utf-8"))
     assert abs_meta["chapters"][-1]["end"] == 20.0
+
+
+def test_add_metadata_to_dir_respects_write_cover_false(tmp_path):
+    from audiobookdl.output.download import add_metadata_to_dir
+
+    book_dir = tmp_path / "book_out"
+    book_dir.mkdir()
+    ab = Audiobook(
+        session=requests.Session(),
+        metadata=AudiobookMetadata(title="No Cover Book", authors=["Author"]),
+        files=[],
+        cover=Cover(image=b"\xff\xd8\xff\xe0fake-jpeg", extension="jpg"),
+    )
+
+    add_metadata_to_dir(ab, [], str(book_dir), DownloadOptions(write_cover=False))
+    assert not (book_dir / "cover.jpg").exists()
+
+    add_metadata_to_dir(ab, [], str(book_dir), DownloadOptions(write_cover=True))
+    assert (book_dir / "cover.jpg").read_bytes() == b"\xff\xd8\xff\xe0fake-jpeg"
 
 
 

@@ -607,5 +607,71 @@ def test_resolve_effective_source_profile(tmp_path):
     assert resolve_effective_source_profile(cfg, "nextory") == "default"
 
 
+def test_custom_metadata_providers_toml_migration_save_and_delete(tmp_path):
+    from audiobookdl.config import (
+        delete_custom_metadata_provider,
+        save_custom_metadata_provider,
+    )
+    from audiobookdl.credentials import CredentialStore
+
+    class _MemSecureStore(CredentialStore):
+        is_secure = True
+
+        def __init__(self) -> None:
+            self.data: dict[tuple[str, str | None], str] = {}
+
+        def get_password(self, service_key: str, username: str | None) -> str | None:
+            return self.data.get((service_key, username))
+
+        def set_password(self, service_key: str, username: str | None, password: str) -> None:
+            self.data[(service_key, username)] = password
+
+        def delete_password(self, service_key: str, username: str | None) -> None:
+            self.data.pop((service_key, username), None)
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    cfg_path.write_text(
+        "# Keep top comment\n"
+        'enrich_providers = "hardcover,audnexus"\n\n'
+        "[enrichment.custom.hardcover]\n"
+        'url = "https://abs-hardcover.example.com/"\n'
+        'api_key = "hc-plaintext-secret"\n'
+        "enabled = true\n",
+        encoding="utf-8",
+    )
+    store = _MemSecureStore()
+    loaded = load_config(str(cfg_path), credential_store=store)
+    assert loaded.enrich_providers == "custom:hardcover,audnexus"
+    assert "hardcover" in loaded.custom_metadata_providers
+    prov = loaded.custom_metadata_providers["hardcover"]
+    assert prov.url == "https://abs-hardcover.example.com"
+    assert prov.api_key == "hc-plaintext-secret"
+    assert prov.enabled is True
+    toml_after_load = cfg_path.read_text(encoding="utf-8")
+    assert "hc-plaintext-secret" not in toml_after_load
+    assert "# Keep top comment" in toml_after_load
+    assert (
+        store.get_password("metadata_provider:hardcover", "https://abs-hardcover.example.com")
+        == "hc-plaintext-secret"
+    )
+
+    save_custom_metadata_provider(
+        "hardcover",
+        url="https://hardcover-v2.example.com/",
+        enabled=False,
+        overwrite=str(cfg_path),
+        credential_store=store,
+    )
+    reloaded = load_config(str(cfg_path), credential_store=store)
+    assert reloaded.custom_metadata_providers["hardcover"].url == "https://hardcover-v2.example.com"
+    assert reloaded.custom_metadata_providers["hardcover"].enabled is False
+    assert reloaded.custom_metadata_providers["hardcover"].api_key == "hc-plaintext-secret"
+
+    delete_custom_metadata_provider("hardcover", overwrite=str(cfg_path), credential_store=store)
+    after_delete = load_config(str(cfg_path), credential_store=store)
+    assert after_delete.custom_metadata_providers == {}
+    assert store.data == {}
+
+
 
 

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import MutableMapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import escape
 import json
 import mimetypes
 import posixpath
 import re
+import threading
 from typing import Any
 from urllib.parse import quote_plus, urljoin
 import zipfile
@@ -26,6 +28,7 @@ from audiobookdl.exceptions import (
 )
 from audiobookdl.utils.audiobook import (
     clean_html_description,
+    detect_image_extension,
     is_video_extension,
     parse_duration_ms,
     parse_language,
@@ -405,8 +408,7 @@ class OReillySource(Source[str]):
             except RequestError:
                 continue
             if data:
-                ext = "png" if data[:8] == b"\x89PNG\r\n\x1a\n" else "jpg"
-                return Cover(image=data, extension=ext)
+                return Cover(image=data, extension=detect_image_extension(data, default="jpg"))
         return None
 
     @staticmethod
@@ -444,7 +446,8 @@ class OReillySource(Source[str]):
         if needs_kaltura:
             self._get_kaltura_session()
 
-        for idx, entry in enumerate(entries):
+        def _resolve_entry(item: tuple[int, dict[str, Any]]) -> tuple[str, int, list[AudiobookFile]]:
+            idx, entry = item
             title = str(entry.get("title") or entry.get("name") or f"Chapter {idx + 1}").strip()
             dur_ms = _duration_ms_from_entry(entry)
             direct_url = self._direct_audio_url(entry)
@@ -484,7 +487,19 @@ class OReillySource(Source[str]):
                         expected_content_type=_HLS_CONTENT_TYPES,
                         prefer_video=prefer_video,
                     )
+            return title, dur_ms, resolved_segment_files
 
+        indexed_entries = list(enumerate(entries))
+        if len(indexed_entries) > 1:
+            resolved_entries = run_cancellable_pool(
+                _resolve_entry,
+                indexed_entries,
+                max_workers=min(6, len(indexed_entries)),
+            )
+        else:
+            resolved_entries = [_resolve_entry(item) for item in indexed_entries]
+
+        for title, dur_ms, resolved_segment_files in resolved_entries:
             if not resolved_segment_files:
                 continue
             chapter_idx = len(chapters)
@@ -558,23 +573,35 @@ class OReillySource(Source[str]):
         if not download_specs:
             raise BookHasNoEbook
 
-        raw_assets = run_cancellable_pool(
-            lambda spec: self.get(spec[1], headers={"Referer": f"{_BASE_URL}/"}),
-            download_specs,
-            max_workers=min(8, len(download_specs)),
-        )
         member_paths = {spec[0] for spec in download_specs}
         has_container = "META-INF/container.xml" in member_paths
         has_opf = any(p.lower().endswith(".opf") for p in member_paths)
+        asset_specs = [spec for spec in download_specs if spec[0] != "mimetype"]
+        zip_lock = threading.Lock()
 
         with zipfile.ZipFile(dest_path, "w") as zf:
             # Per EPUB Open Container Format spec, `mimetype` must be first and uncompressed.
             zf.writestr("mimetype", b"application/epub+zip", compress_type=zipfile.ZIP_STORED)
 
-            for (rel_path, _url, _mt), content in zip(download_specs, raw_assets, strict=True):
-                if rel_path == "mimetype":
-                    continue
-                zf.writestr(rel_path, content, compress_type=zipfile.ZIP_DEFLATED)
+            if len(asset_specs) <= 1:
+                for rel_path, asset_url, _mt in asset_specs:
+                    content = self.get(asset_url, headers={"Referer": f"{_BASE_URL}/"})
+                    zf.writestr(rel_path, content, compress_type=zipfile.ZIP_DEFLATED)
+            else:
+                with ThreadPoolExecutor(max_workers=min(8, len(asset_specs))) as pool:
+                    futures = {
+                        pool.submit(
+                            self.get,
+                            asset_url,
+                            headers={"Referer": f"{_BASE_URL}/"},
+                        ): rel_path
+                        for rel_path, asset_url, _mt in asset_specs
+                    }
+                    for fut in as_completed(futures):
+                        rel_path = futures[fut]
+                        content = fut.result()
+                        with zip_lock:
+                            zf.writestr(rel_path, content, compress_type=zipfile.ZIP_DEFLATED)
 
             if not has_container:
                 opf_path = next((p for p in member_paths if p.lower().endswith(".opf")), "OEBPS/content.opf")

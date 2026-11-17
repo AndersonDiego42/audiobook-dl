@@ -369,7 +369,7 @@ def test_enrichment_cache_hit_ttl_expiry_and_bypass(tmp_path):
     )
     assert book2.metadata.publisher == "Chilton"
 
-    # Bypassing cache (`use_cache=False`, i.e. --no-enrich-cache) performs fresh HTTP GET
+    # Bypassing cache (`use_cache=False`) performs fresh HTTP GET
     book3 = Audiobook(
         session=requests.Session(),
         metadata=AudiobookMetadata(title="Dune", authors=["Frank Herbert"]),
@@ -502,3 +502,156 @@ def test_enrichment_skips_incapable_providers_for_missing_fields():
     assert all("itunes.apple.com" not in u for u in requested_urls)
     assert all("googleapis.com" not in u for u in requested_urls)
     assert all("openlibrary.org" not in u for u in requested_urls)
+
+
+def test_abs_custom_provider_search_mapping_and_enrichment(tmp_path):
+    from audiobookdl.config import CustomMetadataProviderConfig
+    from audiobookdl.utils.enrichment import (
+        resolve_provider_list,
+        test_custom_metadata_provider,
+    )
+
+    cover_bytes = _make_jpeg_bytes()
+    seen_requests: list[tuple[str, dict[str, Any] | None, dict[str, str]]] = []
+
+    class _CustomProviderSession:
+        def get(self, url, params=None, headers=None, **_kwargs):
+            seen_requests.append((url, params, dict(headers or {})))
+            if url == "https://abs-meta.example.com/search":
+                return _FakeResponse(
+                    json_data={
+                        "matches": [
+                            {
+                                "title": "Project Hail Mary",
+                                "author": "Andy Weir, Co Author",
+                                "narrator": "Ray Porter",
+                                "publisher": "Audible Studios",
+                                "publishedYear": "2021",
+                                "description": "<p>Sci-fi survival story.</p>",
+                                "cover": "https://cdn.example.com/phm.jpg",
+                                "isbn": "9780593135204",
+                                "asin": "B08G9PRS1K",
+                                "genres": ["Science Fiction", "Audiobook"],
+                                "series": [{"series": "Hail Mary Verse", "sequence": "1"}],
+                                "language": "eng",
+                            }
+                        ]
+                    }
+                )
+            if url == "https://cdn.example.com/phm.jpg":
+                return _FakeResponse(content=cover_bytes)
+            return _FakeResponse(status_code=404)
+
+    custom_map = {
+        "hardcover": CustomMetadataProviderConfig(
+            name="hardcover",
+            url="https://abs-meta.example.com",
+            api_key="my-secret-token",
+            enabled=True,
+        ),
+        "disabledsvc": CustomMetadataProviderConfig(
+            name="disabledsvc",
+            url="https://disabled.example.com",
+            enabled=False,
+        ),
+    }
+
+    assert resolve_provider_list(None, custom_providers=custom_map) == (
+        *DEFAULT_PROVIDERS,
+        "custom:hardcover",
+    )
+    assert parse_provider_list("hardcover, audnexus", custom_providers=custom_map) == (
+        "custom:hardcover",
+        "audnexus",
+    )
+    with pytest.raises(ValueError):
+        parse_provider_list("missing_custom", custom_providers=custom_map)
+
+    book = Audiobook(
+        session=requests.Session(),
+        metadata=AudiobookMetadata(title="Project Hail Mary", authors=["Andy Weir"]),
+        files=[],
+    )
+    db_dir = tmp_path / "db"
+    db_dir.mkdir()
+    result = enrich_audiobook_metadata(
+        book,
+        providers=("custom:hardcover", "custom:disabledsvc"),
+        custom_providers=custom_map,
+        session=_CustomProviderSession(),  # type: ignore[arg-type]
+        database_directory=str(db_dir),
+        use_cache=True,
+        include_chapters=False,
+    )
+    assert result.updated is True
+    assert result.providers_used == ["custom:hardcover"]
+    assert result.cover_updated is True
+    assert book.metadata.narrators == ["Ray Porter"]
+    assert book.metadata.series == "Hail Mary Verse"
+    assert book.metadata.series_order == 1
+    assert book.metadata.publisher == "Audible Studios"
+    assert book.metadata.release_date == date(2021, 1, 1)
+    assert book.metadata.asin == "B08G9PRS1K"
+    assert book.metadata.isbn == "9780593135204"
+    assert book.metadata.genres == ["Science Fiction", "Audiobook"]
+    assert book.metadata.authors == ["Andy Weir"]  # existing author preserved
+
+    # Verify AUTHORIZATION header matches ABS OpenAPI spec verbatim (raw key) and query/author params sent
+    search_call = next(r for r in seen_requests if r[0] == "https://abs-meta.example.com/search")
+    assert search_call[1] == {"query": "Project Hail Mary", "author": "Andy Weir"}
+    assert search_call[2]["Authorization"] == "my-secret-token"
+    assert all("disabled.example.com" not in r[0] for r in seen_requests)
+
+    # Probe helper works and surfaces invalid payload cleanly
+    count, summary = test_custom_metadata_provider(
+        "https://abs-meta.example.com/",
+        api_key="my-secret-token",
+        session=_CustomProviderSession(),  # type: ignore[arg-type]
+    )
+    assert count == 1
+    assert "1 sample match" in summary
+
+    class _InvalidJsonSession:
+        def get(self, *_args, **_kwargs):
+            return _FakeResponse(json_data={"unexpected": True})
+
+    with pytest.raises(ValueError, match="matches"):
+        test_custom_metadata_provider(
+            "https://abs-meta.example.com",
+            session=_InvalidJsonSession(),  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.no_worker_cap
+def test_search_enrichment_candidates_runs_concurrently_when_session_is_none(monkeypatch):
+    import threading
+    from audiobookdl.utils import enrichment as enr_mod
+
+    active = 0
+    peak_active = 0
+    lock = threading.Lock()
+    barrier = threading.Barrier(3, timeout=2.0)
+
+    def _fake_query(provider, metadata, **_kwargs):
+        nonlocal active, peak_active
+        with lock:
+            active += 1
+            peak_active = max(peak_active, active)
+        try:
+            barrier.wait()
+            return [
+                EnrichmentCandidate(
+                    provider=provider,
+                    score=0.90,
+                    title=f"{metadata.title}-{provider}",
+                )
+            ]
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(enr_mod, "_query_provider", _fake_query)
+    meta = AudiobookMetadata(title="Dune", authors=["Frank Herbert"])
+    results = search_enrichment_candidates(meta, providers=("itunes", "google", "openlibrary"))
+    assert peak_active >= 2
+    assert [c.provider for c in results] == ["itunes", "google", "openlibrary"]

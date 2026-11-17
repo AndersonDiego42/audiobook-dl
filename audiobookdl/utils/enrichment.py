@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import date
@@ -5,6 +6,7 @@ from difflib import SequenceMatcher
 from io import BytesIO
 import re
 from typing import Any
+from urllib.parse import urlparse
 from collections.abc import Callable, Mapping, Sequence
 
 from PIL import Image
@@ -31,6 +33,7 @@ from audiobookdl.utils.http import DEFAULT_USER_AGENT
 
 
 DEFAULT_PROVIDERS: tuple[str, ...] = ("audnexus", "itunes", "google", "openlibrary")
+CUSTOM_PROVIDER_PREFIX = "custom:"
 PROVIDER_ALIASES: dict[str, str] = {
     "audnexus": "audnexus",
     "audible": "audnexus",
@@ -43,6 +46,8 @@ PROVIDER_ALIASES: dict[str, str] = {
     "ol": "openlibrary",
 }
 DEFAULT_CONFIDENCE_THRESHOLD = 0.65
+
+_CUSTOM_PROVIDER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
 _EDITION_MARKER_RE = re.compile(
     r"\s*(?:\([^)]*\b(?:unabridged|abridged|audiobook|edition|annotated|illustrated)\b[^)]*\)"
@@ -95,8 +100,54 @@ class EnrichmentResult:
 CandidateSelector = Callable[[str, Sequence[EnrichmentCandidate]], int | None]
 
 
-def parse_provider_list(raw: str | None) -> tuple[str, ...]:
-    """Parse a comma-separated provider list into canonical deduplicated provider names."""
+def normalize_custom_provider_name(raw: str) -> str:
+    """Validate and normalize a custom metadata provider slug."""
+    cleaned = str(raw or "").strip().lower()
+    if cleaned.startswith(CUSTOM_PROVIDER_PREFIX):
+        cleaned = cleaned[len(CUSTOM_PROVIDER_PREFIX) :].strip()
+    if not cleaned or not _CUSTOM_PROVIDER_NAME_RE.fullmatch(cleaned):
+        raise ValueError(
+            f"Invalid custom provider name {raw!r}; use lowercase letters, digits, '-' or '_'"
+        )
+    if cleaned in PROVIDER_ALIASES:
+        raise ValueError(
+            f"Custom provider name '{cleaned}' conflicts with built-in provider name"
+        )
+    return cleaned
+
+
+def validate_custom_provider_url(raw: str) -> str:
+    """Validate and normalize a base HTTP(S) URL for an ABS custom metadata provider."""
+    cleaned = str(raw or "").strip().rstrip("/")
+    parsed = urlparse(cleaned)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+        raise ValueError(
+            f"Invalid custom provider URL {raw!r}; expected http:// or https:// URL"
+        )
+    return cleaned
+
+
+def _lookup_custom_provider(
+    slug: str,
+    custom_providers: Mapping[str, Any] | None,
+) -> Any | None:
+    if not custom_providers:
+        return None
+    if slug in custom_providers:
+        return custom_providers[slug]
+    lowered = slug.lower()
+    for key, val in custom_providers.items():
+        if str(key).strip().lower() == lowered:
+            return val
+    return None
+
+
+def parse_provider_list(
+    raw: str | None,
+    *,
+    custom_providers: Mapping[str, Any] | None = None,
+) -> tuple[str, ...]:
+    """Parse a comma-separated provider list into canonical deduplicated provider identifiers."""
     if raw is None or not raw.strip():
         return DEFAULT_PROVIDERS
     resolved: list[str] = []
@@ -107,13 +158,55 @@ def parse_provider_list(raw: str | None) -> tuple[str, ...]:
             continue
         canonical = PROVIDER_ALIASES.get(cleaned)
         if canonical is None:
-            valid = ", ".join(DEFAULT_PROVIDERS)
-            raise ValueError(f"Unknown enrichment provider '{token.strip()}'. Valid providers: {valid}")
+            if cleaned.startswith(CUSTOM_PROVIDER_PREFIX):
+                slug = normalize_custom_provider_name(cleaned)
+                if custom_providers is not None and _lookup_custom_provider(slug, custom_providers) is None:
+                    raise ValueError(
+                        f"Unknown custom enrichment provider '{token.strip()}'. "
+                        f"Configured custom providers: {', '.join(custom_providers.keys()) or 'none'}"
+                    )
+                canonical = f"{CUSTOM_PROVIDER_PREFIX}{slug}"
+            elif custom_providers is not None:
+                slug = cleaned
+                if _lookup_custom_provider(slug, custom_providers) is not None:
+                    canonical = f"{CUSTOM_PROVIDER_PREFIX}{slug}"
+        if canonical is None:
+            valid = list(DEFAULT_PROVIDERS) + [
+                f"{CUSTOM_PROVIDER_PREFIX}{k}" for k in (custom_providers or {})
+            ]
+            raise ValueError(
+                f"Unknown enrichment provider '{token.strip()}'. Valid providers: {', '.join(valid)}"
+            )
         if canonical not in seen:
             seen.add(canonical)
             resolved.append(canonical)
     if not resolved:
         raise ValueError("At least one enrichment provider must be specified")
+    return tuple(resolved)
+
+
+def resolve_provider_list(
+    raw: str | None = None,
+    *,
+    custom_providers: Mapping[str, Any] | None = None,
+) -> tuple[str, ...]:
+    """Return explicit `raw` providers, or `DEFAULT_PROVIDERS` plus enabled custom providers."""
+    if raw is not None and raw.strip():
+        return parse_provider_list(raw, custom_providers=custom_providers)
+    if not custom_providers:
+        return DEFAULT_PROVIDERS
+    resolved: list[str] = list(DEFAULT_PROVIDERS)
+    for key, cfg in custom_providers.items():
+        if not getattr(cfg, "enabled", True):
+            continue
+        name = getattr(cfg, "name", None) or key
+        try:
+            slug = normalize_custom_provider_name(str(name))
+        except ValueError:
+            continue
+        token = f"{CUSTOM_PROVIDER_PREFIX}{slug}"
+        if token not in resolved:
+            resolved.append(token)
     return tuple(resolved)
 
 
@@ -817,6 +910,184 @@ def _query_openlibrary(
     return candidates
 
 
+def _split_people_field(raw: Any) -> list[str]:
+    if isinstance(raw, list):
+        return _extract_names(raw)
+    if not isinstance(raw, str) or not raw.strip():
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+    for part in raw.split(","):
+        cleaned = part.strip()
+        if cleaned and cleaned.lower() not in seen:
+            seen.add(cleaned.lower())
+            names.append(cleaned)
+    return names
+
+
+def _is_http_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.scheme.lower() in ("http", "https") and bool(parsed.netloc)
+
+
+def _parse_abs_custom_match(
+    provider_key: str,
+    match: Mapping[str, Any],
+) -> EnrichmentCandidate | None:
+    title = str(match.get("title") or "").strip()
+    if not title:
+        return None
+    authors = _split_people_field(match.get("author"))
+    narrators = _split_people_field(match.get("narrator"))
+
+    series_name: str | None = None
+    series_order: int | None = None
+    raw_series = match.get("series")
+    if isinstance(raw_series, list):
+        for entry in raw_series:
+            if isinstance(entry, dict):
+                candidate_series = str(entry.get("series") or entry.get("name") or "").strip()
+                if candidate_series:
+                    series_name = candidate_series
+                    series_order = parse_series_order(entry.get("sequence"))
+                    break
+            elif isinstance(entry, str) and entry.strip():
+                series_name = entry.strip()
+                break
+    elif isinstance(raw_series, str) and raw_series.strip():
+        series_name = raw_series.strip()
+
+    raw_genres = match.get("genres")
+    genres: list[str] = []
+    if isinstance(raw_genres, list):
+        seen_genres: set[str] = set()
+        for item in raw_genres:
+            cleaned = str(item or "").strip()
+            if cleaned and cleaned.lower() not in seen_genres:
+                seen_genres.add(cleaned.lower())
+                genres.append(cleaned)
+                if len(genres) >= 5:
+                    break
+
+    raw_cover = str(match.get("cover") or "").strip()
+    cover_url = raw_cover if raw_cover and _is_http_url(raw_cover) else None
+    publisher = str(match.get("publisher") or "").strip() or None
+    description = clean_html_description(match.get("description"), preserve_newlines=True)
+    raw_id = (
+        _clean_asin(match.get("asin"))
+        or _clean_isbn(match.get("isbn"))
+        or str(match.get("id") or "").strip()
+        or None
+    )
+    return EnrichmentCandidate(
+        provider=provider_key,
+        score=0.0,
+        title=title,
+        authors=authors,
+        narrators=narrators,
+        series=series_name,
+        series_order=series_order,
+        genres=genres,
+        language=parse_language(match.get("language")),
+        description=description,
+        isbn=_clean_isbn(match.get("isbn")),
+        asin=_clean_asin(match.get("asin")),
+        publisher=publisher,
+        release_date=parse_release_date(match.get("publishedYear")),
+        cover_url=cover_url,
+        raw_id=raw_id,
+    )
+
+
+def _query_abs_custom_provider(
+    provider_cfg: Any,
+    metadata: AudiobookMetadata,
+    *,
+    session: requests.Session,
+    proxy: str | None = None,
+    timeout: float = 10.0,
+    cache: EnrichmentCache | None = None,
+    use_cache: bool = True,
+    cache_ttl_seconds: float = DEFAULT_CACHE_TTL_SECONDS,
+) -> list[EnrichmentCandidate]:
+    if not getattr(provider_cfg, "enabled", True):
+        return []
+    base_url = validate_custom_provider_url(str(getattr(provider_cfg, "url", "") or ""))
+    slug = normalize_custom_provider_name(str(getattr(provider_cfg, "name", "") or ""))
+    provider_key = f"{CUSTOM_PROVIDER_PREFIX}{slug}"
+
+    query_text = (metadata.title or "").strip() or (metadata.isbn or "").strip() or (metadata.asin or "").strip()
+    if not query_text:
+        return []
+    params: dict[str, Any] = {"query": query_text}
+    if metadata.authors:
+        params["author"] = metadata.authors[0]
+
+    api_key = getattr(provider_cfg, "api_key", None)
+    headers = {"Authorization": str(api_key)} if api_key else None
+    payload = _cached_get_json(
+        session,
+        provider_key,
+        f"{base_url}/search",
+        params=params,
+        headers=headers,
+        proxy=proxy,
+        timeout=timeout,
+        cache=cache,
+        use_cache=use_cache,
+        cache_ttl_seconds=cache_ttl_seconds,
+    )
+    if not isinstance(payload, dict):
+        return []
+    matches = payload.get("matches")
+    if not isinstance(matches, list):
+        return []
+
+    candidates: list[EnrichmentCandidate] = []
+    for item in matches:
+        if not isinstance(item, Mapping):
+            continue
+        cand = _parse_abs_custom_match(provider_key, item)
+        if cand is None:
+            continue
+        cand.score = score_candidate_match(metadata, cand)
+        candidates.append(cand)
+    candidates.sort(key=lambda c: c.score, reverse=True)
+    return candidates
+
+
+def test_custom_metadata_provider(
+    url: str,
+    *,
+    api_key: str | None = None,
+    sample_query: str = "Dune",
+    session: requests.Session | None = None,
+    proxy: str | None = None,
+    timeout: float = 10.0,
+) -> tuple[int, str]:
+    """Probe an ABS-compatible custom metadata provider endpoint and return `(match_count, summary)`."""
+    base_url = validate_custom_provider_url(url)
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    headers = {"User-Agent": DEFAULT_USER_AGENT}
+    if api_key and api_key.strip():
+        headers["Authorization"] = api_key.strip()
+    session_cm = nullcontext(session) if session is not None else requests.Session()
+    with session_cm as sess:
+        resp = sess.get(
+            f"{base_url}/search",
+            params={"query": sample_query},
+            headers=headers,
+            proxies=proxies,
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    if not isinstance(payload, dict) or not isinstance(payload.get("matches"), list):
+        raise ValueError("Provider response JSON must be an object containing a 'matches' array")
+    count = len(payload["matches"])
+    return count, f"Connected ({count} sample match{'es' if count != 1 else ''})"
+
+
 def _query_provider(
     provider: str,
     metadata: AudiobookMetadata,
@@ -828,6 +1099,7 @@ def _query_provider(
     use_cache: bool = True,
     cache_ttl_seconds: float = DEFAULT_CACHE_TTL_SECONDS,
     min_confidence: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    custom_providers: Mapping[str, Any] | None = None,
 ) -> list[EnrichmentCandidate]:
     if provider == "audnexus":
         return _query_audnexus(
@@ -862,6 +1134,21 @@ def _query_provider(
         )
     if provider == "openlibrary":
         return _query_openlibrary(
+            metadata,
+            session=session,
+            proxy=proxy,
+            timeout=timeout,
+            cache=cache,
+            use_cache=use_cache,
+            cache_ttl_seconds=cache_ttl_seconds,
+        )
+    if provider.startswith(CUSTOM_PROVIDER_PREFIX):
+        slug = provider[len(CUSTOM_PROVIDER_PREFIX) :].strip().lower()
+        provider_cfg = _lookup_custom_provider(slug, custom_providers)
+        if provider_cfg is None:
+            raise ValueError(f"Custom enrichment provider '{slug}' is not configured")
+        return _query_abs_custom_provider(
+            provider_cfg,
             metadata,
             session=session,
             proxy=proxy,
@@ -952,6 +1239,29 @@ _PROVIDER_CAPABILITIES: dict[str, frozenset[str]] = {
         "cover",
     }),
 }
+
+
+_ABS_CUSTOM_CAPABILITIES: frozenset[str] = frozenset({
+    "title",
+    "authors",
+    "narrators",
+    "series",
+    "series_order",
+    "genres",
+    "language",
+    "description",
+    "isbn",
+    "asin",
+    "publisher",
+    "release_date",
+    "cover",
+})
+
+
+def _provider_capabilities_for(provider: str) -> frozenset[str] | None:
+    if provider.startswith(CUSTOM_PROVIDER_PREFIX):
+        return _ABS_CUSTOM_CAPABILITIES
+    return _PROVIDER_CAPABILITIES.get(provider)
 
 
 def _missing_enrichment_fields(
@@ -1104,6 +1414,7 @@ def search_enrichment_candidates(
     metadata: AudiobookMetadata,
     *,
     providers: Sequence[str] | None = None,
+    custom_providers: Mapping[str, Any] | None = None,
     session: requests.Session | None = None,
     proxy: str | None = None,
     timeout: float = 10.0,
@@ -1113,7 +1424,11 @@ def search_enrichment_candidates(
     min_confidence: float = DEFAULT_CONFIDENCE_THRESHOLD,
 ) -> list[EnrichmentCandidate]:
     """Query configured providers and return scored `EnrichmentCandidate` entries."""
-    provider_list = tuple(providers) if providers is not None else DEFAULT_PROVIDERS
+    provider_list = (
+        tuple(providers)
+        if providers is not None
+        else resolve_provider_list(None, custom_providers=custom_providers)
+    )
     cache_cm: Any = (
         EnrichmentCache(
             default_enrichment_cache_path(database_directory),
@@ -1123,23 +1438,46 @@ def search_enrichment_candidates(
         if database_directory
         else nullcontext(None)
     )
-    session_cm = nullcontext(session) if session is not None else requests.Session()
     collected: list[EnrichmentCandidate] = []
-    with cache_cm as cache, session_cm as sess:
-        for provider in provider_list:
-            collected.extend(
-                _query_provider(
-                    provider,
-                    metadata,
-                    session=sess,
-                    proxy=proxy,
-                    timeout=timeout,
-                    cache=cache,
-                    use_cache=use_cache,
-                    cache_ttl_seconds=cache_ttl_seconds,
-                    min_confidence=min_confidence,
-                )
-            )
+    with cache_cm as cache:
+        if session is None and len(provider_list) > 1:
+            def _query_worker(prov: str) -> list[EnrichmentCandidate]:
+                with requests.Session() as worker_sess:
+                    return _query_provider(
+                        prov,
+                        metadata,
+                        session=worker_sess,
+                        proxy=proxy,
+                        timeout=timeout,
+                        cache=cache,
+                        use_cache=use_cache,
+                        cache_ttl_seconds=cache_ttl_seconds,
+                        min_confidence=min_confidence,
+                        custom_providers=custom_providers,
+                    )
+
+            with ThreadPoolExecutor(max_workers=min(4, len(provider_list))) as executor:
+                futures = [executor.submit(_query_worker, provider) for provider in provider_list]
+                for future in futures:
+                    collected.extend(future.result())
+        else:
+            session_cm = nullcontext(session) if session is not None else requests.Session()
+            with session_cm as sess:
+                for provider in provider_list:
+                    collected.extend(
+                        _query_provider(
+                            provider,
+                            metadata,
+                            session=sess,
+                            proxy=proxy,
+                            timeout=timeout,
+                            cache=cache,
+                            use_cache=use_cache,
+                            cache_ttl_seconds=cache_ttl_seconds,
+                            min_confidence=min_confidence,
+                            custom_providers=custom_providers,
+                        )
+                    )
     collected.sort(key=lambda c: c.score, reverse=True)
     return collected
 
@@ -1148,6 +1486,7 @@ def enrich_audiobook_metadata(
     audiobook: Audiobook,
     *,
     providers: Sequence[str] | None = None,
+    custom_providers: Mapping[str, Any] | None = None,
     session: requests.Session | None = None,
     proxy: str | None = None,
     timeout: float = 10.0,
@@ -1163,7 +1502,11 @@ def enrich_audiobook_metadata(
     Enrich `audiobook` across `providers` in priority order, filling missing
     metadata, cover art, and chapters without overwriting existing source data.
     """
-    provider_list = tuple(providers) if providers is not None else DEFAULT_PROVIDERS
+    provider_list = (
+        tuple(providers)
+        if providers is not None
+        else resolve_provider_list(None, custom_providers=custom_providers)
+    )
     result = EnrichmentResult()
     if not _has_missing_enrichment_fields(audiobook, include_chapters=include_chapters):
         return result
@@ -1184,7 +1527,7 @@ def enrich_audiobook_metadata(
             missing = _missing_enrichment_fields(audiobook, include_chapters=include_chapters)
             if not missing:
                 break
-            supported = _PROVIDER_CAPABILITIES.get(provider)
+            supported = _provider_capabilities_for(provider)
             if supported is not None and missing.isdisjoint(supported):
                 continue
             candidates = _query_provider(
@@ -1197,6 +1540,7 @@ def enrich_audiobook_metadata(
                 use_cache=use_cache,
                 cache_ttl_seconds=cache_ttl_seconds,
                 min_confidence=min_confidence,
+                custom_providers=custom_providers,
             )
             if not candidates:
                 continue
@@ -1232,6 +1576,8 @@ def enrich_audiobook_metadata(
                 result.fields_updated.extend(f for f in fields if f not in result.fields_updated)
                 result.cover_updated = result.cover_updated or cover_updated
                 result.chapters_updated = result.chapters_updated or chapters_updated
+            if not _has_missing_enrichment_fields(audiobook, include_chapters=include_chapters):
+                break
 
     return result
 

@@ -155,6 +155,7 @@ def atomic_write_text(
     *,
     encoding: str = "utf-8",
     private: bool = False,
+    newline: str | None = None,
 ) -> str:
     """Atomically write `content` to `target_path` via a unique temp file."""
     abs_path = os.path.abspath(target_path)
@@ -167,7 +168,7 @@ def atomic_write_text(
         dir=parent or ".",
     )
     try:
-        with os.fdopen(fd, "w", encoding=encoding) as handle:
+        with os.fdopen(fd, "w", encoding=encoding, newline=newline) as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())

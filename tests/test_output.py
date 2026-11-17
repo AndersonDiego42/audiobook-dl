@@ -260,7 +260,7 @@ def test_combine_audiofiles_sizes_remux_pool_dynamically(tmp_path, monkeypatch):
     )
     assert pool_sizes == [3]
 
-    # 20 files without pre-warmed cache: both pools capped at COMBINE_REMUX_THREADS (16)
+    # 20 files without pre-warmed cache: both pools bounded by resolve_ffmpeg_pool_workers (I/O)
     pool_sizes.clear()
     files_20 = []
     for i in range(20):
@@ -268,7 +268,13 @@ def test_combine_audiofiles_sizes_remux_pool_dynamically(tmp_path, monkeypatch):
         p.write_bytes(b"a")
         files_20.append(str(p))
     combine_audiofiles(files_20, str(tmp_path / "tmp20"), str(tmp_path / "out20.mp3"))
-    assert pool_sizes == [output.COMBINE_REMUX_THREADS, output.COMBINE_REMUX_THREADS]
+    expected_io = output.resolve_ffmpeg_pool_workers(None, cpu_bound=False)
+    assert pool_sizes == [expected_io, expected_io]
+
+    # Explicit max_workers=2 bounds both probe and remux pools
+    pool_sizes.clear()
+    combine_audiofiles(files_20, str(tmp_path / "tmp20_cap"), str(tmp_path / "out20.mp3"), max_workers=2)
+    assert pool_sizes == [2, 2]
 
 
 def test_run_cancellable_subprocess_terminates_child_promptly():
@@ -1430,6 +1436,21 @@ def test_convert_output_reuses_and_updates_probe_cache_without_stale_staged_keys
     assert len(probed) == 2
     assert str(out0) in cache and str(out1) in cache
     assert not any(".tmp." in k for k in cache)
+
+
+def test_resolve_ffmpeg_pool_workers_cpu_and_explicit_caps(monkeypatch):
+    from audiobookdl.output.output import resolve_ffmpeg_pool_workers
+
+    monkeypatch.setattr(output, "COMBINE_REMUX_THREADS", 8)
+    monkeypatch.setattr(output.os, "cpu_count", lambda: 16)
+    assert resolve_ffmpeg_pool_workers(None, cpu_bound=False) == 8
+    assert resolve_ffmpeg_pool_workers(None, cpu_bound=True) == 8
+    assert resolve_ffmpeg_pool_workers(3, cpu_bound=True) == 3
+
+    monkeypatch.setattr(output.os, "cpu_count", lambda: 2)
+    assert resolve_ffmpeg_pool_workers(None, cpu_bound=False) == 4
+    assert resolve_ffmpeg_pool_workers(None, cpu_bound=True) == 2
+    assert resolve_ffmpeg_pool_workers(6, cpu_bound=True) == 2
 
 
 

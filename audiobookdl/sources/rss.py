@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+import json
 import os
 from urllib.parse import urljoin, urlparse
 
@@ -11,7 +13,12 @@ from lxml import etree
 from .source import Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover
 from audiobookdl.exceptions import BookNotFound
-from audiobookdl.utils.audiobook import clean_html_description, parse_duration_ms, parse_language
+from audiobookdl.utils.audiobook import (
+    clean_html_description,
+    detect_image_extension,
+    parse_duration_ms,
+    parse_language,
+)
 
 _AUDIO_MIME_TO_EXT = {
     "audio/mpeg": "mp3",
@@ -60,6 +67,27 @@ def _guess_extension(audio_url: str, mime_type: str | None) -> str:
     return "mp3"
 
 
+def _parse_feed_timestamp(raw: str | None) -> float | None:
+    """Parse RFC 2822 RSS `<pubDate>` or ISO-8601 Atom `<published>`/`<updated>` timestamps."""
+    if not raw:
+        return None
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    try:
+        return parsedate_to_datetime(cleaned).timestamp()
+    except (TypeError, ValueError):
+        pass
+    try:
+        iso_val = cleaned[:-1] + "+00:00" if cleaned.endswith(("Z", "z")) else cleaned
+        dt = datetime.fromisoformat(iso_val)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except ValueError:
+        return None
+
+
 class RssSource(Source):
     """Generic RSS 2.0 / Atom podcast & audiobook XML feed adapter."""
 
@@ -69,9 +97,13 @@ class RssSource(Source):
     supports_library = False
 
     match = [
-        r"https?://[^?#]+\.(?:rss|xml)(?:[?#].*)?$",
-        r"https?://[^?#]+/(?:feed|rss)/?(?:[?#].*)?$",
-        r"https?://[^/]+/[^?#]*[?&](?:format|alt|feed)=rss(?:&|#|$)",
+        r"https?://[^?#]+\.(?:rss|xml|atom)(?:[?#].*)?$",
+        r"https?://[^?#]+/(?:feed|rss|atom)/?(?:[?#].*)?$",
+        r"https?://[^/]+/[^?#]*[?&](?:format|alt|feed)=(?:rss|atom)(?:&|#|$)",
+        r"https?://(?:[^/]+\.)?substack\.com/feed/?(?:[?#].*)?$",
+        r"https?://feeds\.feedburner\.com/[^?#]+",
+        r"https?://feeds\.libsyn\.com/[^?#]+",
+        r"https?://feeds\.(?:megaphone\.fm|simplecast\.com|buzzsprout\.com|transistor\.fm|captivate\.fm|acast\.com|podbean\.com)/[^?#]+",
     ]
 
     def _parse_feed_root(self, xml_bytes: bytes) -> etree._Element:
@@ -90,41 +122,78 @@ class RssSource(Source):
                     href = (_find_child_text(child, ("url",)) or "").strip()
                 if href:
                     abs_url = urljoin(base_url, href)
+                    default_ext = os.path.splitext(urlparse(abs_url).path)[1].lstrip(".").lower() or "jpg"
                     try:
                         img_bytes = self.get(abs_url)
-                        ext = os.path.splitext(urlparse(abs_url).path)[1].lstrip(".").lower() or "jpg"
-                        return Cover(image=img_bytes, extension=ext)
+                        if not img_bytes:
+                            return None
+                        return Cover(
+                            image=img_bytes,
+                            extension=detect_image_extension(img_bytes, default=default_ext),
+                        )
                     except Exception:
                         return None
         return None
+
+    def _fetch_podcast_chapters(self, chapters_url: str) -> list[Chapter]:
+        """Fetch Podcasting 2.0 JSON chapters from `chapters_url` non-fatally."""
+        try:
+            raw = self.get(chapters_url)
+            payload = json.loads(raw.decode("utf-8", errors="replace"))
+        except Exception:
+            return []
+        if not isinstance(payload, dict):
+            return []
+        raw_chapters = payload.get("chapters")
+        if not isinstance(raw_chapters, list):
+            return []
+        parsed: list[Chapter] = []
+        for idx, entry in enumerate(raw_chapters, start=1):
+            if not isinstance(entry, dict):
+                continue
+            start_raw = entry.get("startTime")
+            if start_raw is None:
+                continue
+            try:
+                start_sec = float(start_raw)
+            except (TypeError, ValueError):
+                continue
+            if start_sec < 0:
+                continue
+            title = str(entry.get("title") or f"Chapter {idx}").strip() or f"Chapter {idx}"
+            parsed.append(Chapter(start=round(start_sec * 1000), title=title))
+        return parsed
 
     def _extract_rss_items(
         self,
         channel: etree._Element,
         base_url: str,
-    ) -> list[tuple[str, str, str, int | None, int | None, float | None]]:
-        """Return list of `(url, ext, title, duration_ms, episode_num, pub_ts)`."""
-        episodes: list[tuple[str, str, str, int | None, int | None, float | None]] = []
+    ) -> list[tuple[str, str, str, int | None, int | None, float | None, str | None]]:
+        """Return list of `(url, ext, title, duration_ms, episode_num, pub_ts, chapters_url)`."""
+        episodes: list[tuple[str, str, str, int | None, int | None, float | None, str | None]] = []
         raw_items = [c for c in channel if _local_tag(c) in ("item", "entry")]
         for idx, item in enumerate(raw_items, start=1):
             enclosure_url: str | None = None
             enclosure_type: str | None = None
+            chapters_url: str | None = None
             for child in item:
                 ctag = _local_tag(child)
-                if ctag == "enclosure":
+                if ctag == "chapters":
+                    ch_href = (child.get("url") or "").strip()
+                    ch_type = (child.get("type") or "").split(";", 1)[0].strip().lower()
+                    if ch_href and (not ch_type or "json" in ch_type):
+                        chapters_url = urljoin(base_url, ch_href)
+                elif ctag == "enclosure" and not enclosure_url:
                     enclosure_url = (child.get("url") or "").strip() or None
                     enclosure_type = (child.get("type") or "").strip() or None
-                    break
-                if ctag == "link" and (child.get("rel") or "").lower() == "enclosure":
+                elif ctag == "link" and not enclosure_url and (child.get("rel") or "").lower() == "enclosure":
                     enclosure_url = (child.get("href") or "").strip() or None
                     enclosure_type = (child.get("type") or "").strip() or None
-                    break
-                if ctag == "content" and child.get("url"):
+                elif ctag == "content" and not enclosure_url and child.get("url"):
                     ctype = (child.get("type") or "").lower()
                     if not ctype or ctype.startswith("audio/"):
                         enclosure_url = (child.get("url") or "").strip() or None
                         enclosure_type = ctype or None
-                        break
             if not enclosure_url:
                 continue
             abs_url = urljoin(base_url, enclosure_url)
@@ -139,19 +208,14 @@ class RssSource(Source):
             raw_ep = _find_child_text(item, ("episode",))
             ep_num = int(raw_ep) if (raw_ep and raw_ep.isdigit()) else None
             pub_raw = _find_child_text(item, ("pubdate", "published", "updated"))
-            pub_ts: float | None = None
-            if pub_raw:
-                try:
-                    pub_ts = parsedate_to_datetime(pub_raw).timestamp()
-                except (TypeError, ValueError):
-                    pub_ts = None
-            episodes.append((abs_url, ext, ep_title, duration_ms, ep_num, pub_ts))
+            pub_ts = _parse_feed_timestamp(pub_raw)
+            episodes.append((abs_url, ext, ep_title, duration_ms, ep_num, pub_ts, chapters_url))
         return episodes
 
     def _order_episodes(
         self,
-        episodes: list[tuple[str, str, str, int | None, int | None, float | None]],
-    ) -> list[tuple[str, str, str, int | None, int | None, float | None]]:
+        episodes: list[tuple[str, str, str, int | None, int | None, float | None, str | None]],
+    ) -> list[tuple[str, str, str, int | None, int | None, float | None, str | None]]:
         if len(episodes) <= 1:
             return episodes
         if all(ep[4] is not None for ep in episodes):
@@ -197,10 +261,20 @@ class RssSource(Source):
         chapters: list[Chapter] = []
         running_ms = 0
         all_have_duration = all(ep[3] is not None and ep[3] > 0 for ep in episodes)
-        for ep_url, ext, ep_title, duration_ms, _ep_num, _pub_ts in episodes:
+        for ep_url, ext, ep_title, duration_ms, _ep_num, _pub_ts, ch_url in episodes:
             files.append(AudiobookFile(url=ep_url, ext=ext, title=ep_title))
-            if all_have_duration and duration_ms is not None:
-                chapters.append(Chapter(start=running_ms, title=ep_title))
+            if len(episodes) == 1 and ch_url:
+                chapters.extend(self._fetch_podcast_chapters(ch_url))
+            elif all_have_duration and duration_ms is not None:
+                if ch_url:
+                    ep_chapters = self._fetch_podcast_chapters(ch_url)
+                    if ep_chapters:
+                        for ch in ep_chapters:
+                            chapters.append(Chapter(start=running_ms + ch.start, title=ch.title))
+                    else:
+                        chapters.append(Chapter(start=running_ms, title=ep_title))
+                else:
+                    chapters.append(Chapter(start=running_ms, title=ep_title))
                 running_ms += duration_ms
 
         return Audiobook(

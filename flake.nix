@@ -37,25 +37,27 @@
             setuptools
           ];
 
-          dependencies = with python.pkgs; [
-            attrs
-            cssselect
-            keyring
-            lxml
-            m3u8
-            mutagen
-            openpyxl
-            pillow
-            platformdirs
-            pycountry
-            pycryptodome
-            requests
-            rich
-            tkinter
-            tomli
-            urllib3
-            python-dateutil
-          ];
+          dependencies =
+            (with python.pkgs; [
+              attrs
+              cssselect
+              keyring
+              lxml
+              m3u8
+              mutagen
+              openpyxl
+              pillow
+              platformdirs
+              pycountry
+              pycryptodome
+              requests
+              rich
+              tkinter
+              urllib3
+              python-dateutil
+            ])
+            ++ lib.optionals (python.pythonOlder "3.11") [ python.pkgs.tomli ]
+            ++ lib.optionals (python.pkgs ? curl-cffi) [ python.pkgs.curl-cffi ];
 
           makeWrapperArgs = [
             "--prefix" "PATH" ":" "${lib.makeBinPath [ pkgs.ffmpeg ]}"
@@ -85,7 +87,6 @@
               pycryptodome
               platformdirs
               keyring
-              tomli
               attrs
               pycountry
               urllib3
@@ -102,7 +103,8 @@
               build
               setuptools
               twine
-            ]))
+            ] ++ lib.optionals (ps.python.pythonOlder "3.11") [ ps.tomli ]
+              ++ lib.optionals (ps ? curl-cffi) [ ps.curl-cffi ]))
           ];
 
         };

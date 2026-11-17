@@ -11,7 +11,7 @@ from typing import Any
 from collections.abc import Callable, Sequence
 
 from audiobookdl.options_schema import DownloadOptions
-from audiobookdl.exceptions import AudiobookDLException
+from audiobookdl.exceptions import AudiobookDLException, DownloadCancelled
 from audiobookdl.gui.chapter_editor import ChapterEditorFrame
 from audiobookdl.gui.controller import GuiController, PackJobRequest
 from audiobookdl.gui.formatting import format_duration
@@ -136,8 +136,10 @@ class PackPage(ttk.Frame):
         self._palette = palette or LIGHT_PALETTE
         self._paths: list[str] = []
         self._preview_specs: list[PackBookSpec] = []
-        self._edited_chapters_by_idx: dict[int, list[Chapter]] = {}
-        self._book_overrides_by_idx: dict[int, dict[str, Any]] = {}
+        self._edited_chapters_by_key: dict[str, list[Chapter]] = {}
+        self._book_overrides_by_key: dict[str, dict[str, Any]] = {}
+        self._scan_cancel_event: threading.Event | None = None
+        self._prune_edits_on_scan: bool = False
         self._scan_token = 0
         self._is_scanning = False
         self._cb_queue = MainThreadCallbackQueue(self)
@@ -406,21 +408,49 @@ class PackPage(ttk.Frame):
                 self._append_path(item)
             self._start_scan()
 
+    @staticmethod
+    def _spec_key(spec: PackBookSpec) -> str:
+        root_norm = os.path.normcase(os.path.abspath(spec.source_root))
+        if os.path.isdir(spec.source_root):
+            return root_norm
+        tracks_norm = "|".join(sorted(os.path.normcase(os.path.abspath(p)) for p in spec.track_paths))
+        return f"{root_norm}|{tracks_norm}"
+
+    def _book_key_for_index(self, idx: int | None) -> str | None:
+        if idx is None:
+            return None
+        if 0 <= idx < len(self._preview_specs):
+            return self._spec_key(self._preview_specs[idx])
+        if not self._preview_specs and idx == 0 and len(self._paths) == 1:
+            return os.path.normcase(os.path.abspath(self._paths[0]))
+        return None
+
+    def _cancel_active_scan(self) -> None:
+        if self._scan_cancel_event is not None:
+            self._scan_cancel_event.set()
+            self._scan_cancel_event = None
+
     def _clear_all_paths(self) -> None:
         self._paths.clear()
         self._paths_listbox.delete(0, tk.END)
-        self._invalidate_preview("Add one or more local folders or audio tracks to preview.")
+        self._invalidate_preview(
+            "Add one or more local folders or audio tracks to preview.",
+            clear_edits=True,
+        )
 
-    def _invalidate_preview(self, message: str) -> None:
+    def _invalidate_preview(self, message: str, *, clear_edits: bool = False) -> None:
         self._scan_token += 1
+        self._cancel_active_scan()
         self._is_scanning = False
         self._loading_bar.stop()
         self._loading_bar.grid_remove()
         self._scan_btn.configure(state="normal")
         self._pack_btn.configure(state="normal")
         self._preview_specs.clear()
-        self._edited_chapters_by_idx.clear()
-        self._book_overrides_by_idx.clear()
+        if clear_edits:
+            self._edited_chapters_by_key.clear()
+            self._book_overrides_by_key.clear()
+            self._prune_edits_on_scan = False
         self._chapter_editor.set_chapters([])
         for iid in self._tree.get_children():
             self._tree.delete(iid)
@@ -447,8 +477,9 @@ class PackPage(ttk.Frame):
         if idx is None:
             return
         spec = self._preview_specs[idx]
+        key = self._spec_key(spec)
         dur_ms = round(spec.total_duration_seconds * 1000) if spec.total_duration_seconds > 0 else None
-        chapters = self._edited_chapters_by_idx.get(idx, spec.audiobook.chapters)
+        chapters = self._edited_chapters_by_key.get(key, spec.audiobook.chapters)
         self._chapter_editor.set_chapters(
             chapters,
             total_duration_ms=dur_ms,
@@ -461,10 +492,12 @@ class PackPage(ttk.Frame):
             idx = 0
         if idx is None:
             return
+        spec = self._preview_specs[idx]
+        key = self._spec_key(spec)
         ch_copy = [Chapter(start=ch.start, title=ch.title) for ch in chapters]
-        self._edited_chapters_by_idx[idx] = ch_copy
-        self._preview_specs[idx].audiobook.chapters = ch_copy
-        self._preview_specs[idx].chapters_source = "edited"
+        self._edited_chapters_by_key[key] = ch_copy
+        spec.audiobook.chapters = ch_copy
+        spec.chapters_source = "edited"
         iid = str(idx)
         if self._tree.exists(iid):
             vals = tree_item_values(self._tree, iid)
@@ -477,7 +510,8 @@ class PackPage(ttk.Frame):
         if idx is None:
             return
         spec = self._preview_specs[idx]
-        existing = self._book_overrides_by_idx.get(idx, {})
+        key = self._spec_key(spec)
+        existing = self._book_overrides_by_key.get(key, {})
         dlg = _PackBookEditDialog(
             self,
             title=str(existing.get("title") or spec.audiobook.title),
@@ -498,13 +532,9 @@ class PackPage(ttk.Frame):
         if not (0 <= idx < len(self._preview_specs)):
             return
         spec = self._preview_specs[idx]
-        self._book_overrides_by_idx[idx] = dict(book_ov)
-        if book_ov.get("title"):
-            spec.audiobook.metadata.title = str(book_ov["title"])
-        if "authors" in book_ov:
-            spec.audiobook.metadata.authors = list(book_ov["authors"])
-        if "series_order" in book_ov:
-            spec.audiobook.metadata.series_order = book_ov["series_order"]
+        key = self._spec_key(spec)
+        self._book_overrides_by_key[key] = dict(book_ov)
+        self._apply_saved_edits_to_spec(spec)
         if len(self._preview_specs) == 1:
             self.title_var.set(str(book_ov.get("title") or ""))
             self.author_var.set("; ".join(book_ov.get("authors") or []))
@@ -517,6 +547,22 @@ class PackPage(ttk.Frame):
                 vals[0] = spec.audiobook.title
                 vals[1] = spec.audiobook.metadata.author or "(Unknown)"
                 self._tree.item(iid, values=tuple(vals))
+
+    def _apply_saved_edits_to_spec(self, spec: PackBookSpec) -> None:
+        """Reapply any saved per-book overrides or chapter edits onto `spec`."""
+        key = self._spec_key(spec)
+        raw_chapters = self._edited_chapters_by_key.get(key)
+        if raw_chapters is not None:
+            spec.audiobook.chapters = [Chapter(start=ch.start, title=ch.title) for ch in raw_chapters]
+            spec.chapters_source = "edited"
+        book_ov = self._book_overrides_by_key.get(key)
+        if book_ov:
+            if book_ov.get("title"):
+                spec.audiobook.metadata.title = str(book_ov["title"])
+            if "authors" in book_ov:
+                spec.audiobook.metadata.authors = list(book_ov["authors"])
+            if "series_order" in book_ov:
+                spec.audiobook.metadata.series_order = book_ov["series_order"]
 
     def _on_scan_option_changed(self) -> None:
         if self._paths:
@@ -532,8 +578,12 @@ class PackPage(ttk.Frame):
             self._paths_listbox.delete(idx)
             del self._paths[idx]
         if not self._paths:
-            self._invalidate_preview("Add one or more local folders or audio tracks to preview.")
+            self._invalidate_preview(
+                "Add one or more local folders or audio tracks to preview.",
+                clear_edits=True,
+            )
         else:
+            self._prune_edits_on_scan = True
             self._start_scan()
 
     def _browse_cover(self) -> None:
@@ -567,7 +617,8 @@ class PackPage(ttk.Frame):
         if raw_lang and parse_language(raw_lang) is None:
             raise ValueError(f"Unrecognized language {raw_lang!r}")
         description = self.description_var.get().strip() or None
-        raw_chapters = self._edited_chapters_by_idx.get(book_idx) if book_idx is not None else None
+        book_key = self._book_key_for_index(book_idx)
+        raw_chapters = self._edited_chapters_by_key.get(book_key) if book_key is not None else None
         chapters = (
             [Chapter(start=ch.start, title=ch.title) for ch in raw_chapters]
             if raw_chapters is not None
@@ -614,8 +665,9 @@ class PackPage(ttk.Frame):
         base_overrides: PackOverrides | None,
         idx: int,
     ) -> PackOverrides | None:
-        raw_chapters = self._edited_chapters_by_idx.get(idx)
-        book_ov = self._book_overrides_by_idx.get(idx)
+        book_key = self._book_key_for_index(idx)
+        raw_chapters = self._edited_chapters_by_key.get(book_key) if book_key is not None else None
+        book_ov = self._book_overrides_by_key.get(book_key) if book_key is not None else None
         if raw_chapters is None and not book_ov:
             return base_overrides
         merged = (
@@ -662,6 +714,9 @@ class PackPage(ttk.Frame):
 
         self._scan_token += 1
         token = self._scan_token
+        self._cancel_active_scan()
+        cancel_event = threading.Event()
+        self._scan_cancel_event = cancel_event
         self._is_scanning = True
         self._scan_btn.configure(state="disabled")
         self._pack_btn.configure(state="disabled")
@@ -673,10 +728,13 @@ class PackPage(ttk.Frame):
         recursive = self.recursive_var.get()
         output_dir = self._output_dir_provider()
         self._output_label_var.set(f"Output folder: {output_dir}")
+
         def _apply(s: list[PackBookSpec] | None, e: str | None) -> None:
             if not self.winfo_exists() or token != self._scan_token:
                 return
             self._is_scanning = False
+            if self._scan_cancel_event is cancel_event:
+                self._scan_cancel_event = None
             self._loading_bar.stop()
             self._loading_bar.grid_remove()
             self._scan_btn.configure(state="normal")
@@ -685,15 +743,21 @@ class PackPage(ttk.Frame):
                 self._tree.delete(iid)
             if e is not None:
                 self._preview_specs.clear()
-                self._edited_chapters_by_idx.clear()
-                self._book_overrides_by_idx.clear()
                 self._scrolled_tree.set_empty_state(True, f"Scan error: {e}")
                 self.status_var.set(f"Scan error: {e}")
                 return
-            self._edited_chapters_by_idx.clear()
-            self._book_overrides_by_idx.clear()
             self._preview_specs = s or []
+            if self._prune_edits_on_scan:
+                active_keys = {self._spec_key(spec) for spec in self._preview_specs}
+                self._edited_chapters_by_key = {
+                    k: v for k, v in self._edited_chapters_by_key.items() if k in active_keys
+                }
+                self._book_overrides_by_key = {
+                    k: v for k, v in self._book_overrides_by_key.items() if k in active_keys
+                }
+                self._prune_edits_on_scan = False
             for idx, spec in enumerate(self._preview_specs):
+                self._apply_saved_edits_to_spec(spec)
                 dur = format_duration(spec.total_duration_seconds) if spec.total_duration_seconds > 0 else "-"
                 self._tree.insert(
                     "",
@@ -724,6 +788,7 @@ class PackPage(ttk.Frame):
         def _worker() -> None:
             specs: list[PackBookSpec] | None = None
             err: str | None = None
+            cancelled = False
             try:
                 specs = self._controller.inspect_local_pack_preview(
                     paths_snapshot,
@@ -731,13 +796,18 @@ class PackPage(ttk.Frame):
                     recursive=recursive,
                     output_dir=output_dir,
                     overrides=overrides,
+                    cancel_event=cancel_event,
                 )
+            except DownloadCancelled:
+                cancelled = True
             except AudiobookDLException as exc:
                 err = exc.error_description
             except Exception as exc:
                 err = str(exc)
             finally:
                 def _post_scan() -> None:
+                    if cancelled:
+                        return
                     _apply(specs, err)
 
                 self._cb_queue.post(_post_scan)
@@ -779,7 +849,7 @@ class PackPage(ttk.Frame):
             batch_overrides = scope_overrides_for_batch(overrides, len(self._preview_specs))
             requests = []
             for idx, spec in enumerate(self._preview_specs):
-                book_ov = self._book_overrides_by_idx.get(idx)
+                book_ov = self._book_overrides_by_key.get(self._spec_key(spec))
                 label = str((book_ov or {}).get("title") or spec.audiobook.title)
                 requests.append(
                     PackJobRequest(
@@ -793,7 +863,8 @@ class PackPage(ttk.Frame):
                     )
                 )
         else:
-            book_ov = self._book_overrides_by_idx.get(0)
+            single_key = self._book_key_for_index(0)
+            book_ov = self._book_overrides_by_key.get(single_key) if single_key is not None else None
             label = str(
                 (book_ov or {}).get("title")
                 or (
@@ -808,11 +879,7 @@ class PackPage(ttk.Frame):
                     recursive=recursive,
                     delete_source=delete_source,
                     output_dir=output_dir,
-                    overrides=(
-                        self._merge_book_overrides(overrides, 0)
-                        if 0 in self._book_overrides_by_idx
-                        else overrides
-                    ),
+                    overrides=self._merge_book_overrides(overrides, 0),
                     label=label,
                     output_format=fmt,
                 )

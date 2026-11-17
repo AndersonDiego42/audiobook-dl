@@ -41,7 +41,7 @@ def _sanitize_nodeid(nodeid: str) -> str:
 
 @dataclass
 class SubprocessRecord:
-    """Captured details for a single CLI or GUI subprocess invocation."""
+    """Captured details for a single GUI or tool subprocess invocation."""
 
     command: list[str]
     cwd: str

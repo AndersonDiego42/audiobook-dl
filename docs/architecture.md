@@ -100,7 +100,7 @@ Source adapters subclass `Source` ([`audiobookdl/sources/source/__init__.py`](..
 - `_authentication_methods` (`"cookies"`, `"login"`, or `[]`) and `login_data`
 - `supports_search` / `search(query)` and `supports_library` / `list_library()`
 
-[`audiobookdl/sources/__init__.py`](../audiobookdl/sources/__init__.py) combines the 16 built-in `_BUILTIN_SOURCES` with external plugins registered under the `audiobookdl.sources` `importlib.metadata` entry point group. For HTTP requests, `networking.py` supports standard `requests.Session` as well as optional TLS/HTTP2 browser fingerprint impersonation via `curl_cffi` (`--impersonate`).
+[`audiobookdl/sources/__init__.py`](../audiobookdl/sources/__init__.py) combines the 17 built-in `_BUILTIN_SOURCES` with external plugins registered under the `audiobookdl.sources` `importlib.metadata` entry point group. For HTTP requests, `networking.py` supports standard `requests.Session` as well as optional TLS/HTTP2 browser fingerprint impersonation via `curl_cffi` (`impersonate`).
 
 ## Configuration, Credentials & State Layout
 
@@ -129,5 +129,5 @@ flowchart LR
     CFGFILE --> Data
 ```
 
-- **Comment-Preserving Config Updates**: [`audiobookdl/config.py`](../audiobookdl/config.py) updates existing keys in place when saving GUI/output preferences or migrating legacy plaintext passwords, retaining `#` comments and unknown sections.
+- **Comment-Preserving Config Updates**: [`audiobookdl/config.py`](../audiobookdl/config.py) updates existing keys in place when saving GUI/output preferences, `[audiobookshelf]`, `[enrichment.custom.<name>]` custom metadata providers (with vaulted `api_key` secrets), or migrating legacy plaintext passwords, retaining `#` comments and unknown sections.
 - **SQLite Library Ledger (`downloads.db`)**: Schema version 2 tracks entries across `downloads` (with `source`, `profile`, `book_key`, `status` in `'downloaded' | 'pending' | 'trashed'`, `output_path`, `isbn`, `asin`, `series`, etc.) normalized alongside `item_tags` (including the reserved `'hidden'` tag).

@@ -105,32 +105,43 @@ class _JobOptionsDialog(ModalDialog):
             parent,
             "Edit Job Options",
             palette=palette,
-            default_size=(420, 270),
-            min_size=(380, 240),
+            default_size=(460, 380),
+            min_size=(400, 340),
             resizable=(True, False),
         )
         self.result: tuple[str, dict[str, Any]] | None = None
 
         ov = record.get("job_overrides")
         ov_map: Mapping[str, Any] = ov if isinstance(ov, Mapping) else {}
+        pack_req = record.get("pack_request")
+        pack_map: Mapping[str, Any] = pack_req if isinstance(pack_req, Mapping) else {}
+        is_pack = record.get("job_kind", "download") == "pack"
 
         profile_values = [DEFAULT_PROFILE] + [p for p in profiles if p and p != DEFAULT_PROFILE]
         cur_prof = str(record.get("profile") or DEFAULT_PROFILE).strip().lower() or DEFAULT_PROFILE
         if cur_prof not in profile_values:
             profile_values.append(cur_prof)
 
-        raw_fmt = str(ov_map.get("output_format") or "Original").strip()
+        raw_fmt = str(ov_map.get("output_format") or pack_map.get("output_format") or "Original").strip()
         cur_fmt = raw_fmt if raw_fmt in GUI_OUTPUT_FORMATS else "Original"
         raw_media = str(ov_map.get("media_type") or "auto").strip().lower()
         cur_media = raw_media.capitalize() if raw_media in ("auto", "audiobook", "ebook", "both") else "Auto"
         if cur_media not in GUI_MEDIA_TYPE_OPTIONS:
             cur_media = "Auto"
+        cur_bitrate = str(ov_map.get("audio_bitrate") or "").strip()
+        raw_skip = ov_map.get("skip_downloaded")
+        cur_skip = "On" if raw_skip is True else ("Off" if raw_skip is False else "Default")
 
         self._profile_var = tk.StringVar(value=cur_prof)
         self._format_var = tk.StringVar(value=cur_fmt)
         self._media_var = tk.StringVar(value=cur_media)
+        self._bitrate_var = tk.StringVar(value=cur_bitrate)
+        self._skip_dl_var = tk.StringVar(value=cur_skip)
         self._combine_var = tk.BooleanVar(value=bool(ov_map.get("combine", False)))
         self._split_var = tk.BooleanVar(value=bool(ov_map.get("split_chapters", False)))
+        self._overwrite_var = tk.BooleanVar(value=bool(ov_map.get("overwrite", False)))
+        self._write_abs_var = tk.BooleanVar(value=bool(ov_map.get("write_abs_metadata", False)))
+        self._upload_abs_var = tk.BooleanVar(value=bool(ov_map.get("upload_to_abs", False)))
 
         body = ttk.Frame(self, padding=scale_px(self, 14))
         body.pack(fill=tk.BOTH, expand=True)
@@ -141,52 +152,94 @@ class _JobOptionsDialog(ModalDialog):
             body,
             textvariable=self._profile_var,
             values=profile_values,
-            state="normal",
+            state="disabled" if is_pack else "normal",
         )
         prof_combo.grid(row=0, column=1, sticky="ew", pady=4)
 
         ttk.Label(body, text="Output Format:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Combobox(
+        fmt_combo = ttk.Combobox(
             body,
             textvariable=self._format_var,
             values=GUI_OUTPUT_FORMATS,
             state="readonly",
-        ).grid(row=1, column=1, sticky="ew", pady=4)
+        )
+        fmt_combo.grid(row=1, column=1, sticky="ew", pady=4)
 
         ttk.Label(body, text="Media Type:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Combobox(
             body,
             textvariable=self._media_var,
             values=GUI_MEDIA_TYPE_OPTIONS,
-            state="readonly",
+            state="disabled" if is_pack else "readonly",
         ).grid(row=2, column=1, sticky="ew", pady=4)
 
+        ttk.Label(body, text="Audio Bitrate:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Combobox(
+            body,
+            textvariable=self._bitrate_var,
+            values=("", "64k", "96k", "128k", "192k", "256k", "320k"),
+            state="normal",
+        ).grid(row=3, column=1, sticky="ew", pady=4)
+
+        ttk.Label(body, text="Skip Downloaded:").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Combobox(
+            body,
+            textvariable=self._skip_dl_var,
+            values=("Default", "On", "Off"),
+            state="disabled" if is_pack else "readonly",
+        ).grid(row=4, column=1, sticky="ew", pady=4)
+
         toggles = ttk.Frame(body)
-        toggles.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 4))
-        ttk.Checkbutton(toggles, text="Combine parts", variable=self._combine_var).pack(
+        toggles.grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 2))
+        ttk.Checkbutton(
+            toggles,
+            text="Combine parts",
+            variable=self._combine_var,
+            state="disabled" if is_pack else "normal",
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Checkbutton(
+            toggles,
+            text="Split chapters",
+            variable=self._split_var,
+            state="disabled" if is_pack else "normal",
+        ).pack(side=tk.LEFT)
+
+        toggles2 = ttk.Frame(body)
+        toggles2.grid(row=6, column=0, columnspan=2, sticky="w", pady=(2, 4))
+        ttk.Checkbutton(toggles2, text="Overwrite", variable=self._overwrite_var).pack(
             side=tk.LEFT, padx=(0, 12)
         )
-        ttk.Checkbutton(toggles, text="Split chapters", variable=self._split_var).pack(
+        ttk.Checkbutton(toggles2, text="Write ABS metadata", variable=self._write_abs_var).pack(
+            side=tk.LEFT, padx=(0, 12)
+        )
+        ttk.Checkbutton(toggles2, text="Upload to ABS", variable=self._upload_abs_var).pack(
             side=tk.LEFT
         )
 
         btns = ttk.Frame(body)
-        btns.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        btns.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         ttk.Button(btns, text="Save", command=self._save, style="Accent.TButton").pack(side=tk.RIGHT)
         ttk.Button(btns, text="Cancel", command=self.destroy).pack(side=tk.RIGHT, padx=(0, 6))
 
-        self.finalize_modal(initial_focus=prof_combo)
+        self.finalize_modal(initial_focus=fmt_combo if is_pack else prof_combo)
 
     def _save(self) -> None:
         prof = (self._profile_var.get() or DEFAULT_PROFILE).strip().lower() or DEFAULT_PROFILE
         fmt_raw = self._format_var.get().strip()
         fmt = None if fmt_raw in ("", "Original") else fmt_raw
         media = (self._media_var.get() or "Auto").strip().lower()
+        bitrate = (self._bitrate_var.get() or "").strip() or None
+        skip_dl = {"On": True, "Off": False}.get(self._skip_dl_var.get(), None)
         overrides: dict[str, Any] = {
             "output_format": fmt,
-            "combine": bool(self._combine_var.get()),
-            "split_chapters": bool(self._split_var.get()),
+            "combine": self._combine_var.get(),
+            "split_chapters": self._split_var.get(),
             "media_type": media,
+            "audio_bitrate": bitrate,
+            "overwrite": self._overwrite_var.get(),
+            "skip_downloaded": skip_dl,
+            "write_abs_metadata": self._write_abs_var.get(),
+            "upload_to_abs": self._upload_abs_var.get(),
         }
         self.result = (prof, overrides)
         self.destroy()
@@ -265,9 +318,9 @@ class JobInspectorDialog(ModalDialog):
             ttk.Button(btns, text="Copy Path", command=self._copy_path).pack(
                 side=tk.LEFT, padx=(0, 6)
             )
-        can_edit = bool(
+        can_edit = (
             on_save_options is not None
-            and record.get("job_kind", "download") == "download"
+            and record.get("job_kind", "download") in ("download", "pack")
             and str(record.get("status") or "") in self._EDITABLE_STATUSES
         )
         self._edit_btn = ttk.Button(
@@ -407,6 +460,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
         self.queue_filter_var = tk.StringVar(value="All")
         self.queue_search_var = tk.StringVar(value="")
         self._queue_order: list[str] = []
+        self._detached_iids: set[str] = set()
         self._drag_job_id: str | None = None
         self._drag_start_y: int | None = None
         self._drag_hover_iid: str | None = None
@@ -1052,18 +1106,51 @@ class ActivityQueuePanel(ttk.LabelFrame):
                 return False
         return True
 
-    def _apply_queue_filter(self) -> None:
+    def _sync_single_row_visibility(
+        self,
+        job_id: str,
+        rec: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.queue_tree.exists(job_id):
+            self._detached_iids.discard(job_id)
+            return
+        if rec is None:
+            rec = self._controller.get_queue_record(job_id)
+        if self._queue_record_matches_filter(rec):
+            if job_id in self._detached_iids:
+                pos = 0
+                for iid in self._queue_order:
+                    if iid == job_id:
+                        break
+                    if iid not in self._detached_iids and self.queue_tree.exists(iid):
+                        pos += 1
+                self.queue_tree.reattach(job_id, "", pos)
+                self._detached_iids.discard(job_id)
+        elif job_id not in self._detached_iids:
+            self.queue_tree.detach(job_id)
+            self._detached_iids.add(job_id)
+
+    def _apply_queue_filter(self, *, force_reorder: bool = False) -> None:
         self._cancel_after("_queue_filter_after_id")
-        pos = 0
-        for iid in list(self._queue_order):
-            if not self.queue_tree.exists(iid):
-                continue
-            rec = self._controller.get_queue_record(iid)
-            if self._queue_record_matches_filter(rec):
-                self.queue_tree.reattach(iid, "", pos)
-                pos += 1
-            else:
-                self.queue_tree.detach(iid)
+        is_unfiltered = (
+            (self.queue_filter_var.get() or "All") == "All"
+            and not (self.queue_search_var.get() or "").strip()
+        )
+        if not is_unfiltered or self._detached_iids or force_reorder:
+            pos = 0
+            for iid in list(self._queue_order):
+                if not self.queue_tree.exists(iid):
+                    self._detached_iids.discard(iid)
+                    continue
+                rec = self._controller.get_queue_record(iid)
+                if self._queue_record_matches_filter(rec):
+                    if iid in self._detached_iids or not is_unfiltered or force_reorder:
+                        self.queue_tree.reattach(iid, "", pos)
+                        self._detached_iids.discard(iid)
+                    pos += 1
+                elif iid not in self._detached_iids:
+                    self.queue_tree.detach(iid)
+                    self._detached_iids.add(iid)
         self._refresh_queue_empty_and_badge()
 
     def _refresh_queue_empty_and_badge(self) -> None:
@@ -1124,7 +1211,8 @@ class ActivityQueuePanel(ttk.LabelFrame):
             values=self.format_queue_row_values(rec),
             tags=self._status_tag(str(rec.get("status") or "")),
         )
-        self._apply_queue_filter()
+        self._sync_single_row_visibility(job.job_id, rec)
+        self._refresh_queue_empty_and_badge()
 
     def update_queue_row(self, job_id: str, status: str, detail: str = "") -> None:
         rec = self._controller.update_queue_record(job_id, status, detail)
@@ -1136,7 +1224,8 @@ class ActivityQueuePanel(ttk.LabelFrame):
                 values=self.format_queue_row_values(rec),
                 tags=self._status_tag(status),
             )
-        self._apply_queue_filter()
+        self._sync_single_row_visibility(job_id, rec)
+        self._refresh_queue_empty_and_badge()
 
     def update_queue_row_metadata(
         self,
@@ -1272,7 +1361,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
         if len(records) != 1:
             return
         rec = records[0]
-        if rec.get("job_kind", "download") != "download":
+        if rec.get("job_kind", "download") not in ("download", "pack"):
             return
         if str(rec.get("status") or "") not in JobInspectorDialog._EDITABLE_STATUSES:
             return
@@ -1403,7 +1492,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
             and single.get("job_kind", "download") == "download"
             and single.get("url")
         )
-        can_send = bool(
+        can_send = (
             self._on_send_to_urls is not None
             and any(rec.get("job_kind", "download") == "download" and rec.get("url") for rec in records)
         )
@@ -1417,9 +1506,9 @@ class ActivityQueuePanel(ttk.LabelFrame):
             for iid in self.queue_tree.get_children()
         )
 
-        can_edit_job = bool(
+        can_edit_job = (
             single is not None
-            and single.get("job_kind", "download") == "download"
+            and single.get("job_kind", "download") in ("download", "pack")
             and str(single.get("status") or "") in JobInspectorDialog._EDITABLE_STATUSES
         )
         can_change_profile = bool(
@@ -1474,6 +1563,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
                 latest_total = new_total
             if self.queue_tree.exists(job_id):
                 self.queue_tree.delete(job_id)
+            self._detached_iids.discard(job_id)
             if job_id in self._queue_order:
                 self._queue_order.remove(job_id)
         if latest_total is not None:
@@ -1500,7 +1590,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
             ia = self._queue_order.index(job_id)
             ib = self._queue_order.index(neighbor_id)
             self._queue_order[ia], self._queue_order[ib] = self._queue_order[ib], self._queue_order[ia]
-        self._apply_queue_filter()
+        self._apply_queue_filter(force_reorder=True)
         if self.queue_tree.exists(job_id):
             self.queue_tree.see(job_id)
 
@@ -1511,7 +1601,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
         self._queue_order = [
             next(it) if jid in pending_set else jid for jid in self._queue_order
         ]
-        self._apply_queue_filter()
+        self._apply_queue_filter(force_reorder=True)
 
     def move_selected_to_edge(self, *, to_top: bool) -> None:
         selected = self.queue_tree.selection()
@@ -1580,6 +1670,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
         for iid in self._controller.clear_completed_records(list(self._queue_order)):
             if self.queue_tree.exists(iid):
                 self.queue_tree.delete(iid)
+            self._detached_iids.discard(iid)
             if iid in self._queue_order:
                 self._queue_order.remove(iid)
         self._refresh_queue_empty_and_badge()
@@ -1589,7 +1680,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
         if isinstance(item, LogEvent):
             level, message = item.level, item.message
             prefix = f"[{level}] " if level in ("DEBUG", "ERROR") else ""
-            self.append_log_batch([(str(level), f"{prefix}{message}")])
+            self.append_log_batch([(level, f"{prefix}{message}")])
             if level == "INFO" and message.strip():
                 self.status_var.set(message.strip().splitlines()[0][:80])
                 self._update_stage_from_message(message)
@@ -1599,9 +1690,9 @@ class ActivityQueuePanel(ttk.LabelFrame):
             last_info = ""
             for level, message in item.entries:
                 prefix = f"[{level}] " if level in ("DEBUG", "ERROR") else ""
-                formatted.append((str(level), f"{prefix}{message}"))
-                if level == "INFO" and str(message).strip():
-                    last_info = str(message)
+                formatted.append((level, f"{prefix}{message}"))
+                if level == "INFO" and message.strip():
+                    last_info = message
             self.append_log_batch(formatted)
             if last_info:
                 self.status_var.set(last_info.strip().splitlines()[0][:80])
@@ -1615,7 +1706,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
                 self.ui_book_total = 0
                 self.stage_var.set("Stage: Fetching metadata")
                 if item.target_url:
-                    self.active_job_var.set(str(item.target_url).strip()[:60])
+                    self.active_job_var.set(item.target_url.strip()[:60])
                 self.refresh_batch_label()
             return True
         if isinstance(item, JobStatusEvent):
@@ -1638,14 +1729,14 @@ class ActivityQueuePanel(ttk.LabelFrame):
                 output_path=item.output_path or None,
             )
             if item.title:
-                self.active_job_var.set(str(item.title).strip()[:60])
+                self.active_job_var.set(item.title.strip()[:60])
             return True
         if isinstance(item, ItemProgressEvent):
             if item.run_id == self.current_ui_run_id:
                 self.ui_book_index = item.current
                 self.ui_book_total = item.total
                 if item.title:
-                    self.active_job_var.set(str(item.title).strip()[:60])
+                    self.active_job_var.set(item.title.strip()[:60])
                 self.refresh_batch_label()
             return True
         if isinstance(item, ProgressStartEvent):

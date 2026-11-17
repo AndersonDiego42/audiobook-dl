@@ -447,7 +447,7 @@ def test_oreilly_video_mode_and_format_preserve_video_stream(tmp_path):
         source.request = _request  # type: ignore[method-assign,assignment]
         source.get = _get  # type: ignore[method-assign,assignment]
 
-    # Explicit `--media-type video` chooses video stream and resolves `.mp4` even with default/audio format
+    # Explicit `media_type="video"` chooses video stream and resolves `.mp4` even with default/audio format
     src_video = OReillySource(_opts(tmp_path, media_type="video"))
     _wire(src_video)
     res_video = src_video.download("https://learning.oreilly.com/videos/python-video-course/9780134567890/")
@@ -587,4 +587,66 @@ def test_real_ffmpeg_video_course_combines_and_merges_per_lesson_mp4(tmp_path):
         assert linfo.video_codec_name == "h264"
         assert linfo.codec_name == "aac"
         assert 1.5 <= linfo.duration <= 2.5
+
+
+@pytest.mark.no_worker_cap
+def test_oreilly_parallel_kaltura_preserves_order_and_streaming_epub_zip(tmp_path):
+    import threading
+    from unittest.mock import MagicMock
+    import zipfile
+    from audiobookdl import AudiobookFile
+    from audiobookdl.sources.oreilly import OReillySource
+
+    src = OReillySource(_opts(tmp_path))
+    raw_entries = [
+        {"title": f"Ch {i}", "duration": 10 + i, "kaltura_entry_id": f"k_{i}"}
+        for i in range(6)
+    ]
+    src._fetch_chapters_raw = lambda _urn, _info: raw_entries  # type: ignore[method-assign]
+
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+    barrier = threading.Barrier(4, timeout=2.0)
+
+    def _fake_resolve(manifest_url: str, **_kwargs):
+        nonlocal active, peak
+        entry_id = manifest_url.rsplit("/", 1)[-1].split(".")[0]
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            if entry_id in {"k_0", "k_1", "k_2", "k_3"}:
+                barrier.wait()
+            return [AudiobookFile(url=f"https://cdn.example.com/{entry_id}.mp4", ext="mp4")]
+        finally:
+            with lock:
+                active -= 1
+
+    src._get_kaltura_session = lambda: ("fake_ks", 12345)  # type: ignore[method-assign]
+    src._kaltura_manifest_url = lambda eid: f"https://cdn.example.com/{eid}.m3u8"  # type: ignore[method-assign]
+    src.get_stream_files = _fake_resolve  # type: ignore[method-assign]
+    files, chapters = src._resolve_audio_files_and_chapters("9780000000001", {"title": "Parallel Book"})
+    assert peak >= 2
+    assert [f.url for f in files] == [f"https://cdn.example.com/k_{i}.mp4" for i in range(6)]
+    assert [c.title for c in chapters] == [f"Ch {i}" for i in range(6)]
+
+    # Streaming EPUB zip archive assembly preserves all files & mimetype
+    epub_dest = tmp_path / "out.epub"
+    epub_info = {"files": "https://learning.oreilly.com/api/v2/epubs/urn:orm:book:9780000000001/files/"}
+    src._fetch_paginated_results = lambda _url: [  # type: ignore[method-assign]
+        {"full_path": "META-INF/container.xml", "url": "https://cdn.example.com/container.xml"},
+        {"full_path": "OEBPS/content.opf", "url": "https://cdn.example.com/content.opf"},
+        {"full_path": "OEBPS/ch01.xhtml", "url": "https://cdn.example.com/ch01.xhtml"},
+    ]
+
+    def _fake_get_asset(url, **_kwargs):
+        return MagicMock(status_code=200, content=f"<data url='{url}'/>".encode())
+
+    src._session.get = MagicMock(side_effect=_fake_get_asset)
+    src._write_epub_archive("9780000000001", epub_info, str(epub_dest))
+    assert epub_dest.is_file()
+    with zipfile.ZipFile(epub_dest, "r") as zf:
+        names = set(zf.namelist())
+        assert {"mimetype", "META-INF/container.xml", "OEBPS/content.opf", "OEBPS/ch01.xhtml"} <= names
 

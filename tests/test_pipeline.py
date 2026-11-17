@@ -211,7 +211,7 @@ def test_apply_runtime_options_merges_resume_and_audio_bitrate():
     assert opts.resume is True
     assert opts.audio_bitrate == "192k"
 
-    # Explicit "auto" CLI override beats config audio_bitrate
+    # Explicit "auto" option override beats config audio_bitrate
     opts_auto = build_default_options(audio_bitrate="auto")
     apply_runtime_options(opts_auto, cfg)
     assert opts_auto.audio_bitrate == "auto"
@@ -986,17 +986,19 @@ def test_fetch_metadata_and_process_url_close_owned_source_sessions(tmp_path, mo
 
 
 def test_post_exec_hook_injects_metadata_env_vars(tmp_path):
+    import subprocess
     from unittest.mock import patch
-    from audiobookdl.pipeline import run_post_exec_hook
+    from audiobookdl.pipeline import DEFAULT_POST_EXEC_TIMEOUT, run_post_exec_hook
 
-    # run_post_exec_hook injects AUDIOBOOK_DL_* environment variables
+    # run_post_exec_hook injects AUDIOBOOK_DL_* environment variables and passes timeout/capture_output
     captured_env = {}
 
-    def fake_subproc_run(cmd, shell=False, env=None, check=False):
+    def fake_subproc_run(cmd, shell=False, env=None, check=False, **kwargs):
         captured_env["cmd"] = cmd
         captured_env["shell"] = shell
         captured_env["env"] = dict(env or {})
-        return type("_R", (), {"returncode": 0})()
+        captured_env["kwargs"] = kwargs
+        return type("_R", (), {"returncode": 0, "stdout": "ok\n", "stderr": ""})()
 
     with patch("audiobookdl.pipeline.subprocess.run", side_effect=fake_subproc_run):
         rc = run_post_exec_hook(
@@ -1007,10 +1009,53 @@ def test_post_exec_hook_injects_metadata_env_vars(tmp_path):
         )
     assert rc == 0
     assert captured_env["cmd"] == "notify-hook"
+    assert captured_env["kwargs"]["timeout"] == DEFAULT_POST_EXEC_TIMEOUT
+    assert captured_env["kwargs"]["capture_output"] is True
+    assert captured_env["kwargs"]["text"] is True
     assert captured_env["env"]["AUDIOBOOK_DL_TITLE"] == "Hook Book"
     assert captured_env["env"]["AUDIOBOOK_DL_AUTHOR"] == "Hook Author"
     assert captured_env["env"]["AUDIOBOOK_DL_FORMAT"] == "m4b"
     assert captured_env["env"]["AUDIOBOOK_DL_SOURCE"] == "librivox"
+
+    # Timeout and nonzero stderr are logged cleanly and return None / nonzero without crashing
+    logged: list[str] = []
+    with (
+        patch(
+            "audiobookdl.pipeline.subprocess.run",
+            side_effect=subprocess.TimeoutExpired("notify-hook", 1.5, stderr=b"hung"),
+        ),
+        patch("audiobookdl.pipeline.logging.error", side_effect=logged.append),
+    ):
+        assert (
+            run_post_exec_hook(
+                "notify-hook",
+                output_path=str(tmp_path / "Book.m4b"),
+                metadata=AudiobookMetadata(title="Hook Book"),
+                audio_format="m4b",
+                timeout=1.5,
+            )
+            is None
+        )
+    assert any("timed out" in msg for msg in logged)
+
+    logged.clear()
+    with (
+        patch(
+            "audiobookdl.pipeline.subprocess.run",
+            return_value=type("_R", (), {"returncode": 2, "stdout": "", "stderr": "boom"})(),
+        ),
+        patch("audiobookdl.pipeline.logging.error", side_effect=logged.append),
+    ):
+        assert (
+            run_post_exec_hook(
+                "notify-hook",
+                output_path=str(tmp_path / "Book.m4b"),
+                metadata=AudiobookMetadata(title="Hook Book"),
+                audio_format="m4b",
+            )
+            == 2
+        )
+    assert any("boom" in msg for msg in logged)
 
 
 def test_source_impersonate_session_and_cookie_bridge(tmp_path, monkeypatch):
@@ -1107,6 +1152,95 @@ def test_source_impersonate_session_and_cookie_bridge(tmp_path, monkeypatch):
         src.close()
     assert src._session.closed is True
     assert child.closed is True
+
+
+def test_process_audiobook_uses_custom_metadata_provider_from_config(tmp_path):
+    from unittest.mock import MagicMock, patch
+
+    from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata
+    from audiobookdl.config import CustomMetadataProviderConfig, structure_config
+    from audiobookdl.pipeline import process_audiobook
+    from audiobookdl.utils.enrichment import EnrichmentResult
+
+    captured: dict[str, Any] = {}
+
+    def fake_enrich(audiobook, **kwargs):
+        captured["providers"] = kwargs.get("providers")
+        captured["custom_providers"] = kwargs.get("custom_providers")
+        audiobook.metadata.narrators = ["Custom Narrator"]
+        return EnrichmentResult(
+            updated=True,
+            providers_used=["custom:hardcover"],
+            fields_updated=["narrators"],
+        )
+
+    cfg = structure_config(
+        str(tmp_path / "audiobook-dl.toml"),
+        {
+            "enrich_metadata": True,
+            "enrich_providers": "hardcover",
+            "enrichment": {
+                "custom": {
+                    "hardcover": {
+                        "url": "https://hc.example.com",
+                        "api_key": "tok",
+                        "enabled": True,
+                    }
+                }
+            },
+        },
+        credential_store=None,
+    )
+    src = MagicMock()
+    src.name = "librivox"
+    src._session = MagicMock()
+    book = Audiobook(
+        session=src._session,
+        metadata=AudiobookMetadata(title="Custom Enrich Book"),
+        files=[AudiobookFile(url="https://example.com/a.mp3", ext="mp3")],
+    )
+    opts = build_default_options(
+        output_template=str(tmp_path / "{title}"),
+        enrich_metadata=True,
+        enrich_providers="hardcover",
+    )
+    with (
+        patch("audiobookdl.pipeline.enrich_audiobook_metadata", side_effect=fake_enrich),
+        patch("audiobookdl.pipeline.download"),
+    ):
+        process_audiobook(src, book, opts, config=cfg)
+
+    assert captured["providers"] == ("custom:hardcover",)
+    assert isinstance(captured["custom_providers"], dict)
+    assert isinstance(captured["custom_providers"]["hardcover"], CustomMetadataProviderConfig)
+    assert book.metadata.narrators == ["Custom Narrator"]
+
+
+def test_downloader_session_pool_isolates_profiles_and_closes(tmp_path):
+    from audiobookdl.config import structure_config
+    from audiobookdl.pipeline import Downloader, _resolve_pool_key
+    from audiobookdl.sources.librivox import LibrivoxSource
+
+    opts1 = build_default_options(output_template=str(tmp_path / "{title}"), profile="work")
+    opts2 = build_default_options(output_template=str(tmp_path / "{title}"), profile="personal")
+    cfg = structure_config(str(tmp_path / "audiobook-dl.toml"), {}, credential_store=None)
+
+    k1 = _resolve_pool_key(LibrivoxSource, opts1, cfg)
+    k2 = _resolve_pool_key(LibrivoxSource, opts2, cfg)
+    assert k1 != k2
+
+    closed_flags: list[bool] = []
+    with Downloader(options=opts1, config=cfg) as dl:
+        pool = dl._effective_session_pool()
+        sess1 = requests.Session()
+        orig_close = sess1.close
+        sess1.close = lambda: (closed_flags.append(True), orig_close())[1]  # type: ignore[method-assign]
+        pool[k1] = sess1
+        pool[k2] = requests.Session()
+        assert pool[k1] is not pool[k2]
+
+    assert closed_flags == [True]
+    assert dl._owned_session_pool == {}
 
 
 

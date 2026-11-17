@@ -92,3 +92,109 @@ def test_winget_helpers(monkeypatch):
     assert winget_available() is False
     ok_missing, _ = install_ffmpeg_via_winget()
     assert ok_missing is False
+
+
+def test_check_for_updates_cache_ttl_etag_and_winget_subprocess_kwargs(tmp_path, monkeypatch):
+    import subprocess
+
+    cache_file = tmp_path / "update_check.json"
+    calls: list[dict] = []
+
+    class _Resp:
+        def __init__(self, status_code: int, payload: dict | None = None, headers: dict | None = None) -> None:
+            self.status_code = status_code
+            self._payload = payload or {}
+            self.headers = headers or {}
+
+        def json(self) -> dict:
+            return self._payload
+
+    class _CacheSession:
+        def __init__(self) -> None:
+            self._step = 0
+
+        def get(self, url, **kwargs):
+            calls.append({"url": url, "headers": dict(kwargs.get("headers") or {})})
+            self._step += 1
+            if self._step == 1:
+                return _Resp(
+                    200,
+                    {"tag_name": "v2.0.0", "html_url": "https://github.com/example/releases/v2.0.0"},
+                    headers={"ETag": '"etag-v2"'},
+                )
+            if self._step == 2:
+                assert kwargs["headers"].get("If-None-Match") == '"etag-v2"'
+                return _Resp(304)
+            return _Resp(
+                200,
+                {"tag_name": "v3.0.0", "html_url": "https://github.com/example/releases/v3.0.0"},
+                headers={"ETag": '"etag-v3"'},
+            )
+
+    sess = _CacheSession()
+    info1 = check_for_updates(
+        current_version="1.0.0",
+        session=sess,  # type: ignore[arg-type]
+        respect_opt_out=False,
+        cache_path=str(cache_file),
+        cache_ttl_seconds=3600.0,
+        now=1000.0,
+    )
+    assert info1 is not None and info1.latest_version == "2.0.0" and info1.has_update is True
+    assert len(calls) == 1
+
+    # Within TTL and force=False -> returns cached result with 0 network calls
+    info2 = check_for_updates(
+        current_version="2.0.0",
+        session=sess,  # type: ignore[arg-type]
+        respect_opt_out=False,
+        cache_path=str(cache_file),
+        cache_ttl_seconds=3600.0,
+        now=2000.0,
+    )
+    assert info2 is not None and info2.latest_version == "2.0.0" and info2.has_update is False
+    assert len(calls) == 1
+
+    # Expired TTL with HTTP 304 refreshes cache without failing
+    info3 = check_for_updates(
+        current_version="1.0.0",
+        session=sess,  # type: ignore[arg-type]
+        respect_opt_out=False,
+        cache_path=str(cache_file),
+        cache_ttl_seconds=3600.0,
+        now=5000.0,
+    )
+    assert info3 is not None and info3.latest_version == "2.0.0" and info3.has_update is True
+    assert len(calls) == 2
+
+    # force=True bypasses cache and omits conditional If-None-Match
+    info4 = check_for_updates(
+        current_version="1.0.0",
+        session=sess,  # type: ignore[arg-type]
+        respect_opt_out=False,
+        cache_path=str(cache_file),
+        cache_ttl_seconds=3600.0,
+        force=True,
+        now=5100.0,
+    )
+    assert info4 is not None and info4.latest_version == "3.0.0"
+    assert len(calls) == 3
+    assert "If-None-Match" not in calls[-1]["headers"]
+
+    # install_ffmpeg_via_winget passes creationflags via subprocess_kwargs when CREATE_NO_WINDOW exists
+    captured_run_kwargs: list[dict] = []
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr("audiobookdl.utils.updater.shutil.which", lambda _n: "winget.exe")
+    monkeypatch.setattr(
+        "audiobookdl.utils.updater.subprocess_kwargs",
+        lambda capture_output=True: {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)},
+    )
+
+    def _capture_run(*_a, **kw):
+        captured_run_kwargs.append(kw)
+        return MagicMock(returncode=0, stderr="", stdout="ok")
+
+    monkeypatch.setattr("audiobookdl.utils.updater.subprocess.run", _capture_run)
+    ok_winget, _ = install_ffmpeg_via_winget()
+    assert ok_winget is True
+    assert "creationflags" in captured_run_kwargs[0]

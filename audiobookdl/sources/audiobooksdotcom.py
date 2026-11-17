@@ -10,7 +10,7 @@ from audiobookdl import (
     Series,
     logging,
 )
-from audiobookdl.exceptions import DataNotPresent, GenericAudiobookDLException, NoSourceFound
+from audiobookdl.exceptions import DataNotPresent, GenericAudiobookDLException, NoSourceFound, RequestError, UserNotAuthorized
 from audiobookdl.utils.audiobook import parse_duration_ms
 from audiobookdl.utils.http import DEFAULT_USER_AGENT, extract_session_cookies
 from rich.markup import escape
@@ -43,6 +43,31 @@ class AudiobooksdotcomSource(Source):
     ]
     names = ["audiobooks.com"]
     supports_library = True
+
+    def verify_auth(self, url: str = "") -> bool:
+        if not self._session.cookies and not self.authenticated:
+            return False
+        if self._get_ci_session_cookie():
+            self._apply_cookie_user_agent()
+        try:
+            resp = self.request(
+                "GET",
+                "https://www.audiobooks.com/browse/library",
+                allow_redirects=False,
+            )
+        except (RequestError, UserNotAuthorized):
+            return False
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = (resp.headers.get("location") or resp.headers.get("Location") or "").lower()
+            return not any(tok in location for tok in ("login", "signin", "sign-in"))
+        if resp.status_code in (401, 403) or resp.status_code != 200:
+            return False
+        if "/login" in (getattr(resp, "url", "") or "").lower():
+            return False
+        body = (getattr(resp, "content", b"") or b"").decode("utf-8", errors="replace").lower()
+        if ("sign in" in body or "log in" in body) and 'div class="book"' not in body:
+            return False
+        return True
 
     def download(self, url: str) -> Result:
         path = parse_url(url).path
@@ -300,14 +325,17 @@ class AudiobooksdotcomSource(Source):
             chapters.append(Chapter(start=start_ms, title=ch_title))
         return chapters
 
-    def download_cover(self, scrape_url: str) -> Cover:
-        raw_cover_url = self.find_elem_in_page(
-            scrape_url,
-            "img.bookimage",
-            data="src",
-        )
+    def download_cover(self, scrape_url: str) -> Cover | None:
+        try:
+            raw_cover_url = self.find_elem_in_page(
+                scrape_url,
+                "img.bookimage",
+                data="src",
+            )
+        except DataNotPresent:
+            return None
         cover_url = urljoin(scrape_url, raw_cover_url)
-        return Cover(self.get(cover_url), "jpg")
+        return self.fetch_cover_safe(cover_url)
 
     def _get_ci_session_cookie(self) -> str | None:
         fallback: str | None = None

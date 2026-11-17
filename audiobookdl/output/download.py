@@ -69,7 +69,7 @@ def download(
     Download contents of audiobook
 
     :param audiobook: Audiobook to download
-    :param options: Cli options
+    :param options: Runtime download options
     :param interaction: Optional handler for confirmation prompts
     :param cancel_event: Optional event checked to cancel download
     """
@@ -320,6 +320,7 @@ def download_audiobook(
             else None
         )
 
+        max_workers = getattr(options, "max_workers", None)
         if splitting and segment_groups is not None:
             filepaths = output.merge_segment_groups_into_chapters(
                 segment_groups,
@@ -329,6 +330,7 @@ def download_audiobook(
                 audio_bitrate=options.audio_bitrate,
                 probe_cache=probe_cache,
                 preserve_video=video,
+                max_workers=max_workers,
                 **audio_filter_kwargs,
             )
             current_format = output_format
@@ -354,6 +356,7 @@ def download_audiobook(
                         audio_bitrate=options.audio_bitrate,
                         probe_cache=probe_cache,
                         preserve_video=video,
+                        max_workers=max_workers,
                         **audio_filter_kwargs,
                     )
                     if not audiobook.chapters and may_silence_chapters:
@@ -377,6 +380,7 @@ def download_audiobook(
                             audio_bitrate=options.audio_bitrate,
                             probe_cache=probe_cache,
                             preserve_video=video,
+                            max_workers=max_workers,
                         )
                         for src_part in filepaths:
                             if src_part not in split_result and os.path.exists(src_part):
@@ -402,6 +406,7 @@ def download_audiobook(
                     audio_bitrate=options.audio_bitrate,
                     probe_cache=probe_cache,
                     preserve_video=video,
+                    max_workers=max_workers,
                     **audio_filter_kwargs,
                 )
                 if src_single not in filepaths and os.path.exists(src_single):
@@ -432,6 +437,7 @@ def download_audiobook(
                     probe_cache=probe_cache,
                     faststart=True,
                     preserve_video=video,
+                    max_workers=max_workers,
                     **audio_filter_kwargs,
                 )
                 staged_key = staged_combined_path
@@ -466,6 +472,7 @@ def download_audiobook(
                 audio_bitrate=options.audio_bitrate,
                 probe_cache=probe_cache,
                 preserve_video=video,
+                max_workers=max_workers,
                 **audio_filter_kwargs,
             )
             current_format = output_format
@@ -484,6 +491,7 @@ def download_audiobook(
                 audio_bitrate=options.audio_bitrate,
                 probe_cache=probe_cache,
                 preserve_video=video,
+                max_workers=max_workers,
                 **audio_filter_kwargs,
             )
             current_format = output_format
@@ -516,6 +524,7 @@ def download_audiobook(
                     audio_bitrate=options.audio_bitrate,
                     probe_cache=probe_cache,
                     preserve_video=video,
+                    max_workers=max_workers,
                     **audio_filter_kwargs,
                 )
         if cancel_event is not None and cancel_event.is_set():
@@ -640,7 +649,7 @@ def _resolve_abs_sidecar_path(filepath: str, metadata_obj: AudiobookMetadata) ->
         logging.log(
             f"[yellow]Warning:[/yellow] Shared output directory detected at '{parent_dir}'; "
             f"writing '{stem}.metadata.json' instead of overwriting 'metadata.json'. "
-            "Use per-book folders (e.g. '--output-preset audiobookshelf')."
+            "Use per-book folders (e.g. the 'Audiobookshelf' naming preset)."
         )
         return os.path.join(parent_dir, f"{stem}.metadata.json")
     return default_path
@@ -660,7 +669,7 @@ def add_metadata_to_file(
 
     :param audiobook: Audiobook object. Stores metadata
     :param filepath: Filepath of output file
-    :options: Cli options
+    :param options: Runtime download options
     """
     ebook_file = is_ebook_extension(os.path.splitext(filepath)[1])
     needs_chapters = (
@@ -780,7 +789,7 @@ def add_metadata_to_dir(
     :param audiobook: Audiobook object. Stores metadata
     :param filepaths: Iterable over filepaths of output files
     :param output_dir: Directory where files are stored
-    :param options: Cli options
+    :param options: Runtime download options
     """
     logging.book_update("Adding metadata")
     file_list = list(filepaths)
@@ -803,7 +812,7 @@ def add_metadata_to_dir(
         if audiobook.cover is not None and not embedded_cover:
             metadata.embed_cover(filepath, audiobook.cover)
     cover_sidecar_name: str | None = None
-    if audiobook.cover:
+    if audiobook.cover and options.write_cover:
         logging.book_update("Adding cover")
         cover_sidecar_name = f"cover.{audiobook.cover.extension}"
         cover_path = os.path.join(output_dir, cover_sidecar_name)
@@ -852,7 +861,7 @@ def download_files_with_cli_output(
     probe_cache: dict[str, Any] | None = None,
 ) -> list[str]:
     """
-    Download `audiobook` with cli progress bar
+    Download `audiobook` tracks with active job progress reporting
 
     :param audiobook: Audiobook to download
     :param output_dir: Output directory where files are downloaded to

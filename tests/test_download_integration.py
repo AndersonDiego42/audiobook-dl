@@ -70,7 +70,7 @@ class _CookieGatedMediaHandler(BaseHTTPRequestHandler):
     expected_header: tuple[str, str] = ("", "")
     recorded_requests: list[tuple[str, str, str]] = []
 
-    def log_message(self, format: str, *args) -> None:  # noqa: A002
+    def log_message(self, format: str, *args) -> None:
         return
 
     def do_GET(self) -> None:
@@ -434,7 +434,7 @@ def test_downloader_multipart_convert_output_m4b_integration(tmp_path):
     }
 
     class _MultipartHandler(BaseHTTPRequestHandler):
-        def log_message(self, format: str, *args) -> None:  # noqa: A002
+        def log_message(self, format: str, *args) -> None:
             return
 
         def do_GET(self) -> None:

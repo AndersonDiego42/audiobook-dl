@@ -48,6 +48,18 @@ class LibrofmSource(Source):
         self._access_token: str | None = None
         self._library_cache: list[dict[str, Any]] | None = None
 
+    def verify_auth(self, url: str = "") -> bool:
+        has_auth = bool(self._access_token) or any(
+            k.lower() == "authorization" for k in self._session.headers
+        )
+        if not self.authenticated and not has_auth:
+            return False
+        try:
+            payload = self.get_json("https://libro.fm/api/v7/library?page=1")
+            return isinstance(payload, dict)
+        except (RequestError, UserNotAuthorized, ValueError):
+            return False
+
     def _login(self, url: str, username: str, password: str) -> None:
         resp = self.request(
             "POST",
@@ -229,12 +241,8 @@ class LibrofmSource(Source):
         cover: Cover | None = None
         cover_url = info.get("cover_url") or manifest.get("cover_url")
         if isinstance(cover_url, str) and cover_url.strip():
-            try:
-                cover_data = self.get(cover_url.strip())
-                cover_ext = os.path.splitext(urlparse(cover_url).path)[1].lstrip(".").lower() or "jpg"
-                cover = Cover(image=cover_data, extension=cover_ext)
-            except Exception:
-                cover = None
+            default_ext = os.path.splitext(urlparse(cover_url).path)[1].lstrip(".").lower() or "jpg"
+            cover = self.fetch_cover_safe(cover_url, default_ext=default_ext)
 
         return Audiobook(
             session=self._session,

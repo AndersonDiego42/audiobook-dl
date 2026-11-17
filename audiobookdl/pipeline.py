@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 import os
 import subprocess
@@ -6,7 +8,7 @@ import threading
 import time
 import weakref
 from typing import Any
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 
 import requests
 
@@ -37,7 +39,9 @@ from .exceptions import (
 )
 from .output.download import download
 from .sources import find_compatible_source, find_source_by_name
-from .sources.source import CatalogBook, Source
+from .sources.source import CatalogBook, Source, bind_pooled_session
+from .utils import subprocess_kwargs
+from .utils.http import create_configured_http_session
 from .utils.archive import DownloadArchive, default_archive_path, make_book_key
 from .utils.audiobook import (
     Audiobook,
@@ -50,7 +54,7 @@ from .utils.enrichment import (
     EnrichmentCandidate,
     EnrichmentResult,
     enrich_audiobook_metadata,
-    parse_provider_list,
+    resolve_provider_list,
     resolve_redirect_url,
 )
 
@@ -82,17 +86,23 @@ class DownloadSummary:
         }
 
 
+DEFAULT_POST_EXEC_TIMEOUT = 300.0
+
+
 def run_post_exec_hook(
     command: str | None,
     *,
     output_path: str,
     metadata: Any,
     audio_format: str | None,
+    timeout: float | None = DEFAULT_POST_EXEC_TIMEOUT,
 ) -> int | None:
     """
-    Execute user-configured `--post-exec` command with `AUDIOBOOK_DL_*` environment variables.
+    Execute user-configured `post_exec` command with `AUDIOBOOK_DL_*` environment variables.
 
-    Logs warnings on failure without failing an already-completed audiobook download.
+    Uses a bounded timeout (`DEFAULT_POST_EXEC_TIMEOUT` = 300s), suppresses Windows console
+    windows, captures stdout/stderr into the application log, and logs failures without
+    failing an already-completed audiobook download.
     """
     if not command or not str(command).strip():
         return None
@@ -108,12 +118,45 @@ def run_post_exec_hook(
         }
     )
     try:
-        completed = subprocess.run(cmd, shell=True, env=env, check=False)
-    except OSError as exc:
-        logging.error(f"--post-exec hook failed to start ({cmd}): {exc}")
+        completed = subprocess.run(
+            cmd,
+            shell=True,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            **subprocess_kwargs(capture_output=True),
+        )
+    except subprocess.TimeoutExpired as exc:
+        logging.error(
+            f"post_exec hook timed out after {timeout}s ({cmd})"
+            if timeout is not None
+            else f"post_exec hook timed out ({cmd})"
+        )
+        stderr_raw = getattr(exc, "stderr", None)
+        if stderr_raw:
+            stderr_txt = (
+                stderr_raw.decode("utf-8", errors="replace")
+                if isinstance(stderr_raw, bytes)
+                else str(stderr_raw)
+            ).strip()
+            if stderr_txt:
+                logging.debug(f"post_exec stderr before timeout: {stderr_txt}")
         return None
+    except OSError as exc:
+        logging.error(f"post_exec hook failed to start ({cmd}): {exc}")
+        return None
+
+    stdout_txt = (getattr(completed, "stdout", None) or "").strip()
+    stderr_txt = (getattr(completed, "stderr", None) or "").strip()
+    if stdout_txt:
+        logging.log(f"post_exec stdout: {stdout_txt}")
     if completed.returncode != 0:
-        logging.error(f"--post-exec hook exited with code {completed.returncode}: {cmd}")
+        detail = f" — {stderr_txt}" if stderr_txt else ""
+        logging.error(f"post_exec hook exited with code {completed.returncode}: {cmd}{detail}")
+    elif stderr_txt:
+        logging.debug(f"post_exec stderr: {stderr_txt}")
     return completed.returncode
 
 
@@ -224,6 +267,86 @@ def _pause_between_books(delay: float, cancel_event: threading.Event | None) -> 
         time.sleep(delay)
 
 
+SessionPoolKey = tuple[str, str, str, str, str]
+SessionPool = dict[SessionPoolKey, Any]
+_ACTIVE_SESSION_POOL: ContextVar[SessionPool | None] = ContextVar(
+    "audiobookdl_active_session_pool",
+    default=None,
+)
+
+
+@contextmanager
+def session_pool_scope(pool: SessionPool | None) -> Iterator[None]:
+    """Bind a per-run HTTP session pool for `Downloader` / `prepare_source_result` calls."""
+    if pool is None:
+        yield
+        return
+    token = _ACTIVE_SESSION_POOL.set(pool)
+    try:
+        yield
+    finally:
+        _ACTIVE_SESSION_POOL.reset(token)
+
+
+def close_session_pool(pool: SessionPool | None) -> None:
+    """Close and clear all pooled HTTP sessions without raising."""
+    if not pool:
+        return
+    for session in list(pool.values()):
+        close_fn = getattr(session, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                pass
+    pool.clear()
+
+
+def _close_downloader_sessions(
+    http_session: Any,
+    session_pool: SessionPool,
+) -> None:
+    close_fn = getattr(http_session, "close", None)
+    if callable(close_fn):
+        try:
+            close_fn()
+        except Exception:
+            pass
+    close_session_pool(session_pool)
+
+
+def _resolve_pool_key(
+    source_class: type[Source[Any]],
+    options: DownloadOptions,
+    config: Config,
+) -> SessionPoolKey:
+    names = getattr(source_class, "names", ())
+    service_key = names[0].lower() if names else source_class.__name__.lower()
+    explicit_inline_creds = bool(
+        getattr(options, "username", None)
+        or getattr(options, "password", None)
+        or getattr(options, "cookie_file", None)
+    )
+    requested_profile = getattr(options, "profile", None)
+    if explicit_inline_creds and not (requested_profile and str(requested_profile).strip()):
+        eff_profile = DEFAULT_PROFILE
+    else:
+        eff_profile = resolve_effective_source_profile(
+            config,
+            service_key,
+            requested_profile,
+            aliases=names,
+        )
+    impersonate = (getattr(options, "impersonate", None) or "").strip()
+    proxy = (getattr(options, "proxy", None) or getattr(config, "proxy", None) or "").strip()
+    inline_scope = (
+        f"{getattr(options, 'username', None) or ''}|{getattr(options, 'cookie_file', None) or ''}"
+        if explicit_inline_creds
+        else ""
+    )
+    return (service_key, eff_profile, impersonate, proxy, inline_scope)
+
+
 class Downloader:
     """
     Programmatic client for authenticating, fetching metadata, and downloading audiobooks.
@@ -262,11 +385,22 @@ class Downloader:
             self.sink = _EventLogSink(on_event)
         else:
             self.sink = None
-        self._http_session = requests.Session()
-        self._http_session_finalizer = weakref.finalize(self, self._http_session.close)
+        proxy = getattr(self.options, "proxy", None) or getattr(self.config, "proxy", None)
+        self._http_session = create_configured_http_session(self.options, proxy=proxy)
+        self._owned_session_pool: SessionPool = {}
+        self._http_session_finalizer = weakref.finalize(
+            self,
+            _close_downloader_sessions,
+            self._http_session,
+            self._owned_session_pool,
+        )
+
+    def _effective_session_pool(self) -> SessionPool:
+        active = _ACTIVE_SESSION_POOL.get()
+        return active if active is not None else self._owned_session_pool
 
     def close(self) -> None:
-        """Close the shared HTTP session held by this `Downloader`."""
+        """Close the shared HTTP session and any pooled source sessions held by this `Downloader`."""
         self._http_session_finalizer()
 
     def __enter__(self) -> "Downloader":
@@ -293,6 +427,7 @@ class Downloader:
                 interaction=self.interaction,
                 cancel_event=self.cancel_event,
                 session=self._http_session,
+                session_pool=self._effective_session_pool(),
             )
 
     def fetch_metadata(self, url: str) -> Result:
@@ -371,6 +506,7 @@ class Downloader:
                         cancel_event=self.cancel_event,
                         summary=summary,
                         session=self._http_session,
+                        session_pool=self._effective_session_pool(),
                         **extra_kwargs,
                     )
                     if (
@@ -407,18 +543,19 @@ def run_downloads(
     prefetched: tuple[Source, Result] | None = None,
 ) -> DownloadSummary:
     """Run audiobook downloads for `urls` with isolated per-job context."""
-    return Downloader(
+    with Downloader(
         config=config,
         options=options,
         sink=sink,
         interaction=interaction,
         cancel_event=cancel_event,
         pause_event=pause_event,
-    ).download(
-        urls,
-        selected_indices=selected_indices,
-        prefetched=prefetched,
-    )
+    ) as downloader:
+        return downloader.download(
+            urls,
+            selected_indices=selected_indices,
+            prefetched=prefetched,
+        )
 
 
 def prepare_source_result(
@@ -428,6 +565,7 @@ def prepare_source_result(
     interaction: logging.InteractionHandler | None = None,
     cancel_event: threading.Event | None = None,
     session: requests.Session | None = None,
+    session_pool: SessionPool | None = None,
 ) -> tuple[Source, Result]:
     """
     Resolve source for `url`, authenticate if required, and fetch `Result`
@@ -450,11 +588,26 @@ def prepare_source_result(
         logging.debug(f"Resolved short URL '{url}' -> '{resolved_url}'")
         url = resolved_url
         source_class = find_compatible_source(url)
-    source = source_class(options)
+    active_pool = session_pool if session_pool is not None else _ACTIVE_SESSION_POOL.get()
+    pool_key = _resolve_pool_key(source_class, options, config) if active_pool is not None else None
+    pooled_session = active_pool.get(pool_key) if (active_pool is not None and pool_key is not None) else None
+    with bind_pooled_session(pooled_session):
+        source = source_class(options)
     try:
         handler = interaction or logging.NonInteractiveInteractionHandler()
         if source.requires_authentication and not source.authenticated:
             authenticate(url, source, options, config, interaction=handler)
+        if (
+            active_pool is not None
+            and pool_key is not None
+            and pooled_session is None
+            and hasattr(source, "_session")
+            and (not source.requires_authentication or source.authenticated)
+        ):
+            active_pool[pool_key] = source._session
+            release_fn = getattr(source, "release_session_ownership", None)
+            if callable(release_fn):
+                release_fn()
         if cancel_event is not None and cancel_event.is_set():
             raise DownloadCancelled
         logging.debug(f"Downloading result of [underline]{url}")
@@ -638,6 +791,7 @@ def process_url(
     prefetched: tuple[Source, Result] | None = None,
     summary: DownloadSummary | None = None,
     session: requests.Session | None = None,
+    session_pool: SessionPool | None = None,
 ) -> None:
     """
     Process `url` based on `options` and `config`.
@@ -654,6 +808,7 @@ def process_url(
             interaction=interaction,
             cancel_event=cancel_event,
             session=session,
+            session_pool=session_pool,
         )
     try:
         download_result(
@@ -673,8 +828,7 @@ def process_url(
 
 def get_cookie_path(options: DownloadOptions, config: SourceConfig | None) -> str | None:
     """
-    Find path to cookie file. The cookie files are looked for in CLI arguments
-    and in the current directory.
+    Find path to cookie file from `options.cookie_file`, source config, or `./cookies.txt`.
     """
     if options.cookie_file is not None and os.path.exists(options.cookie_file):
         return options.cookie_file
@@ -693,7 +847,7 @@ def get_or_ask(
     interaction: logging.InteractionHandler | None = None,
 ) -> str:
     """
-    Check for `attr` in CLI options and config options.
+    Check for `attr` in `options` and source config options.
     Ask the user for the value if it is not found.
     """
     config_value = getattr(config, attr, None)
@@ -750,6 +904,8 @@ def authenticate(
         req_profile,
         aliases=getattr(source, "names", ()),
     )
+    if source_config is not None and getattr(source_config, "locale", None):
+        source._configured_locale = source_config.locale  # type: ignore[attr-defined]
     if (
         req_profile != DEFAULT_PROFILE
         and source_config is None
@@ -917,11 +1073,21 @@ def enrich_audiobook_with_options(
     *,
     source: Source | None = None,
     interaction: logging.InteractionHandler | None = None,
+    config: Config | None = None,
 ) -> EnrichmentResult | None:
     """Run multi-provider metadata enrichment for `audiobook` according to `options`."""
+    resolved_cfg = config
+    if resolved_cfg is None and getattr(options, "config_location", None):
+        try:
+            resolved_cfg = load_config(options.config_location)
+        except Exception:
+            resolved_cfg = None
+    custom_providers = (
+        resolved_cfg.custom_metadata_providers if resolved_cfg is not None else None
+    )
     raw_providers = getattr(options, "enrich_providers", None)
     try:
-        providers = parse_provider_list(raw_providers) if raw_providers else None
+        providers = resolve_provider_list(raw_providers, custom_providers=custom_providers)
     except ValueError as exc:
         raise GenericAudiobookDLException(str(exc)) from exc
 
@@ -943,6 +1109,7 @@ def enrich_audiobook_with_options(
     result = enrich_audiobook_metadata(
         audiobook,
         providers=providers,
+        custom_providers=custom_providers,
         session=getattr(source, "_session", None),
         proxy=getattr(options, "proxy", None),
         timeout=getattr(options, "timeout", None) or 10.0,
@@ -1011,6 +1178,7 @@ def process_audiobook(
             options,
             source=source,
             interaction=interaction,
+            config=config,
         )
 
     logging.wait_if_paused(cancel_event=cancel_event)
@@ -1071,6 +1239,10 @@ def process_audiobook(
         metadata=audiobook.metadata,
         audio_format=fmt,
     )
+    if source is not None:
+        clear_fn = getattr(source, "clear_page_cache", None)
+        if callable(clear_fn):
+            clear_fn()
     return True
 
 

@@ -72,12 +72,15 @@ target-version = "py310"
 line-length = 120
 
 [tool.ruff.lint]
-select = ["E9", "E722", "F", "B", "UP"]
+select = ["E9", "E722", "F", "B", "UP", "RUF100"]
 
 [tool.mypy]
 ignore_missing_imports = true
 allow_untyped_globals = false
 disallow_untyped_calls = true
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
 explicit_package_bases = true
 
 [[tool.mypy.overrides]]
@@ -87,7 +90,7 @@ follow_imports = "skip"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-    "e2e: End-to-end tests exercising real CLI/GUI processes, HTTP servers, and media pipelines",
+    "e2e: End-to-end tests exercising real GUI subprocesses, HTTP servers, and media pipelines",
     "gui: Tests requiring a Tkinter display",
     "ffmpeg: Tests requiring ffmpeg and ffprobe executables",
     "real_integrity: Tests exercising real ffprobe media integrity verification without stubbing",

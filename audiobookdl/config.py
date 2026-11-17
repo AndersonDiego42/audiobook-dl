@@ -38,6 +38,7 @@ class SourceConfig:
     password: str | None
     library: str | None
     cookie_file: str | None
+    locale: str | None = None
 
 
 @define
@@ -72,6 +73,15 @@ class AudiobookshelfConfig:
 
 
 @define
+class CustomMetadataProviderConfig:
+    """Configuration for an Audiobookshelf-compatible custom metadata provider."""
+    name: str
+    url: str
+    api_key: str | None = None
+    enabled: bool = True
+
+
+@define
 class Config:
     """audiobook-dl config"""
     sources: dict[str, SourceConfig]
@@ -91,6 +101,7 @@ class Config:
     proxy: str | None = None
     timeout: float | None = None
     impersonate: str | None = None
+    locale: str | None = None
     post_exec: str | None = None
     loudnorm: bool | None = None
     mono: bool | None = None
@@ -116,6 +127,7 @@ class Config:
     enrich_interactive: bool | None = None
     gui: GuiConfig = Factory(GuiConfig)
     audiobookshelf: AudiobookshelfConfig = Factory(AudiobookshelfConfig)
+    custom_metadata_providers: dict[str, CustomMetadataProviderConfig] = Factory(dict)
 
     def clone(self) -> "Config":
         """Return an isolated copy of this configuration for background jobs."""
@@ -125,6 +137,7 @@ class Config:
                 password=src.password,
                 library=src.library,
                 cookie_file=src.cookie_file,
+                locale=src.locale,
             )
             for name, src in self.sources.items()
         }
@@ -157,10 +170,20 @@ class Config:
             auto_upload=self.audiobookshelf.auto_upload,
             auto_scan=self.audiobookshelf.auto_scan,
         )
+        custom_providers_copy = {
+            name: CustomMetadataProviderConfig(
+                name=prov.name,
+                url=prov.url,
+                api_key=prov.api_key,
+                enabled=prov.enabled,
+            )
+            for name, prov in self.custom_metadata_providers.items()
+        }
         kwargs: dict[str, Any] = {
             "sources": sources_copy,
             "gui": gui_copy,
             "audiobookshelf": abs_copy,
+            "custom_metadata_providers": custom_providers_copy,
         }
         for spec in CONFIG_OPTION_SPECS:
             if spec.config_key is not None:
@@ -414,48 +437,83 @@ def _migrate_profile_password(
     return True
 
 
+_CUSTOM_PROVIDER_VAULT_PREFIX = "metadata_provider:"
+
+
+def _custom_provider_vault_service(slug: str) -> str:
+    return f"{_CUSTOM_PROVIDER_VAULT_PREFIX}{slug}"
+
+
 def _migrate_legacy_passwords(
     config_location: str,
     config_dict: dict[str, Any],
     store: CredentialStore,
 ) -> None:
-    """Move any plaintext passwords in `config_dict` into `store` and scrub TOML."""
+    """Move any plaintext passwords or custom-provider keys in `config_dict` into `store` and scrub TOML."""
     if not store.is_secure:
         return
-    sources = config_dict.get("sources")
-    if not isinstance(sources, dict):
-        return
     migrated = False
-    for source_name, values in list(sources.items()):
-        if not isinstance(values, dict):
-            continue
-        base_svc, base_prof = split_source_profile_key(source_name)
-        if _migrate_profile_password(
-            make_source_profile_key(base_svc, base_prof),
-            values,
-            store,
-        ):
-            migrated = True
-        profiles = values.get("profiles")
-        if isinstance(profiles, dict):
-            for prof_name, prof_values in list(profiles.items()):
-                if not isinstance(prof_values, dict):
-                    continue
-                prof_key = make_source_profile_key(base_svc, str(prof_name))
-                if _migrate_profile_password(prof_key, prof_values, store):
-                    migrated = True
-                if not any(v is not None and v != "" for v in prof_values.values()):
-                    profiles.pop(prof_name, None)
-            if not profiles:
-                values.pop("profiles", None)
-        if not any(
-            k != "profiles" and v is not None and v != ""
-            for k, v in values.items()
-        ) and not values.get("profiles"):
-            sources.pop(source_name, None)
-    if migrated:
+    sources = config_dict.get("sources")
+    if isinstance(sources, dict):
+        for source_name, values in list(sources.items()):
+            if not isinstance(values, dict):
+                continue
+            base_svc, base_prof = split_source_profile_key(source_name)
+            if _migrate_profile_password(
+                make_source_profile_key(base_svc, base_prof),
+                values,
+                store,
+            ):
+                migrated = True
+            profiles = values.get("profiles")
+            if isinstance(profiles, dict):
+                for prof_name, prof_values in list(profiles.items()):
+                    if not isinstance(prof_values, dict):
+                        continue
+                    prof_key = make_source_profile_key(base_svc, str(prof_name))
+                    if _migrate_profile_password(prof_key, prof_values, store):
+                        migrated = True
+                    if not any(v is not None and v != "" for v in prof_values.values()):
+                        profiles.pop(prof_name, None)
+                if not profiles:
+                    values.pop("profiles", None)
+            if not any(
+                k != "profiles" and v is not None and v != ""
+                for k, v in values.items()
+            ) and not values.get("profiles"):
+                sources.pop(source_name, None)
         if not sources:
             config_dict.pop("sources", None)
+
+    enrichment = config_dict.get("enrichment")
+    if isinstance(enrichment, dict) and isinstance(enrichment.get("custom"), dict):
+        from audiobookdl.utils.enrichment import normalize_custom_provider_name
+
+        for raw_name, raw_entry in list(enrichment["custom"].items()):
+            if not isinstance(raw_entry, dict) or "api_key" not in raw_entry:
+                continue
+            legacy_key = raw_entry.pop("api_key")
+            cleaned_key = str(legacy_key).strip() if isinstance(legacy_key, str) else ""
+            if not cleaned_key:
+                migrated = True
+                continue
+            try:
+                slug = normalize_custom_provider_name(str(raw_name))
+            except ValueError:
+                raw_entry["api_key"] = legacy_key
+                continue
+            raw_url = raw_entry.get("url")
+            account = raw_url.strip().rstrip("/") if isinstance(raw_url, str) and raw_url.strip() else "api"
+            try:
+                store.set_password(_custom_provider_vault_service(slug), account, cleaned_key)
+                migrated = True
+            except Exception as exc:
+                raw_entry["api_key"] = legacy_key
+                logging.debug(
+                    f"Failed to migrate API key for custom provider '{slug}' to OS keystore: {exc}"
+                )
+
+    if migrated:
         if os.path.exists(config_location):
             try:
                 with file_lock(config_location):
@@ -494,11 +552,16 @@ def _build_source_config_from_dict(
         cookie_file = None
     if cookie_file and not os.path.isabs(cookie_file):
         cookie_file = os.path.normpath(os.path.join(config_dir_path, cookie_file))
+    raw_locale = values.get("locale")
+    if raw_locale is not None and not isinstance(raw_locale, str):
+        logging.log(f"Warning: invalid 'locale' in '{section_label}'; ignoring")
+        raw_locale = None
     return SourceConfig(
         username=username if isinstance(username, str) or username is None else str(username),
         password=password if isinstance(password, str) or password is None else str(password),
         library=values.get("library"),
         cookie_file=cookie_file,
+        locale=raw_locale.strip() or None if isinstance(raw_locale, str) else None,
     )
 
 
@@ -535,7 +598,8 @@ def _read_gui_positive_int(gui_section: dict[str, Any], key: str) -> int | None:
     return raw
 
 
-_VALID_AUTO_SYNC_MODES = ("enqueue", "scan_only", "dry_run")
+DEFAULT_AUTO_SYNC_MODE = "enqueue"
+VALID_AUTO_SYNC_MODES = ("enqueue", "scan_only", "dry_run")
 
 
 def _read_gui_sync_mode(gui_section: dict[str, Any]) -> str | None:
@@ -545,7 +609,7 @@ def _read_gui_sync_mode(gui_section: dict[str, Any]) -> str | None:
         return None
     if isinstance(raw, str):
         normalized = raw.strip().lower()
-        if normalized in _VALID_AUTO_SYNC_MODES:
+        if normalized in VALID_AUTO_SYNC_MODES:
             return normalized
     logging.log(
         "Warning: config '[gui].auto_sync_mode' must be 'enqueue', 'scan_only', or 'dry_run'; ignoring"
@@ -749,12 +813,82 @@ def structure_config(
             auto_scan=abs_auto_scan,
         )
 
+    custom_providers: dict[str, CustomMetadataProviderConfig] = {}
+    enrichment_section = config_dict.get("enrichment")
+    if enrichment_section is not None and not isinstance(enrichment_section, dict):
+        logging.log("Warning: config '[enrichment]' must be a table; ignoring")
+    elif isinstance(enrichment_section, dict):
+        for key in enrichment_section:
+            if key != "custom":
+                logging.log(f"Warning: unknown key '{key}' in '[enrichment]' ignored")
+        raw_custom = enrichment_section.get("custom")
+        if raw_custom is not None and not isinstance(raw_custom, dict):
+            logging.log("Warning: config '[enrichment.custom]' must be a table; ignoring")
+        elif isinstance(raw_custom, dict):
+            from audiobookdl.utils.enrichment import (
+                normalize_custom_provider_name,
+                validate_custom_provider_url,
+            )
+
+            for raw_name, raw_entry in raw_custom.items():
+                section_label = f"[enrichment.custom.{raw_name}]"
+                if not isinstance(raw_entry, dict):
+                    logging.log(f"Warning: config '{section_label}' must be a table; ignoring")
+                    continue
+                try:
+                    slug = normalize_custom_provider_name(str(raw_name))
+                except ValueError as exc:
+                    logging.log(f"Warning: invalid custom provider '{raw_name}': {exc}; ignoring")
+                    continue
+                for entry_key in raw_entry:
+                    if entry_key not in {"url", "api_key", "enabled"}:
+                        logging.log(f"Warning: unknown key '{entry_key}' in '{section_label}' ignored")
+                raw_url = raw_entry.get("url")
+                if not isinstance(raw_url, str) or not raw_url.strip():
+                    logging.log(f"Warning: missing 'url' in '{section_label}'; ignoring")
+                    continue
+                try:
+                    norm_url = validate_custom_provider_url(raw_url)
+                except ValueError as exc:
+                    logging.log(f"Warning: invalid 'url' in '{section_label}': {exc}; ignoring")
+                    continue
+                raw_enabled = raw_entry.get("enabled")
+                enabled = raw_enabled if isinstance(raw_enabled, bool) else True
+                if raw_enabled is not None and not isinstance(raw_enabled, bool):
+                    logging.log(f"Warning: invalid 'enabled' in '{section_label}'; defaulting to true")
+                raw_key = raw_entry.get("api_key")
+                prov_key = raw_key.strip() if isinstance(raw_key, str) and raw_key.strip() else None
+                vault_service = _custom_provider_vault_service(slug)
+                if credential_store is not None:
+                    if prov_key is not None and credential_store.is_secure:
+                        try:
+                            credential_store.set_password(vault_service, norm_url, prov_key)
+                        except Exception as exc:
+                            logging.log(
+                                f"Warning: could not store API key for custom provider '{slug}': {exc}"
+                            )
+                    elif prov_key is None:
+                        prov_key = credential_store.get_password(vault_service, norm_url)
+                        if prov_key is None:
+                            prov_key = credential_store.get_password(vault_service, "api")
+                custom_providers[slug] = CustomMetadataProviderConfig(
+                    name=slug,
+                    url=norm_url,
+                    api_key=prov_key,
+                    enabled=enabled,
+                )
+
     parsed_options: dict[str, Any] = {}
     for spec in CONFIG_OPTION_SPECS:
         key = spec.config_key
         if key is None or spec.config_kind is None:
             continue
-        value, warning = validate_config_value(key, spec.config_kind, config_dict.get(key))
+        value, warning = validate_config_value(
+            key,
+            spec.config_kind,
+            config_dict.get(key),
+            custom_providers=custom_providers if spec.config_kind == "enrich_providers" else None,
+        )
         if warning is not None:
             logging.log(warning)
         parsed_options[key] = value
@@ -764,6 +898,7 @@ def structure_config(
         sources=sources,
         gui=gui_config,
         audiobookshelf=abs_config,
+        custom_metadata_providers=custom_providers,
         **parsed_options,
     )
 
@@ -994,19 +1129,26 @@ def _dump_toml(data: dict[str, Any]) -> str:
 
 def _has_plaintext_password(config_dict: dict[str, Any]) -> bool:
     sources = config_dict.get("sources")
-    if not isinstance(sources, dict):
-        return False
-    for values in sources.values():
-        if not isinstance(values, dict):
-            continue
-        if values.get("password"):
-            return True
-        profiles = values.get("profiles")
-        if isinstance(profiles, dict) and any(
-            isinstance(pv, dict) and bool(pv.get("password"))
-            for pv in profiles.values()
-        ):
-            return True
+    if isinstance(sources, dict):
+        for values in sources.values():
+            if not isinstance(values, dict):
+                continue
+            if values.get("password"):
+                return True
+            profiles = values.get("profiles")
+            if isinstance(profiles, dict) and any(
+                isinstance(pv, dict) and bool(pv.get("password"))
+                for pv in profiles.values()
+            ):
+                return True
+    abs_section = config_dict.get("audiobookshelf")
+    if isinstance(abs_section, dict) and abs_section.get("api_key"):
+        return True
+    enrichment = config_dict.get("enrichment")
+    if isinstance(enrichment, dict) and isinstance(enrichment.get("custom"), dict):
+        for entry in enrichment["custom"].values():
+            if isinstance(entry, dict) and entry.get("api_key"):
+                return True
     return False
 
 
@@ -1216,8 +1358,11 @@ def save_gui_preferences(
             gui_dict["auto_sync_minutes"] = int(auto_sync_minutes)
         if auto_sync_mode is not None:
             norm_mode = auto_sync_mode.strip().lower()
-            if norm_mode in _VALID_AUTO_SYNC_MODES:
-                gui_dict["auto_sync_mode"] = norm_mode
+            if norm_mode not in VALID_AUTO_SYNC_MODES:
+                raise ValueError(
+                    f"Invalid auto_sync_mode {auto_sync_mode!r}; expected one of {VALID_AUTO_SYNC_MODES}"
+                )
+            gui_dict["auto_sync_mode"] = norm_mode
         if auto_sync_targets is not None:
             gui_dict["auto_sync_targets"] = [
                 str(t).strip() for t in auto_sync_targets if str(t).strip()
@@ -1320,4 +1465,98 @@ def save_audiobookshelf_config(
             config_dict["audiobookshelf"] = abs_dict
         else:
             config_dict.pop("audiobookshelf", None)
+        return _write_config_dict(config_location, config_dict)
+
+
+def save_custom_metadata_provider(
+    name: str,
+    *,
+    url: str,
+    api_key: str | None = None,
+    enabled: bool = True,
+    overwrite: str | None = None,
+    credential_store: CredentialStore | None = None,
+) -> str:
+    """Persist or update an ABS-spec custom metadata provider in TOML and OS credential store."""
+    from audiobookdl.utils.enrichment import (
+        normalize_custom_provider_name,
+        validate_custom_provider_url,
+    )
+
+    slug = normalize_custom_provider_name(name)
+    cleaned_url = validate_custom_provider_url(url)
+    config_location = overwrite or get_config_location(None)
+    store = credential_store or get_credential_store(config_location)
+    vault_service = _custom_provider_vault_service(slug)
+    with file_lock(config_location):
+        config_dict = read_config(config_location)
+        enrichment_dict = dict(config_dict.get("enrichment") or {})
+        custom_dict = dict(enrichment_dict.get("custom") or {})
+        prev_entry = custom_dict.get(slug)
+        raw_prev_url = prev_entry.get("url") if isinstance(prev_entry, dict) else None
+        prev_url = raw_prev_url.strip().rstrip("/") if isinstance(raw_prev_url, str) else None
+        entry_dict: dict[str, Any] = {
+            "url": cleaned_url,
+            "enabled": bool(enabled),
+        }
+        if api_key is not None:
+            cleaned_key = api_key.strip()
+            if prev_url and prev_url != cleaned_url:
+                store.delete_password(vault_service, prev_url)
+            if cleaned_key:
+                store.set_password(vault_service, cleaned_url, cleaned_key)
+                if (
+                    not store.is_secure
+                    and isinstance(store, PlaintextFallbackCredentialStore)
+                    and store.allow_plaintext
+                ):
+                    entry_dict["api_key"] = cleaned_key
+            else:
+                store.delete_password(vault_service, cleaned_url)
+                store.delete_password(vault_service, "api")
+        elif prev_url and prev_url != cleaned_url:
+            existing = store.get_password(vault_service, prev_url)
+            if existing:
+                store.set_password(vault_service, cleaned_url, existing)
+                store.delete_password(vault_service, prev_url)
+            elif isinstance(prev_entry, dict) and prev_entry.get("api_key"):
+                entry_dict["api_key"] = prev_entry["api_key"]
+        elif isinstance(prev_entry, dict) and prev_entry.get("api_key"):
+            entry_dict["api_key"] = prev_entry["api_key"]
+
+        custom_dict[slug] = entry_dict
+        enrichment_dict["custom"] = custom_dict
+        config_dict["enrichment"] = enrichment_dict
+        return _write_config_dict(config_location, config_dict)
+
+
+def delete_custom_metadata_provider(
+    name: str,
+    *,
+    overwrite: str | None = None,
+    credential_store: CredentialStore | None = None,
+) -> str:
+    """Remove a configured custom metadata provider from TOML and delete any vaulted key."""
+    from audiobookdl.utils.enrichment import normalize_custom_provider_name
+
+    slug = normalize_custom_provider_name(name)
+    config_location = overwrite or get_config_location(None)
+    store = credential_store or get_credential_store(config_location)
+    vault_service = _custom_provider_vault_service(slug)
+    with file_lock(config_location):
+        config_dict = read_config(config_location)
+        enrichment_dict = dict(config_dict.get("enrichment") or {})
+        custom_dict = dict(enrichment_dict.get("custom") or {})
+        removed = custom_dict.pop(slug, None)
+        if isinstance(removed, dict) and isinstance(removed.get("url"), str) and removed["url"].strip():
+            store.delete_password(vault_service, removed["url"].strip().rstrip("/"))
+        store.delete_password(vault_service, "api")
+        if custom_dict:
+            enrichment_dict["custom"] = custom_dict
+        else:
+            enrichment_dict.pop("custom", None)
+        if enrichment_dict:
+            config_dict["enrichment"] = enrichment_dict
+        else:
+            config_dict.pop("enrichment", None)
         return _write_config_dict(config_location, config_dict)

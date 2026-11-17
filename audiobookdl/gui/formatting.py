@@ -106,34 +106,37 @@ def get_monitor_work_areas(widget: tk.Misc) -> list[tuple[int, int, int, int]]:
                     ("dwFlags", wintypes.DWORD),
                 ]
 
-            monitors: list[tuple[int, int, int, int]] = []
-            primary: list[tuple[int, int, int, int]] = []
-            user32 = ctypes.windll.user32  # type: ignore[attr-defined]
-            monitor_enum_proc = ctypes.WINFUNCTYPE(
-                wintypes.BOOL,
-                wintypes.HMONITOR,
-                wintypes.HDC,
-                ctypes.POINTER(wintypes.RECT),
-                wintypes.LPARAM,
-            )
+            windll: Any = getattr(ctypes, "windll", None)
+            winfunc: Any = getattr(ctypes, "WINFUNCTYPE", None)
+            if windll is not None and winfunc is not None:
+                monitors: list[tuple[int, int, int, int]] = []
+                primary: list[tuple[int, int, int, int]] = []
+                user32 = windll.user32
+                monitor_enum_proc = winfunc(
+                    wintypes.BOOL,
+                    wintypes.HMONITOR,
+                    wintypes.HDC,
+                    ctypes.POINTER(wintypes.RECT),
+                    wintypes.LPARAM,
+                )
 
-            def _cb(hmon: Any, _hdc: Any, _rect: Any, _data: Any) -> bool:
-                info = _MONITORINFO()
-                info.cbSize = ctypes.sizeof(_MONITORINFO)
-                if user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
-                    rc = info.rcWork
-                    area = (int(rc.left), int(rc.top), int(rc.right), int(rc.bottom))
-                    if area[2] > area[0] and area[3] > area[1]:
-                        if info.dwFlags & 1:  # MONITORINFOF_PRIMARY
-                            primary.append(area)
-                        else:
-                            monitors.append(area)
-                return True
+                def _cb(hmon: Any, _hdc: Any, _rect: Any, _data: Any) -> bool:
+                    info = _MONITORINFO()
+                    info.cbSize = ctypes.sizeof(_MONITORINFO)
+                    if user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
+                        rc = info.rcWork
+                        area = (int(rc.left), int(rc.top), int(rc.right), int(rc.bottom))
+                        if area[2] > area[0] and area[3] > area[1]:
+                            if info.dwFlags & 1:  # MONITORINFOF_PRIMARY
+                                primary.append(area)
+                            else:
+                                monitors.append(area)
+                    return True
 
-            user32.EnumDisplayMonitors(0, 0, monitor_enum_proc(_cb), 0)
-            ordered = primary + monitors
-            if ordered:
-                return ordered
+                user32.EnumDisplayMonitors(0, 0, monitor_enum_proc(_cb), 0)
+                ordered = primary + monitors
+                if ordered:
+                    return ordered
         except Exception:
             pass
     try:

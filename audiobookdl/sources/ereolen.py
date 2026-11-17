@@ -252,13 +252,7 @@ class EreolenSource(Source):
 
         if not cover_url:
             return None
-        try:
-            cover_data = self.get(cover_url)
-            if cover_data:
-                return Cover(cover_data, "jpg")
-        except RequestError:
-            return None
-        return None
+        return self.fetch_cover_safe(cover_url)
 
     def download(self, url: str) -> Audiobook:
         work_id = urlparse(url).path.split("/")[-1]

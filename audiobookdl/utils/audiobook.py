@@ -25,6 +25,37 @@ class Cover:
     extension: str
 
 
+_IMAGE_MIME_TO_EXT = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/webp": "webp",
+    "image/gif": "gif",
+}
+
+
+def detect_image_extension(
+    data: bytes | None,
+    content_type: str | None = None,
+    default: str = "jpg",
+) -> str:
+    """Detect image container extension from magic bytes, falling back to `content_type` or `default`."""
+    if data:
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            return "png"
+        if data[:3] == b"\xff\xd8\xff":
+            return "jpg"
+        if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return "webp"
+        if data[:6] in (b"GIF87a", b"GIF89a"):
+            return "gif"
+    if content_type:
+        ct = content_type.split(";", 1)[0].strip().lower()
+        if ct in _IMAGE_MIME_TO_EXT:
+            return _IMAGE_MIME_TO_EXT[ct]
+    return default
+
+
 @define
 class AESEncryption:
     key: bytes

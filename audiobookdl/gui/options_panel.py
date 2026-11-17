@@ -174,9 +174,12 @@ class OptionsPanel(ttk.LabelFrame):
             width=26,
         )
         enrich_providers_entry.pack(side=tk.LEFT, padx=(0, 8))
+        self._enrich_providers_hint_var = tk.StringVar(
+            value="audnexus, itunes, google, openlibrary"
+        )
         ttk.Label(
             enrich_row,
-            text="audnexus, itunes, google, openlibrary",
+            textvariable=self._enrich_providers_hint_var,
             style="Muted.TLabel",
         ).pack(side=tk.LEFT)
 
@@ -517,6 +520,15 @@ class OptionsPanel(ttk.LabelFrame):
         else:
             self._validation_var.set("")
             self._validation_label.grid_remove()
+
+    def update_custom_providers_hint(self, custom_names: tuple[str, ...] | list[str]) -> None:
+        """Update the provider hint label to include configured custom providers."""
+        base = "audnexus, itunes, google, openlibrary"
+        cleaned = [str(n).strip() for n in custom_names if str(n).strip()]
+        if cleaned:
+            self._enrich_providers_hint_var.set(f"{base} + custom: {', '.join(cleaned)}")
+        else:
+            self._enrich_providers_hint_var.set(base)
 
     def sync_dependency_states(self) -> None:
         """Update enabled/disabled states for dependent controls when idle."""

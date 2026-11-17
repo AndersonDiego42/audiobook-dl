@@ -3700,7 +3700,9 @@ def test_gui_m3_chapter_editor_preview_diff_and_pack_extended_overrides(tmp_path
             pack_page.release_date_var.set("2019")
             pack_page.language_var.set("en")
             pack_page.description_var.set("Notes")
-            pack_page._edited_chapters_by_idx[0] = [Chapter(0, "Part A")]
+            book_key = pack_page._book_key_for_index(0)
+            assert book_key is not None
+            pack_page._edited_chapters_by_key[book_key] = [Chapter(0, "Part A")]
             ov = pack_page._build_overrides(book_idx=0)
             assert ov is not None
             assert ov.genres == ["History"]
@@ -5534,6 +5536,252 @@ def test_gui_22_catalog_cover_width_series_order_filter_and_details():
                 tab.destroy()
     finally:
         root.destroy()
+
+
+@pytest.mark.gui
+def test_settings_page_custom_providers_ui_and_app_integration(tmp_path, monkeypatch):
+    import audiobookdl.gui.pages.settings_page as settings_mod
+    from audiobookdl import Audiobook, AudiobookMetadata
+    from audiobookdl.config import load_config
+    from audiobookdl.credentials import PLAINTEXT_OPT_IN_ENV
+
+    monkeypatch.setenv(PLAINTEXT_OPT_IN_ENV, "1")
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    cfg_path.write_text('output_template = "{title}"\n', encoding="utf-8")
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        app = AudiobookDLApp(root, config_location=str(cfg_path))
+        try:
+            settings_page = app.navigate("settings")
+            # Initially empty
+            assert list(settings_page._custom_tree.get_children()) == []
+            assert "No custom" in settings_page._custom_status_var.get()
+
+            # Save a custom provider through the Settings callback
+            assert settings_page._persist_custom_provider(
+                "hardcover",
+                url="https://abs-hc.example.com/",
+                api_key="hc-key",
+                enabled=True,
+            )
+            settings_page._refresh_custom_providers()
+            assert list(settings_page._custom_tree.get_children()) == ["hardcover"]
+            assert settings_page._custom_tree.item("hardcover", "values")[2] == "Configured"
+
+            # DownloadPage OptionsPanel hint & build_options reflect the new custom provider
+            dl_page = app.navigate("download")
+            assert "custom: hardcover" in dl_page.options_panel._enrich_providers_hint_var.get()
+            app.enrich_providers_var.set("hardcover,itunes")
+            opts = app.build_options(urls_override=[])
+            assert opts.enrich_providers == "custom:hardcover,itunes"
+            assert app._read_persisted_gui_preferences()["enrich_providers"] == "custom:hardcover,itunes"
+
+            # Toggle Enabled persists to TOML
+            app.navigate("settings")
+            settings_page._custom_tree.selection_set("hardcover")
+            settings_page._toggle_custom_provider()
+            assert load_config(str(cfg_path)).custom_metadata_providers["hardcover"].enabled is False
+            assert settings_page._custom_tree.item("hardcover", "values")[3] == "No"
+
+            # Test Connection updates treeview status on success and error
+            monkeypatch.setattr(
+                settings_mod,
+                "test_custom_metadata_provider",
+                lambda *_a, **_kw: (3, "Connected (3 sample matches)"),
+            )
+            settings_page._custom_tree.selection_set("hardcover")
+            settings_page._test_custom_provider()
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and settings_page._testing_custom_provider:
+                root.update()
+                time.sleep(0.02)
+            root.update()
+            assert settings_page._custom_tree.item("hardcover", "values")[4] == "Connected (3 sample matches)"
+
+            def _fail_probe(*_a, **_kw):
+                raise RuntimeError("HTTP 401 Unauthorized")
+
+            monkeypatch.setattr(settings_mod, "test_custom_metadata_provider", _fail_probe)
+            settings_page._test_custom_provider()
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and settings_page._testing_custom_provider:
+                root.update()
+                time.sleep(0.02)
+            root.update()
+            assert "401" in settings_page._custom_tree.item("hardcover", "values")[4]
+
+            # Controller search_enrichment_for_audiobook routes custom providers cleanly
+            captured_calls: list[Any] = []
+
+            def _fake_search(meta, **kwargs):
+                captured_calls.append((meta.title, kwargs.get("providers"), kwargs.get("custom_providers")))
+                return []
+
+            monkeypatch.setattr("audiobookdl.gui.controller.search_enrichment_candidates", _fake_search)
+            dummy_book = Audiobook(session=MagicMock(), metadata=AudiobookMetadata(title="Dune"), files=[])
+            app.controller.search_enrichment_for_audiobook(dummy_book, opts)
+            assert len(captured_calls) == 1
+            assert captured_calls[0][1] == ("custom:hardcover", "itunes")
+            assert "hardcover" in captured_calls[0][2]
+        finally:
+            app._on_close(force=True)
+    finally:
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
+
+@pytest.mark.gui
+def test_audit_regressions_queue_reset_pack_keys_sync_mode_filter_and_abs_chapters(tmp_path: Path):
+    import json
+    import tkinter as tk
+    from audiobookdl import Chapter
+    from audiobookdl.gui.app import AudiobookDLApp
+    from audiobookdl.gui.chapter_editor import parse_chapters_from_file
+    from audiobookdl.gui.controller import GuiInteractionHandler, PackJobRequest, QueuedJob
+    from audiobookdl.gui.coordinators import AutomationCoordinator
+    from audiobookdl.options_schema import build_default_options
+    from audiobookdl.pack import PackBookSpec
+    from audiobookdl.utils.audiobook import Audiobook, AudiobookMetadata
+
+    # 1. AutomationCoordinator auto_sync_mode defaults to "enqueue" & validates modes
+    coord = AutomationCoordinator.__new__(AutomationCoordinator)
+    coord._auto_sync_mode = "enqueue"
+    assert coord.auto_sync_mode == "enqueue"
+    coord.auto_sync_mode = "scan_only"
+    assert coord.auto_sync_mode == "scan_only"
+    with pytest.raises(ValueError, match="Invalid auto_sync_mode"):
+        coord.auto_sync_mode = "download_missing"
+
+    # 2. parse_chapters_from_file handles ABS metadata.json float seconds accurately
+    abs_json = tmp_path / "metadata.json"
+    abs_json.write_text(
+        json.dumps({
+            "tags": [],
+            "chapters": [
+                {"id": 0, "start": 0.0, "end": 12.5, "title": "Intro"},
+                {"id": 1, "start": 12.5, "end": 45.25, "title": "Chapter 1"},
+            ],
+        }),
+        encoding="utf-8",
+    )
+    parsed_chapters = parse_chapters_from_file(str(abs_json))
+    assert [(c.start, c.title) for c in parsed_chapters] == [
+        (0, "Intro"),
+        (12_500, "Chapter 1"),
+    ]
+
+    # 3. queue_state_path honors database_directory & clearing override restores baseline
+    custom_db = tmp_path / "custom_db"
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    posix_db = str(custom_db).replace("\\", "/")
+    cfg_path.write_text(f'database_directory = "{posix_db}"\n', encoding="utf-8")
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        app = AudiobookDLApp(root, config_location=str(cfg_path))
+        try:
+            ctrl = app.controller
+            assert Path(ctrl.queue_state_path()).parent == custom_db
+
+            interaction = GuiInteractionHandler(ctrl.event_queue, ctrl.cancel_event)
+            base_opts = build_default_options(output_format="mp3")
+            job = QueuedJob(
+                job_id="dl-ov-1",
+                run_id=1,
+                url="https://librivox.org/book-1",
+                options=base_opts,
+                interaction=interaction,
+            )
+            ctrl.pending_jobs.append(job)
+            app._queue_panel.register_queue_job(job, persist=False)
+
+            ctrl.update_queue_job_config("dl-ov-1", job_overrides={"output_format": "m4b", "audio_bitrate": "128k"})
+            assert job.options.output_format == "m4b"
+            assert job.options.audio_bitrate == "128k"
+            assert "audio_bitrate" in job.options._explicit_fields
+
+            ctrl.update_queue_job_config("dl-ov-1", job_overrides={"output_format": None, "audio_bitrate": None})
+            opts_after_reset: Any = job.options
+            assert opts_after_reset.audio_bitrate is None
+            assert "audio_bitrate" not in job.options._explicit_fields
+
+            # Pack job output_format edit syncs pack_request
+            pack_job = QueuedJob(
+                job_id="pack-ov-1",
+                run_id=1,
+                url="Local Book",
+                options=build_default_options(output_format="m4b"),
+                interaction=interaction,
+                pack_request=PackJobRequest(paths=[str(tmp_path)], output_format="m4b"),
+            )
+            ctrl.pending_jobs.append(pack_job)
+            app._queue_panel.register_queue_job(pack_job, persist=False)
+            updated_pack = ctrl.update_queue_job_config("pack-ov-1", job_overrides={"output_format": "mp3"})
+            assert updated_pack is not None
+            assert updated_pack["pack_request"]["output_format"] == "mp3"
+            assert pack_job.pack_request is not None and pack_job.pack_request.output_format == "mp3"
+
+            # PackPage re-applying scanned specs preserves edits keyed by source_root
+            pack_page = app.shell.ensure_page("pack")
+            spec_a = PackBookSpec(
+                source_root=str(tmp_path / "book_a"),
+                track_paths=[str(tmp_path / "book_a" / "01.mp3")],
+                audiobook=Audiobook(
+                    session=MagicMock(),
+                    metadata=AudiobookMetadata(title="Book A"),
+                    chapters=[Chapter(start=0, title="Old Ch")],
+                    files=[],
+                ),
+                output_format="m4b",
+                output_path=str(tmp_path / "Book A.m4b"),
+                total_duration_seconds=60.0,
+            )
+            key_a = pack_page._spec_key(spec_a)
+            pack_page._edited_chapters_by_key[key_a] = [Chapter(start=0, title="Edited Ch")]
+            pack_page._book_overrides_by_key[key_a] = {"title": "Custom Title"}
+            pack_page._invalidate_preview("Rescanning...", clear_edits=False)
+            rescanned = PackBookSpec(
+                source_root=str(tmp_path / "book_a"),
+                track_paths=[str(tmp_path / "book_a" / "01.mp3")],
+                audiobook=Audiobook(
+                    session=MagicMock(),
+                    metadata=AudiobookMetadata(title="Book A"),
+                    chapters=[Chapter(start=0, title="Old Ch")],
+                    files=[],
+                ),
+                output_format="mp3",
+                output_path=str(tmp_path / "Book A.mp3"),
+                total_duration_seconds=60.0,
+            )
+            pack_page._apply_saved_edits_to_spec(rescanned)
+            assert rescanned.audiobook.chapters[0].title == "Edited Ch"
+            assert rescanned.audiobook.metadata.title == "Custom Title"
+
+            # ActivityQueuePanel single-row filter detach/reattach on status update
+            panel = app._queue_panel
+            panel.queue_filter_var.set("Failed")
+            panel._apply_queue_filter()
+            assert "dl-ov-1" in panel._detached_iids
+            panel.update_queue_row("dl-ov-1", "Failed", "boom")
+            assert "dl-ov-1" not in panel._detached_iids
+            assert panel.queue_tree.parent("dl-ov-1") == ""
+        finally:
+            app._on_close(force=True)
+    finally:
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
 
 
 

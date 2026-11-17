@@ -6,11 +6,12 @@ import sys
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 from audiobookdl import __version__
 from audiobookdl.config import (
     AudiobookshelfConfig,
+    CustomMetadataProviderConfig,
     get_config_location,
     save_audiobookshelf_config,
 )
@@ -23,12 +24,131 @@ from audiobookdl.gui.theme import (
     make_bold_font,
     scale_px,
 )
-from audiobookdl.gui.widgets import MainThreadCallbackQueue, ScrollableFrame
+from audiobookdl.gui.widgets import (
+    MainThreadCallbackQueue,
+    ModalDialog,
+    ScrollableFrame,
+    ScrolledTreeview,
+    TreeColumnSpec,
+    tree_item_values,
+)
 from audiobookdl.integrations.audiobookshelf import AudiobookshelfClient
+from audiobookdl.utils.http import DEFAULT_HTTP_TIMEOUT, create_configured_http_session
+from audiobookdl.utils.enrichment import (
+    normalize_custom_provider_name,
+    test_custom_metadata_provider,
+    validate_custom_provider_url,
+)
+
+
+class _CustomProviderDialog(ModalDialog):
+    """Modal dialog for creating or editing a custom ABS-spec metadata provider."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        *,
+        existing: CustomMetadataProviderConfig | None = None,
+        palette: ThemePalette | None = None,
+    ) -> None:
+        title = (
+            f"Edit Provider \u2014 {existing.name}"
+            if existing is not None
+            else "Add Custom Metadata Provider"
+        )
+        super().__init__(
+            parent,
+            title,
+            palette=palette,
+            default_size=(480, 250),
+            min_size=(420, 220),
+            resizable=(True, False),
+        )
+        self.result: tuple[str, str, str | None, bool] | None = None
+        self._is_edit = existing is not None
+
+        self._name_var = tk.StringVar(value=existing.name if existing is not None else "")
+        self._url_var = tk.StringVar(value=existing.url if existing is not None else "")
+        self._key_var = tk.StringVar(value=(existing.api_key or "") if existing is not None else "")
+        self._show_key_var = tk.BooleanVar(value=False)
+        self._enabled_var = tk.BooleanVar(value=existing.enabled if existing is not None else True)
+
+        body = ttk.Frame(self, padding=scale_px(self, 12))
+        body.pack(fill=tk.BOTH, expand=True)
+        body.columnconfigure(1, weight=1)
+
+        ttk.Label(body, text="Name:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        self._name_entry = ttk.Entry(body, textvariable=self._name_var)
+        self._name_entry.grid(row=0, column=1, columnspan=2, sticky="ew", pady=4)
+        if self._is_edit:
+            self._name_entry.configure(state="disabled")
+
+        ttk.Label(body, text="Base URL:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        self._url_entry = ttk.Entry(body, textvariable=self._url_var)
+        self._url_entry.grid(row=1, column=1, columnspan=2, sticky="ew", pady=4)
+
+        ttk.Label(body, text="API Key (optional):").grid(
+            row=2, column=0, sticky="w", padx=(0, 8), pady=4
+        )
+        self._key_entry = ttk.Entry(body, textvariable=self._key_var, show="*")
+        self._key_entry.grid(row=2, column=1, sticky="ew", pady=4, padx=(0, 6))
+        ttk.Checkbutton(
+            body,
+            text="Show",
+            variable=self._show_key_var,
+            command=self._toggle_key_visibility,
+        ).grid(row=2, column=2, sticky="e", pady=4)
+
+        ttk.Checkbutton(
+            body,
+            text="Enabled for metadata enrichment",
+            variable=self._enabled_var,
+        ).grid(row=3, column=1, columnspan=2, sticky="w", pady=(4, 6))
+
+        ttk.Label(
+            body,
+            text="Implements Audiobookshelf custom provider API: GET <Base URL>/search?query=...&author=...",
+            style="Muted.TLabel",
+            wraplength=scale_px(self, 440),
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+        btns = ttk.Frame(body)
+        btns.grid(row=5, column=0, columnspan=3, sticky="ew")
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Save", command=self._save, style="Accent.TButton").pack(
+            side=tk.RIGHT, padx=(0, 6)
+        )
+
+        self.bind("<Return>", lambda _e: self._save())
+        self.finalize_modal(
+            initial_focus=self._url_entry if self._is_edit else self._name_entry
+        )
+
+    def _toggle_key_visibility(self) -> None:
+        self._key_entry.configure(show="" if self._show_key_var.get() else "*")
+
+    def _save(self) -> None:
+        try:
+            slug = normalize_custom_provider_name(self._name_var.get())
+            clean_url = validate_custom_provider_url(self._url_var.get())
+        except ValueError as exc:
+            messagebox.showwarning("Invalid Custom Provider", str(exc), parent=self)
+            return
+        api_key = self._key_var.get().strip()
+        self.result = (slug, clean_url, api_key, bool(self._enabled_var.get()))
+        self.destroy()
 
 
 class SettingsPage(ttk.Frame):
     """App-level preferences, FFmpeg setup, Audiobookshelf integration, and updates."""
+
+    _CUSTOM_PROVIDER_COLUMNS = (
+        TreeColumnSpec("name", "Name", width=110, stretch=False),
+        TreeColumnSpec("url", "Base URL", width=230, stretch=True),
+        TreeColumnSpec("auth", "API Key", width=85, stretch=False, anchor="center"),
+        TreeColumnSpec("enabled", "Enabled", width=70, stretch=False, anchor="center"),
+        TreeColumnSpec("status", "Status", width=165, stretch=True),
+    )
 
     def __init__(
         self,
@@ -47,6 +167,11 @@ class SettingsPage(ttk.Frame):
         abs_config_provider: Callable[[], AudiobookshelfConfig],
         config_location: str | None = None,
         on_abs_saved: Callable[[AudiobookshelfConfig], None] | None = None,
+        custom_providers_provider: Callable[[], Mapping[str, CustomMetadataProviderConfig]] | None = None,
+        on_save_custom_provider: Callable[..., object] | None = None,
+        on_delete_custom_provider: Callable[[str], object] | None = None,
+        http_proxy_provider: Callable[[], str | None] | None = None,
+        http_timeout_provider: Callable[[], float | None] | None = None,
         palette: ThemePalette | None = None,
         style: ttk.Style | None = None,
     ) -> None:
@@ -54,9 +179,15 @@ class SettingsPage(ttk.Frame):
         self._config_location = config_location
         self._on_abs_saved = on_abs_saved
         self._abs_config_provider = abs_config_provider
+        self._custom_providers_provider = custom_providers_provider
+        self._on_save_custom_provider = on_save_custom_provider
+        self._on_delete_custom_provider = on_delete_custom_provider
+        self._http_proxy_provider = http_proxy_provider
+        self._http_timeout_provider = http_timeout_provider
         self._ffmpeg = ffmpeg_assistant
         self._palette = palette or LIGHT_PALETTE
         self._libraries: list[tuple[str, str]] = []
+        self._testing_custom_provider = False
         self._cb_queue = MainThreadCallbackQueue(self)
 
         self.columnconfigure(0, weight=1)
@@ -204,9 +335,61 @@ class SettingsPage(ttk.Frame):
             style="Accent.TButton",
         ).pack(side=tk.RIGHT)
 
-        # 4. Configuration & Updates
+        # 4. Custom Metadata Providers (Audiobookshelf Spec)
+        providers_frame = ttk.LabelFrame(
+            body, text="Custom Metadata Providers", padding=scale_px(self, 10)
+        )
+        providers_frame.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        providers_frame.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            providers_frame,
+            text="Connect self-hosted or community Audiobookshelf-compatible metadata servers for enrichment.",
+            style="Muted.TLabel",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 6))
+
+        self._custom_scrolled = ScrolledTreeview(
+            providers_frame,
+            self._CUSTOM_PROVIDER_COLUMNS,
+            selectmode="browse",
+            height=4,
+            enable_sorting=False,
+        )
+        self._custom_scrolled.grid(row=1, column=0, sticky="ew")
+        self._custom_tree = self._custom_scrolled.tree
+        self._custom_tree.bind("<Double-1>", lambda _e: self._edit_custom_provider())
+
+        self._custom_status_var = tk.StringVar(value="")
+        self._custom_loading_bar = ttk.Progressbar(providers_frame, mode="indeterminate")
+        self._custom_loading_bar.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        self._custom_loading_bar.grid_remove()
+
+        custom_btns = ttk.Frame(providers_frame)
+        custom_btns.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(custom_btns, text="Add...", command=self._add_custom_provider).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        ttk.Button(custom_btns, text="Edit...", command=self._edit_custom_provider).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        ttk.Button(custom_btns, text="Toggle Enabled", command=self._toggle_custom_provider).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        self._custom_test_btn = ttk.Button(
+            custom_btns, text="Test Connection", command=self._test_custom_provider
+        )
+        self._custom_test_btn.pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(custom_btns, text="Remove", command=self._remove_custom_provider).pack(
+            side=tk.LEFT
+        )
+
+        ttk.Label(providers_frame, textvariable=self._custom_status_var, style="Muted.TLabel").grid(
+            row=4, column=0, sticky="w", pady=(6, 0)
+        )
+
+        # 5. Configuration & Updates
         cfg_frame = ttk.LabelFrame(body, text="Configuration & Updates", padding=scale_px(self, 10))
-        cfg_frame.grid(row=3, column=0, sticky="ew")
+        cfg_frame.grid(row=4, column=0, sticky="ew")
         cfg_frame.columnconfigure(0, weight=1)
 
         resolved_cfg = config_location or get_config_location(None)
@@ -235,14 +418,17 @@ class SettingsPage(ttk.Frame):
             side=tk.LEFT, padx=(0, 10)
         )
         ttk.Label(cfg_btns, text=f"v{__version__}", style="Muted.TLabel").pack(side=tk.LEFT)
+        self._refresh_custom_providers()
         self._scroll.guard_scroll_inputs()
 
     def apply_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
+        self._custom_tree.tag_configure("ok", foreground=palette.success)
+        self._custom_tree.tag_configure("err", foreground=palette.error)
         self._scroll.apply_theme(palette)
 
     def on_show(self) -> None:
-        """Refresh FFmpeg and Audiobookshelf field values from current config."""
+        """Refresh FFmpeg, Audiobookshelf, and custom provider values from current config."""
         self._ffmpeg.update_status()
         current = self._abs_config_provider()
         self._url_var.set(current.url or "")
@@ -250,6 +436,228 @@ class SettingsPage(ttk.Frame):
         self._library_var.set(current.library_id or "")
         self._auto_upload_var.set(bool(current.auto_upload))
         self._auto_scan_var.set(bool(current.auto_scan))
+        self._refresh_custom_providers()
+
+    def _get_custom_providers(self) -> dict[str, CustomMetadataProviderConfig]:
+        if self._custom_providers_provider is None:
+            return {}
+        return dict(self._custom_providers_provider() or {})
+
+    def _refresh_custom_providers(
+        self,
+        *,
+        status_overrides: Mapping[str, tuple[str, tuple[str, ...]]] | None = None,
+    ) -> None:
+        existing_status: dict[str, tuple[str, tuple[str, ...]]] = {}
+        for iid in self._custom_tree.get_children():
+            vals = tree_item_values(self._custom_tree, iid)
+            tags = tuple(self._custom_tree.item(iid, "tags") or ())
+            if len(vals) >= 5 and vals[4]:
+                existing_status[iid] = (str(vals[4]), tags)
+        if status_overrides:
+            existing_status.update(status_overrides)
+
+        existing = self._custom_tree.get_children()
+        if existing:
+            self._custom_tree.delete(*existing)
+
+        providers = self._get_custom_providers()
+        for slug, cfg in providers.items():
+            status_text, tags = existing_status.get(
+                slug,
+                ("Active" if cfg.enabled else "Disabled", ()),
+            )
+            self._custom_tree.insert(
+                "",
+                tk.END,
+                iid=slug,
+                values=(
+                    slug,
+                    cfg.url,
+                    "Configured" if cfg.api_key else "None",
+                    "Yes" if cfg.enabled else "No",
+                    status_text,
+                ),
+                tags=tags,
+            )
+        self._custom_scrolled.set_empty_state(
+            len(providers) == 0,
+            "No custom metadata providers configured.",
+            action_text="Add Provider...",
+            action_command=self._add_custom_provider,
+        )
+        if not self._testing_custom_provider:
+            if providers:
+                self._custom_status_var.set(
+                    f"{len(providers)} custom provider{'s' if len(providers) != 1 else ''} configured."
+                )
+            else:
+                self._custom_status_var.set("No custom metadata providers configured.")
+
+    def _selected_custom_provider(self) -> CustomMetadataProviderConfig | None:
+        sel = self._custom_tree.selection()
+        if not sel:
+            return None
+        return self._get_custom_providers().get(sel[0])
+
+    def _persist_custom_provider(
+        self,
+        name: str,
+        *,
+        url: str,
+        api_key: str | None,
+        enabled: bool,
+    ) -> bool:
+        if self._on_save_custom_provider is None:
+            return False
+        try:
+            self._on_save_custom_provider(
+                name,
+                url=url,
+                api_key=api_key,
+                enabled=enabled,
+            )
+            return True
+        except Exception as exc:
+            messagebox.showerror("Save Provider Failed", str(exc), parent=self.winfo_toplevel())
+            return False
+
+    def _add_custom_provider(self) -> None:
+        dlg = _CustomProviderDialog(self.winfo_toplevel(), palette=self._palette)
+        self.wait_window(dlg)
+        if dlg.result is None:
+            return
+        slug, url, api_key, enabled = dlg.result
+        if slug in self._get_custom_providers():
+            if not messagebox.askyesno(
+                "Overwrite Provider",
+                f"A custom provider named '{slug}' already exists. Replace it?",
+                parent=self.winfo_toplevel(),
+            ):
+                return
+        if self._persist_custom_provider(slug, url=url, api_key=api_key, enabled=enabled):
+            self._refresh_custom_providers(status_overrides={slug: ("Saved", ("ok",))})
+            self._custom_status_var.set(f"Saved custom provider '{slug}'.")
+
+    def _edit_custom_provider(self) -> None:
+        current = self._selected_custom_provider()
+        if current is None:
+            self._custom_status_var.set("Select a custom provider to edit.")
+            return
+        dlg = _CustomProviderDialog(
+            self.winfo_toplevel(),
+            existing=current,
+            palette=self._palette,
+        )
+        self.wait_window(dlg)
+        if dlg.result is None:
+            return
+        slug, url, api_key, enabled = dlg.result
+        if self._persist_custom_provider(slug, url=url, api_key=api_key, enabled=enabled):
+            self._refresh_custom_providers(status_overrides={slug: ("Updated", ("ok",))})
+            self._custom_status_var.set(f"Updated custom provider '{slug}'.")
+
+    def _toggle_custom_provider(self) -> None:
+        current = self._selected_custom_provider()
+        if current is None:
+            self._custom_status_var.set("Select a custom provider first.")
+            return
+        new_enabled = not current.enabled
+        if self._persist_custom_provider(
+            current.name,
+            url=current.url,
+            api_key=current.api_key,
+            enabled=new_enabled,
+        ):
+            label = "Active" if new_enabled else "Disabled"
+            self._refresh_custom_providers(status_overrides={current.name: (label, ())})
+            self._custom_status_var.set(
+                f"{'Enabled' if new_enabled else 'Disabled'} custom provider '{current.name}'."
+            )
+
+    def _remove_custom_provider(self) -> None:
+        current = self._selected_custom_provider()
+        if current is None:
+            self._custom_status_var.set("Select a custom provider to remove.")
+            return
+        if not messagebox.askyesno(
+            "Remove Custom Provider",
+            f"Delete custom metadata provider '{current.name}' and its stored API key?",
+            parent=self.winfo_toplevel(),
+        ):
+            return
+        if self._on_delete_custom_provider is None:
+            return
+        try:
+            self._on_delete_custom_provider(current.name)
+        except Exception as exc:
+            messagebox.showerror("Remove Failed", str(exc), parent=self.winfo_toplevel())
+            return
+        self._refresh_custom_providers()
+        self._custom_status_var.set(f"Removed custom provider '{current.name}'.")
+
+    def _test_custom_provider(self) -> None:
+        if self._testing_custom_provider:
+            return
+        current = self._selected_custom_provider()
+        if current is None:
+            self._custom_status_var.set("Select a custom provider to test.")
+            return
+        self._testing_custom_provider = True
+        self._custom_test_btn.configure(state="disabled")
+        self._custom_loading_bar.grid()
+        self._custom_loading_bar.start(12)
+        self._custom_status_var.set(f"Testing '{current.name}' ({current.url})...")
+
+        proxy = self._http_proxy_provider() if self._http_proxy_provider is not None else None
+        raw_timeout = self._http_timeout_provider() if self._http_timeout_provider is not None else None
+        timeout = float(raw_timeout) if raw_timeout and float(raw_timeout) > 0 else 10.0
+
+        def _done(summary: str | None, error: str | None) -> None:
+            if not self.winfo_exists():
+                return
+            self._testing_custom_provider = False
+            self._custom_loading_bar.stop()
+            self._custom_loading_bar.grid_remove()
+            self._custom_test_btn.configure(state="normal")
+            if error is not None:
+                self._custom_status_var.set(f"Test failed for '{current.name}': {error}")
+                if self._custom_tree.exists(current.name):
+                    vals = tree_item_values(self._custom_tree, current.name)
+                    if len(vals) >= 5:
+                        vals[4] = f"Error: {error}"
+                        self._custom_tree.item(current.name, values=tuple(vals), tags=("err",))
+                return
+            ok_text = summary or "Connected"
+            self._custom_status_var.set(f"'{current.name}': {ok_text}")
+            if self._custom_tree.exists(current.name):
+                vals = tree_item_values(self._custom_tree, current.name)
+                if len(vals) >= 5:
+                    vals[4] = ok_text
+                    self._custom_tree.item(current.name, values=tuple(vals), tags=("ok",))
+
+        self._cb_queue.begin_task()
+
+        def _worker() -> None:
+            summary: str | None = None
+            err: str | None = None
+            try:
+                _count, summary = test_custom_metadata_provider(
+                    current.url,
+                    api_key=current.api_key,
+                    proxy=proxy,
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                err = str(exc) or type(exc).__name__
+            finally:
+                def _post() -> None:
+                    _done(summary, err)
+
+                self._cb_queue.post(_post)
+                self._cb_queue.finish_worker()
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _resolve_library_id_value(self) -> str:
         raw = self._library_var.get().strip()
@@ -285,10 +693,18 @@ class SettingsPage(ttk.Frame):
                 self._library_var.set(labels[0])
             self._status_var.set(f"Connected as {username} ({len(libs)} libraries found).")
 
+        proxy = self._http_proxy_provider() if self._http_proxy_provider is not None else None
+        raw_timeout = self._http_timeout_provider() if self._http_timeout_provider is not None else None
+        timeout: float | tuple[int, int] = (
+            float(raw_timeout)
+            if isinstance(raw_timeout, (int, float)) and not isinstance(raw_timeout, bool) and float(raw_timeout) > 0
+            else DEFAULT_HTTP_TIMEOUT
+        )
         self._cb_queue.begin_task()
 
         def _worker() -> None:
-            client = AudiobookshelfClient(url, token)
+            session = create_configured_http_session(proxy=proxy)
+            client = AudiobookshelfClient(url, token, session=session, timeout=timeout)
             try:
                 username = client.ping()
                 libs = client.list_libraries()
@@ -306,6 +722,7 @@ class SettingsPage(ttk.Frame):
                 self._cb_queue.post(_post_err)
             finally:
                 client.close()
+                session.close()
                 self._cb_queue.finish_worker()
 
         threading.Thread(target=_worker, daemon=True).start()

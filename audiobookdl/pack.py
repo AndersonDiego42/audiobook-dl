@@ -150,6 +150,7 @@ def discover_pack_groups(
     paths: Sequence[str],
     *,
     recursive: bool = False,
+    cancel_event: threading.Event | None = None,
 ) -> list[tuple[str, list[str]]]:
     """Discover `(source_root, track_paths)` book units from local directories/files.
 
@@ -173,6 +174,8 @@ def discover_pack_groups(
         groups.append((os.path.abspath(root_dir), files))
 
     for raw_path in paths:
+        if cancel_event is not None and cancel_event.is_set():
+            raise DownloadCancelled
         abs_path = os.path.abspath(raw_path)
         if not os.path.exists(abs_path):
             raise GenericAudiobookDLException(f"Local path not found: {raw_path}")
@@ -190,12 +193,14 @@ def discover_pack_groups(
             if not direct:
                 raise GenericAudiobookDLException(
                     f"No audio files found directly in '{raw_path}'. "
-                    "Pass --recursive to scan subdirectories."
+                    "Enable recursive scanning to scan subdirectories."
                 )
             _append_group(abs_path, direct)
         else:
             found_any = False
             for walk_root, dirs, files in os.walk(abs_path):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise DownloadCancelled
                 dirs.sort(key=natural_sort_key)
                 audio_in_dir = [
                     os.path.abspath(os.path.join(walk_root, name))
@@ -422,13 +427,16 @@ def _build_pack_chapters(
     probe_cache: dict[str, AudioProbeInfo],
     *,
     no_chapters: bool,
+    cancel_event: threading.Event | None = None,
+    max_workers: int | None = None,
 ) -> tuple[list[Chapter], float, str]:
     uncached = [p for p in dict.fromkeys(sorted_tracks) if p not in probe_cache]
     if uncached:
         probed = run_cancellable_pool(
             probe_audio_info,
             uncached,
-            max_workers=output.COMBINE_REMUX_THREADS,
+            max_workers=output.resolve_ffmpeg_pool_workers(max_workers, cpu_bound=False),
+            cancel_event=cancel_event,
         )
         for path, info in zip(uncached, probed, strict=True):
             probe_cache[path] = info
@@ -447,7 +455,11 @@ def _build_pack_chapters(
         return list(sidecar_chapters), total_seconds, "sidecar"
 
     if len(sorted_tracks) == 1:
-        embedded = _probe_embedded_chapters(sorted_tracks[0])
+        single_info = probe_cache[sorted_tracks[0]]
+        if single_info.chapters_probed:
+            embedded = [Chapter(start=start_ms, title=ch_title) for start_ms, ch_title in single_info.chapters]
+        else:
+            embedded = _probe_embedded_chapters(sorted_tracks[0])
         if embedded:
             return embedded, total_seconds, "embedded"
         return [], total_seconds, "none"
@@ -473,7 +485,7 @@ def resolve_pack_output_path(
     *,
     output_dir: str | None = None,
 ) -> str:
-    """Resolve destination file path using `--output-template`, `output_dir`, and `output_format`."""
+    """Resolve destination file path using `options.output_template`, `output_dir`, and `output_format`."""
     ext = output_format.lstrip(".").lower() or "m4b"
     location = output.gen_output_location(
         options.output_template,
@@ -497,9 +509,14 @@ def inspect_local_book(
     overrides: PackOverrides | None = None,
     probe_cache: dict[str, AudioProbeInfo] | None = None,
     session: requests.Session | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> PackBookSpec:
     """Inspect tracks, sidecars, and tags for a local audiobook without modifying disk."""
+    if cancel_event is not None and cancel_event.is_set():
+        raise DownloadCancelled
     sorted_tracks, tag_map = sort_track_paths(raw_paths)
+    if cancel_event is not None and cancel_event.is_set():
+        raise DownloadCancelled
     sidecar_dir = source_root if os.path.isdir(source_root) else os.path.dirname(source_root)
     audio_stem = os.path.splitext(os.path.basename(sorted_tracks[0]))[0] if len(sorted_tracks) == 1 else None
     sidecar_meta, sidecar_cover, sidecar_chapters = read_sidecar_metadata(sidecar_dir, audio_stem=audio_stem)
@@ -520,6 +537,8 @@ def inspect_local_book(
         metadata.title,
         cache,
         no_chapters=bool(getattr(options, "no_chapters", False)),
+        cancel_event=cancel_event,
+        max_workers=getattr(options, "max_workers", None),
     )
     if overrides is not None and overrides.chapters is not None and not getattr(options, "no_chapters", False):
         chapters = [Chapter(start=c.start, title=c.title) for c in overrides.chapters]
@@ -627,6 +646,7 @@ def pack_book(
     interaction: logging.InteractionHandler | None = None,
     cancel_event: threading.Event | None = None,
     probe_cache: dict[str, AudioProbeInfo] | None = None,
+    config: Config | None = None,
 ) -> str:
     """Repackage a single inspected `PackBookSpec` and return the final output path."""
     if cancel_event is not None and cancel_event.is_set():
@@ -637,6 +657,7 @@ def pack_book(
             spec.audiobook,
             options,
             interaction=interaction,
+            config=config,
         )
         # Recompute output path after enrichment in case template uses newly populated fields
         spec.output_path = resolve_pack_output_path(
@@ -727,6 +748,7 @@ def pack_book(
                 cover=spec.audiobook.cover,
                 probe_cache=cache,
                 faststart=True,
+                max_workers=getattr(options, "max_workers", None),
                 **extra_filter_kwargs,
             )
             cover_embedded = spec.audiobook.cover is not None and spec.output_format in output.MP4_CONTAINERS
@@ -866,6 +888,7 @@ def run_pack(
                         interaction=ctx.interaction,
                         cancel_event=cancel_event,
                         probe_cache=probe_cache,
+                        config=resolved_config,
                     )
                     summary.output_paths.append(final_path)
                     summary.books_completed += 1

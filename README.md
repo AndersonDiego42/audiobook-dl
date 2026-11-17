@@ -46,7 +46,8 @@ pip install audiobook-dl
 Optional extras:
 ```shell
 pip install "audiobook-dl[export]"       # openpyxl>=3.1 for .xlsx Excel catalog exports
-pip install "audiobook-dl[impersonate]"  # curl_cffi>=0.7 for --impersonate browser TLS/HTTP2 impersonation
+pip install "audiobook-dl[impersonate]"  # curl_cffi>=0.7 for browser TLS/HTTP2 impersonation (impersonate)
+pip install "audiobook-dl[dnd]"          # tkinterdnd2>=0.4 for native drag-and-drop on macOS/Linux
 ```
 
 To install the latest development version from Git:
@@ -160,10 +161,15 @@ url = "https://abs.example.com"
 library_id = "lib-1"
 auto_upload = false
 auto_scan = true
+
+# Optional Audiobookshelf-spec custom/community metadata providers:
+[enrichment.custom.hardcover]
+url = "https://hardcover-provider.example.com"
+enabled = true
 ```
 
 ### Credential Storage & Session Cookies
-- **Passwords & ABS API tokens**: Stored in `credentials.dpapi` (Windows DPAPI) or the OS keyring with a `credentials.keyring.json` index (macOS/Linux) rather than plaintext in `audiobook-dl.toml`. Legacy `password = "..."` entries in `audiobook-dl.toml` are automatically migrated and scrubbed on load when a secure store is available. In headless containers without an OS keyring, set `AUDIOBOOK_DL_ALLOW_PLAINTEXT_CREDENTIALS=1` if you want to opt into plaintext config storage (or use cookie files).
+- **Passwords & API tokens**: Passwords, Audiobookshelf API keys, and `[enrichment.custom.<name>]` API keys are stored in `credentials.dpapi` (Windows DPAPI) or the OS keyring with a `credentials.keyring.json` index (macOS/Linux) rather than plaintext in `audiobook-dl.toml`. Legacy `password = "..."` or `api_key = "..."` entries in `audiobook-dl.toml` are automatically migrated and scrubbed on load when a secure store is available. In headless containers without an OS keyring, set `AUDIOBOOK_DL_ALLOW_PLAINTEXT_CREDENTIALS=1` if you want to opt into plaintext config storage (or use cookie files).
 - **Session cookies**: Cached automatically after authentication at `<database_directory>/<service>/session_cookies.txt` (or `session_cookies_<profile>.txt` for named profiles) with owner-only file permissions.
 
 ### Environment Variables
@@ -173,7 +179,7 @@ auto_scan = true
 | `AUDIOBOOK_DL_ALLOW_PLAINTEXT_CREDENTIALS` | Set to `1` / `true` to opt in when running without an OS keyring |
 | `AUDIOBOOK_DL_NO_UPDATE_CHECK` | Set to `1` / `true` to disable automatic background update checks |
 | `AUDIOBOOK_DL_SAXO_APP_OS`, `AUDIOBOOK_DL_SAXO_APP_VERSION` | Override Saxo client request headers |
-| `AUDIOBOOK_DL_PATH`, `AUDIOBOOK_DL_TITLE`, `AUDIOBOOK_DL_AUTHOR`, `AUDIOBOOK_DL_SOURCE`, `AUDIOBOOK_DL_FORMAT` | Populated in the child environment when running post-execution commands |
+| `AUDIOBOOK_DL_PATH`, `AUDIOBOOK_DL_TITLE`, `AUDIOBOOK_DL_AUTHOR`, `AUDIOBOOK_DL_SOURCE`, `AUDIOBOOK_DL_FORMAT` | Populated in the child environment when running `post_exec` hooks (300s default timeout; use only trusted commands) |
 
 ## Python Library API
 `audiobookdl` also exposes a programmatic client (`Downloader`, `DownloadOptions`, `DownloadSummary`, `DownloadEvent`):

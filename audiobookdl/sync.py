@@ -156,28 +156,49 @@ def _build_sync_download_options(
     return base_opts
 
 
-def run_sync_once(
+@dataclass
+class SyncDiscoveryResult:
+    """Canonical result of discovering pending library items across `(service, profile)` targets."""
+
+    config: Config
+    archive_path: str
+    pending_groups: list[tuple[str, str, list[str]]]
+    profile_jobs: list[tuple[str, str, DownloadOptions, list[str], ProfileSyncStats]]
+    cycle: SyncCycleResult
+
+
+def discover_pending_sync_books(
     sync_opts: SyncOptions,
     *,
+    targets: Sequence[tuple[str, str]] | None = None,
     config: Config | None = None,
     cancel_event: threading.Event | None = None,
     interaction: logging.InteractionHandler | None = None,
-    sink: logging.LogSink | None = None,
-) -> SyncCycleResult:
-    """Perform one sync cycle: poll account libraries, update ledger, download new pending items."""
+) -> SyncDiscoveryResult:
+    """Discover remote library items, update the SQLite catalog, and collect pending URLs."""
     resolved_config = config if config is not None else load_config(sync_opts.config_location)
     archive_path = resolve_archive_path(resolved_config, sync_opts.archive_path)
 
-    targets, target_errors = _resolve_sync_targets(
-        resolved_config,
-        sync_opts.services,
-        sync_opts.profile,
-    )
     cycle = SyncCycleResult()
-    cycle.errors.extend(target_errors)
-    archive = DownloadArchive(archive_path)
+    if targets is None:
+        resolved_targets, target_errors = _resolve_sync_targets(
+            resolved_config,
+            sync_opts.services,
+            sync_opts.profile,
+        )
+        cycle.errors.extend(target_errors)
+    else:
+        resolved_targets = [
+            (normalize_source_key(svc), normalize_profile_name(prof))
+            for svc, prof in targets
+            if str(svc).strip()
+        ]
 
-    for svc, prof in targets:
+    archive = DownloadArchive(archive_path)
+    pending_groups: list[tuple[str, str, list[str]]] = []
+    profile_jobs: list[tuple[str, str, DownloadOptions, list[str], ProfileSyncStats]] = []
+
+    for svc, prof in resolved_targets:
         if cancel_event is not None and cancel_event.is_set():
             cycle.cancelled = True
             break
@@ -213,24 +234,9 @@ def run_sync_once(
 
             stats.pending_count = len(pending_urls)
             cycle.pending_count += len(pending_urls)
-
-            if pending_urls and not sync_opts.scan_only and not sync_opts.dry_run:
-                dl_kwargs: dict[str, Any] = {
-                    "config": resolved_config,
-                    "options": dl_opts,
-                    "cancel_event": cancel_event,
-                }
-                if sink is not None:
-                    dl_kwargs["sink"] = sink
-                if interaction is not None:
-                    dl_kwargs["interaction"] = interaction
-                dl_summary = Downloader(**dl_kwargs).download(pending_urls)
-                stats.downloaded = dl_summary.books_completed
-                stats.failed = dl_summary.failed
-                cycle.downloaded += dl_summary.books_completed
-                cycle.failed += dl_summary.failed
-                if dl_summary.cancelled:
-                    cycle.cancelled = True
+            if pending_urls:
+                pending_groups.append((svc, "" if prof == DEFAULT_PROFILE else prof, pending_urls))
+            profile_jobs.append((svc, prof, dl_opts, pending_urls, stats))
         except Exception as exc:
             msg = f"{svc} ({prof}): {exc}"
             stats.error = str(exc)
@@ -238,6 +244,70 @@ def run_sync_once(
             cycle.failed += 1
             cycle.errors.append(msg)
         cycle.details.append(stats)
+
+    return SyncDiscoveryResult(
+        config=resolved_config,
+        archive_path=archive_path,
+        pending_groups=pending_groups,
+        profile_jobs=profile_jobs,
+        cycle=cycle,
+    )
+
+
+def run_sync_once(
+    sync_opts: SyncOptions,
+    *,
+    config: Config | None = None,
+    cancel_event: threading.Event | None = None,
+    interaction: logging.InteractionHandler | None = None,
+    sink: logging.LogSink | None = None,
+) -> SyncCycleResult:
+    """Perform one sync cycle: poll account libraries, update ledger, download new pending items."""
+    discovery = discover_pending_sync_books(
+        sync_opts,
+        config=config,
+        cancel_event=cancel_event,
+        interaction=interaction,
+    )
+    cycle = discovery.cycle
+    if cycle.cancelled or sync_opts.scan_only or sync_opts.dry_run:
+        return cycle
+
+    for svc, prof, dl_opts, pending_urls, stats in discovery.profile_jobs:
+        if cancel_event is not None and cancel_event.is_set():
+            cycle.cancelled = True
+            break
+        if not pending_urls:
+            continue
+        try:
+            dl_kwargs: dict[str, Any] = {
+                "config": discovery.config,
+                "options": dl_opts,
+                "cancel_event": cancel_event,
+            }
+            if sink is not None:
+                dl_kwargs["sink"] = sink
+            if interaction is not None:
+                dl_kwargs["interaction"] = interaction
+            downloader = Downloader(**dl_kwargs)
+            try:
+                dl_summary = downloader.download(pending_urls)
+            finally:
+                close_fn = getattr(downloader, "close", None)
+                if callable(close_fn):
+                    close_fn()
+            stats.downloaded = dl_summary.books_completed
+            stats.failed += dl_summary.failed
+            cycle.downloaded += dl_summary.books_completed
+            cycle.failed += dl_summary.failed
+            if dl_summary.cancelled:
+                cycle.cancelled = True
+        except Exception as exc:
+            msg = f"{svc} ({prof}): {exc}"
+            stats.error = str(exc)
+            stats.failed += 1
+            cycle.failed += 1
+            cycle.errors.append(msg)
         if cycle.cancelled:
             break
 

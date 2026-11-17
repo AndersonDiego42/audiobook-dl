@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import importlib
 import sys
 import tkinter as tk
-from typing import Any
+from typing import Any, cast
 
 
 def create_tk_root() -> tk.Tk:
     """Create a `TkinterDnD.Tk` root when `tkinterdnd2` is installed, else standard `tk.Tk`."""
     try:
-        from tkinterdnd2 import TkinterDnD
-
-        return TkinterDnD.Tk()  # type: ignore[no-any-return]
+        mod = importlib.import_module("tkinterdnd2")
+        return cast(tk.Tk, mod.TkinterDnD.Tk())
     except Exception:
         return tk.Tk()
 
@@ -147,7 +147,8 @@ def install_windows_file_drop(
             pass
 
     # Keep callback alive on `root` until window destruction.
-    root._win_drop_callback = callback  # type: ignore[attr-defined]
-    root._win_drop_cleanup = _cleanup  # type: ignore[attr-defined]
+    root_holder: Any = root
+    root_holder._win_drop_callback = callback
+    root_holder._win_drop_cleanup = _cleanup
     root.bind("<Destroy>", lambda ev: _cleanup() if getattr(ev, "widget", None) is root else None, add="+")
     return _cleanup

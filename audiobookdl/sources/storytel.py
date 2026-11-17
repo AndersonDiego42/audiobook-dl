@@ -188,6 +188,23 @@ class StorytelSource(Source):
         self._language = account_info.get("lang") or "en"
         self._session.headers.update({"authorization": f"Bearer {jwt}"})
 
+    def verify_auth(self, url: str = "") -> bool:
+        has_auth = any(k.lower() == "authorization" for k in self._session.headers)
+        if not self.authenticated and not has_auth:
+            return False
+        try:
+            payload = self.post_json(
+                "https://api.storytel.net/libraries/bookshelf",
+                data="",
+                headers={
+                    "content-type": "application/x-www-form-urlencoded",
+                    "Accept": "*/*",
+                },
+            )
+            return isinstance(payload, dict)
+        except (RequestError, UserNotAuthorized, ValueError):
+            return False
+
     def _relogin_check(self) -> None:
         """
         There's a ratelimit for the MP3 download, if triggered, it will invalidate all sessions and you'll get an email about suspicios activities on your account
@@ -775,11 +792,7 @@ class StorytelSource(Source):
     def download_cover(self, book_details) -> Cover | None:
         cover_info = book_details.get("cover")
         cover_url = cover_info.get("url") if isinstance(cover_info, dict) else None
-        if not cover_url:
-            return None
-        # cover_url = f"https://www.storytel.com/images/{isbn}/640x640/cover.jpg"
-        cover_data = self.get(cover_url)
-        return Cover(cover_data, "jpg")
+        return self.fetch_cover_safe(cover_url)
 
     @staticmethod
     def _write_json(path: str, payload: Any) -> None:

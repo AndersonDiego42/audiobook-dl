@@ -52,6 +52,17 @@ class NextorySource(Source):
         super().__init__(options)
         # Keep want-to-read cache isolated per source instance.
         self._wantlist_cache: list[dict] | None = None
+        self._configured_locale: str | None = None
+
+    def verify_auth(self, url: str = "") -> bool:
+        has_token = "X-Profile-Token" in self._session.headers or "token" in self._session.headers
+        if not self.authenticated and not has_token:
+            return False
+        try:
+            payload = self.get_json("https://api.nextory.com/user/v1/me/profiles")
+            return isinstance(payload, dict) and isinstance(payload.get("profiles"), list)
+        except (RequestError, UserNotAuthorized, ValueError):
+            return False
 
     @staticmethod
     def create_device_id() -> str:
@@ -77,7 +88,9 @@ class NextorySource(Source):
         return generated
 
     def _resolve_locale(self, url: str = "") -> str:
-        configured = getattr(self._options, "locale", None)
+        configured = getattr(self._options, "locale", None) or getattr(
+            self, "_configured_locale", None
+        )
         if isinstance(configured, str) and configured.strip():
             return configured.strip()
         if url:
@@ -425,10 +438,9 @@ class NextorySource(Source):
             chapters.append(Chapter(title=ch_title, start=file["start_at"]))
         return chapters
 
-    def get_cover(self, book_info) -> Cover:
-        cover_url = self.find_format_data(book_info)["img_url"]
-        cover_data = self.get(cover_url)
-        return Cover(cover_data, "jpg")
+    def get_cover(self, book_info) -> Cover | None:
+        cover_url = self.find_format_data(book_info).get("img_url")
+        return self.fetch_cover_safe(cover_url)
 
     @staticmethod
     def _products_to_catalog(products: Any) -> list[CatalogBook]:

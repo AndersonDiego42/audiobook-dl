@@ -7,7 +7,7 @@ import shlex
 import sqlite3
 import threading
 from typing import Any
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Generator, Iterable, Sequence
 
 from audiobookdl.sources.source import CatalogBook
 from audiobookdl.utils.audiobook import Audiobook, is_ebook
@@ -127,6 +127,22 @@ def default_archive_path(database_directory: str) -> str:
     return os.path.join(database_directory, "downloads.db")
 
 
+def resolve_database_directory(
+    config: Any,
+    *,
+    config_location: str | None = None,
+) -> str:
+    """Resolve the effective database directory from `config`, `config_location`, or default."""
+    configured = getattr(config, "database_directory", None)
+    if isinstance(configured, str) and configured.strip():
+        return os.path.abspath(os.path.expanduser(configured.strip()))
+    if config_location:
+        return os.path.join(os.path.dirname(os.path.abspath(config_location)), "db")
+    from audiobookdl.options_schema import default_database_directory
+
+    return default_database_directory()
+
+
 def resolve_archive_path(config: Any, explicit_path: str | None = None) -> str:
     """Resolve the SQLite ledger path from an explicit override, `config`, or default db dir."""
     if explicit_path:
@@ -134,10 +150,7 @@ def resolve_archive_path(config: Any, explicit_path: str | None = None) -> str:
     configured = getattr(config, "download_archive", None)
     if configured:
         return str(configured)
-    from audiobookdl.options_schema import default_database_directory
-
-    db_dir = getattr(config, "database_directory", None) or default_database_directory()
-    return default_archive_path(db_dir)
+    return default_archive_path(resolve_database_directory(config))
 
 
 class ArchiveMatchIndex:
@@ -281,7 +294,7 @@ class DownloadArchive:
         return conn
 
     @contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
+    def _connection(self) -> Generator[sqlite3.Connection, None, None]:
         with self._lock:
             if self._persistent:
                 if self._conn is None:
@@ -297,7 +310,7 @@ class DownloadArchive:
                 conn.close()
 
     @contextmanager
-    def batch_connection(self) -> Iterator[None]:
+    def batch_connection(self) -> Generator[None, None, None]:
         """Keep a single SQLite connection open across bulk operations (such as library scanning)."""
         with self._lock:
             was_persistent = self._persistent

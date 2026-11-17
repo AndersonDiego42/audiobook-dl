@@ -108,8 +108,8 @@ def test_discover_pack_groups_single_recursive_and_errors(tmp_path: Path):
     assert groups_single[0][0] == str(book_a.resolve())
     assert [Path(p).name for p in groups_single[0][1]] == ["01.mp3"]
 
-    # Non-recursive parent folder without direct audio files hints at --recursive
-    with pytest.raises(GenericAudiobookDLException, match="--recursive"):
+    # Non-recursive parent folder without direct audio files hints at recursive scanning
+    with pytest.raises(GenericAudiobookDLException, match="recursive"):
         discover_pack_groups([str(tmp_path / "Nested")])
 
     # Recursive discovery walks subfolders in natural order
@@ -1042,6 +1042,114 @@ def test_pack_extended_metadata_and_chapter_overrides(tmp_path: Path):
     assert restored.overrides.release_date == "2021-05-11"
     assert restored.overrides.description == "Extended description body"
     assert restored.overrides.chapters is not None and len(restored.overrides.chapters) == 3
+
+
+def test_run_pack_passes_custom_providers_from_config(tmp_path: Path):
+    from audiobookdl.config import structure_config
+    from audiobookdl.pack import pack_book
+    from audiobookdl.utils import AudioProbeInfo
+    from audiobookdl.utils.enrichment import EnrichmentResult
+
+    book_dir = tmp_path / "Local Book"
+    book_dir.mkdir()
+    t1 = book_dir / "01.mp3"
+    _create_empty_id3_mp3(t1)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    cfg = structure_config(
+        str(tmp_path / "audiobook-dl.toml"),
+        {
+            "enrichment": {
+                "custom": {
+                    "fantlab": {
+                        "url": "https://fantlab-abs.example.com",
+                        "api_key": "fl-secret",
+                        "enabled": True,
+                    }
+                }
+            }
+        },
+        credential_store=None,
+    )
+    opts = build_default_options(
+        output_template="{title}",
+        output_format="m4b",
+        enrich_metadata=True,
+        enrich_providers="fantlab",
+    )
+    fake_probe = AudioProbeInfo(duration=30.0, bitrate=128_000, codec_name="mp3", format_name="mp3")
+    with patch("audiobookdl.pack.probe_audio_info", return_value=fake_probe):
+        spec = inspect_local_book(str(book_dir), [str(t1)], opts, output_dir=str(out_dir))
+
+    seen_calls: list[dict] = []
+
+    def _fake_enrich(audiobook, **kwargs):
+        seen_calls.append(kwargs)
+        audiobook.metadata.publisher = "FantLab Press"
+        return EnrichmentResult(
+            updated=True,
+            providers_used=["custom:fantlab"],
+            fields_updated=["publisher"],
+        )
+
+    def _fake_pack_single(_src, staged_path, *_args, **_kwargs):
+        Path(staged_path).write_bytes(b"packed")
+        return False, False
+
+    with (
+        patch("audiobookdl.pipeline.enrich_audiobook_metadata", side_effect=_fake_enrich),
+        patch("audiobookdl.pack.output_download.confirm_overwrite_file"),
+        patch("audiobookdl.pack._pack_single_track", side_effect=_fake_pack_single),
+        patch("audiobookdl.pack.output_download.add_metadata_to_file"),
+    ):
+        pack_book(spec, opts, output_dir=str(out_dir), config=cfg)
+
+    assert len(seen_calls) == 1
+    assert seen_calls[0]["providers"] == ("custom:fantlab",)
+    assert "fantlab" in seen_calls[0]["custom_providers"]
+    assert spec.audiobook.metadata.publisher == "FantLab Press"
+
+
+def test_inspect_local_book_uses_single_ffprobe_for_duration_and_chapters(tmp_path):
+    book_dir = tmp_path / "Chapter Book"
+    book_dir.mkdir()
+    m4b = book_dir / "book.m4b"
+    _create_empty_id3_mp3(m4b)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    probe_calls: list[str] = []
+
+    def _single_probe(path: str) -> AudioProbeInfo:
+        probe_calls.append(path)
+        return AudioProbeInfo(
+            duration=120.0,
+            bitrate=128_000,
+            codec_name="aac",
+            format_name="mov,mp4,m4a",
+            chapters=(
+                (0, "Prologue"),
+                (35_000, "Chapter 1"),
+            ),
+            chapters_probed=True,
+        )
+
+    opts = build_default_options(output_template="{title}", output_format="m4b")
+    with (
+        patch("audiobookdl.pack.probe_audio_info", side_effect=_single_probe),
+        patch(
+            "audiobookdl.pack.subprocess.run",
+            side_effect=AssertionError("should not spawn separate chapter ffprobe"),
+        ),
+    ):
+        spec = inspect_local_book(str(book_dir), [str(m4b)], opts, output_dir=str(out_dir))
+
+    assert probe_calls == [str(m4b)]
+    assert [(c.start, c.title) for c in spec.audiobook.chapters] == [
+        (0, "Prologue"),
+        (35_000, "Chapter 1"),
+    ]
 
 
 

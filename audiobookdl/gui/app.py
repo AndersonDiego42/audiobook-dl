@@ -16,7 +16,9 @@ from collections.abc import Mapping, Sequence
 from audiobookdl import __version__, output
 from audiobookdl.options_schema import DownloadOptions, SyncOptions, build_default_options
 from audiobookdl.config import (
+    DEFAULT_AUTO_SYNC_MODE,
     DEFAULT_PROFILE,
+    VALID_AUTO_SYNC_MODES,
     is_portable_mode,
     list_source_profiles,
     make_source_profile_key,
@@ -24,6 +26,7 @@ from audiobookdl.config import (
     split_source_profile_key,
 )
 from audiobookdl.exceptions import DownloadCancelled
+from audiobookdl.utils.enrichment import parse_provider_list
 from audiobookdl.gui.auth_panel import ServiceAuthCoordinator
 from audiobookdl.gui.controller import GuiController, PackJobRequest
 from audiobookdl.gui.coordinators import (
@@ -258,8 +261,8 @@ class AudiobookDLApp:
         )
         self._automation.auto_sync_mode = (
             cfg_gui.auto_sync_mode
-            if cfg_gui.auto_sync_mode in ("enqueue", "scan_only", "dry_run")
-            else "enqueue"
+            if cfg_gui.auto_sync_mode in VALID_AUTO_SYNC_MODES
+            else DEFAULT_AUTO_SYNC_MODE
         )
         self._automation.auto_sync_targets = (
             [split_source_profile_key(t) for t in cfg_gui.auto_sync_targets]
@@ -678,6 +681,7 @@ class AudiobookDLApp:
         page.update_ffmpeg_banner(self._last_ffmpeg_available, self._last_ffmpeg_status_text)
         self._apply_download_page_running_state(page, self._is_running)
         self._update_download_summaries(page)
+        self._sync_custom_providers_ui(download_page=page)
         return page
 
     def _create_library_page(self, parent: ttk.Frame) -> LibraryPage:
@@ -807,6 +811,17 @@ class AudiobookDLApp:
             palette=self._palette,
         )
 
+    def _sync_custom_providers_ui(
+        self,
+        *,
+        download_page: DownloadPage | None = None,
+    ) -> None:
+        providers = self._controller.config_snapshot().custom_metadata_providers
+        names = [name for name, prov in providers.items() if prov.enabled]
+        dl_page = download_page if download_page is not None else self.shell.get_page("download")
+        if dl_page is not None:
+            dl_page.options_panel.update_custom_providers_hint(names)
+
     def _create_settings_page(self, parent: ttk.Frame) -> SettingsPage:
         from audiobookdl.config import load_config
 
@@ -815,6 +830,27 @@ class AudiobookDLApp:
         def _on_abs_saved(_updated: Any) -> None:
             self._controller.config = load_config(config_loc)
             self.status_var.set("Saved Audiobookshelf configuration.")
+
+        def _on_save_custom_provider(
+            name: str,
+            *,
+            url: str,
+            api_key: str | None = None,
+            enabled: bool = True,
+        ) -> None:
+            self._controller.save_custom_metadata_provider(
+                name,
+                url=url,
+                api_key=api_key,
+                enabled=enabled,
+            )
+            self._sync_custom_providers_ui()
+            self.status_var.set(f"Saved custom metadata provider '{name}'.")
+
+        def _on_delete_custom_provider(name: str) -> None:
+            self._controller.delete_custom_metadata_provider(name)
+            self._sync_custom_providers_ui()
+            self.status_var.set(f"Removed custom metadata provider '{name}'.")
 
         return SettingsPage(
             parent,
@@ -831,6 +867,11 @@ class AudiobookDLApp:
             abs_config_provider=lambda: self._controller.config_snapshot().audiobookshelf,
             config_location=config_loc,
             on_abs_saved=_on_abs_saved,
+            custom_providers_provider=lambda: self._controller.config_snapshot().custom_metadata_providers,
+            on_save_custom_provider=_on_save_custom_provider,
+            on_delete_custom_provider=_on_delete_custom_provider,
+            http_proxy_provider=lambda: self.proxy_var.get().strip() or self._controller.config_snapshot().proxy,
+            http_timeout_provider=lambda: self._controller.config_snapshot().timeout,
             palette=self._palette,
             style=self._style,
         )
@@ -1171,6 +1212,7 @@ class AudiobookDLApp:
 
     def _reload_config(self) -> None:
         try:
+            previous_post_exec = self.post_exec_var.get().strip()
             cfg = self._controller.reload_config()
             if (cfg.gui.output_dir or "").strip():
                 self.output_dir_var.set((cfg.gui.output_dir or "").strip())
@@ -1182,6 +1224,19 @@ class AudiobookDLApp:
                     continue
                 cfg_val = getattr(cfg, spec.config_key, None)
                 getattr(self, binding.var_attr).set(binding.init_value(cfg_val))
+            new_post_exec = (cfg.post_exec or "").strip()
+            if new_post_exec and new_post_exec != previous_post_exec:
+                approved = messagebox.askyesno(
+                    "Confirm Post-Exec Command",
+                    "The reloaded configuration defines a shell post-exec command:\n\n"
+                    f"{new_post_exec}\n\n"
+                    "This command will run via the system shell after each completed audiobook. "
+                    "Keep this command enabled?",
+                    parent=self.root,
+                )
+                if not approved:
+                    self.post_exec_var.set("")
+                    self._append_log("[WARN] Disabled post_exec command from reloaded configuration.")
             if cfg.gui.use_download_archive is not None:
                 self.download_archive_var.set(cfg.gui.use_download_archive)
             if cfg.gui.notify_on_complete is not None:
@@ -1194,7 +1249,7 @@ class AudiobookDLApp:
                 self._automation.auto_sync_enabled = cfg.gui.auto_sync_enabled
             if cfg.gui.auto_sync_minutes is not None:
                 self._automation.auto_sync_minutes = max(1, cfg.gui.auto_sync_minutes)
-            if cfg.gui.auto_sync_mode in ("enqueue", "scan_only", "dry_run"):
+            if cfg.gui.auto_sync_mode in VALID_AUTO_SYNC_MODES:
                 self._automation.auto_sync_mode = cfg.gui.auto_sync_mode
             if cfg.gui.auto_sync_targets is not None:
                 self._automation.auto_sync_targets = [
@@ -1216,6 +1271,10 @@ class AudiobookDLApp:
             self.m4b_var.set(self.output_format_var.get() == "m4b")
             self._auth.load_service_into_form()
             self._auth.update_field_states()
+            self._sync_custom_providers_ui()
+            settings_page = self.shell.get_page("settings")
+            if settings_page is not None:
+                settings_page.on_show()
             self.status_var.set("Config reloaded")
             self._append_log("Reloaded configuration.")
         except Exception as exc:
@@ -1399,7 +1458,7 @@ class AudiobookDLApp:
             if job_kind == "pack" and isinstance(rec.get("pack_request"), dict):
                 req = PackJobRequest.from_dict(rec["pack_request"])
                 if req is not None:
-                    pack_specs.append((req, self._build_retry_pack_options(base_opts, req)))
+                    pack_specs.append((req, self._build_retry_pack_options(base_opts, req, rec)))
             else:
                 url = str(rec.get("url") or "").strip()
                 if url:
@@ -1461,8 +1520,9 @@ class AudiobookDLApp:
                 if reveal_in_folder and not os.path.isdir(cleaned)
                 else cleaned
             )
-            if sys.platform.startswith("win") and hasattr(os, "startfile"):
-                os.startfile(open_target)  # type: ignore[attr-defined]
+            startfile = getattr(os, "startfile", None)
+            if sys.platform.startswith("win") and startfile is not None:
+                startfile(open_target)
             elif sys.platform == "darwin":
                 subprocess.Popen(["open", open_target])
             else:
@@ -1555,13 +1615,23 @@ class AudiobookDLApp:
             )
             return None
 
+    def _read_gui_option_value(self, spec: Any, custom_providers: Mapping[str, Any]) -> Any:
+        raw_val = getattr(self, spec.gui.var_attr).get()
+        if spec.name == "enrich_providers":
+            cleaned = str(raw_val).strip()
+            if not cleaned:
+                return None
+            return ",".join(parse_provider_list(cleaned, custom_providers=custom_providers))
+        return spec.gui.read_option(raw_val)
+
     def build_options(self, urls_override: Sequence[str] | None = None) -> DownloadOptions:
         """Build `DownloadOptions` from current UI field values."""
         output_dir = self.output_dir_var.get().strip() or default_output_dir()
         template = self.template_var.get().strip() or "{title}"
         output_template = os.path.join(output_dir, template)
+        custom_providers = self._controller.config_snapshot().custom_metadata_providers
         option_values = {
-            spec.name: spec.gui.read_option(getattr(self, spec.gui.var_attr).get())
+            spec.name: self._read_gui_option_value(spec, custom_providers)
             for spec in GUI_OPTION_SPECS
             if spec.gui is not None
         }
@@ -1591,13 +1661,13 @@ class AudiobookDLApp:
     def _read_persisted_gui_preferences(self) -> dict[str, Any]:
         """Read valid persisted GUI toggle/option values without failing on transient invalid input."""
         prefs: dict[str, Any] = {}
+        custom_providers = self._controller.config_snapshot().custom_metadata_providers
         for spec in PERSISTED_GUI_OPTION_SPECS:
             binding = spec.gui
             if binding is None:
                 continue
-            raw_val = getattr(self, binding.var_attr).get()
             try:
-                prefs[spec.name] = binding.read_option(raw_val)
+                prefs[spec.name] = self._read_gui_option_value(spec, custom_providers)
             except ValueError:
                 continue
         return prefs
@@ -1705,6 +1775,23 @@ class AudiobookDLApp:
         if queued_jobs:
             self._controller.save_queue_state()
 
+    @staticmethod
+    def _apply_job_overrides_to_options(
+        opts: DownloadOptions,
+        rec: Mapping[str, Any] | None,
+    ) -> None:
+        if not isinstance(rec, Mapping):
+            return
+        job_overrides = rec.get("job_overrides")
+        if not isinstance(job_overrides, Mapping):
+            return
+        explicit = set(getattr(opts, "_explicit_fields", set()))
+        for attr in GuiController._EDITABLE_OVERRIDE_KEYS:
+            if attr in job_overrides:
+                setattr(opts, attr, job_overrides[attr])
+                explicit.add(attr)
+        opts._explicit_fields = frozenset(explicit)
+
     def _build_retry_download_spec(
         self,
         base_opts: DownloadOptions,
@@ -1715,14 +1802,7 @@ class AudiobookDLApp:
         profile = str(rec.get("profile") or "").strip()
         if profile:
             opts.profile = profile
-        job_overrides = rec.get("job_overrides")
-        if isinstance(job_overrides, dict):
-            explicit = set(getattr(opts, "_explicit_fields", set()))
-            for attr in ("output_format", "combine", "output_template", "split_chapters", "media_type"):
-                if attr in job_overrides:
-                    setattr(opts, attr, job_overrides[attr])
-                    explicit.add(attr)
-            opts._explicit_fields = frozenset(explicit)
+        self._apply_job_overrides_to_options(opts, rec)
         raw_indices = rec.get("selected_indices")
         selected_indices = (
             [i for i in raw_indices if isinstance(i, int) and not isinstance(i, bool)]
@@ -1731,14 +1811,23 @@ class AudiobookDLApp:
         )
         return (url, opts, selected_indices, None)
 
-    @staticmethod
+    @classmethod
     def _build_retry_pack_options(
+        cls,
         base_opts: DownloadOptions,
         req: PackJobRequest,
+        rec: Mapping[str, Any] | None = None,
     ) -> DownloadOptions:
-        fmt = req.output_format or base_opts.output_format or "m4b"
-        opts = dataclasses.replace(base_opts, output_format=fmt)
-        opts._explicit_fields = frozenset(base_opts._explicit_fields | {"output_format"})
+        opts = dataclasses.replace(base_opts)
+        opts._explicit_fields = frozenset(base_opts._explicit_fields)
+        cls._apply_job_overrides_to_options(opts, rec)
+        overrides = rec.get("job_overrides") if isinstance(rec, Mapping) else None
+        override_fmt = (
+            overrides.get("output_format") if isinstance(overrides, Mapping) else None
+        )
+        fmt = override_fmt or req.output_format or base_opts.output_format or "m4b"
+        opts.output_format = fmt
+        opts._explicit_fields = frozenset(opts._explicit_fields | {"output_format"})
         return opts
 
     def _retry_failed_queue_items(self, job_ids: Sequence[str] | None = None) -> None:
@@ -1750,12 +1839,12 @@ class AudiobookDLApp:
 
         download_recs: list[dict[str, Any]] = []
         seen_download_keys: set[tuple[str, str, tuple[int, ...] | None]] = set()
-        pack_requests: list[PackJobRequest] = []
+        pack_entries: list[tuple[PackJobRequest, dict[str, Any]]] = []
         for rec in retry_records:
             if rec.get("job_kind", "download") == "pack":
                 parsed = PackJobRequest.from_dict(rec.get("pack_request"))
                 if parsed is not None:
-                    pack_requests.append(parsed)
+                    pack_entries.append((parsed, rec))
             else:
                 url = str(rec.get("url") or "").strip()
                 if not url:
@@ -1772,7 +1861,7 @@ class AudiobookDLApp:
                     seen_download_keys.add(dedup_key)
                     download_recs.append(rec)
 
-        if not download_recs and not pack_requests:
+        if not download_recs and not pack_entries:
             self.status_var.set("No failed or cancelled jobs to retry")
             return
 
@@ -1784,7 +1873,8 @@ class AudiobookDLApp:
                 return
             dl_specs = [self._build_retry_download_spec(base_opts, rec) for rec in download_recs]
             pack_pairs = [
-                (req, self._build_retry_pack_options(base_opts, req)) for req in pack_requests
+                (req, self._build_retry_pack_options(base_opts, req, rec))
+                for req, rec in pack_entries
             ]
             was_appended, run_id, queued_jobs, new_total = self._controller.start_or_enqueue_jobs(
                 download_specs=dl_specs,
@@ -1804,7 +1894,7 @@ class AudiobookDLApp:
         base_opts = self._try_build_options(urls_override=[])
         if base_opts is None:
             return
-        if download_recs and not pack_requests:
+        if download_recs and not pack_entries:
             if not self._ffmpeg_assistant.ensure_available(base_opts):
                 return
             self._save_run_preferences(base_opts)
@@ -1813,10 +1903,8 @@ class AudiobookDLApp:
             return
 
         pack_pairs = []
-        for req in pack_requests:
-            fmt = req.output_format or base_opts.output_format or "m4b"
-            opts = dataclasses.replace(base_opts, output_format=fmt)
-            opts._explicit_fields = frozenset(base_opts._explicit_fields | {"output_format"})
+        for req, rec in pack_entries:
+            opts = self._build_retry_pack_options(base_opts, req, rec)
             if not self._ffmpeg_assistant.ensure_available(opts):
                 return
             pack_pairs.append((req, opts))
@@ -1839,9 +1927,14 @@ class AudiobookDLApp:
         )
 
     def _execute_sync_targets(self, targets: Sequence[tuple[str, str]], mode: str) -> None:
-        if mode == "enqueue":
+        normalized = str(mode or "").strip().lower()
+        if normalized not in VALID_AUTO_SYNC_MODES:
+            raise ValueError(
+                f"Invalid auto_sync_mode {mode!r}; expected one of {VALID_AUTO_SYNC_MODES}"
+            )
+        if normalized == "enqueue":
             self._sync_and_enqueue_targets(targets)
-        elif mode == "dry_run":
+        elif normalized == "dry_run":
             self._sync_libraries(
                 services=[s for s, _p in targets],
                 scan_only=True,
@@ -1861,7 +1954,11 @@ class AudiobookDLApp:
         targets: list[tuple[str, str]],
     ) -> None:
         norm_minutes = max(1, minutes)
-        norm_mode = mode if mode in ("enqueue", "scan_only", "dry_run") else "enqueue"
+        norm_mode = str(mode or "").strip().lower()
+        if norm_mode not in VALID_AUTO_SYNC_MODES:
+            raise ValueError(
+                f"Invalid auto_sync_mode {mode!r}; expected one of {VALID_AUTO_SYNC_MODES}"
+            )
         self._automation.auto_sync_mode = norm_mode
         self._automation.auto_sync_targets = list(targets)
         self._automation.configure_auto_sync_timer(enabled, norm_minutes)

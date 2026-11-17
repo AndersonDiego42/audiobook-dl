@@ -1,13 +1,18 @@
 """Library export utilities for CSV, JSON, and Excel (.xlsx) formats."""
 
 import csv
+import io
 import json
 import os
+import tempfile
 from typing import Any
 from collections.abc import Sequence
 
 from audiobookdl.exceptions import GenericAudiobookDLException
 from audiobookdl.utils.archive import ArchiveEntry
+from audiobookdl.utils.fs import atomic_write_text
+
+_FORMULA_PREFIXES = ("=", "+", "-", "@")
 
 SUPPORTED_EXPORT_FORMATS = ("csv", "json", "xlsx")
 
@@ -68,8 +73,17 @@ def _entry_to_dict(entry: ArchiveEntry) -> dict[str, Any]:
     }
 
 
+def _sanitize_spreadsheet_cell(value: Any) -> Any:
+    """Neutralize spreadsheet formula/DDE injection payloads in string cells."""
+    if not isinstance(value, str) or not value:
+        return value
+    if value[0] in ("\t", "\r", "\n") or value.lstrip("\t\r\n ").startswith(_FORMULA_PREFIXES):
+        return f"'{value}"
+    return value
+
+
 def _entry_to_row(entry: ArchiveEntry) -> list[Any]:
-    return [
+    raw_row: list[Any] = [
         entry.id,
         entry.status,
         entry.source,
@@ -90,6 +104,7 @@ def _entry_to_row(entry: ArchiveEntry) -> list[Any]:
         entry.downloaded_at,
         entry.last_seen_at or "",
     ]
+    return [_sanitize_spreadsheet_cell(cell) for cell in raw_row]
 
 
 def export_library_entries(
@@ -106,15 +121,19 @@ def export_library_entries(
         os.makedirs(parent, exist_ok=True)
 
     if resolved_fmt == "csv":
-        with open(abs_path, "w", encoding="utf-8", newline="") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(EXPORT_COLUMNS)
-            for entry in entries:
-                writer.writerow(_entry_to_row(entry))
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(EXPORT_COLUMNS)
+        for entry in entries:
+            writer.writerow(_entry_to_row(entry))
+        atomic_write_text(abs_path, buf.getvalue(), encoding="utf-8", newline="")
     elif resolved_fmt == "json":
         payload = [_entry_to_dict(entry) for entry in entries]
-        with open(abs_path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, ensure_ascii=False)
+        atomic_write_text(
+            abs_path,
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
     else:
         try:
             import openpyxl
@@ -128,6 +147,21 @@ def export_library_entries(
         sheet.append(list(EXPORT_COLUMNS))
         for entry in entries:
             sheet.append(_entry_to_row(entry))
-        workbook.save(abs_path)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(abs_path)}.",
+            suffix=".xlsx.tmp",
+            dir=parent or ".",
+        )
+        os.close(fd)
+        try:
+            workbook.save(tmp_path)
+            os.replace(tmp_path, abs_path)
+        except Exception:
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     return len(entries)

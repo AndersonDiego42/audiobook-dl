@@ -5,7 +5,14 @@ from dataclasses import fields as dataclass_fields
 from attrs import fields as attrs_fields
 import pytest
 
-from audiobookdl.config import Config, GuiConfig, SourceConfig, save_output_preferences, structure_config
+from audiobookdl.config import (
+    Config,
+    CustomMetadataProviderConfig,
+    GuiConfig,
+    SourceConfig,
+    save_output_preferences,
+    structure_config,
+)
 from audiobookdl.options_schema import (
     CONFIG_OPTION_SPECS,
     DOWNLOAD_OPTION_SPECS,
@@ -45,11 +52,15 @@ def test_download_options_parity_with_schema():
 
 def test_config_fields_parity_with_schema():
     cfg_fields = {
-        f.name for f in attrs_fields(Config) if f.name not in ("sources", "gui", "audiobookshelf")
+        f.name
+        for f in attrs_fields(Config)
+        if f.name not in ("sources", "gui", "audiobookshelf", "custom_metadata_providers")
     }
     schema_config_keys = {spec.config_key for spec in CONFIG_OPTION_SPECS if spec.config_key}
     assert schema_config_keys == cfg_fields
-    assert KNOWN_TOP_LEVEL_CONFIG_KEYS == ({"sources", "gui", "audiobookshelf"} | schema_config_keys)
+    assert KNOWN_TOP_LEVEL_CONFIG_KEYS == (
+        {"sources", "gui", "audiobookshelf", "enrichment"} | schema_config_keys
+    )
 
     assert {f.name for f in attrs_fields(GuiConfig)} == set(GUI_CONFIG_KEYS)
     assert {f.name for f in attrs_fields(SourceConfig)} == set(SOURCE_CONFIG_KEYS)
@@ -82,6 +93,14 @@ def test_config_clone_copies_all_fields_independently():
         download_archive="/tmp/archive.sqlite",
         check_updates=True,
         gui=GuiConfig(window_geometry="900x700", output_dir="/tmp/out", output_template="{title}"),
+        custom_metadata_providers={
+            "hardcover": CustomMetadataProviderConfig(
+                name="hardcover",
+                url="https://hardcover.example.com",
+                api_key="hc-secret",
+                enabled=True,
+            )
+        },
     )
 
     cloned = original.clone()
@@ -89,6 +108,9 @@ def test_config_clone_copies_all_fields_independently():
     assert cloned.sources is not original.sources
     assert cloned.sources["storytel"] is not original.sources["storytel"]
     assert cloned.gui is not original.gui
+    assert cloned.custom_metadata_providers is not original.custom_metadata_providers
+    assert cloned.custom_metadata_providers["hardcover"] is not original.custom_metadata_providers["hardcover"]
+    assert cloned.custom_metadata_providers["hardcover"].url == "https://hardcover.example.com"
 
     for spec in CONFIG_OPTION_SPECS:
         key = spec.config_key

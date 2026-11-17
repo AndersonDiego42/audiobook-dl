@@ -1,6 +1,6 @@
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, logging
-from audiobookdl.exceptions import RequestError, UserNotAuthorized
+from audiobookdl.exceptions import GenericAudiobookDLException, RequestError, UserNotAuthorized
 from audiobookdl.utils.audiobook import parse_language, parse_release_date
 
 import json
@@ -125,10 +125,11 @@ class YourCloudLibrarySource(Source):
         )
         return metadata
 
-    def download_cover(self, meta) -> Cover:
-        cover_url = meta["cover_url"]
-        cover_data = self.get(f"{cover_url}?aspect=1:1")
-        return Cover(cover_data, "jpg")
+    def download_cover(self, meta) -> Cover | None:
+        cover_url = meta.get("cover_url")
+        if not cover_url:
+            return None
+        return self.fetch_cover_safe(f"{cover_url}?aspect=1:1")
 
     @staticmethod
     def create_chapters(book_info: dict) -> list[Chapter]:
@@ -178,6 +179,28 @@ class YourCloudLibrarySource(Source):
                 return True
         return False
 
+    def verify_auth(self, url: str = "") -> bool:
+        if not self._session.cookies and not self.authenticated:
+            return False
+        library: str | None = getattr(self, "_library_id", None) or getattr(
+            self._options, "library", None
+        )
+        if not library:
+            return self.authenticated
+        shelf_url = f"https://ebook.yourcloudlibrary.com/library/{library}/shelf"
+        try:
+            resp = self.request("GET", shelf_url, allow_redirects=False)
+        except (RequestError, UserNotAuthorized):
+            return False
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = (resp.headers.get("location") or resp.headers.get("Location") or "").lower()
+            return not any(tok in location for tok in ("login", "signin", "sign-in"))
+        if resp.status_code in (401, 403) or resp.status_code != 200:
+            return False
+        if "/login" in (getattr(resp, "url", "") or "").lower():
+            return False
+        return True
+
     def _login(self, url: str, username: str, password: str, library: str):  # type: ignore
         self._library_id = library
         self.get(f"https://ebook.yourcloudlibrary.com/library/{library}/featured")
@@ -199,8 +222,8 @@ class YourCloudLibrarySource(Source):
             return
         try:
             payload = json.loads(resp.content.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise UserNotAuthorized from exc
         if isinstance(payload, dict) and self._is_failed_login_payload(payload):
             raise UserNotAuthorized
 
@@ -210,7 +233,10 @@ class YourCloudLibrarySource(Source):
             self._options, "library", None
         )
         if not library:
-            return []
+            raise GenericAudiobookDLException(
+                heading="Library ID required",
+                body="YourCloudLibrary requires a library ID (set 'library' on the Accounts page or in config).",
+            )
         shelf_url = f"https://ebook.yourcloudlibrary.com/library/{library}/shelf"
         raw = self._get_page(shelf_url, use_cache=False).decode("utf-8", errors="replace")
         results: list[CatalogBook] = []

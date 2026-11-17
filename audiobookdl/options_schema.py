@@ -35,7 +35,7 @@ GUI_CONFIG_KEYS: frozenset[str] = frozenset(
         "auto_sync_targets",
     }
 )
-SOURCE_CONFIG_KEYS: frozenset[str] = frozenset({"username", "password", "library", "cookie_file"})
+SOURCE_CONFIG_KEYS: frozenset[str] = frozenset({"username", "password", "library", "cookie_file", "locale"})
 
 
 def default_database_directory() -> str:
@@ -133,7 +133,12 @@ def _validate_audio_bitrate(key: str, raw: Any) -> tuple[str | None, str | None]
         return None, f"Warning: invalid '{key}' in config ('{val}'); ignoring"
 
 
-def _validate_enrich_providers(key: str, raw: Any) -> tuple[str | None, str | None]:
+def _validate_enrich_providers(
+    key: str,
+    raw: Any,
+    *,
+    custom_providers: Mapping[str, Any] | None = None,
+) -> tuple[str | None, str | None]:
     val, warning = _validate_str(key, raw)
     if warning is not None or val is None:
         return None, warning
@@ -142,7 +147,7 @@ def _validate_enrich_providers(key: str, raw: Any) -> tuple[str | None, str | No
     from audiobookdl.utils.enrichment import parse_provider_list
 
     try:
-        return ",".join(parse_provider_list(val)), None
+        return ",".join(parse_provider_list(val, custom_providers=custom_providers)), None
     except ValueError:
         return None, f"Warning: invalid '{key}' in config ('{val}'); ignoring"
 
@@ -187,10 +192,18 @@ _CONFIG_VALIDATORS: Mapping[str, Callable[[str, Any], tuple[Any, str | None]]] =
 }
 
 
-def validate_config_value(key: str, value_kind: str, raw: Any) -> tuple[Any, str | None]:
+def validate_config_value(
+    key: str,
+    value_kind: str,
+    raw: Any,
+    *,
+    custom_providers: Mapping[str, Any] | None = None,
+) -> tuple[Any, str | None]:
     """Validate and normalize a raw TOML value according to `value_kind`."""
     if raw is None:
         return None, None
+    if value_kind == "enrich_providers":
+        return _validate_enrich_providers(key, raw, custom_providers=custom_providers)
     validator = _CONFIG_VALIDATORS.get(value_kind)
     if validator is None:
         raise ValueError(f"Unknown config value kind: {value_kind!r}")
@@ -936,7 +949,10 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="post_exec",
         default=None,
-        help="Shell command to execute after each completed audiobook (sets AUDIOBOOK_DL_* env vars)",
+        help=(
+            "Shell command to execute after each completed audiobook (300s timeout; "
+            "read AUDIOBOOK_DL_PATH/TITLE/AUTHOR/SOURCE/FORMAT env vars rather than interpolating titles)"
+        ),
         config_key="post_exec",
         config_kind="str",
         toml_serializer=_serialize_non_empty_str,
@@ -1110,6 +1126,17 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         ),
     ),
     OptionSpec(
+        name="locale",
+        default=None,
+        help="Optional regional locale code for sources such as Nextory (e.g. sv_SE, en_GB)",
+        config_key="locale",
+        config_kind="str",
+        toml_serializer=_serialize_non_empty_str,
+        merge_from_config=True,
+        merge_only_if_default=True,
+        merge_require_truthy=True,
+    ),
+    OptionSpec(
         name="service",
         default=None,
         help="Target service key",
@@ -1133,7 +1160,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="enrich_providers",
         default=None,
-        help="Comma-separated enrichment providers in priority order (audnexus,itunes,google,openlibrary)",
+        help="Comma-separated enrichment providers in priority order (audnexus,itunes,google,openlibrary, or custom:<name>)",
         config_key="enrich_providers",
         config_kind="enrich_providers",
         toml_serializer=_serialize_non_empty_str,
@@ -1206,7 +1233,7 @@ PERSISTED_GUI_OPTION_SPECS: tuple[OptionSpec, ...] = tuple(
     spec for spec in OPTION_REGISTRY if spec.gui is not None and spec.gui.persisted_in_output_prefs
 )
 KNOWN_TOP_LEVEL_CONFIG_KEYS: frozenset[str] = frozenset(
-    {"sources", "gui", "audiobookshelf"}
+    {"sources", "gui", "audiobookshelf", "enrichment"}
     | {spec.config_key for spec in CONFIG_OPTION_SPECS if spec.config_key is not None}
 )
 
@@ -1261,6 +1288,7 @@ class DownloadOptions:
     proxy: str | None = None
     timeout: float | None = None
     impersonate: str | None = None
+    locale: str | None = None
     service: str | None = None
     enrich_metadata: bool = False
     enrich_providers: str | None = None

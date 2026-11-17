@@ -8,6 +8,7 @@ import sys
 import tkinter as tk
 from tkinter import font as tkfont
 from tkinter import ttk
+from typing import Any
 
 
 THEME_MODES: tuple[str, ...] = ("system", "light", "dark")
@@ -159,20 +160,23 @@ def enable_high_dpi_awareness() -> None:
     """Enable per-monitor DPI awareness on Windows when supported by the OS."""
     if not sys.platform.startswith("win"):
         return
+    windll: Any = getattr(ctypes, "windll", None)
+    if windll is None:
+        return
     try:
         # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 (-4)
-        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))  # type: ignore[attr-defined]
+        windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
         return
     except Exception:
         pass
     try:
-        shcore = ctypes.windll.shcore  # type: ignore[attr-defined]
+        shcore = windll.shcore
         shcore.SetProcessDpiAwareness(2)
         return
     except Exception:
         pass
     try:
-        ctypes.windll.user32.SetProcessDPIAware()  # type: ignore[attr-defined]
+        windll.user32.SetProcessDPIAware()
     except Exception:
         pass
 
@@ -201,7 +205,7 @@ def configure_hidpi_scaling(root: tk.Misc, style: ttk.Style) -> float:
     scale = get_dpi_scale(root)
     try:
         default_font = tkfont.nametofont("TkDefaultFont", root=root)
-        line_h = int(default_font.metrics("linespace"))
+        line_h = default_font.metrics("linespace")
     except (tk.TclError, ValueError, TypeError):
         line_h = round(16 * scale)
     row_height = max(scale_px(root, 22), line_h + scale_px(root, 6))
@@ -219,12 +223,15 @@ def _apply_windows_titlebar_theme(window: tk.Misc, *, is_dark: bool) -> None:
     """Toggle dark title bar on Windows 10/11 when supported by DWM."""
     if not sys.platform.startswith("win"):
         return
+    windll: Any = getattr(ctypes, "windll", None)
+    if windll is None:
+        return
     try:
-        hwnd = ctypes.windll.user32.GetParent(window.winfo_id())  # type: ignore[attr-defined]
+        hwnd = windll.user32.GetParent(window.winfo_id())
         if not hwnd:
             hwnd = window.winfo_id()
         value = ctypes.c_int(1 if is_dark else 0)
-        dwmapi = ctypes.windll.dwmapi  # type: ignore[attr-defined]
+        dwmapi = windll.dwmapi
         # DWMWA_USE_IMMUTABLE_DARK_MODE is 20 on Windows 11 / 20H1+, 19 on older Win10 builds
         for attr in (20, 19):
             res = dwmapi.DwmSetWindowAttribute(
@@ -575,7 +582,8 @@ def apply_theme_to_widget_tree(widget: tk.Misc, palette: ThemePalette) -> None:
 def apply_theme_to_window(window: tk.Toplevel, palette: ThemePalette) -> None:
     """Apply `palette` to a `Toplevel` dialog, its classic Tk children, and Windows title bar."""
     if hasattr(window, "_palette"):
-        window._palette = palette  # type: ignore[attr-defined]
+        win_any: Any = window
+        win_any._palette = palette
     apply_theme_to_widget_tree(window, palette)
     _apply_windows_titlebar_theme(window, is_dark=(palette.mode == "dark"))
 

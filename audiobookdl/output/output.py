@@ -327,6 +327,7 @@ def _probe_uncached_audio_info(
     paths: Sequence[str],
     cache: dict[str, AudioProbeInfo],
     cancel_event: threading.Event | None = None,
+    max_workers: int | None = None,
 ) -> list[AudioProbeInfo]:
     """Populate `cache` for any uncached `paths` in parallel and return infos in order."""
     with _PROBE_CACHE_LOCK:
@@ -335,7 +336,7 @@ def _probe_uncached_audio_info(
         probed = run_cancellable_pool(
             _probe_audio_info,
             uncached,
-            max_workers=COMBINE_REMUX_THREADS,
+            max_workers=resolve_ffmpeg_pool_workers(max_workers, cpu_bound=False),
             cancel_event=cancel_event,
         )
         with _PROBE_CACHE_LOCK:
@@ -621,9 +622,26 @@ _MAX_CONCAT_ARG_CHARS = 16000
 _MAX_CONCAT_PROTOCOL_FILES = 64
 
 
-def _transcode_pool_workers() -> int:
+def resolve_ffmpeg_pool_workers(
+    options_max_workers: int | None = None,
+    *,
+    cpu_bound: bool,
+) -> int:
+    """Resolve bounded worker count for FFmpeg/FFprobe pools from `max_workers` and CPU count."""
+    cpus = max(1, os.cpu_count() or 4)
+    has_explicit = isinstance(options_max_workers, int) and not isinstance(options_max_workers, bool) and options_max_workers > 0
+    if cpu_bound:
+        default_cap = min(COMBINE_REMUX_THREADS, cpus)
+        requested = options_max_workers if has_explicit else default_cap
+        return max(1, min(int(requested), cpus))  # type: ignore[arg-type]
+    io_cap = max(2, cpus * 2)
+    requested_io = options_max_workers if has_explicit else COMBINE_REMUX_THREADS
+    return max(1, min(int(requested_io), min(COMBINE_REMUX_THREADS, io_cap)))  # type: ignore[arg-type]
+
+
+def _transcode_pool_workers(options_max_workers: int | None = None) -> int:
     """Return bounded worker count for CPU-bound parallel FFmpeg transcodes."""
-    return min(COMBINE_REMUX_THREADS, max(1, os.cpu_count() or 4))
+    return resolve_ffmpeg_pool_workers(options_max_workers, cpu_bound=True)
 
 
 def _write_concat_list_file(concat_path: str, filepaths: Sequence[str]) -> None:
@@ -687,6 +705,7 @@ def combine_audiofiles(
     mono: bool = False,
     preserve_video: bool = False,
     show_progress: bool = True,
+    max_workers: int | None = None,
 ) -> bool:
     """
     Combines the given audio/video files into `output_path` (optionally transcoding
@@ -721,7 +740,12 @@ def combine_audiofiles(
             and len(filepaths) > 1
             and output_extension not in MP4_CONTAINERS
         ):
-            input_infos = _probe_uncached_audio_info(filepaths, cache, cancel_event=cancel_event)
+            input_infos = _probe_uncached_audio_info(
+                filepaths,
+                cache,
+                cancel_event=cancel_event,
+                max_workers=max_workers,
+            )
             codecs = {i.codec_name for i in input_infos if i.codec_name}
             sample_rates = {i.sample_rate for i in input_infos if i.sample_rate}
             channel_counts = {i.channels for i in input_infos if i.channels}
@@ -756,7 +780,12 @@ def combine_audiofiles(
                 target_sr: int | None = None
                 target_ch: int | None = None
                 if len(filepaths) > 1 and output_extension in MP4_CONTAINERS:
-                    input_infos = _probe_uncached_audio_info(filepaths, cache, cancel_event=cancel_event)
+                    input_infos = _probe_uncached_audio_info(
+                        filepaths,
+                        cache,
+                        cancel_event=cancel_event,
+                        max_workers=max_workers,
+                    )
                     sample_rates = {i.sample_rate for i in input_infos if i.sample_rate}
                     channel_counts = {i.channels for i in input_infos if i.channels}
                     any_non_aac = any(i.codec_name != "aac" for i in input_infos)
@@ -773,7 +802,10 @@ def combine_audiofiles(
                 completed_parts = 0
                 part_lock = threading.Lock()
                 verb = "Encoding parts" if parallel_aac_encoded else "Remuxing parts"
-                pool_workers = _transcode_pool_workers() if parallel_aac_encoded else COMBINE_REMUX_THREADS
+                pool_workers = resolve_ffmpeg_pool_workers(
+                    max_workers,
+                    cpu_bound=parallel_aac_encoded,
+                )
 
                 def _run_remux_pool(remux_progress=None, remux_task=None) -> list[tuple[str, bool]]:
                     def remux(item):
@@ -934,7 +966,7 @@ def combine_audiofiles(
                 normalized = run_cancellable_pool(
                     _normalize_part,
                     list(enumerate(filepaths)),
-                    max_workers=_transcode_pool_workers(),
+                    max_workers=resolve_ffmpeg_pool_workers(max_workers, cpu_bound=True),
                     cancel_event=cancel_event,
                 )
                 concat_sources = []
@@ -1419,6 +1451,7 @@ def split_audio_by_chapters(
     loudnorm: bool = False,
     mono: bool = False,
     preserve_video: bool = False,
+    max_workers: int | None = None,
 ) -> list[str]:
     """
     Split `master_path` into individual zero-padded chapter files inside `output_dir`.
@@ -1529,7 +1562,7 @@ def split_audio_by_chapters(
             exported_paths = run_cancellable_pool(
                 _run_task,
                 tasks,
-                max_workers=COMBINE_REMUX_THREADS,
+                max_workers=resolve_ffmpeg_pool_workers(max_workers, cpu_bound=True),
                 cancel_event=effective_cancel,
             )
             return list(exported_paths)
@@ -1555,6 +1588,7 @@ def merge_segment_groups_into_chapters(
     loudnorm: bool = False,
     mono: bool = False,
     preserve_video: bool = False,
+    max_workers: int | None = None,
 ) -> list[str]:
     """
     Merge pre-grouped segment lists directly into per-chapter/per-lesson files in `output_dir`.
@@ -1628,6 +1662,7 @@ def merge_segment_groups_into_chapters(
                                 mono=mono,
                                 preserve_video=preserve_video,
                                 show_progress=False,
+                                max_workers=max_workers,
                             )
                     except BaseException as exc:
                         with state_lock:
@@ -1644,7 +1679,7 @@ def merge_segment_groups_into_chapters(
                     run_cancellable_pool(
                         _merge_one,
                         list(enumerate(non_empty)),
-                        max_workers=COMBINE_REMUX_THREADS,
+                        max_workers=resolve_ffmpeg_pool_workers(max_workers, cpu_bound=False),
                         cancel_event=effective_cancel,
                     )
                 )
@@ -1680,6 +1715,7 @@ def merge_hls_segments_into_chapters(
     loudnorm: bool = False,
     mono: bool = False,
     preserve_video: bool = False,
+    max_workers: int | None = None,
 ) -> list[str]:
     """
     Combine fine-grained HLS segment files seamlessly and split cleanly by `chapters`.
@@ -1710,6 +1746,7 @@ def merge_hls_segments_into_chapters(
             loudnorm=loudnorm,
             mono=mono,
             preserve_video=preserve_video,
+            max_workers=max_workers,
         )
         split_paths = split_audio_by_chapters(
             master_path,
@@ -1720,6 +1757,7 @@ def merge_hls_segments_into_chapters(
             audio_bitrate=audio_bitrate,
             probe_cache=cache,
             preserve_video=preserve_video,
+            max_workers=max_workers,
         )
     for part in filepaths:
         if part not in split_paths and os.path.exists(part):
@@ -1739,6 +1777,7 @@ def convert_output(
     mono: bool = False,
     probe_cache: dict[str, AudioProbeInfo] | None = None,
     preserve_video: bool = False,
+    max_workers: int | None = None,
 ):
     """Converts a list of media files into another format and returns new files"""
     explicit_bitrate = normalize_audio_bitrate(audio_bitrate)
@@ -1800,7 +1839,7 @@ def convert_output(
         results = run_cancellable_pool(
             _convert_one,
             list(filenames),
-            max_workers=COMBINE_REMUX_THREADS,
+            max_workers=resolve_ffmpeg_pool_workers(max_workers, cpu_bound=True),
             cancel_event=effective_cancel,
         )
         for old_path, new_path, converted in results:

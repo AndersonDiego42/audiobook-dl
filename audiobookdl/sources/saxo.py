@@ -1,6 +1,6 @@
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, logging
-from audiobookdl.exceptions import BookNotFound, NoSourceFound
+from audiobookdl.exceptions import BookNotFound, NoSourceFound, RequestError, UserNotAuthorized
 from audiobookdl.utils.audiobook import (
     AESEncryption,
     clean_html_description,
@@ -33,6 +33,18 @@ class SaxoSource(Source):
             "App-Os": app_os,
             "App-Version": app_version,
         }
+
+    def verify_auth(self, url: str = "") -> bool:
+        if not self.authenticated or not getattr(self, "bearer_token", None) or not getattr(self, "user_id", None):
+            return False
+        try:
+            payload = self.get_json(
+                f"https://api-read.saxo.com/api/v2/user/{self.user_id}/books?booktypefilter=Audiobook",
+                headers=self._app_headers(),
+            )
+            return isinstance(payload, dict)
+        except (RequestError, UserNotAuthorized, ValueError):
+            return False
 
     def _login(self, url: str, username: str, password: str) -> None:
         resp = self.post_json(
@@ -175,10 +187,9 @@ class SaxoSource(Source):
         )
         return result
 
-    def get_cover(self, book_info) -> Cover:
-        cover_url = book_info["bookMetadata"]["image"]["highQualityImageUrl"]
-        data = self.get(cover_url)
-        return Cover(data, "jpg")
+    def get_cover(self, book_info) -> Cover | None:
+        cover_url = ((book_info.get("bookMetadata") or {}).get("image") or {}).get("highQualityImageUrl")
+        return self.fetch_cover_safe(cover_url)
 
     @staticmethod
     def _items_to_catalog(items: Any) -> list[CatalogBook]:

@@ -998,7 +998,7 @@ class ModalDialog(tk.Toplevel):
 
         self.withdraw()
         self.title(title)
-        self.transient(self._owner)  # type: ignore[call-overload]
+        self.transient(self._owner)
         self.resizable(*resizable)
         if min_size is not None:
             self.minsize(scale_px(self, min_size[0]), scale_px(self, min_size[1]))
