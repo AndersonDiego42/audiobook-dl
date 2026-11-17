@@ -206,6 +206,8 @@ def configure_hidpi_scaling(root: tk.Misc, style: ttk.Style) -> float:
         line_h = round(16 * scale)
     row_height = max(scale_px(root, 22), line_h + scale_px(root, 6))
     style.configure("Treeview", rowheight=row_height)
+    catalog_row_height = max(scale_px(root, 56), line_h + scale_px(root, 10))
+    style.configure("Catalog.Treeview", rowheight=catalog_row_height)
     return scale
 
 
@@ -475,28 +477,29 @@ def _configure_clam_palette(style: ttk.Style, palette: ThemePalette) -> None:
         background=[("active", palette.surface_hover)],
     )
 
-    style.configure(
-        "Treeview",
-        background=palette.surface,
-        fieldbackground=palette.surface,
-        foreground=palette.fg,
-        bordercolor=palette.border,
-    )
-    style.map(
-        "Treeview",
-        background=[("selected", palette.select_bg)],
-        foreground=[("selected", palette.select_fg)],
-    )
-    style.configure(
-        "Treeview.Heading",
-        background=palette.surface_alt,
-        foreground=palette.fg,
-        bordercolor=palette.border,
-    )
-    style.map(
-        "Treeview.Heading",
-        background=[("active", palette.surface_hover)],
-    )
+    for tree_style in ("Treeview", "Catalog.Treeview"):
+        style.configure(
+            tree_style,
+            background=palette.surface,
+            fieldbackground=palette.surface,
+            foreground=palette.fg,
+            bordercolor=palette.border,
+        )
+        style.map(
+            tree_style,
+            background=[("selected", palette.select_bg)],
+            foreground=[("selected", palette.select_fg)],
+        )
+        style.configure(
+            f"{tree_style}.Heading",
+            background=palette.surface_alt,
+            foreground=palette.fg,
+            bordercolor=palette.border,
+        )
+        style.map(
+            f"{tree_style}.Heading",
+            background=[("active", palette.surface_hover)],
+        )
 
 
 def _configure_menu(menu: tk.Menu, palette: ThemePalette) -> None:

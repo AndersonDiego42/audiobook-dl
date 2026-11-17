@@ -485,6 +485,77 @@ def render_cover_thumbnail(
         return None
 
 
+def resize_cover_thumbnail_bytes(raw_bytes: bytes, size: int = 48) -> bytes | None:
+    """Decode raw image bytes in a worker thread into square `size x size` PNG bytes."""
+    if not raw_bytes:
+        return None
+    try:
+        from PIL import Image, ImageOps
+
+        with Image.open(io.BytesIO(raw_bytes)) as opened:
+            rgba = opened.convert("RGBA")
+            square = ImageOps.pad(rgba, (size, size), color=(0, 0, 0, 0))
+            buf = io.BytesIO()
+            square.save(buf, format="PNG")
+            return buf.getvalue()
+    except Exception:
+        return None
+
+
+def photo_from_image_bytes(raw_bytes: bytes, master: tk.Misc) -> Any | None:
+    """Convert pre-sized PNG/image bytes into an `ImageTk.PhotoImage` on the Tk main thread."""
+    if not raw_bytes:
+        return None
+    try:
+        from PIL import Image, ImageTk
+
+        with Image.open(io.BytesIO(raw_bytes)) as image:
+            return ImageTk.PhotoImage(image.copy(), master=master)
+    except Exception:
+        return None
+
+
+def create_placeholder_cover_thumbnail(
+    master: tk.Misc,
+    size: int = 48,
+    *,
+    bg_hex: str,
+    border_hex: str,
+    glyph_hex: str,
+) -> Any | None:
+    """Render a minimal square placeholder book-cover icon matching the active palette."""
+    try:
+        from PIL import Image, ImageDraw, ImageTk
+
+        img = Image.new("RGBA", (size, size), bg_hex)
+        draw = ImageDraw.Draw(img)
+        pad = max(2, size // 12)
+        draw.rectangle([pad, pad, size - 1 - pad, size - 1 - pad], outline=border_hex, width=1)
+        bx0 = size // 3
+        bx1 = size - bx0
+        by0 = size // 4
+        by1 = size - by0
+        draw.rectangle([bx0, by0, bx1, by1], outline=glyph_hex, width=1)
+        draw.line([bx0 + max(2, size // 14), by0, bx0 + max(2, size // 14), by1], fill=glyph_hex, width=1)
+        return ImageTk.PhotoImage(img, master=master)
+    except Exception:
+        return None
+
+
+def format_catalog_formats(book: Any) -> str:
+    """Format advertised catalog media types (`Audiobook + Ebook`, `Audiobook`, `Ebook`)."""
+    formats = getattr(book, "formats", ()) or ()
+    has_ab = "audiobook" in formats
+    has_eb = "ebook" in formats
+    if has_ab and has_eb:
+        return "Audiobook + Ebook"
+    if has_eb:
+        return "Ebook"
+    if has_ab:
+        return "Audiobook"
+    return ""
+
+
 def default_output_dir() -> str:
     """Return the default output directory (user Downloads folder if it exists)."""
     downloads = Path.home() / "Downloads"

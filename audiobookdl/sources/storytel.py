@@ -173,11 +173,19 @@ class StorytelSource(Source):
         if resp.status_code != 200:
             if resp.status_code == 403:
                 self.check_cloudflare_blocked(resp)
-            raise UserNotAuthorized
+            raise UserNotAuthorized(
+                detail=f"Storytel login failed (HTTP {resp.status_code})"
+            )
 
-        user_data = resp.json()
-        jwt = user_data["accountInfo"]["jwt"]
-        self._language = user_data["accountInfo"]["lang"]
+        try:
+            user_data = resp.json()
+        except ValueError as exc:
+            raise UserNotAuthorized(detail="Storytel login returned invalid JSON") from exc
+        account_info = user_data.get("accountInfo") if isinstance(user_data, dict) else None
+        jwt = account_info.get("jwt") if isinstance(account_info, dict) else None
+        if not jwt:
+            raise UserNotAuthorized(detail="Storytel login response missing session token")
+        self._language = account_info.get("lang") or "en"
         self._session.headers.update({"authorization": f"Bearer {jwt}"})
 
     def _relogin_check(self) -> None:
@@ -267,6 +275,32 @@ class StorytelSource(Source):
             books=books,
         )
 
+    @staticmethod
+    def _iter_bookshelf_models(data: Any) -> list[dict[str, Any]]:
+        """Extract normalized book model dicts from Storytel bookshelf payloads."""
+        if isinstance(data, list):
+            entries: Any = data
+        elif isinstance(data, dict):
+            raw_items = data.get("items")
+            if raw_items is None:
+                raw_items = data.get("books") or data.get("consumables") or []
+            if isinstance(raw_items, dict):
+                entries = raw_items.values()
+            elif isinstance(raw_items, list):
+                entries = raw_items
+            else:
+                entries = ()
+        else:
+            entries = ()
+        models: list[dict[str, Any]] = []
+        for item in entries:
+            if not isinstance(item, dict):
+                continue
+            model = item.get("model") or item.get("book") or item.get("consumable") or item
+            if isinstance(model, dict):
+                models.append(model)
+        return models
+
     def download_bookshelf_wtr(self) -> Series[str]:
         """
         Download books in the user's bookshelf marked as "want to read"
@@ -274,9 +308,8 @@ class StorytelSource(Source):
         """
         data = self.download_bookshelf()
         books: list[BookId[str] | Audiobook] = []
-        for item in data.get("items", {}).values():
-            model = item.get("model", {})
-            book_id = model.get("id")
+        for model in self._iter_bookshelf_models(data):
+            book_id = model.get("id") or model.get("consumableId")
             if not book_id or model.get("state") != "WILL_CONSUME":
                 continue
             if self._should_include_item(book_id, model.get("formats", [])):
@@ -464,10 +497,16 @@ class StorytelSource(Source):
                 setattr(metadata, key, value)
 
     def download_bookshelf(self) -> dict[str, Any]:
-        """Download bookshelf data"""
+        """Download full bookshelf snapshot from Storytel's delta-sync endpoint."""
+        # An empty body requests the full snapshot; Storytel rejects {"items": []} with HTTP 400
+        # because `items` expects a map keyed by consumable id.
         data: dict[str, Any] = self.post_json(
             "https://api.storytel.net/libraries/bookshelf",
-            json={"items": []},
+            data="",
+            headers={
+                "content-type": "application/x-www-form-urlencoded",
+                "Accept": "*/*",
+            },
         )
 
         if self._debug_dump_enabled():
@@ -788,6 +827,111 @@ class StorytelSource(Source):
         lang = getattr(self, "_language", None) or model_lang or "en"
         return f"https://www.storytel.com/{lang}/books/{book_id}"
 
+    @staticmethod
+    def _normalize_cover_url(raw_url: Any) -> str | None:
+        if not isinstance(raw_url, str):
+            return None
+        cleaned = raw_url.strip()
+        if not cleaned:
+            return None
+        if cleaned.startswith("//"):
+            return f"https:{cleaned}"
+        if cleaned.startswith("/"):
+            return f"https://www.storytel.com{cleaned}"
+        return cleaned
+
+    @classmethod
+    def _extract_formats_and_cover(
+        cls,
+        model: dict[str, Any],
+    ) -> tuple[tuple[str, ...], str | None]:
+        """Extract available media formats (`audiobook`, `ebook`) and cover URL from `model`."""
+        found_formats: set[str] = set()
+        preferred_cover: str | None = None
+        fallback_cover: str | None = None
+        formats_raw = model.get("formats")
+        if isinstance(formats_raw, list):
+            for fmt in formats_raw:
+                if not isinstance(fmt, dict):
+                    continue
+                if fmt.get("isReleased") is False:
+                    continue
+                ftype = str(fmt.get("type") or "").strip().lower()
+                if ftype == "abook":
+                    found_formats.add("audiobook")
+                elif ftype == "ebook":
+                    found_formats.add("ebook")
+                cov_obj = fmt.get("cover")
+                cov_url = cls._normalize_cover_url(
+                    cov_obj.get("url") if isinstance(cov_obj, dict) else fmt.get("coverUrl")
+                )
+                if cov_url:
+                    if ftype == "abook" and preferred_cover is None:
+                        preferred_cover = cov_url
+                    elif fallback_cover is None:
+                        fallback_cover = cov_url
+
+        if isinstance(model.get("abook"), dict) or model.get("abookExists") or model.get("hasAbook"):
+            found_formats.add("audiobook")
+        if isinstance(model.get("ebook"), dict) or model.get("ebookExists") or model.get("hasEbook"):
+            found_formats.add("ebook")
+
+        if preferred_cover is None and fallback_cover is None:
+            model_cover = model.get("cover")
+            fallback_cover = cls._normalize_cover_url(
+                model_cover.get("url")
+                if isinstance(model_cover, dict)
+                else (
+                    model.get("largeCover")
+                    or model.get("largeCoverE")
+                    or model.get("coverUrl")
+                    or model.get("imageUrl")
+                )
+            )
+        ordered = tuple(f for f in ("audiobook", "ebook") if f in found_formats)
+        return ordered, (preferred_cover or fallback_cover)
+
+    def _catalog_book_from_model(
+        self,
+        model: dict[str, Any],
+        *,
+        require_title: bool = False,
+    ) -> CatalogBook | None:
+        book_id = model.get("id") or model.get("consumableId")
+        if not book_id:
+            return None
+        raw_title = str(model.get("name") or model.get("title") or "").strip()
+        if require_title and not raw_title:
+            return None
+        title = raw_title or str(book_id)
+        authors_raw = model.get("authors") or []
+        author_names = [
+            str(a.get("name") or "").strip()
+            for a in authors_raw
+            if isinstance(a, dict) and str(a.get("name") or "").strip()
+        ]
+        series_name: str | None = None
+        series_order: int | None = None
+        series_info = model.get("seriesInfo") or model.get("series")
+        if isinstance(series_info, dict):
+            s_name = str(series_info.get("name") or series_info.get("title") or "").strip()
+            if s_name:
+                series_name = s_name
+            raw_order = series_info.get("orderInSeries")
+            if isinstance(raw_order, int) and not isinstance(raw_order, bool):
+                series_order = raw_order
+        formats, cover_url = self._extract_formats_and_cover(model)
+        return CatalogBook(
+            title=title,
+            url=self._book_url(str(book_id), model),
+            author=", ".join(author_names),
+            series=series_name,
+            series_order=series_order,
+            source="storytel",
+            cover_url=cover_url,
+            formats=formats,
+        )
+
     def search(self, query: str) -> list[CatalogBook]:
         cleaned = query.strip()
         if not cleaned:
@@ -809,43 +953,16 @@ class StorytelSource(Source):
             model = entry.get("book") or entry.get("consumable") or entry
             if not isinstance(model, dict):
                 continue
-            book_id = model.get("id") or model.get("consumableId")
-            title = str(model.get("name") or model.get("title") or "").strip()
-            if not book_id or not title:
-                continue
-            authors_raw = model.get("authors") or []
-            author_names = [
-                str(a.get("name") or "") for a in authors_raw if isinstance(a, dict) and a.get("name")
-            ]
-            results.append(
-                CatalogBook(
-                    title=title,
-                    url=self._book_url(str(book_id), model),
-                    author=", ".join(author_names),
-                    source="storytel",
-                )
-            )
+            item = self._catalog_book_from_model(model, require_title=True)
+            if item is not None:
+                results.append(item)
         return results
 
     def list_library(self) -> list[CatalogBook]:
         data = self.download_bookshelf()
         results: list[CatalogBook] = []
-        for item in data.get("items", {}).values():
-            model = item.get("model", {})
-            book_id = model.get("id")
-            if not book_id:
-                continue
-            title = str(model.get("name") or model.get("title") or book_id)
-            authors_raw = model.get("authors") or []
-            author_names = [
-                str(a.get("name") or "") for a in authors_raw if isinstance(a, dict)
-            ]
-            results.append(
-                CatalogBook(
-                    title=title,
-                    url=self._book_url(str(book_id), model),
-                    author=", ".join(a for a in author_names if a),
-                    source="storytel",
-                )
-            )
+        for model in self._iter_bookshelf_models(data):
+            item = self._catalog_book_from_model(model, require_title=False)
+            if item is not None:
+                results.append(item)
         return results

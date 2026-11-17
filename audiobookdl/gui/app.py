@@ -591,6 +591,13 @@ class AudiobookDLApp:
                 return
             chosen_profile = normalize_profile_name(tab.selected_profile)
             options.profile = None if chosen_profile == DEFAULT_PROFILE else chosen_profile
+            auth_service = self._auth.selected_service()
+            auth_profile = normalize_profile_name(self.profile_var.get())
+            if auth_service is None or auth_service.key != svc.key or auth_profile != chosen_profile:
+                options.username = None
+                options.password = None
+                options.library = None
+                options.cookie_file = None
             self._controller.start_catalog_fetch(
                 mode,
                 svc.key,
@@ -2243,8 +2250,11 @@ class AudiobookDLApp:
             except tk.TclError:
                 return
             if cat_exc is not None:
-                catalog_tab.set_error_status("Error loading items")
-                messagebox.showerror("Catalog Error", str(cat_exc), parent=self.root)
+                err_text = str(cat_exc).strip() or type(cat_exc).__name__
+                first_line = err_text.splitlines()[0].strip()
+                catalog_tab.set_error_status(f"Error: {first_line}")
+                self._queue_panel.append_log(f"[ERROR] Catalog fetch failed: {err_text}")
+                messagebox.showerror("Catalog Error", err_text, parent=self.root)
             else:
                 if isinstance(payload, tuple) and len(payload) == 2:
                     books, statuses = payload

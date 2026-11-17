@@ -62,6 +62,18 @@ class CatalogBook:
     source: str = ""
     series_order: int | None = None
     item_type: str = "book"
+    cover_url: str | None = None
+    formats: tuple[str, ...] = ()
+
+    @property
+    def has_audiobook(self) -> bool:
+        """Return `True` when this entry advertises an audiobook format."""
+        return "audiobook" in self.formats
+
+    @property
+    def has_ebook(self) -> bool:
+        """Return `True` when this entry advertises an ebook format."""
+        return "ebook" in self.formats
 
 
 class Source(Generic[T]):

@@ -118,3 +118,18 @@ def test_non_subclass_error_templates_render_cleanly():
     assert len(sink.messages) == 2
     assert "Nextory" in sink.messages[0][1]
     assert "m4b" in sink.messages[1][1]
+
+
+@pytest.mark.parametrize("exc_cls,kwargs", _SUBCLASS_CASES, ids=lambda v: v.__name__ if isinstance(v, type) else "kwargs")
+def test_audiobook_dl_exception_str_is_non_empty_plain_text(exc_cls, kwargs):
+    exc = exc_cls(**kwargs)
+    text = str(exc).strip()
+    assert text != ""
+    assert "[red]" not in text
+
+    # Subclasses using base `**kwargs` accept `detail=...` cleanly for GUI dialogs.
+    if exc_cls not in (AudiobookshelfError, exceptions.GenericAudiobookDLException):
+        bare = exc_cls(detail="HTTP 401 from https://api.storytel.net/libraries/bookshelf")
+        bare_text = str(bare).strip()
+        assert bare_text != ""
+        assert "HTTP 401 from https://api.storytel.net/libraries/bookshelf" in bare_text

@@ -2,15 +2,27 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import os
 import sys
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
+from typing import Any
 from collections.abc import Callable, Sequence
 
+import requests
+
 from audiobookdl.config import DEFAULT_PROFILE, Config, list_configured_source_profiles
-from audiobookdl.gui.formatting import format_duration, load_cover_from_file, render_cover_thumbnail
+from audiobookdl.gui.formatting import (
+    create_placeholder_cover_thumbnail,
+    format_catalog_formats,
+    format_duration,
+    load_cover_from_file,
+    photo_from_image_bytes,
+    render_cover_thumbnail,
+    resize_cover_thumbnail_bytes,
+)
 from audiobookdl.gui.theme import (
     LIGHT_PALETTE,
     ThemePalette,
@@ -777,12 +789,15 @@ class ArchiveTab(ttk.Frame):
 class CatalogTab(ttk.Frame):
     """Tab hosting service catalog search and remote library browsing."""
 
+    _MAX_COVER_CACHE = 500
+    _MAX_COVER_BYTES = 5 * 1024 * 1024
     _COLUMNS = (
         TreeColumnSpec("title", "Title", width=210, stretch=True),
         TreeColumnSpec("author", "Author", width=140, stretch=True),
         TreeColumnSpec("series", "Series", width=120, stretch=True),
-        TreeColumnSpec("status", "Library", width=110, stretch=False),
-        TreeColumnSpec("url", "URL", width=200, stretch=True),
+        TreeColumnSpec("status", "Library", width=105, stretch=False),
+        TreeColumnSpec("formats", "Formats", width=125, stretch=False),
+        TreeColumnSpec("url", "URL", width=190, stretch=True),
     )
 
     def __init__(
@@ -798,6 +813,7 @@ class CatalogTab(ttk.Frame):
         on_sync_libraries: Callable[[str], None] | None = None,
         profile_resolver: Callable[[str], Sequence[str]] | None = None,
         status_resolver: Callable[[str, Sequence[CatalogBook]], Sequence[str]] | None = None,
+        cover_fetcher: Callable[[str], bytes | None] | None = None,
         selected_profile: str = "default",
         palette: ThemePalette | None = None,
     ) -> None:
@@ -811,11 +827,20 @@ class CatalogTab(ttk.Frame):
         self._on_sync_libraries = on_sync_libraries
         self._profile_resolver = profile_resolver
         self._status_resolver = status_resolver
+        self._cover_fetcher = cover_fetcher
         self._loaded_books: list[CatalogBook] = []
         self._book_statuses: list[str] = []
         self._loaded_service_key: str = ""
         self._loaded_profile: str = "default"
         self._palette = palette or LIGHT_PALETTE
+        self._cb_queue = MainThreadCallbackQueue(self)
+        self._cover_fetch_token = 0
+        self._thumb_size = scale_px(self, 48)
+        self._cover_png_cache: dict[str, bytes | None] = {}
+        self._url_photos: dict[str, Any] = {}
+        self._row_photos: dict[str, Any] = {}
+        self._placeholder_photo: Any | None = None
+        self.bind("<Destroy>", self._on_destroy, add="+")
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
@@ -864,11 +889,15 @@ class CatalogTab(ttk.Frame):
 
         self._group_var = tk.BooleanVar(value=True)
         self._hide_downloaded_var = tk.BooleanVar(value=False)
+        self._has_ebook_var = tk.BooleanVar(value=False)
         self._scrolled_tree = ScrolledTreeview(
             self,
             self._COLUMNS,
             selectmode="extended",
             show_tree=True,
+            tree_heading="Cover",
+            tree_width=72,
+            tree_style="Catalog.Treeview",
         )
         self._scrolled_tree.grid(row=1, column=0, sticky="nsew")
         self._tree = self._scrolled_tree.tree
@@ -899,6 +928,12 @@ class CatalogTab(ttk.Frame):
             btn_bar,
             text="Hide Downloaded",
             variable=self._hide_downloaded_var,
+            command=self._on_filter_toggled,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Checkbutton(
+            btn_bar,
+            text="Has Ebook",
+            variable=self._has_ebook_var,
             command=self._on_filter_toggled,
         ).pack(side=tk.LEFT, padx=(8, 0))
         self._download_btn: ttk.Button | None = None
@@ -940,7 +975,24 @@ class CatalogTab(ttk.Frame):
         self._tree.tag_configure("pending", foreground=palette.warning)
         self._tree.tag_configure("hidden", foreground=palette.fg_muted)
         self._tree.tag_configure("trashed", foreground=palette.fg_muted)
+        self._placeholder_photo = create_placeholder_cover_thumbnail(
+            self,
+            size=self._thumb_size,
+            bg_hex=palette.surface_alt,
+            border_hex=palette.border,
+            glyph_hex=palette.fg_muted,
+        )
+        if self._loaded_books:
+            self._render_tree()
         apply_theme_to_widget_tree(self._context_menu, palette)
+
+    def _on_destroy(self, event: tk.Event) -> None:
+        if event.widget is not self:
+            return
+        self._cover_fetch_token += 1
+        self._row_photos.clear()
+        self._url_photos.clear()
+        self._placeholder_photo = None
 
     def _build_context_menu(self) -> None:
         menu = tk.Menu(self._tree, tearoff=0)
@@ -985,17 +1037,21 @@ class CatalogTab(ttk.Frame):
     def _update_count_status(self, visible_count: int) -> None:
         total = len(self._loaded_books)
         downloaded = sum(1 for s in self._book_statuses if s.lower().startswith("downloaded"))
-        if self._hide_downloaded_var.get() and visible_count < total:
-            self._status_var.set(
-                f"Showing {visible_count} of {total} book{'s' if total != 1 else ''} "
-                f"({downloaded} downloaded hidden)."
-            )
+        ebooks = sum(1 for b in self._loaded_books if getattr(b, "has_ebook", False))
+        details: list[str] = []
+        if ebooks > 0:
+            details.append(f"{ebooks} with ebook")
+        if self._hide_downloaded_var.get() and downloaded > 0:
+            details.append(f"{downloaded} downloaded hidden")
         elif downloaded > 0:
+            details.append(f"{downloaded} in library")
+        suffix = f" ({', '.join(details)})" if details else ""
+        if visible_count < total:
             self._status_var.set(
-                f"Found {total} book{'s' if total != 1 else ''} ({downloaded} in library)."
+                f"Showing {visible_count} of {total} book{'s' if total != 1 else ''}{suffix}."
             )
         else:
-            self._status_var.set(f"Found {total} book{'s' if total != 1 else ''}.")
+            self._status_var.set(f"Found {total} book{'s' if total != 1 else ''}{suffix}.")
 
     def _on_filter_toggled(self) -> None:
         visible_count = self._render_tree()
@@ -1055,14 +1111,113 @@ class CatalogTab(ttk.Frame):
         if not self._loaded_books:
             self._scrolled_tree.set_empty_state(True, message)
 
+    def _photo_for_book(self, book: CatalogBook) -> Any | None:
+        cover_url = (getattr(book, "cover_url", None) or "").strip()
+        if cover_url:
+            photo = self._url_photos.get(cover_url)
+            if photo is None and cover_url in self._cover_png_cache:
+                cached_png = self._cover_png_cache[cover_url]
+                if cached_png:
+                    photo = photo_from_image_bytes(cached_png, self)
+                    if photo is not None:
+                        self._url_photos[cover_url] = photo
+            if photo is not None:
+                return photo
+        return self._placeholder_photo
+
+    def _default_fetch_cover_bytes(self, url: str) -> bytes | None:
+        if not url.lower().startswith(("http://", "https://")):
+            return None
+        try:
+            resp = requests.get(
+                url,
+                timeout=10,
+                headers={"User-Agent": "audiobook-dl"},
+            )
+            if resp.status_code != 200 or not resp.content:
+                return None
+            if len(resp.content) > self._MAX_COVER_BYTES:
+                return None
+            return resp.content
+        except Exception:
+            return None
+
+    def _start_cover_loading(self, token: int) -> None:
+        urls_to_fetch: list[str] = []
+        seen: set[str] = set()
+        for book in self._loaded_books:
+            cover_url = (getattr(book, "cover_url", None) or "").strip()
+            if not cover_url or cover_url in seen or cover_url in self._cover_png_cache:
+                continue
+            seen.add(cover_url)
+            urls_to_fetch.append(cover_url)
+        if not urls_to_fetch:
+            return
+
+        fetcher = self._cover_fetcher or self._default_fetch_cover_bytes
+        thumb_size = self._thumb_size
+        self._cb_queue.begin_task()
+
+        def _fetch_one(url: str) -> None:
+            if token != self._cover_fetch_token:
+                return
+            raw = fetcher(url)
+            png_bytes = resize_cover_thumbnail_bytes(raw, size=thumb_size) if raw else None
+            if token == self._cover_fetch_token:
+                self._cb_queue.post(
+                    lambda u=url, b=png_bytes, t=token: self._on_cover_bytes_ready(t, u, b)
+                )
+
+        def _dispatcher() -> None:
+            try:
+                with ThreadPoolExecutor(max_workers=6) as pool:
+                    list(pool.map(_fetch_one, urls_to_fetch))
+            finally:
+                self._cb_queue.finish_worker()
+
+        threading.Thread(target=_dispatcher, daemon=True).start()
+
+    def _on_cover_bytes_ready(self, token: int, url: str, png_bytes: bytes | None) -> None:
+        if not self.winfo_exists() or token != self._cover_fetch_token:
+            return
+        if len(self._cover_png_cache) >= self._MAX_COVER_CACHE and url not in self._cover_png_cache:
+            oldest = next(iter(self._cover_png_cache))
+            self._cover_png_cache.pop(oldest, None)
+            self._url_photos.pop(oldest, None)
+        self._cover_png_cache[url] = png_bytes
+        if not png_bytes:
+            return
+        photo = photo_from_image_bytes(png_bytes, self)
+        if photo is None:
+            return
+        self._url_photos[url] = photo
+        for idx, book in enumerate(self._loaded_books):
+            if (getattr(book, "cover_url", None) or "").strip() != url:
+                continue
+            iid = f"book-{idx}"
+            if self._tree.exists(iid):
+                self._row_photos[iid] = photo
+                self._tree.item(iid, image=photo)
+
     def _render_tree(self) -> int:
         hide_downloaded = bool(self._hide_downloaded_var.get())
+        only_has_ebook = bool(self._has_ebook_var.get())
         indexed_books: list[tuple[int, CatalogBook, str]] = []
         for idx, book in enumerate(self._loaded_books):
             status_label = self._book_statuses[idx] if idx < len(self._book_statuses) else ""
             if hide_downloaded and status_label.lower().startswith("downloaded"):
                 continue
+            if only_has_ebook and not getattr(book, "has_ebook", False):
+                continue
             indexed_books.append((idx, book, status_label))
+
+        self._row_photos.clear()
+
+        def _row_image(entry: tuple[int, CatalogBook, str]) -> Any | None:
+            photo = self._photo_for_book(entry[1])
+            if photo is not None:
+                self._row_photos[f"book-{entry[0]}"] = photo
+            return photo
 
         populate_grouped_tree(
             self._tree,
@@ -1074,12 +1229,14 @@ class CatalogTab(ttk.Frame):
                 entry[1].author,
                 entry[1].series or "",
                 entry[2],
+                format_catalog_formats(entry[1]),
                 entry[1].url,
             ),
             get_group_key=lambda entry: entry[1].series or "",
-            format_group_values=lambda key, count: (f"{key} ({count} items)", "", key, "", ""),
+            format_group_values=lambda key, count: (f"{key} ({count} items)", "", key, "", "", ""),
             should_group=lambda entry, count: count >= 2 or entry[1].item_type == "podcast",
             get_tags=lambda entry: self._status_tags(entry[2]),
+            get_image=_row_image,
         )
         self._scrolled_tree.set_empty_state(
             len(indexed_books) == 0,
@@ -1094,6 +1251,8 @@ class CatalogTab(ttk.Frame):
         statuses: Sequence[str] | None = None,
     ) -> None:
         self._stop_loading()
+        self._cover_fetch_token += 1
+        token = self._cover_fetch_token
         self._loaded_books = list(books)
         if statuses is not None:
             resolved = list(statuses)
@@ -1107,6 +1266,7 @@ class CatalogTab(ttk.Frame):
         if self._save_lib_btn is not None:
             self._save_lib_btn.configure(state="normal" if self._loaded_books else "disabled")
         self._update_count_status(visible_count)
+        self._start_cover_loading(token)
 
     def refresh_statuses(self) -> None:
         """Re-query library statuses for loaded books and refresh the tree."""

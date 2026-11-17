@@ -1,5 +1,12 @@
 import audiobookdl.sources as sources
-from .logging import print_error_file
+from .logging import error, print_error_file, strip_markup
+from .utils import read_asset_file
+
+
+class _SafeFormatDict(dict):
+    def __missing__(self, _key: str) -> str:
+        return ""
+
 
 class AudiobookDLException(Exception):
     error_description = "unknown"
@@ -11,8 +18,28 @@ class AudiobookDLException(Exception):
             self.error_description = error_description
         self.data = kwargs
 
+    def __str__(self) -> str:
+        base = super().__str__().strip()
+        if not base:
+            if self.error_description == "cancelled":
+                base = "Download cancelled"
+            else:
+                try:
+                    template = read_asset_file(f"assets/errors/{self.error_description}.txt")
+                    rendered = template.format_map(_SafeFormatDict(self.data))
+                    base = strip_markup(rendered).strip()
+                except Exception:
+                    base = self.error_description.replace("_", " ").capitalize()
+        detail = str(self.data.get("detail") or "").strip()
+        if detail and detail not in base:
+            base = f"{base}\n\nDetails: {detail}" if base else detail
+        return base
+
     def print(self) -> None:
         print_error_file(self.error_description, **self.data)
+        detail = str(self.data.get("detail") or "").strip()
+        if detail:
+            error(detail)
 
 class DataNotPresent(AudiobookDLException):
     error_description = "data_not_present"

@@ -4014,6 +4014,161 @@ def test_gui_sidebar_badge_footer_and_ffmpeg_banner(tmp_path):
         root.destroy()
 
 
+def test_gui_catalog_fetch_scopes_auth_to_catalog_service_and_shows_non_empty_error(tmp_path, monkeypatch):
+    from audiobookdl.exceptions import UserNotAuthorized
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+    try:
+        captured: list[tuple[str, str, Any]] = []
+        shown_errors: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            app.controller,
+            "start_catalog_fetch",
+            lambda mode, svc_key, query, opts, _tab, archive_path=None: captured.append(
+                (mode, svc_key, opts)
+            ) or 1,
+        )
+        monkeypatch.setattr(
+            "audiobookdl.gui.app.messagebox.showerror",
+            lambda title, msg, parent=None: shown_errors.append((title, msg)),
+        )
+
+        # Configure Accounts with Nextory credentials while Catalog fetches Storytel
+        app._auth.select_service_profile("nextory")
+        app._auth.username_var.set("nextory-user")
+        app._auth.password_var.set("nextory-pass")
+
+        lib_page = app.open_library_tab("catalog")
+        cat = lib_page.catalog_tab
+        cat._service_var.set("Storytel / Mofibo")
+        cat.sync_buttons()
+        cat.run_fetch("library")
+
+        assert len(captured) == 1
+        mode, svc_key, opts = captured[0]
+        assert mode == "library"
+        assert svc_key == "storytel"
+        assert opts.username is None
+        assert opts.password is None
+
+        # UserNotAuthorized without a custom message still displays readable dialog text
+        app.controller.catalog_request_id = 1
+        app._handle_event(
+            (
+                "catalog_loaded",
+                1,
+                cat,
+                ([], None),
+                UserNotAuthorized(detail="HTTP 401 from https://api.storytel.net/libraries/bookshelf"),
+            )
+        )
+        assert shown_errors
+        assert shown_errors[0][0] == "Catalog Error"
+        assert "User not authorized" in shown_errors[0][1]
+        assert "HTTP 401 from https://api.storytel.net/libraries/bookshelf" in shown_errors[0][1]
+    finally:
+        app.controller.shutdown(is_running=False, is_previewing=False)
+        root.destroy()
+
+
+def test_gui_catalog_displays_covers_and_ebook_formats(tmp_path):
+    import io
+    import time
+    from PIL import Image
+    from audiobookdl.gui.pages.library_page import CatalogTab
+    from audiobookdl.sources import ServiceInfo
+    from audiobookdl.sources.source import CatalogBook
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        buf = io.BytesIO()
+        Image.new("RGB", (60, 80), color=(22, 120, 200)).save(buf, format="PNG")
+        sample_png = buf.getvalue()
+
+        fetched_urls: list[str] = []
+
+        def fake_cover_fetch(url: str) -> bytes | None:
+            fetched_urls.append(url)
+            return sample_png if "cover-1" in url else None
+
+        svc = ServiceInfo(
+            key="storytel",
+            label="Storytel / Mofibo",
+            auth_methods=("login",),
+            login_fields=("username", "password"),
+            supports_search=True,
+            supports_library=True,
+        )
+        tab = CatalogTab(
+            root,
+            [svc],
+            svc,
+            on_fetch=lambda *_a: None,
+            on_add_urls=lambda *_a: None,
+            cover_fetcher=fake_cover_fetch,
+        )
+        try:
+            assert tab._tree.heading("#0", "text") == "Cover"
+            books = [
+                CatalogBook(
+                    title="Dual Format",
+                    url="https://www.storytel.com/en/books/1",
+                    author="Alice",
+                    source="storytel",
+                    cover_url="https://covers.example.com/cover-1.jpg",
+                    formats=("audiobook", "ebook"),
+                ),
+                CatalogBook(
+                    title="Audio Only",
+                    url="https://www.storytel.com/en/books/2",
+                    author="Bob",
+                    source="storytel",
+                    formats=("audiobook",),
+                ),
+            ]
+            tab.populate_items(books)
+            assert tab._tree.item("book-0", "values")[4] == "Audiobook + Ebook"
+            assert tab._tree.item("book-1", "values")[4] == "Audiobook"
+            assert "1 with ebook" in tab._status_var.get()
+
+            # Wait briefly for background cover fetch + PhotoImage update
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                root.update()
+                if "https://covers.example.com/cover-1.jpg" in tab._url_photos:
+                    break
+                time.sleep(0.02)
+
+            assert "https://covers.example.com/cover-1.jpg" in fetched_urls
+            assert "https://covers.example.com/cover-1.jpg" in tab._url_photos
+            expected_photo_name = str(tab._url_photos["https://covers.example.com/cover-1.jpg"])
+            row_images = tab._tree.item("book-0", "image")
+            if isinstance(row_images, (tuple, list)):
+                assert expected_photo_name in row_images
+            else:
+                assert str(row_images) == expected_photo_name
+
+            # Has Ebook filter shows only books with an ebook
+            tab._has_ebook_var.set(True)
+            tab._on_filter_toggled()
+            assert list(tab._tree.get_children()) == ["book-0"]
+            assert "Showing 1 of 2" in tab._status_var.get()
+        finally:
+            if tab.winfo_exists():
+                tab.destroy()
+    finally:
+        root.destroy()
+
+
 
 
 

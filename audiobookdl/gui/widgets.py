@@ -113,6 +113,7 @@ def populate_grouped_tree(
     group_prefix: str = "group:",
     open_groups: bool = True,
     get_tags: typing.Callable[[_TreeItemT], tuple[str, ...]] | None = None,
+    get_image: typing.Callable[[_TreeItemT], Any] | None = None,
 ) -> int:
     """Populate `tree` flat or grouped under collapsible parent rows.
 
@@ -122,10 +123,22 @@ def populate_grouped_tree(
     if existing:
         tree.delete(*existing)
 
+    def _insert_leaf(parent_iid: str, item: _TreeItemT, idx: int) -> None:
+        tags = get_tags(item) if get_tags is not None else ()
+        kwargs: dict[str, Any] = {
+            "iid": get_iid(item, idx),
+            "values": get_values(item),
+            "tags": tags,
+        }
+        if get_image is not None:
+            img = get_image(item)
+            if img is not None:
+                kwargs["image"] = img
+        tree.insert(parent_iid, "end", **kwargs)
+
     if not grouped:
         for idx, item in enumerate(items):
-            tags = get_tags(item) if get_tags is not None else ()
-            tree.insert("", "end", iid=get_iid(item, idx), values=get_values(item), tags=tags)
+            _insert_leaf("", item, idx)
         return 0
 
     group_counts: dict[str, int] = {}
@@ -163,8 +176,7 @@ def populate_grouped_tree(
                     open=open_groups,
                     tags=("group",),
                 )
-        tags = get_tags(item) if get_tags is not None else ()
-        tree.insert(parent_iid, "end", iid=get_iid(item, idx), values=get_values(item), tags=tags)
+        _insert_leaf(parent_iid, item, idx)
     return group_counter
 
 
@@ -181,6 +193,7 @@ class ScrolledTreeview(ttk.Frame):
         show_tree: bool = False,
         tree_heading: str = "",
         tree_width: int = 28,
+        tree_style: str | None = None,
         enable_sorting: bool = True,
     ) -> None:
         super().__init__(parent)
@@ -201,6 +214,8 @@ class ScrolledTreeview(ttk.Frame):
         }
         if height is not None:
             tree_kwargs["height"] = height
+        if tree_style:
+            tree_kwargs["style"] = tree_style
 
         self.tree = ttk.Treeview(self, **tree_kwargs)
         if show_tree:

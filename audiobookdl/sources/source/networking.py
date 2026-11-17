@@ -105,11 +105,22 @@ def request(
     raise exceptions.RequestError
 
 
+def _safe_url_label(url: str) -> str:
+    """Return `scheme://host/path` without query tokens or fragments."""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    if parts.scheme and parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}{parts.path}"
+    return url.split("?", 1)[0]
+
+
 def _raise_for_failed_response(url: str, resp: requests.Response) -> None:
     logging.debug(f"Failed to download data from: {url}\nResponse:\n{resp.content}")
+    detail = f"HTTP {resp.status_code} from {_safe_url_label(url)}"
     if resp.status_code in (401, 403):
-        raise exceptions.UserNotAuthorized
-    raise exceptions.RequestError
+        raise exceptions.UserNotAuthorized(detail=detail)
+    raise exceptions.RequestError(detail=detail)
 
 
 def post(self, url: str, **kwargs) -> bytes:

@@ -822,5 +822,126 @@ def test_storytel_library_and_search_urls_route_back_through_source(tmp_path):
     assert downloaded.title == "Lib Book"
 
 
+def test_storytel_bookshelf_handles_list_items_empty_and_http_error_detail(tmp_path):
+    src = _make_source(tmp_path)
+    src._language = "en"
+
+    # List-shaped bookshelf items and direct entries without a `model` wrapper
+    src._session.post = MagicMock(
+        return_value=_mock_resp(
+            200,
+            json_data={
+                "items": [
+                    {"model": {"id": "101", "name": "Wrapped Book", "authors": [{"name": "A1"}], "state": "WILL_CONSUME", "formats": [{"type": "abook", "isReleased": True}]}},
+                    {"consumableId": "102", "title": "Direct Book", "authors": [{"name": "A2"}]},
+                    None,
+                ]
+            },
+        )
+    )
+    items = src.list_library()
+    assert [b.title for b in items] == ["Wrapped Book", "Direct Book"]
+    assert [b.author for b in items] == ["A1", "A2"]
+    post_call = src._session.post.call_args
+    assert post_call.kwargs.get("json") is None
+    assert post_call.kwargs.get("data") == ""
+    assert post_call.kwargs.get("headers", {}).get("content-type") == "application/x-www-form-urlencoded"
+    series = src.download_bookshelf_wtr()
+    assert [b.id for b in series.books if isinstance(b, BookId)] == ["101"]
+
+    # Null items returns empty list rather than AttributeError
+    src._session.post = MagicMock(return_value=_mock_resp(200, json_data={"items": None}))
+    assert src.list_library() == []
+
+    # Non-200 bookshelf status includes non-empty error details for GUI dialogs
+    src._session.post = MagicMock(return_value=_mock_resp(401, text="Unauthorized"))
+    with pytest.raises(UserNotAuthorized) as exc_info:
+        src.list_library()
+    assert "HTTP 401" in str(exc_info.value)
+    assert "api.storytel.net/libraries/bookshelf" in str(exc_info.value)
+
+    # Login HTTP 200 without accountInfo/jwt raises UserNotAuthorized instead of KeyError
+    src._session.post = MagicMock(return_value=_mock_resp(200, json_data={"result": "error"}))
+    with pytest.raises(UserNotAuthorized) as login_exc:
+        src.login("https://www.storytel.com/en/books/101", username="u", password="p")
+    assert "missing session token" in str(login_exc.value)
+
+
+def test_storytel_catalog_extracts_cover_urls_and_ebook_formats(tmp_path):
+    src = _make_source(tmp_path)
+    src._language = "en"
+    src._session.post = MagicMock(
+        return_value=_mock_resp(
+            200,
+            json_data={
+                "items": {
+                    "201": {
+                        "model": {
+                            "id": "201",
+                            "title": "Dual Format Book",
+                            "authors": [{"name": "Author One"}],
+                            "seriesInfo": {"name": "Saga", "orderInSeries": 2},
+                            "formats": [
+                                {"type": "ebook", "cover": {"url": "//covers.storytel.com/201e.jpg"}},
+                                {"type": "abook", "cover": {"url": "https://covers.storytel.com/201a.jpg"}},
+                            ],
+                        }
+                    },
+                    "202": {
+                        "model": {
+                            "id": "202",
+                            "title": "Audio Only Book",
+                            "authors": [{"name": "Author Two"}],
+                            "formats": [
+                                {"type": "abook", "isReleased": True, "cover": {"url": "/images/202.jpg"}},
+                                {"type": "ebook", "isReleased": False},
+                            ],
+                        }
+                    },
+                }
+            },
+        )
+    )
+    lib = src.list_library()
+    assert len(lib) == 2
+
+    b0, b1 = lib[0], lib[1]
+    assert b0.cover_url == "https://covers.storytel.com/201a.jpg"
+    assert b0.formats == ("audiobook", "ebook")
+    assert b0.has_audiobook is True
+    assert b0.has_ebook is True
+    assert b0.series == "Saga"
+    assert b0.series_order == 2
+
+    assert b1.cover_url == "https://www.storytel.com/images/202.jpg"
+    assert b1.formats == ("audiobook",)
+    assert b1.has_audiobook is True
+    assert b1.has_ebook is False
+
+    # Search uses the same shared extractor
+    src._session.get = MagicMock(
+        return_value=_mock_resp(
+            200,
+            json_data={
+                "books": [
+                    {
+                        "id": "303",
+                        "name": "Search Ebook",
+                        "authors": [{"name": "S"}],
+                        "largeCover": "https://covers.storytel.com/303.jpg",
+                        "hasAbook": True,
+                        "hasEbook": True,
+                    }
+                ]
+            },
+        )
+    )
+    found = src.search("Search")
+    assert len(found) == 1
+    assert found[0].cover_url == "https://covers.storytel.com/303.jpg"
+    assert found[0].has_ebook is True
+    assert found[0].has_audiobook is True
+
+
 
 
