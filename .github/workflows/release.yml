@@ -6,7 +6,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-windows:
@@ -21,15 +21,27 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Install FFmpeg
+        run: choco install ffmpeg -y
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev,build]"
+          python -m pip install -e ".[dev,build,export,impersonate,dnd,tray]"
 
-      - name: Run test suite
-        run: python -m pytest -m "not e2e" -q
+      - name: Verify release tag matches package version
+        shell: pwsh
+        run: |
+          python -c "import os, audiobookdl; tag = os.environ['GITHUB_REF_NAME']; expected = f'v{audiobookdl.__version__}'; assert tag == expected, f'Tag {tag!r} does not match package version {expected!r}'"
+
+      - name: Run lint, typecheck, and test suite
+        run: |
+          ruff check audiobookdl tests scripts
+          mypy audiobookdl scripts
+          python -m pytest -m "not e2e" -q
 
       - name: Build and verify portable executables
+        shell: pwsh
         run: |
           python scripts/build_exe.py --onefile --verify
           python scripts/build_exe.py --onedir --verify
@@ -39,6 +51,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows-dist
+          if-no-files-found: error
           path: |
             dist/audiobook-dl.exe
             dist/audiobook-dl-portable-win64.zip
@@ -55,6 +68,21 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Verify release tag matches package version
+        run: |
+          python - <<'EOF'
+          import os
+          import re
+          from pathlib import Path
+
+          text = Path("audiobookdl/__init__.py").read_text(encoding="utf-8")
+          match = re.search(r'^__version__\s*=\s*"([^"]+)"', text, re.M)
+          assert match, "__version__ not found in audiobookdl/__init__.py"
+          tag = os.environ["GITHUB_REF_NAME"]
+          expected = f"v{match.group(1)}"
+          assert tag == expected, f"Tag {tag!r} does not match package version {expected!r}"
+          EOF
+
       - name: Install build tooling
         run: |
           python -m pip install --upgrade pip
@@ -68,15 +96,29 @@ jobs:
 
       - name: Smoke test wheel installation in clean virtualenv
         run: |
-          python -m venv /tmp/wheel-smoke
-          /tmp/wheel-smoke/bin/pip install dist/*.whl
-          /tmp/wheel-smoke/bin/python -c "import audiobookdl, audiobookdl.gui; print(audiobookdl.__version__)"
+          python -m venv "${{ runner.temp }}/wheel-smoke"
+          "${{ runner.temp }}/wheel-smoke/bin/pip" install dist/*.whl
+          "${{ runner.temp }}/wheel-smoke/bin/python" - <<'EOF'
+          import os
+          import audiobookdl
+          import audiobookdl.config
+          import audiobookdl.gui
+          import audiobookdl.pipeline
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          expected = f"v{audiobookdl.__version__}"
+          assert tag == expected, f"Tag {tag!r} does not match installed version {expected!r}"
+          print(audiobookdl.__version__)
+          EOF
 
       - name: Upload Python package distributions artifact
         uses: actions/upload-artifact@v4
         with:
           name: python-dist
-          path: dist/*
+          if-no-files-found: error
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
 
   release-github:
     needs: [build-windows, build-dist]
@@ -97,14 +139,21 @@ jobs:
           name: python-dist
           path: dist
 
+      - name: Generate SHA256 checksums
+        working-directory: dist
+        run: sha256sum audiobook-dl.exe audiobook-dl-portable-win64.zip *.whl *.tar.gz > SHA256SUMS.txt
+
       - name: Upload GitHub Release assets
         uses: softprops/action-gh-release@v2
         with:
+          fail_on_unmatched_files: true
+          generate_release_notes: true
           files: |
             dist/audiobook-dl.exe
             dist/audiobook-dl-portable-win64.zip
             dist/*.whl
             dist/*.tar.gz
+            dist/SHA256SUMS.txt
 
   publish-pypi:
     needs: [build-windows, build-dist]
@@ -124,3 +173,5 @@ jobs:
 
       - name: Publish to PyPI via Trusted Publishing
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

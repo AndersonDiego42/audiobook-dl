@@ -336,7 +336,7 @@ class ArchiveTab(ttk.Frame):
         btn_bar = ttk.Frame(self)
         btn_bar.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         if self._on_queue_urls is not None:
-            ttk.Button(btn_bar, text="Queue Selected", command=self._queue_selected).pack(
+            ttk.Button(btn_bar, text="Add to URLs", command=self._queue_selected).pack(
                 side=tk.LEFT, padx=(0, 6)
             )
         ttk.Button(btn_bar, text="Edit Tags...", command=self._edit_selected_tags).pack(
@@ -444,7 +444,7 @@ class ArchiveTab(ttk.Frame):
         )
         menu.add_separator()
         if self._on_queue_urls is not None:
-            menu.add_command(label="Queue Selected", command=self._queue_selected)
+            menu.add_command(label="Add to URLs", command=self._queue_selected)
         menu.add_command(label="Edit Metadata...", command=self._edit_selected_metadata)
         menu.add_command(label="Edit Tags...", command=self._edit_selected_tags)
         menu.add_command(label="Verify Missing Files", command=self._verify_missing_files)
@@ -1237,6 +1237,7 @@ class CatalogTab(ttk.Frame):
         status_resolver: Callable[[str, Sequence[CatalogBook]], Sequence[str]] | None = None,
         cover_fetcher: Callable[[str], bytes | None] | None = None,
         on_cancel_fetch: Callable[[], object] | None = None,
+        on_manage_account: Callable[[str, str], object] | None = None,
         config_provider: Callable[[], Config] | None = None,
         selected_profile: str = "default",
         palette: ThemePalette | None = None,
@@ -1253,6 +1254,7 @@ class CatalogTab(ttk.Frame):
         self._status_resolver = status_resolver
         self._cover_fetcher = cover_fetcher
         self._on_cancel_fetch = on_cancel_fetch
+        self._on_manage_account = on_manage_account
         self._config_provider = config_provider
         self._cover_thread_local = threading.local()
         self._cover_sessions_lock = threading.Lock()
@@ -1313,7 +1315,15 @@ class CatalogTab(ttk.Frame):
             state="readonly",
             width=11,
         )
-        self._profile_combo.pack(side=tk.LEFT, padx=(0, 8))
+        self._profile_combo.pack(side=tk.LEFT, padx=(0, 6))
+        self._account_btn: ttk.Button | None = None
+        if self._on_manage_account is not None:
+            self._account_btn = ttk.Button(
+                top_bar,
+                text="Account...",
+                command=self._open_selected_account,
+            )
+            self._account_btn.pack(side=tk.LEFT, padx=(0, 8))
 
         self._query_entry = ttk.Entry(top_bar, textvariable=self._query_var, width=24)
         self._query_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
@@ -1702,6 +1712,13 @@ class CatalogTab(ttk.Frame):
         service_key = self._loaded_service_key or (svc.key if svc is not None else "")
         profile = self._loaded_profile or self.selected_profile
         return service_key, profile
+
+    def _open_selected_account(self) -> None:
+        if self._on_manage_account is None:
+            return
+        svc = self._services_by_label.get(self._service_var.get())
+        service_key = svc.key if svc is not None else self._loaded_service_key
+        self._on_manage_account(service_key, self.selected_profile)
 
     @staticmethod
     def _format_series_cell(book: CatalogBook) -> str:
@@ -2498,6 +2515,7 @@ class SyncTab(ttk.Frame):
         on_run_sync: Callable[[list[tuple[str, str]], str], None],
         on_auto_sync_changed: Callable[[bool, int], None] | None = None,
         on_save_schedule: Callable[[bool, int, str, list[tuple[str, str]]], None] | None = None,
+        on_manage_accounts: Callable[[], object] | None = None,
     ) -> None:
         super().__init__(parent, padding=scale_px(parent, 12))
         self._config_provider = config_provider
@@ -2506,6 +2524,7 @@ class SyncTab(ttk.Frame):
         self._on_run_sync = on_run_sync
         self._on_auto_sync_changed = on_auto_sync_changed
         self._on_save_schedule = on_save_schedule
+        self._on_manage_accounts = on_manage_accounts
         self._initial_targets: set[tuple[str, str]] | None = (
             {(svc, prof) for svc, prof in auto_sync_targets}
             if auto_sync_targets is not None
@@ -2574,6 +2593,10 @@ class SyncTab(ttk.Frame):
 
         btns = ttk.Frame(self)
         btns.grid(row=4, column=0, sticky="ew")
+        if self._on_manage_accounts is not None:
+            ttk.Button(btns, text="Manage Accounts...", command=self._on_manage_accounts).pack(
+                side=tk.LEFT
+            )
         ttk.Button(btns, text="Save Schedule", command=self._save_schedule).pack(side=tk.RIGHT)
         ttk.Button(
             btns,
@@ -2729,10 +2752,16 @@ class LibraryPage(ttk.Frame):
         on_run_sync: Callable[[list[tuple[str, str]], str], None],
         on_auto_sync_changed: Callable[[bool, int], None],
         on_save_schedule: Callable[[bool, int, str, list[tuple[str, str]]], None] | None = None,
+        on_manage_account: Callable[[str, str], object] | None = None,
+        on_manage_accounts: Callable[[], object] | None = None,
+        on_tab_changed: Callable[[str], None] | None = None,
         palette_provider: Callable[[], ThemePalette],
     ) -> None:
         super().__init__(parent, padding=scale_px(parent, 12))
         self._palette_provider = palette_provider
+        self._on_tab_changed = on_tab_changed
+        self._suppress_tab_event = False
+        self._tab_events_armed = False
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
 
@@ -2774,6 +2803,7 @@ class LibraryPage(ttk.Frame):
             status_resolver=status_resolver,
             cover_fetcher=cover_fetcher,
             on_cancel_fetch=on_catalog_cancel,
+            on_manage_account=on_manage_account,
             config_provider=config_provider,
             selected_profile=selected_profile_provider(),
             palette=palette,
@@ -2789,6 +2819,7 @@ class LibraryPage(ttk.Frame):
             on_run_sync=on_run_sync,
             on_auto_sync_changed=on_auto_sync_changed,
             on_save_schedule=on_save_schedule,
+            on_manage_accounts=on_manage_accounts,
         )
 
         self.notebook.add(self.archive_tab, text="Archive Ledger")
@@ -2799,14 +2830,35 @@ class LibraryPage(ttk.Frame):
             "catalog": self.catalog_tab,
             "sync": self.sync_tab,
         }
+        self._keys_by_tab = {str(tab): key for key, tab in self._tabs_by_key.items()}
+        self.notebook.bind("<<NotebookTabChanged>>", self._handle_notebook_tab_changed, add="+")
+
+    def current_sub_tab(self) -> str:
+        """Return the active Library sub-tab key (`'archive'`, `'catalog'`, or `'sync'`)."""
+        try:
+            selected = str(self.notebook.select())  # type: ignore[no-untyped-call]
+        except tk.TclError:
+            return "archive"
+        return self._keys_by_tab.get(selected, "archive")
 
     def select_tab(self, tab_key: str) -> None:
         tab = self._tabs_by_key.get(tab_key)
         if tab is not None:
-            self.notebook.select(tab)  # type: ignore[no-untyped-call]
+            self._suppress_tab_event = True
+            try:
+                self.notebook.select(tab)  # type: ignore[no-untyped-call]
+            finally:
+                self._suppress_tab_event = False
+
+    def _handle_notebook_tab_changed(self, _event: tk.Event | None = None) -> None:
+        if self._suppress_tab_event or not self._tab_events_armed:
+            return
+        if self._on_tab_changed is not None:
+            self._on_tab_changed(self.current_sub_tab())
 
     def on_show(self) -> None:
         """Refresh archive, catalog statuses, and sync targets whenever Library is opened."""
+        self._tab_events_armed = True
         self.archive_tab.refresh()
         self.catalog_tab.sync_buttons()
         self.catalog_tab.refresh_statuses()

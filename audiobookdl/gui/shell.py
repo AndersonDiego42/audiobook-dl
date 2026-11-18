@@ -16,6 +16,7 @@ from audiobookdl.gui.theme import (
     make_bold_font,
     scale_px,
 )
+from audiobookdl.gui.widgets import attach_tooltip
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,31 @@ class NavItemSpec:
     shortcut_hint: str
 
 
+@dataclass(frozen=True)
+class NavRoute:
+    """Canonical navigation route combining top-level page, sub-tab, and contextual state."""
+
+    page_id: str
+    sub_tab: str | None = None
+    service_key: str | None = None
+    profile: str | None = None
+
+    def to_key(self) -> str:
+        if self.sub_tab:
+            return f"{self.page_id}:{self.sub_tab}"
+        return self.page_id
+
+    @classmethod
+    def parse(cls, raw: str | NavRoute) -> NavRoute:
+        if isinstance(raw, NavRoute):
+            return raw
+        cleaned = (raw or "").strip().lower()
+        if ":" in cleaned:
+            pid, sub = cleaned.split(":", 1)
+            return cls(page_id=pid.strip(), sub_tab=sub.strip() or None)
+        return cls(page_id=cleaned)
+
+
 NAV_ITEMS: tuple[NavItemSpec, ...] = (
     NavItemSpec("download", "\u21e9", "Download", "Ctrl+1"),
     NavItemSpec("library", "\u25a4", "Library", "Ctrl+2"),
@@ -36,11 +62,19 @@ NAV_ITEMS: tuple[NavItemSpec, ...] = (
     NavItemSpec("settings", "\u2699", "Settings", "Ctrl+5"),
 )
 
+_PAGE_LABELS: dict[str, str] = {spec.page_id: spec.label for spec in NAV_ITEMS}
+_SUB_TAB_LABELS: dict[tuple[str, str], str] = {
+    ("library", "archive"): "Archive Ledger",
+    ("library", "catalog"): "Catalog & Search",
+    ("library", "sync"): "Library Sync",
+}
+
 
 class SidebarShell(ttk.Frame):
-    """Fixed-width sidebar shell with lazy page mounting, nav badges, and live footer."""
+    """Fixed-width sidebar shell with lazy page mounting, history bar, nav badges, and live footer."""
 
     SIDEBAR_WIDTH_DP = 210
+    MAX_HISTORY = 50
 
     def __init__(
         self,
@@ -62,6 +96,11 @@ class SidebarShell(ttk.Frame):
         self._nav_buttons: dict[str, ttk.Button] = {}
         self._nav_order: list[str] = [spec.page_id for spec in NAV_ITEMS]
         self._active_page_id: str | None = None
+        self._active_route: NavRoute | None = None
+        self._back_stack: list[NavRoute] = []
+        self._forward_stack: list[NavRoute] = []
+        self._breadcrumb_detail: str = ""
+        self._context_action_cb: Callable[[], None] | None = None
         self._badge_labels: dict[str, ttk.Label] = {}
 
         self.columnconfigure(0, weight=0)
@@ -121,6 +160,11 @@ class SidebarShell(ttk.Frame):
             )
             btn.grid(row=0, column=0, sticky="ew")
             _bind_nav(btn, idx, spec.page_id)
+            attach_tooltip(
+                btn,
+                f"{spec.label} ({spec.shortcut_hint})",
+                palette_provider=palette_provider,
+            )
             self._nav_buttons[spec.page_id] = btn
 
             if spec.page_id == "download":
@@ -177,16 +221,79 @@ class SidebarShell(ttk.Frame):
         )
         self.footer_cancel_btn.grid(row=0, column=1, sticky="ew")
 
-        # Vertical divider + Page content stack
+        # Vertical divider + Page content stack with compact navigation bar
         ttk.Separator(self, orient=tk.VERTICAL).grid(row=0, column=1, sticky="ns")
         self.content = ttk.Frame(self)
         self.content.grid(row=0, column=2, sticky="nsew")
         self.content.columnconfigure(0, weight=1)
-        self.content.rowconfigure(0, weight=1)
+        self.content.rowconfigure(2, weight=1)
+
+        self._nav_header = ttk.Frame(
+            self.content,
+            padding=(scale_px(self, 12), scale_px(self, 5), scale_px(self, 12), scale_px(self, 5)),
+        )
+        self._nav_header.grid(row=0, column=0, sticky="ew")
+        self._nav_header.columnconfigure(2, weight=1)
+
+        self.back_btn = ttk.Button(
+            self._nav_header,
+            text="\u25c0",
+            width=3,
+            command=self.go_back,
+            state="disabled",
+        )
+        self.back_btn.grid(row=0, column=0, padx=(0, 3))
+        attach_tooltip(self.back_btn, "Back (Alt+Left)", palette_provider=palette_provider)
+
+        self.forward_btn = ttk.Button(
+            self._nav_header,
+            text="\u25b6",
+            width=3,
+            command=self.go_forward,
+            state="disabled",
+        )
+        self.forward_btn.grid(row=0, column=1, padx=(0, 10))
+        attach_tooltip(self.forward_btn, "Forward (Alt+Right)", palette_provider=palette_provider)
+
+        self.breadcrumb_var = tk.StringVar(value="")
+        self.breadcrumb_label = ttk.Label(
+            self._nav_header,
+            textvariable=self.breadcrumb_var,
+            font=make_bold_font(self, 10),
+        )
+        self.breadcrumb_label.grid(row=0, column=2, sticky="w")
+
+        self.context_action_btn = ttk.Button(
+            self._nav_header,
+            text="",
+            command=self._invoke_context_action,
+            style="Accent.TButton",
+        )
+        self.context_action_btn.grid(row=0, column=3, sticky="e", padx=(8, 0))
+        self.context_action_btn.grid_remove()
+
+        ttk.Separator(self.content, orient=tk.HORIZONTAL).grid(row=1, column=0, sticky="ew")
+
+        self.page_host = ttk.Frame(self.content)
+        self.page_host.grid(row=2, column=0, sticky="nsew")
+        self.page_host.columnconfigure(0, weight=1)
+        self.page_host.rowconfigure(0, weight=1)
 
     @property
     def active_page_id(self) -> str | None:
         return self._active_page_id
+
+    @property
+    def active_route(self) -> NavRoute | None:
+        return self._active_route
+
+    @property
+    def can_go_back(self) -> bool:
+        return bool(self._back_stack)
+
+    @property
+    def can_go_forward(self) -> bool:
+        return bool(self._forward_stack)
 
     def _move_nav_focus(self, current_idx: int, delta: int) -> str:
         next_idx = (current_idx + delta) % len(self._nav_order)
@@ -220,31 +327,157 @@ class SidebarShell(ttk.Frame):
             raise KeyError(f"Unknown page id: {page_id!r}")
         page = self._pages.get(page_id)
         if page is None:
-            page = self._factories[page_id](self.content)
+            page = self._factories[page_id](self.page_host)
             self._pages[page_id] = page
             apply_theme_to_widget_tree(page, self._palette_provider())
         return page
 
-    def navigate(self, page_id: str) -> Any:
-        """Switch to `page_id`, lazily instantiating it on first visit and calling `on_show()`."""
-        if page_id not in self._factories:
-            raise KeyError(f"Unknown page id: {page_id!r}")
+    def _invoke_context_action(self) -> None:
+        cb = self._context_action_cb
+        if cb is not None:
+            cb()
 
-        if self._active_page_id and self._active_page_id in self._pages:
-            self._pages[self._active_page_id].grid_remove()
+    def set_context_action(self, label: str, command: Callable[[], None]) -> None:
+        """Display a contextual quick-jump button in the navigation header bar."""
+        self._context_action_cb = command
+        self.context_action_btn.configure(text=label)
+        self.context_action_btn.grid()
 
-        page = self.ensure_page(page_id)
-        page.grid(row=0, column=0, sticky="nsew")
+    def clear_context_action(self) -> None:
+        """Hide any active contextual quick-jump button in the navigation header bar."""
+        self._context_action_cb = None
+        self.context_action_btn.configure(text="")
+        self.context_action_btn.grid_remove()
 
-        self._active_page_id = page_id
+    def set_breadcrumb_detail(self, detail: str) -> None:
+        """Set or clear an optional trailing context segment in the header breadcrumb."""
+        self._breadcrumb_detail = (detail or "").strip()
+        self._refresh_nav_header()
+
+    def _refresh_nav_header(self) -> None:
+        self.back_btn.configure(state="normal" if self._back_stack else "disabled")
+        self.forward_btn.configure(state="normal" if self._forward_stack else "disabled")
+        route = self._active_route
+        if route is None:
+            self.breadcrumb_var.set("")
+            return
+        parts = [_PAGE_LABELS.get(route.page_id, route.page_id.capitalize())]
+        if route.sub_tab:
+            sub_label = _SUB_TAB_LABELS.get(
+                (route.page_id, route.sub_tab),
+                route.sub_tab.capitalize(),
+            )
+            parts.append(sub_label)
+        if self._breadcrumb_detail:
+            parts.append(self._breadcrumb_detail)
+        self.breadcrumb_var.set("  \u203a  ".join(parts))
+
+    def _push_history(self, previous: NavRoute | None, new_route: NavRoute) -> None:
+        if previous is None or previous == new_route:
+            return
+        self._back_stack.append(previous)
+        if len(self._back_stack) > self.MAX_HISTORY:
+            del self._back_stack[: len(self._back_stack) - self.MAX_HISTORY]
+        self._forward_stack.clear()
+
+    def sync_sub_tab(self, sub_tab: str | None) -> None:
+        """Record an in-page sub-tab change (e.g. notebook tab click) into history and breadcrumb."""
+        if self._active_route is None:
+            return
+        cleaned = sub_tab.strip().lower() if sub_tab else None
+        next_route = NavRoute(
+            page_id=self._active_route.page_id,
+            sub_tab=cleaned,
+            service_key=self._active_route.service_key,
+            profile=self._active_route.profile,
+        )
+        if next_route == self._active_route:
+            return
+        self._push_history(self._active_route, next_route)
+        self._active_route = next_route
+        self._refresh_nav_header()
+
+    def go_back(self) -> NavRoute | None:
+        """Navigate backward to the previous route in history, if available."""
+        if not self._back_stack:
+            return None
+        target = self._back_stack.pop()
+        if self._active_route is not None:
+            self._forward_stack.append(self._active_route)
+        self.navigate(target, record_history=False)
+        return self._active_route
+
+    def go_forward(self) -> NavRoute | None:
+        """Navigate forward to the next route in history, if available."""
+        if not self._forward_stack:
+            return None
+        target = self._forward_stack.pop()
+        if self._active_route is not None:
+            self._back_stack.append(self._active_route)
+        self.navigate(target, record_history=False)
+        return self._active_route
+
+    def navigate(
+        self,
+        target: str | NavRoute,
+        *,
+        record_history: bool = True,
+    ) -> Any:
+        """Switch to `target` (`page_id` or `page_id:sub_tab`), lazily building it and updating history."""
+        route = NavRoute.parse(target)
+        if route.page_id not in self._factories:
+            raise KeyError(f"Unknown page id: {route.page_id!r}")
+
+        prev_route = self._active_route
+        prev_page_id = self._active_page_id
+        if prev_page_id and prev_page_id in self._pages and prev_page_id != route.page_id:
+            self._pages[prev_page_id].grid_remove()
+
+        page = self.ensure_page(route.page_id)
+        if prev_page_id != route.page_id:
+            page.grid(row=0, column=0, sticky="nsew")
+            self._breadcrumb_detail = ""
+            self.clear_context_action()
+        elif route.page_id == "download":
+            self.clear_context_action()
+
+        if route.sub_tab:
+            select_tab = getattr(page, "select_tab", None)
+            if callable(select_tab):
+                select_tab(route.sub_tab)
+
+        resolved_sub = route.sub_tab
+        if resolved_sub is None:
+            cur_sub_fn = getattr(page, "current_sub_tab", None)
+            if callable(cur_sub_fn):
+                resolved_sub = cur_sub_fn()
+        effective_route = NavRoute(
+            page_id=route.page_id,
+            sub_tab=resolved_sub,
+            service_key=route.service_key,
+            profile=route.profile,
+        )
+
+        if record_history:
+            self._push_history(prev_route, effective_route)
+
+        self._active_page_id = route.page_id
+        self._active_route = effective_route
         for pid, btn in self._nav_buttons.items():
-            btn.configure(style="SidebarNavActive.TButton" if pid == page_id else "SidebarNav.TButton")
+            btn.configure(
+                style="SidebarNavActive.TButton" if pid == route.page_id else "SidebarNav.TButton"
+            )
+
+        apply_ctx = getattr(page, "apply_route_context", None)
+        if callable(apply_ctx):
+            apply_ctx(effective_route)
 
         on_show = getattr(page, "on_show", None)
         if callable(on_show):
             on_show()
+        self._refresh_nav_header()
         if self._on_page_changed is not None:
-            self._on_page_changed(page_id)
+            self._on_page_changed(route.page_id)
         return page
 
     def set_download_badge(self, active_count: int, failed_count: int) -> None:

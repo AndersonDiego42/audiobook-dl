@@ -6131,6 +6131,318 @@ def test_p3_2_audition_tray_daemon_and_duplicate_preview(tmp_path, monkeypatch):
             pass
 
 
+@pytest.mark.gui
+def test_gui_download_page_responsive_two_column_layout(tmp_path):
+    from audiobookdl.gui.theme import scale_px
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+    try:
+        root.geometry("960x680+40+40")
+        root.update_idletasks()
+        dl = app.download_page
+        assert dl._layout_mode == "vertical"
+        assert dl.paned is dl._vpaned
+        assert str(dl.top_scroll) in dl._vpaned.panes()
+        assert str(dl.queue_panel) in dl._vpaned.panes()
+
+        dl.urls_text.insert("1.0", "https://example.com/book-1")
+        dl.queue_panel.append_log("sample log entry")
+        ctrl = app.controller
+        interaction = GuiInteractionHandler(ctrl.event_queue, ctrl.cancel_event)
+        opts = app.build_options(urls_override=["https://librivox.org/book-1"])
+        dl.queue_panel.register_queue_job(
+            QueuedJob(
+                job_id="j_resp",
+                run_id=1,
+                url="https://librivox.org/book-1",
+                options=opts,
+                interaction=interaction,
+            ),
+            persist=False,
+        )
+        root.update()
+        dl._split_ratio = 0.37
+
+        wide_w = scale_px(dl, dl.TWO_COL_ENTER_DP + 180)
+        wide_root_w = wide_w + scale_px(dl, app.shell.SIDEBAR_WIDTH_DP)
+        root.geometry(f"{wide_root_w}x720+40+40")
+        root.update()
+        dl._on_page_configure(SimpleNamespace(widget=dl, width=wide_w))  # type: ignore[arg-type]
+        assert dl._layout_mode == "horizontal"
+        assert dl.paned is dl._hpaned
+        assert str(dl.top_scroll) in dl._hpaned.panes()
+        assert str(dl.queue_panel) in dl._hpaned.panes()
+        assert tuple(dl._vpaned.panes()) == ()
+
+        h_pos = dl.fit_horizontal_splitter(total_width=wide_w)
+        assert h_pos is not None
+        assert dl._h_split_ratio == pytest.approx(h_pos / wide_w, abs=0.01)
+        assert dl.get_split_ratio() == pytest.approx(0.37)
+
+        assert "https://example.com/book-1" in dl.urls_text.get("1.0", tk.END)
+        assert "sample log entry" in dl.queue_panel.log_text.get("1.0", tk.END)
+        assert dl.queue_panel.queue_tree.exists("j_resp")
+
+        # Hysteresis band keeps horizontal layout until width drops below TWO_COL_EXIT_DP
+        hyst_w = scale_px(dl, (dl.TWO_COL_ENTER_DP + dl.TWO_COL_EXIT_DP) // 2)
+        dl._on_page_configure(SimpleNamespace(widget=dl, width=hyst_w))  # type: ignore[arg-type]
+        assert dl._layout_mode == "horizontal"
+
+        root.geometry("960x680+40+40")
+        root.update()
+        narrow_w = scale_px(dl, dl.TWO_COL_EXIT_DP - 180)
+        dl._on_page_configure(SimpleNamespace(widget=dl, width=narrow_w))  # type: ignore[arg-type]
+        assert dl._layout_mode == "vertical"
+        assert dl.paned is dl._vpaned
+        assert str(dl.top_scroll) in dl._vpaned.panes()
+        assert str(dl.queue_panel) in dl._vpaned.panes()
+        assert tuple(dl._hpaned.panes()) == ()
+    finally:
+        app.controller.shutdown(is_running=False, is_previewing=False)
+        root.destroy()
+
+
+@pytest.mark.gui
+def test_gui_activity_panel_toolbar_reflow_and_download_bars(tmp_path):
+    from audiobookdl.gui.theme import scale_px
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+    try:
+        dl = app.download_page
+        qp = dl.queue_panel
+
+        qp.sync_responsive_toolbars(scale_px(qp, 420))
+        assert qp._action_bar_mode == "compact"
+        assert qp._log_toolbar_mode == "compact"
+        assert qp._queue_toolbar_mode == "compact"
+        assert int(qp.download_btn.grid_info()["row"]) == 0
+        assert int(qp.pack_btn.grid_info()["row"]) == 1
+        assert int(qp._log_save_btn.grid_info()["row"]) == 1
+        assert int(qp.queue_clear_btn.grid_info()["row"]) == 1
+
+        qp.sync_responsive_toolbars(scale_px(qp, 760))
+        assert qp._action_bar_mode == "wide"
+        assert qp._log_toolbar_mode == "wide"
+        assert qp._queue_toolbar_mode == "wide"
+        assert int(qp.pack_btn.grid_info()["row"]) == 0
+        assert int(qp._log_save_btn.grid_info()["row"]) == 0
+        assert int(qp.queue_clear_btn.grid_info()["row"]) == 0
+
+        dl._on_folder_bar_configure(SimpleNamespace(width=scale_px(dl, 500)))  # type: ignore[arg-type]
+        dl._on_url_footer_configure(SimpleNamespace(width=scale_px(dl, 500)))  # type: ignore[arg-type]
+        assert dl._folder_bar_mode == "compact"
+        assert dl._url_footer_mode == "compact"
+        assert int(dl.account_chip_btn.grid_info()["row"]) == 1
+        assert int(dl._url_btn_row.grid_info()["row"]) == 1
+
+        dl._on_folder_bar_configure(SimpleNamespace(width=scale_px(dl, 700)))  # type: ignore[arg-type]
+        dl._on_url_footer_configure(SimpleNamespace(width=scale_px(dl, 700)))  # type: ignore[arg-type]
+        assert dl._folder_bar_mode == "wide"
+        assert dl._url_footer_mode == "wide"
+        assert int(dl.account_chip_btn.grid_info()["row"]) == 0
+        assert int(dl._url_btn_row.grid_info()["row"]) == 0
+    finally:
+        app.controller.shutdown(is_running=False, is_previewing=False)
+        root.destroy()
+
+
+@pytest.mark.gui
+def test_gui_navigation_history_breadcrumbs_and_deep_links(tmp_path):
+    from audiobookdl.gui.shell import NavRoute
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    cfg_path.write_text('[gui]\nactive_page = "library:catalog"\n', encoding="utf-8")
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    app = AudiobookDLApp(root, config_location=str(cfg_path))
+    try:
+        # Direct deep-link startup restores Library -> Catalog & Search lazily
+        assert app.shell.active_page_id == "library"
+        assert app.shell.active_route == NavRoute("library", sub_tab="catalog")
+        assert app.shell.built_page_ids() == ("library",)
+        lib = app.shell.get_page("library")
+        assert lib is not None
+        assert lib.current_sub_tab() == "catalog"
+        assert "Library" in app.shell.breadcrumb_var.get()
+        assert "Catalog & Search" in app.shell.breadcrumb_var.get()
+        assert not app.shell.can_go_back
+        assert not app.shell.can_go_forward
+
+        # Manual sub-tab switch records history and updates breadcrumb
+        lib.notebook.select(lib.sync_tab)
+        lib._handle_notebook_tab_changed()
+        assert app.shell.active_route == NavRoute("library", sub_tab="sync")
+        assert "Library Sync" in app.shell.breadcrumb_var.get()
+        assert app.shell.can_go_back is True
+
+        # Context-preserving jump to Accounts and Pack
+        app.controller.save_source_credentials("storytel", username="alice", profile="work")
+        app.open_accounts("storytel", "work")
+        assert app.shell.active_page_id == "accounts"
+        sel_svc = app._auth.selected_service()
+        assert sel_svc is not None and sel_svc.key == "storytel"
+        assert app._auth.profile_var.get() == "work"
+        assert f"{sel_svc.label} (work)" in app.shell.breadcrumb_var.get()
+
+        app.navigate("pack")
+        assert app.shell.active_page_id == "pack"
+        assert app.shell.breadcrumb_var.get() == "Pack"
+
+        # Back restores Accounts (with Storytel/work context), then Library Sync, then Catalog
+        app.shell.go_back()
+        assert app.shell.active_page_id == "accounts"
+        sel_back = app._auth.selected_service()
+        assert sel_back is not None and sel_back.key == "storytel"
+        assert app._auth.profile_var.get() == "work"
+
+        app.shell.go_back()
+        assert app.shell.active_page_id == "library"
+        assert lib.current_sub_tab() == "sync"
+
+        app.shell.go_back()
+        assert app.shell.active_page_id == "library"
+        assert lib.current_sub_tab() == "catalog"
+        assert not app.shell.can_go_back
+        assert app.shell.can_go_forward
+
+        # Forward walks back forward through Sync -> Accounts
+        app.shell.go_forward()
+        assert app.shell.active_page_id == "library"
+        assert lib.current_sub_tab() == "sync"
+        app.shell.go_forward()
+        assert app.shell.active_page_id == "accounts"
+        assert app._auth.profile_var.get() == "work"
+
+        # View menu exposes Back, Forward, and Library Tabs while preserving top-level menus
+        menubar = root.nametowidget(root.cget("menu"))
+        top_labels = [
+            menubar.entrycget(i, "label")
+            for i in range((menubar.index("end") or 0) + 1)
+            if menubar.type(i) == "cascade"
+        ]
+        assert top_labels == ["File", "View", "Help"]
+        view_menu = menubar.nametowidget(menubar.entrycget("View", "menu"))
+        view_labels = [
+            view_menu.entrycget(i, "label")
+            for i in range((view_menu.index("end") or 0) + 1)
+            if view_menu.type(i) != "separator"
+        ]
+        assert "Back" in view_labels
+        assert "Forward" in view_labels
+        assert "Library Tabs" in view_labels
+        assert root.bind("<Alt-Left>")
+        assert root.bind("<Alt-Right>")
+
+        # Persistence round-trips sub-tab deep link ("library:catalog")
+        app.open_library_tab("catalog")
+        app._on_close(force=True)
+        persisted = load_config(str(cfg_path))
+        assert persisted.gui.active_page == "library:catalog"
+    finally:
+        app.controller.shutdown(is_running=False, is_previewing=False)
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
+
+@pytest.mark.gui
+def test_gui_contextual_account_jump_and_view_in_download_action(tmp_path, monkeypatch):
+    from tkinter import ttk
+    from audiobookdl.gui.controller import PackJobRequest
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+    try:
+        dl = app.download_page
+        dl.urls_text.insert("1.0", "https://librivox.org/test-book")
+        app._on_urls_changed()
+
+        # Clicking account chip jumps to Accounts for the detected service, Back restores Download + URLs
+        dl.account_chip_btn.invoke()
+        assert app.shell.active_page_id == "accounts"
+        sel = app._auth.selected_service()
+        assert sel is not None and sel.key == "librivox"
+        app.shell.back_btn.invoke()
+        assert app.shell.active_page_id == "download"
+        assert "https://librivox.org/test-book" in dl.urls_text.get("1.0", tk.END)
+
+        # Catalog -> Account... jumps to Accounts pre-selected for Catalog's service
+        lib = app.open_library_tab("catalog")
+        storytel_label = next(s.label for s in app._services if s.key == "storytel")
+        lib.catalog_tab._service_var.set(storytel_label)
+        lib.catalog_tab.sync_buttons()
+        assert lib.catalog_tab._account_btn is not None
+        lib.catalog_tab._account_btn.invoke()
+        assert app.shell.active_page_id == "accounts"
+        acct_sel = app._auth.selected_service()
+        assert acct_sel is not None and acct_sel.key == "storytel"
+        app.shell.go_back()
+        assert app.shell.active_page_id == "library"
+        assert lib.current_sub_tab() == "catalog"
+
+        # ArchiveTab button uses unified "Add to URLs" label and triggers "View in Download ->"
+        archive_btn_texts = [
+            str(w.cget("text"))
+            for frame in lib.archive_tab.winfo_children()
+            for w in frame.winfo_children()
+            if isinstance(w, ttk.Button)
+        ]
+        assert "Add to URLs" in archive_btn_texts
+        assert "Queue Selected" not in archive_btn_texts
+        assert lib.archive_tab._on_queue_urls is not None
+        lib.archive_tab._on_queue_urls(["https://librivox.org/from-archive"])
+        assert app.shell.context_action_btn.winfo_manager() == "grid"
+        assert "View in Download" in str(app.shell.context_action_btn.cget("text"))
+
+        app.shell.context_action_btn.invoke()
+        assert app.shell.active_page_id == "download"
+        assert app.shell.context_action_btn.winfo_manager() == ""
+        assert "https://librivox.org/from-archive" in dl.urls_text.get("1.0", tk.END)
+
+        # Pack submission surfaces "View in Download ->" contextual quick-jump
+        app.navigate("pack")
+        monkeypatch.setattr(
+            app.controller,
+            "start_or_enqueue_pack_jobs",
+            lambda _pairs: (True, 1, [], 1),
+        )
+        req = PackJobRequest(
+            paths=[str(tmp_path)],
+            recursive=False,
+            delete_source=False,
+            output_dir=str(tmp_path),
+            label="Test Pack",
+            output_format="m4b",
+        )
+        app._on_pack_submitted([req], "m4b")
+        assert app.shell.active_page_id == "pack"
+        assert app.shell.context_action_btn.winfo_manager() == "grid"
+        assert "View in Download" in str(app.shell.context_action_btn.cget("text"))
+    finally:
+        app.controller.shutdown(is_running=False, is_previewing=False)
+        root.destroy()
+
+
 
 
 

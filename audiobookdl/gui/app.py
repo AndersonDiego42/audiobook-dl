@@ -86,7 +86,7 @@ from audiobookdl.gui.pages import (
 )
 from audiobookdl.gui.preview_dialog import ChoiceDialog, PreviewDialog
 from audiobookdl.gui.queue_panel import ActivityQueuePanel
-from audiobookdl.gui.shell import NAV_ITEMS, SidebarShell
+from audiobookdl.gui.shell import NAV_ITEMS, NavRoute, SidebarShell
 from audiobookdl.gui.tray import TrayIconController
 from audiobookdl.gui.theme import (
     THEME_LABELS,
@@ -322,11 +322,21 @@ class AudiobookDLApp:
         self._auth.load_service_into_form()
         self._ffmpeg_assistant.update_status()
 
-        saved_page = (self._controller.config.gui.active_page or "").strip().lower()
+        saved_route = NavRoute.parse(self._controller.config.gui.active_page or "")
         valid_pages = {spec.page_id for spec in NAV_ITEMS}
-        initial_page = saved_page if saved_page in valid_pages else "download"
-        self.navigate(initial_page)
-        if initial_page != "download":
+        if saved_route.page_id not in valid_pages:
+            initial_route = NavRoute("download")
+        elif saved_route.page_id == "library" and saved_route.sub_tab not in (
+            None,
+            "archive",
+            "catalog",
+            "sync",
+        ):
+            initial_route = NavRoute("library")
+        else:
+            initial_route = saved_route
+        self.navigate(initial_route, record_history=False)
+        if initial_route.page_id != "download":
             self._refresh_saved_queue_badge()
 
         self.root.bind("<Configure>", self._on_root_configure, add="+")
@@ -710,7 +720,7 @@ class AudiobookDLApp:
             options_collapsed=options_collapsed,
             output_naming_collapsed=naming_collapsed,
             on_locate_ffmpeg=self.browse_ffmpeg_dir,
-            on_open_accounts=lambda: self.navigate("accounts"),
+            on_open_accounts=self._open_accounts_from_download,
             on_open_folder=self._open_output_folder,
             on_browse_output_dir=self._browse_output_dir,
             on_paste_urls=self._paste_urls_from_clipboard,
@@ -755,8 +765,9 @@ class AudiobookDLApp:
         def _on_queue_urls(urls_to_add: list[str]) -> None:
             added = self._append_urls_to_input(urls_to_add)
             self.status_var.set(
-                f"Queued {len(added)} URL{'s' if len(added) != 1 else ''} from library"
+                f"Added {len(added)} URL{'s' if len(added) != 1 else ''} from library"
             )
+            self._show_view_in_download_action()
 
         def _on_fetch(mode: str, svc: ServiceInfo, query_text: str, tab: CatalogTab) -> None:
             options = self._try_build_options(urls_override=[])
@@ -786,6 +797,7 @@ class AudiobookDLApp:
             self.status_var.set(
                 f"Added {len(added)} URL{'s' if len(added) != 1 else ''} from catalog"
             )
+            self._show_view_in_download_action()
 
         def _profile_resolver(service_key: str) -> list[str]:
             return list_source_profiles(self._controller.config_snapshot(), service_key)
@@ -815,6 +827,7 @@ class AudiobookDLApp:
                 urls_to_download,
                 profile_override=None if norm_prof == DEFAULT_PROFILE else norm_prof,
             )
+            self._show_view_in_download_action()
 
         def _on_run_sync(targets: list[tuple[str, str]], mode: str) -> None:
             self._automation.auto_sync_targets = list(targets)
@@ -854,6 +867,9 @@ class AudiobookDLApp:
             on_run_sync=_on_run_sync,
             on_auto_sync_changed=self._automation.configure_auto_sync_timer,
             on_save_schedule=self._save_sync_schedule,
+            on_manage_account=lambda sk, prof: self.open_accounts(sk or None, prof),
+            on_manage_accounts=lambda: self.open_accounts(),
+            on_tab_changed=self.shell.sync_sub_tab,
             palette_provider=lambda: self._palette,
         )
 
@@ -875,6 +891,7 @@ class AudiobookDLApp:
             self._services,
             self._auth,
             on_import_cookies=lambda sk: self._auth.show_cookie_import_dialog(svc_key_override=sk),
+            on_context_label=self.shell.set_breadcrumb_detail,
             palette=self._palette,
         )
 
@@ -946,15 +963,40 @@ class AudiobookDLApp:
             style=self._style,
         )
 
-    def navigate(self, page_id: str) -> Any:
-        """Navigate to a sidebar page (`download`, `library`, `pack`, `accounts`, `settings`)."""
-        return self.shell.navigate(page_id)
+    def navigate(
+        self,
+        target: str | NavRoute,
+        *,
+        record_history: bool = True,
+    ) -> Any:
+        """Navigate to a sidebar page (`download`, `library`, `library:catalog`, etc.)."""
+        return self.shell.navigate(target, record_history=record_history)
 
     def open_library_tab(self, tab_key: str) -> LibraryPage:
         """Navigate to the Library page and select `archive`, `catalog`, or `sync`."""
-        page = self.navigate("library")
-        page.select_tab(tab_key)
-        return page
+        return self.navigate(NavRoute("library", sub_tab=tab_key))
+
+    def open_accounts(
+        self,
+        service_key: str | None = None,
+        profile: str | None = None,
+    ) -> AccountsPage:
+        """Navigate to Accounts, optionally pre-selecting `service_key` and `profile`."""
+        return self.navigate(
+            NavRoute("accounts", service_key=service_key, profile=profile)
+        )
+
+    def _open_accounts_from_download(self) -> None:
+        svc = self._auth.selected_service()
+        prof = normalize_profile_name(self.profile_var.get())
+        self.open_accounts(svc.key if svc is not None else None, prof)
+
+    def _show_view_in_download_action(self) -> None:
+        if self.shell.active_page_id != "download":
+            self.shell.set_context_action(
+                "View in Download \u2192",
+                lambda: self.navigate("download"),
+            )
 
     def open_pack_with_paths(self, paths: Sequence[str]) -> PackPage:
         """Navigate to the Pack page and append `paths` for scanning."""
@@ -1083,6 +1125,17 @@ class AudiobookDLApp:
         menubar.add_cascade(label="File", menu=file_menu)
 
         view_menu = tk.Menu(menubar, tearoff=0)
+        view_menu.add_command(
+            label="Back",
+            command=lambda: self.shell.go_back(),
+            accelerator="Alt+Left",
+        )
+        view_menu.add_command(
+            label="Forward",
+            command=lambda: self.shell.go_forward(),
+            accelerator="Alt+Right",
+        )
+        view_menu.add_separator()
         theme_menu = tk.Menu(view_menu, tearoff=0)
         for mode in THEME_MODES:
 
@@ -1106,6 +1159,17 @@ class AudiobookDLApp:
                 command=_make_nav_cb(spec.page_id),
                 accelerator=spec.shortcut_hint,
             )
+        lib_tabs_menu = tk.Menu(view_menu, tearoff=0)
+        for tab_key, tab_label in (
+            ("archive", "Archive Ledger"),
+            ("catalog", "Catalog & Search"),
+            ("sync", "Library Sync"),
+        ):
+            def _make_lib_cb(tk_key: str = tab_key) -> Any:
+                return lambda: self.open_library_tab(tk_key)
+
+            lib_tabs_menu.add_command(label=tab_label, command=_make_lib_cb())
+        view_menu.add_cascade(label="Library Tabs", menu=lib_tabs_menu)
         menubar.add_cascade(label="View", menu=view_menu)
 
         help_menu = tk.Menu(menubar, tearoff=0)
@@ -1119,6 +1183,17 @@ class AudiobookDLApp:
         self.root.bind("<Control-q>", lambda _e: self._on_close(force=True))
         self.root.bind("<Control-p>", lambda _e: self.preview_metadata())
         self.root.bind("<F5>", lambda _e: self.start_download())
+
+        def _nav_back(_e: tk.Event) -> str:
+            self.shell.go_back()
+            return "break"
+
+        def _nav_forward(_e: tk.Event) -> str:
+            self.shell.go_forward()
+            return "break"
+
+        self.root.bind("<Alt-Left>", _nav_back)
+        self.root.bind("<Alt-Right>", _nav_forward)
         for idx, spec in enumerate(NAV_ITEMS, start=1):
             def _make_shortcut_cb(page_id: str) -> Any:
                 return lambda _e: self.navigate(page_id)
@@ -1261,6 +1336,11 @@ class AudiobookDLApp:
             )
 
     def _update_download_summaries(self, page: DownloadPage | None = None) -> None:
+        if hasattr(self, "shell") and self.shell.active_page_id == "accounts":
+            svc_lbl = self.service_label_var.get().strip()
+            prof_lbl = normalize_profile_name(self.profile_var.get())
+            if svc_lbl:
+                self.shell.set_breadcrumb_detail(f"{svc_lbl} ({prof_lbl})")
         dl_page = page if page is not None else self.shell.get_page("download")
         if dl_page is None:
             return
@@ -2172,6 +2252,7 @@ class AudiobookDLApp:
             append_status=f"Queued +{len(queued_jobs)} pack job(s) (total {new_total})",
             append_log_msg=f"--- Added {len(queued_jobs)} local pack job(s) to queue ---",
         )
+        self._show_view_in_download_action()
 
     def _start_or_enqueue_urls(
         self,
@@ -2781,11 +2862,20 @@ class AudiobookDLApp:
                 if dl_page is not None
                 else self._controller.config.gui.output_naming_collapsed
             )
+            active_route = self.shell.active_route
+            if (
+                active_route is not None
+                and active_route.page_id == "library"
+                and active_route.sub_tab in ("catalog", "sync")
+            ):
+                saved_active_page: str | None = active_route.to_key()
+            else:
+                saved_active_page = self.shell.active_page_id
             self._controller.save_window_preferences(
                 window_geometry=saved_geom,
                 window_maximized=maximized,
                 download_split_ratio=split_ratio,
-                active_page=self.shell.active_page_id,
+                active_page=saved_active_page,
                 options_collapsed=options_collapsed,
                 output_naming_collapsed=naming_collapsed,
                 output_dir=self.output_dir_var.get().strip() or None,

@@ -30,6 +30,21 @@ _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
 
 TreeAnchor = Literal["nw", "n", "ne", "w", "center", "e", "sw", "s", "se"]
+ResponsiveMode = Literal["wide", "compact"]
+
+
+def resolve_responsive_mode(
+    current: ResponsiveMode,
+    width: int,
+    enter_wide_px: int,
+    exit_wide_px: int,
+) -> ResponsiveMode:
+    """Resolve `'wide'` vs `'compact'` toolbar mode with hysteresis around breakpoints."""
+    if width <= 1:
+        return current
+    if current == "wide":
+        return "compact" if width < exit_wide_px else "wide"
+    return "wide" if width >= enter_wide_px else "compact"
 
 
 @dataclass(frozen=True)

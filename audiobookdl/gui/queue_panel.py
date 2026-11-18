@@ -9,7 +9,7 @@ import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from typing import Any, Literal
 
 from audiobookdl.config import DEFAULT_PROFILE, list_source_profiles
 from audiobookdl.gui.controller import GuiController, QueuedJob
@@ -29,7 +29,13 @@ from audiobookdl.gui.events import (
 from audiobookdl.gui.formatting import format_duration, format_speed, parse_url_text
 from audiobookdl.gui.notifications import format_completion_notification, send_os_notification_async
 from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, make_bold_font, scale_px
-from audiobookdl.gui.widgets import ModalDialog, ScrolledTreeview, TreeColumnSpec
+from audiobookdl.gui.widgets import (
+    ModalDialog,
+    ResponsiveMode,
+    ScrolledTreeview,
+    TreeColumnSpec,
+    resolve_responsive_mode,
+)
 from audiobookdl.options_schema import (
     GUI_INTRO_CHAPTER_MODES,
     GUI_MEDIA_TYPE_OPTIONS,
@@ -409,6 +415,12 @@ class ActivityQueuePanel(ttk.LabelFrame):
     """LabelFrame managing action buttons, progress/metrics display, activity log, and queue table."""
 
     MAX_LOG_LINES = 5000
+    _ACTION_BAR_WIDE_ENTER_DP = 680
+    _ACTION_BAR_WIDE_EXIT_DP = 640
+    _LOG_TOOLBAR_WIDE_ENTER_DP = 480
+    _LOG_TOOLBAR_WIDE_EXIT_DP = 450
+    _QUEUE_TOOLBAR_WIDE_ENTER_DP = 650
+    _QUEUE_TOOLBAR_WIDE_EXIT_DP = 610
 
     def __init__(
         self,
@@ -492,6 +504,9 @@ class ActivityQueuePanel(ttk.LabelFrame):
         self._drag_hover_iid: str | None = None
         self._log_search_after_id: str | None = None
         self._queue_filter_after_id: str | None = None
+        self._action_bar_mode: ResponsiveMode = "wide"
+        self._log_toolbar_mode: ResponsiveMode = "wide"
+        self._queue_toolbar_mode: ResponsiveMode = "wide"
 
         self._build_widgets()
         self.bind("<Destroy>", self._on_destroy, add="+")
@@ -501,34 +516,27 @@ class ActivityQueuePanel(ttk.LabelFrame):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(3, weight=1)
 
-        action_bar = ttk.Frame(self)
-        action_bar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
-        action_bar.columnconfigure(7, weight=1)
+        self._action_bar = ttk.Frame(self)
+        self._action_bar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
 
-        self.download_btn = ttk.Button(action_bar, text="Download", command=self._on_start_download)
-        self.download_btn.grid(row=0, column=0, padx=(0, 6))
-
-        self.pause_btn = ttk.Button(action_bar, text="Pause", command=self.toggle_pause)
-        self.pause_btn.grid(row=0, column=1, padx=(0, 6))
-
-        self.cancel_btn = ttk.Button(action_bar, text="Cancel", command=self._on_cancel_download)
-        self.cancel_btn.grid(row=0, column=2, padx=(0, 6))
-
-        self.preview_btn = ttk.Button(action_bar, text="Preview", command=self._on_preview_metadata)
-        self.preview_btn.grid(row=0, column=3, padx=(0, 6))
-
-        self.pack_btn = ttk.Button(action_bar, text="Pack Local...", command=self._on_pack_local)
-        self.pack_btn.grid(row=0, column=4, padx=(0, 6))
-
-        self.open_folder_btn = ttk.Button(
-            action_bar, text="Open Folder", command=self._on_open_folder
+        self.download_btn = ttk.Button(
+            self._action_bar, text="Download", command=self._on_start_download
         )
-        self.open_folder_btn.grid(row=0, column=5, padx=(0, 6))
-
-        ttk.Button(action_bar, text="Clear Log", command=self.clear_log).grid(row=0, column=6)
-
-        self.status_label = ttk.Label(action_bar, textvariable=self.status_var, anchor="e")
-        self.status_label.grid(row=0, column=7, sticky="e")
+        self.pause_btn = ttk.Button(self._action_bar, text="Pause", command=self.toggle_pause)
+        self.cancel_btn = ttk.Button(
+            self._action_bar, text="Cancel", command=self._on_cancel_download
+        )
+        self.preview_btn = ttk.Button(
+            self._action_bar, text="Preview", command=self._on_preview_metadata
+        )
+        self.pack_btn = ttk.Button(self._action_bar, text="Pack Local...", command=self._on_pack_local)
+        self.open_folder_btn = ttk.Button(
+            self._action_bar, text="Open Folder", command=self._on_open_folder
+        )
+        self.clear_log_btn = ttk.Button(self._action_bar, text="Clear Log", command=self.clear_log)
+        self.status_label = ttk.Label(self._action_bar, textvariable=self.status_var, anchor="e")
+        self._apply_action_bar_layout("wide")
+        self._action_bar.bind("<Configure>", self._on_action_bar_configure, add="+")
 
         meta_bar = ttk.Frame(self)
         meta_bar.grid(row=1, column=0, sticky="ew", pady=(0, 2))
@@ -560,28 +568,30 @@ class ActivityQueuePanel(ttk.LabelFrame):
         log_tab.columnconfigure(0, weight=1)
         log_tab.rowconfigure(1, weight=1)
 
-        log_toolbar = ttk.Frame(log_tab, padding=(4, 4))
-        log_toolbar.grid(row=0, column=0, sticky="ew")
-        ttk.Label(log_toolbar, text="Level:").pack(side=tk.LEFT, padx=(0, 4))
-        level_combo = ttk.Combobox(
-            log_toolbar,
+        self._log_toolbar = ttk.Frame(log_tab, padding=(4, 4))
+        self._log_toolbar.grid(row=0, column=0, sticky="ew")
+        self._log_level_label = ttk.Label(self._log_toolbar, text="Level:")
+        self._log_level_combo = ttk.Combobox(
+            self._log_toolbar,
             textvariable=self.log_level_var,
             values=("All", "Info+", "Errors Only"),
             state="readonly",
             width=11,
         )
-        level_combo.pack(side=tk.LEFT, padx=(0, 8))
-        level_combo.bind("<<ComboboxSelected>>", lambda _e: self._rerender_logs())
-        ttk.Label(log_toolbar, text="Search:").pack(side=tk.LEFT, padx=(0, 4))
-        log_search_entry = ttk.Entry(log_toolbar, textvariable=self.log_search_var, width=20)
-        log_search_entry.pack(side=tk.LEFT, padx=(0, 8))
+        self._log_level_combo.bind("<<ComboboxSelected>>", lambda _e: self._rerender_logs())
+        self._log_search_label = ttk.Label(self._log_toolbar, text="Search:")
+        self._log_search_entry = ttk.Entry(
+            self._log_toolbar, textvariable=self.log_search_var, width=20
+        )
         self.log_search_var.trace_add("write", lambda *_args: self._schedule_rerender_logs())
-        ttk.Checkbutton(log_toolbar, text="Auto-scroll", variable=self.autoscroll_var).pack(
-            side=tk.LEFT, padx=(0, 8)
+        self._log_autoscroll_cb = ttk.Checkbutton(
+            self._log_toolbar, text="Auto-scroll", variable=self.autoscroll_var
         )
-        ttk.Button(log_toolbar, text="Save Log...", command=self._save_log_to_file).pack(
-            side=tk.RIGHT
+        self._log_save_btn = ttk.Button(
+            self._log_toolbar, text="Save Log...", command=self._save_log_to_file
         )
+        self._apply_log_toolbar_layout("wide")
+        self._log_toolbar.bind("<Configure>", self._on_log_toolbar_configure, add="+")
 
         self.log_text = ScrolledText(log_tab, height=4, width=40, state="disabled", wrap="word")
         try:
@@ -597,39 +607,32 @@ class ActivityQueuePanel(ttk.LabelFrame):
         queue_tab.rowconfigure(2, weight=1)
         self._queue_tab = queue_tab
 
-        queue_toolbar = ttk.Frame(queue_tab)
-        queue_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 3))
+        self._queue_toolbar = ttk.Frame(queue_tab)
+        self._queue_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 3))
         self.queue_remove_btn = ttk.Button(
-            queue_toolbar, text="Remove", command=self.remove_selected_item
+            self._queue_toolbar, text="Remove", command=self.remove_selected_item
         )
-        self.queue_remove_btn.pack(side=tk.LEFT, padx=(0, 4))
         self.queue_up_btn = ttk.Button(
-            queue_toolbar, text="Move Up", command=lambda: self.move_selected_item(-1)
+            self._queue_toolbar, text="Move Up", command=lambda: self.move_selected_item(-1)
         )
-        self.queue_up_btn.pack(side=tk.LEFT, padx=(0, 4))
         self.queue_down_btn = ttk.Button(
-            queue_toolbar, text="Move Down", command=lambda: self.move_selected_item(1)
+            self._queue_toolbar, text="Move Down", command=lambda: self.move_selected_item(1)
         )
-        self.queue_down_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.queue_retry_btn = ttk.Button(
-            queue_toolbar, text="Retry Failed", command=self._on_retry_failed
+            self._queue_toolbar, text="Retry Failed", command=self._on_retry_failed
         )
-        self.queue_retry_btn.pack(side=tk.LEFT, padx=(0, 4))
         self.queue_open_btn = ttk.Button(
-            queue_toolbar,
+            self._queue_toolbar,
             text="Open Output",
             command=lambda: self._open_selected_output(reveal_in_folder=False),
         )
-        self.queue_open_btn.pack(side=tk.LEFT, padx=(0, 4))
         self.queue_clear_btn = ttk.Button(
-            queue_toolbar, text="Clear Completed", command=self.clear_completed_history
+            self._queue_toolbar, text="Clear Completed", command=self.clear_completed_history
         )
-        self.queue_clear_btn.pack(side=tk.RIGHT)
-        conc_frame = ttk.Frame(queue_toolbar)
-        conc_frame.pack(side=tk.RIGHT, padx=(0, 8))
-        ttk.Label(conc_frame, text="Parallel jobs:").pack(side=tk.LEFT, padx=(0, 4))
+        self._conc_frame = ttk.Frame(self._queue_toolbar)
+        ttk.Label(self._conc_frame, text="Parallel jobs:").pack(side=tk.LEFT, padx=(0, 4))
         self.queue_concurrency_spin = ttk.Spinbox(
-            conc_frame,
+            self._conc_frame,
             from_=1,
             to=4,
             width=3,
@@ -641,6 +644,8 @@ class ActivityQueuePanel(ttk.LabelFrame):
         self.queue_concurrency_spin.bind(
             "<FocusOut>", lambda _e: self._handle_concurrency_change(), add="+"
         )
+        self._apply_queue_toolbar_layout("wide")
+        self._queue_toolbar.bind("<Configure>", self._on_queue_toolbar_configure, add="+")
 
         queue_filter_bar = ttk.Frame(queue_tab)
         queue_filter_bar.grid(row=1, column=0, sticky="ew", pady=(0, 4))
@@ -682,6 +687,139 @@ class ActivityQueuePanel(ttk.LabelFrame):
             self.queue_tree.bind("<Button-2>", self._show_queue_context_menu)
         self.activity_notebook.add(queue_tab, text="Queue & History")
         self._refresh_queue_empty_and_badge()
+
+    def sync_responsive_toolbars(self, width: int | None = None) -> None:
+        """Reflow action, log, and queue toolbars for the available panel width."""
+        w = int(width if width is not None else self.winfo_width())
+        if w <= 1:
+            return
+        action_mode = resolve_responsive_mode(
+            self._action_bar_mode,
+            w,
+            scale_px(self, self._ACTION_BAR_WIDE_ENTER_DP),
+            scale_px(self, self._ACTION_BAR_WIDE_EXIT_DP),
+        )
+        if action_mode != self._action_bar_mode:
+            self._apply_action_bar_layout(action_mode)
+        log_mode = resolve_responsive_mode(
+            self._log_toolbar_mode,
+            w,
+            scale_px(self, self._LOG_TOOLBAR_WIDE_ENTER_DP),
+            scale_px(self, self._LOG_TOOLBAR_WIDE_EXIT_DP),
+        )
+        if log_mode != self._log_toolbar_mode:
+            self._apply_log_toolbar_layout(log_mode)
+        queue_mode = resolve_responsive_mode(
+            self._queue_toolbar_mode,
+            w,
+            scale_px(self, self._QUEUE_TOOLBAR_WIDE_ENTER_DP),
+            scale_px(self, self._QUEUE_TOOLBAR_WIDE_EXIT_DP),
+        )
+        if queue_mode != self._queue_toolbar_mode:
+            self._apply_queue_toolbar_layout(queue_mode)
+
+    def _on_action_bar_configure(self, event: tk.Event) -> None:
+        self.sync_responsive_toolbars(int(getattr(event, "width", 0) or self._action_bar.winfo_width()))
+
+    def _on_log_toolbar_configure(self, event: tk.Event) -> None:
+        w = int(getattr(event, "width", 0) or self._log_toolbar.winfo_width())
+        mode = resolve_responsive_mode(
+            self._log_toolbar_mode,
+            w,
+            scale_px(self, self._LOG_TOOLBAR_WIDE_ENTER_DP),
+            scale_px(self, self._LOG_TOOLBAR_WIDE_EXIT_DP),
+        )
+        if mode != self._log_toolbar_mode:
+            self._apply_log_toolbar_layout(mode)
+
+    def _on_queue_toolbar_configure(self, event: tk.Event) -> None:
+        w = int(getattr(event, "width", 0) or self._queue_toolbar.winfo_width())
+        mode = resolve_responsive_mode(
+            self._queue_toolbar_mode,
+            w,
+            scale_px(self, self._QUEUE_TOOLBAR_WIDE_ENTER_DP),
+            scale_px(self, self._QUEUE_TOOLBAR_WIDE_EXIT_DP),
+        )
+        if mode != self._queue_toolbar_mode:
+            self._apply_queue_toolbar_layout(mode)
+
+    def _apply_action_bar_layout(self, mode: Literal["wide", "compact"]) -> None:
+        self._action_bar_mode = mode
+        for col in range(8):
+            self._action_bar.columnconfigure(col, weight=0)
+        if mode == "wide":
+            self._action_bar.columnconfigure(7, weight=1)
+            buttons = (
+                self.download_btn,
+                self.pause_btn,
+                self.cancel_btn,
+                self.preview_btn,
+                self.pack_btn,
+                self.open_folder_btn,
+                self.clear_log_btn,
+            )
+            for idx, btn in enumerate(buttons):
+                btn.grid(row=0, column=idx, padx=(0, 6) if idx < 6 else 0, pady=0, sticky="w")
+            self.status_label.grid(row=0, column=7, columnspan=1, padx=(8, 0), pady=0, sticky="e")
+            return
+
+        self._action_bar.columnconfigure(4, weight=1)
+        for idx, btn in enumerate((self.download_btn, self.pause_btn, self.cancel_btn, self.preview_btn)):
+            btn.grid(row=0, column=idx, padx=(0, 6), pady=0, sticky="w")
+        self.status_label.grid(row=0, column=4, columnspan=4, padx=(8, 0), pady=0, sticky="e")
+        for idx, btn in enumerate((self.pack_btn, self.open_folder_btn, self.clear_log_btn)):
+            btn.grid(row=1, column=idx, padx=(0, 6) if idx < 2 else 0, pady=(4, 0), sticky="w")
+
+    def _apply_log_toolbar_layout(self, mode: Literal["wide", "compact"]) -> None:
+        self._log_toolbar_mode = mode
+        for col in range(6):
+            self._log_toolbar.columnconfigure(col, weight=0)
+        self._log_level_label.grid(row=0, column=0, padx=(0, 4), pady=0, sticky="w")
+        self._log_level_combo.grid(row=0, column=1, padx=(0, 8), pady=0, sticky="w")
+        self._log_search_label.grid(row=0, column=2, padx=(0, 4), pady=0, sticky="w")
+        if mode == "wide":
+            self._log_toolbar.columnconfigure(4, weight=1)
+            self._log_search_entry.grid(row=0, column=3, padx=(0, 8), pady=0, sticky="w")
+            self._log_autoscroll_cb.grid(row=0, column=4, columnspan=1, padx=(0, 8), pady=0, sticky="w")
+            self._log_save_btn.grid(row=0, column=5, columnspan=1, padx=0, pady=0, sticky="e")
+            return
+
+        self._log_toolbar.columnconfigure(3, weight=1)
+        self._log_search_entry.grid(row=0, column=3, padx=0, pady=0, sticky="ew")
+        self._log_autoscroll_cb.grid(row=1, column=0, columnspan=2, padx=0, pady=(4, 0), sticky="w")
+        self._log_save_btn.grid(row=1, column=2, columnspan=2, padx=0, pady=(4, 0), sticky="e")
+
+    def _apply_queue_toolbar_layout(self, mode: Literal["wide", "compact"]) -> None:
+        self._queue_toolbar_mode = mode
+        for col in range(8):
+            self._queue_toolbar.columnconfigure(col, weight=0)
+        if mode == "wide":
+            self._queue_toolbar.columnconfigure(5, weight=1)
+            row_btns = (
+                (self.queue_remove_btn, 4),
+                (self.queue_up_btn, 4),
+                (self.queue_down_btn, 6),
+                (self.queue_retry_btn, 4),
+                (self.queue_open_btn, 4),
+            )
+            for idx, (btn, pad_r) in enumerate(row_btns):
+                btn.grid(row=0, column=idx, columnspan=1, padx=(0, pad_r), pady=0, sticky="w")
+            self._conc_frame.grid(row=0, column=6, columnspan=1, padx=(0, 8), pady=0, sticky="e")
+            self.queue_clear_btn.grid(row=0, column=7, padx=0, pady=0, sticky="e")
+            return
+
+        self._queue_toolbar.columnconfigure(4, weight=1)
+        row0_btns = (
+            (self.queue_remove_btn, 4),
+            (self.queue_up_btn, 4),
+            (self.queue_down_btn, 6),
+            (self.queue_retry_btn, 0),
+        )
+        for idx, (btn, pad_r) in enumerate(row0_btns):
+            btn.grid(row=0, column=idx, columnspan=1, padx=(0, pad_r), pady=0, sticky="w")
+        self.queue_open_btn.grid(row=1, column=0, columnspan=2, padx=(0, 6), pady=(4, 0), sticky="w")
+        self._conc_frame.grid(row=1, column=2, columnspan=2, padx=(0, 8), pady=(4, 0), sticky="e")
+        self.queue_clear_btn.grid(row=1, column=4, padx=0, pady=(4, 0), sticky="e")
 
     def _build_queue_context_menu(self) -> None:
         menu = tk.Menu(self.queue_tree, tearoff=0)

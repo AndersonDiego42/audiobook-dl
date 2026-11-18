@@ -7,12 +7,14 @@ import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 from collections.abc import Callable, Sequence
+from typing import Any
 
 from audiobookdl.options_schema import build_default_options
 from audiobookdl.config import (
     DEFAULT_PROFILE,
     list_source_profiles,
     make_source_profile_key,
+    normalize_profile_name,
 )
 from audiobookdl.credentials import get_credential_store
 from audiobookdl.gui.auth_panel import ServiceAuthCoordinator, ServiceAuthPanel
@@ -43,6 +45,7 @@ class AccountsPage(ttk.Frame):
         auth_coordinator: ServiceAuthCoordinator,
         *,
         on_import_cookies: Callable[[str], None] | None = None,
+        on_context_label: Callable[[str], None] | None = None,
         palette: ThemePalette | None = None,
     ) -> None:
         super().__init__(parent, padding=scale_px(parent, 12))
@@ -51,6 +54,7 @@ class AccountsPage(ttk.Frame):
         self._services_by_key = {s.key: s for s in self._services}
         self._auth_coord = auth_coordinator
         self._on_import_cookies = on_import_cookies
+        self._on_context_label = on_context_label
         self._palette = palette or LIGHT_PALETTE
         self._cb_queue = MainThreadCallbackQueue(self)
         self._rows: list[tuple[str, str]] = []
@@ -127,11 +131,32 @@ class AccountsPage(ttk.Frame):
         self._tree.tag_configure("ok", foreground=palette.success)
         self._tree.tag_configure("err", foreground=palette.error)
 
+    def apply_route_context(self, route: Any) -> None:
+        """Select the target service and profile carried by an incoming `NavRoute`."""
+        svc_key = getattr(route, "service_key", None)
+        if svc_key:
+            prof = normalize_profile_name(getattr(route, "profile", None) or DEFAULT_PROFILE)
+            self._auth_coord.select_service_profile(svc_key, prof)
+
+    def _sync_active_row_and_breadcrumb(self) -> None:
+        svc = self._auth_coord.selected_service()
+        prof = normalize_profile_name(self._auth_coord.profile_var.get())
+        if svc is None:
+            return
+        iid = f"{svc.key}:{prof}"
+        if self._tree.exists(iid):
+            self._tree.selection_set(iid)
+            self._tree.focus(iid)
+            self._tree.see(iid)
+        if self._on_context_label is not None:
+            self._on_context_label(f"{svc.label} ({prof})")
+
     def on_show(self) -> None:
         """Refresh profile statuses and active service form when Accounts is visited."""
         self._auth_coord.load_service_into_form()
         self._auth_coord.update_field_states()
         self.refresh()
+        self._sync_active_row_and_breadcrumb()
 
     def _vault_backend_label(self) -> str:
         loc = self._controller.config_location
@@ -207,6 +232,7 @@ class AccountsPage(ttk.Frame):
         if picked is None:
             return
         self._auth_coord.select_service_profile(picked[0], picked[1])
+        self._sync_active_row_and_breadcrumb()
 
     def _delete_selected_profile(self) -> None:
         picked = self._selected_service_profile()
