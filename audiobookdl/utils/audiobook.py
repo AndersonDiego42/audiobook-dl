@@ -3,7 +3,7 @@ from html import unescape
 import math
 import re
 import requests
-from typing import Generic, Optional, TypeVar, Any
+from typing import Generic, Literal, Optional, TypeVar, Any
 from collections.abc import Callable, Sequence, MutableMapping
 import json
 from attrs import define, Factory, field
@@ -57,12 +57,111 @@ def detect_image_extension(
 
 
 @define
-class AESEncryption:
+class AESCBCEncryption:
+    """PKCS7- or unpadded AES-CBC stream/file encryption parameters."""
+
+    key: bytes
+    iv: bytes
+    padding: Literal["pkcs7", "none"] = "pkcs7"
+
+
+@define
+class AESCTREncryption:
+    """AES-CTR stream/file encryption parameters."""
+
+    key: bytes
+    nonce: bytes
+
+
+@define
+class AESGCMEncryption:
+    """AES-GCM authenticated encryption parameters (trailing 16-byte tag when `tag` is None)."""
+
+    key: bytes
+    nonce: bytes
+    tag: bytes | None = None
+    aad: bytes = b""
+
+
+@define
+class ChaCha20Encryption:
+    """ChaCha20 or ChaCha20-Poly1305 encryption parameters (trailing 16-byte tag when `poly1305=True` and `tag` is None)."""
+
+    key: bytes
+    nonce: bytes
+    tag: bytes | None = None
+    aad: bytes = b""
+    poly1305: bool = False
+
+
+@define
+class SampleAESEncryption:
+    """MPEG-TS HLS `SAMPLE-AES` per-frame encryption parameters."""
+
     key: bytes
     iv: bytes
 
 
-AudiobookFileEncryption = AESEncryption
+@define
+class CENCDecryption:
+    """ISO BMFF Common Encryption (`cenc`/`cbcs`) clear-key decryption parameters."""
+
+    key: bytes | None = None
+    kid: bytes | None = None
+    key_map: dict[bytes, bytes] = Factory(dict)
+
+
+AudiobookFileEncryption = (
+    AESCBCEncryption
+    | AESCTREncryption
+    | AESGCMEncryption
+    | ChaCha20Encryption
+    | SampleAESEncryption
+    | CENCDecryption
+)
+
+
+def _decode_hex_key(raw: str, label: str, *, allowed_lengths: tuple[int, ...]) -> bytes:
+    cleaned = raw.strip()
+    if cleaned.lower().startswith("0x"):
+        cleaned = cleaned[2:]
+    if not cleaned or len(cleaned) % 2 != 0:
+        raise ValueError(f"Invalid {label}: expected hex string")
+    try:
+        decoded = bytes.fromhex(cleaned)
+    except ValueError as exc:
+        raise ValueError(f"Invalid {label}: expected hex string") from exc
+    if len(decoded) not in allowed_lengths:
+        expected_chars = " or ".join(str(n * 2) for n in allowed_lengths)
+        raise ValueError(f"Invalid {label} length ({len(cleaned)} hex chars; expected {expected_chars})")
+    return decoded
+
+
+def parse_decryption_key_spec(raw: str) -> tuple[bytes | None, dict[bytes, bytes]]:
+    """
+    Parse a user-supplied decryption key specification into `(default_key, kid_to_key_map)`.
+
+    Accepts comma- or semicolon-separated tokens, each either `<KEY_HEX>` (32 or 64 hex chars)
+    or `<KID_HEX>:<KEY_HEX>` (32-hex KID with optional UUID hyphens, plus 32- or 64-hex KEY).
+    """
+    default_key: bytes | None = None
+    key_map: dict[bytes, bytes] = {}
+    tokens = [tok.strip() for tok in re.split(r"[,;]", raw) if tok.strip()]
+    if not tokens:
+        raise ValueError("Decryption key specification cannot be empty")
+    for token in tokens:
+        if ":" in token:
+            kid_part, key_part = token.split(":", 1)
+            kid_cleaned = kid_part.strip().replace("-", "")
+            kid_bytes = _decode_hex_key(kid_cleaned, "KID", allowed_lengths=(16,))
+            key_bytes = _decode_hex_key(key_part, "key", allowed_lengths=(16, 32))
+            key_map[kid_bytes] = key_bytes
+        else:
+            key_bytes = _decode_hex_key(token, "decryption key", allowed_lengths=(16, 32))
+            if default_key is not None and default_key != key_bytes:
+                raise ValueError("Multiple default decryption keys provided without KID prefixes")
+            default_key = key_bytes
+    return default_key, key_map
 
 
 @define

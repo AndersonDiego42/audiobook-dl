@@ -2,7 +2,7 @@ from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, logging
 from audiobookdl.exceptions import BookNotFound, NoSourceFound, RequestError, UserNotAuthorized
 from audiobookdl.utils.audiobook import (
-    AESEncryption,
+    AESCBCEncryption,
     clean_html_description,
     parse_language,
     parse_release_date,
@@ -124,7 +124,7 @@ class SaxoSource(Source):
             AudiobookFile(
                 url="",
                 ext="mp3",
-                encryption_method=AESEncryption(
+                encryption_method=AESCBCEncryption(
                     b"CD3E9D141D8EFC0886912E7A8F3652C4",
                     b"78CB354D377772F1",
                 ),

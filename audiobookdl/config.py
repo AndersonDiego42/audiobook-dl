@@ -200,6 +200,8 @@ _STATIC_SOURCE_ALIASES = {
     "oreillylearning": "oreilly",
     "scribd": "everand",
     "cloudlibrary": "yourcloudlibrary",
+    "ytmusic": "youtubemusic",
+    "youtube-music": "youtubemusic",
 }
 
 

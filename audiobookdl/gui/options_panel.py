@@ -10,6 +10,7 @@ from audiobookdl.gui.theme import ThemePalette
 from audiobookdl.gui.widgets import attach_tooltip
 from audiobookdl.options_schema import GUI_INTRO_CHAPTER_MODES, OPTIONS_BY_NAME
 from audiobookdl.utils import AUDIO_BITRATE_PRESETS
+from audiobookdl.utils.audiobook import parse_decryption_key_spec
 from audiobookdl.utils.http import parse_byte_rate
 
 OptionWidget = ttk.Entry | ttk.Checkbutton | ttk.Combobox | ttk.Spinbox
@@ -349,11 +350,29 @@ class OptionsPanel(ttk.LabelFrame):
         post_exec_entry = ttk.Entry(network_tab, textvariable=self._vars.post_exec_var)
         post_exec_entry.grid(row=2, column=1, columnspan=5, sticky="ew", pady=(6, 0))
 
+        ttk.Label(network_tab, text="Decryption key:").grid(
+            row=3, column=0, sticky="w", padx=(0, 4), pady=(6, 0)
+        )
+        self._show_decryption_key_var = tk.BooleanVar(value=False)
+        decryption_key_entry = ttk.Entry(
+            network_tab,
+            textvariable=self._vars.decryption_key_var,
+            show="*",
+        )
+        decryption_key_entry.grid(row=3, column=1, columnspan=4, sticky="ew", padx=(0, 8), pady=(6, 0))
+        show_key_cb = ttk.Checkbutton(
+            network_tab,
+            text="Show key",
+            variable=self._show_decryption_key_var,
+            command=self._toggle_decryption_key_visibility,
+        )
+        show_key_cb.grid(row=3, column=5, sticky="w", pady=(6, 0))
+
         ttk.Label(
             network_tab,
             text="Defaults: 6 workers, unlimited bandwidth (e.g. 2M), TLS impersonate via curl_cffi (e.g. chrome)",
             style="Muted.TLabel",
-        ).grid(row=3, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        ).grid(row=4, column=0, columnspan=6, sticky="w", pady=(4, 0))
         self._validation_var = tk.StringVar(value="")
         self._validation_label = ttk.Label(
             self,
@@ -381,6 +400,7 @@ class OptionsPanel(ttk.LabelFrame):
         self._cb_mono = cb_mono
         self._max_cover_entry = max_cover_entry
         self._limit_rate_entry = limit_rate_entry
+        self._decryption_key_entry = decryption_key_entry
 
         self._tooltip_bindings: list[tuple[tk.Misc, str]] = [
             (cb_m4b, "Combine and convert output into a single .m4b audiobook with chapters"),
@@ -421,6 +441,8 @@ class OptionsPanel(ttk.LabelFrame):
             (self._impersonate_combo, _option_help("impersonate")),
             (proxy_entry, _option_help("proxy")),
             (post_exec_entry, _option_help("post_exec")),
+            (decryption_key_entry, _option_help("decryption_key")),
+            (show_key_cb, "Temporarily reveal or mask the session decryption key"),
         ]
 
         self._widgets = [
@@ -457,6 +479,8 @@ class OptionsPanel(ttk.LabelFrame):
             self._impersonate_combo,
             proxy_entry,
             post_exec_entry,
+            decryption_key_entry,
+            show_key_cb,
             cb_enrich,
             cb_enrich_interactive,
             enrich_providers_entry,
@@ -483,9 +507,15 @@ class OptionsPanel(ttk.LabelFrame):
             self._chapter_offset_entry,
             self._max_cover_entry,
             self._limit_rate_entry,
+            self._decryption_key_entry,
         ):
             entry.bind("<KeyRelease>", lambda _e: self._validate_inline_fields(), add="+")
             entry.bind("<FocusOut>", lambda _e: self._validate_inline_fields(), add="+")
+
+    def _toggle_decryption_key_visibility(self) -> None:
+        self._decryption_key_entry.configure(
+            show="" if self._show_decryption_key_var.get() else "*"
+        )
 
     def _on_media_selected(self, _event: tk.Event | None = None) -> None:
         if self._vars.media_type_var.get().strip().lower() == "video":
@@ -526,6 +556,12 @@ class OptionsPanel(ttk.LabelFrame):
                 parse_byte_rate(raw_rate)
             except ValueError:
                 errors.append("Limit rate is invalid (e.g. 2M, 500K)")
+        raw_dec_key = self._vars.decryption_key_var.get().strip()
+        if raw_dec_key:
+            try:
+                parse_decryption_key_spec(raw_dec_key)
+            except ValueError as exc:
+                errors.append(str(exc))
         if errors:
             self._validation_var.set(" • ".join(errors))
             self._validation_label.grid()

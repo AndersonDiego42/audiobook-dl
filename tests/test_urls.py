@@ -15,6 +15,11 @@ TEST_DATA = {
     "https://ofs-d2b6150a9dec641552f953da2637d146.listen.overdrive.com/?d=...": "Overdrive",
     "https://www.scribd.com/listen/579426746": "Everand",
     "https://www.storytel.com/no/nn/books/somethingsomething-9999999": "Storytel",
+    "https://music.youtube.com/watch?v=dQw4w9WgXcQ": "YouTubeMusic",
+    "https://music.youtube.com/playlist?list=OLAK5uy_n1234567890": "YouTubeMusic",
+    "https://music.youtube.com/browse/MPREb_abc123": "YouTubeMusic",
+    "https://music.youtube.com/browse/MPSPabc123": "YouTubeMusic",
+    "https://music.youtube.com/podcast/abc123": "YouTubeMusic",
 }
 
 def test_url_to_source():

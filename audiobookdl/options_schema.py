@@ -370,6 +370,16 @@ def _gui_read_limit_rate(raw: Any) -> str | None:
     return cleaned
 
 
+def _gui_read_decryption_key(raw: Any) -> str | None:
+    cleaned = str(raw).strip()
+    if not cleaned:
+        return None
+    from audiobookdl.utils.audiobook import parse_decryption_key_spec
+
+    parse_decryption_key_spec(cleaned)
+    return cleaned
+
+
 def _gui_init_raw_str(cfg_val: Any) -> str:
     return "" if cfg_val is None else str(cfg_val)
 
@@ -1187,6 +1197,19 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         ),
     ),
     OptionSpec(
+        name="decryption_key",
+        default=None,
+        help="Optional session-only clear decryption key (32/64-char hex or KID:KEY pairs) for CENC/HLS overrides",
+        gui=GuiBinding(
+            var_attr="decryption_key_var",
+            var_type="str",
+            gui_default="",
+            from_config=_gui_init_optional_str,
+            to_option=_gui_read_decryption_key,
+            persisted_in_output_prefs=False,
+        ),
+    ),
+    OptionSpec(
         name="locale",
         default=None,
         help="Optional regional locale code for sources such as Nextory (e.g. sv_SE, en_GB)",
@@ -1350,6 +1373,7 @@ class DownloadOptions:
     proxy: str | None = None
     timeout: float | None = None
     impersonate: str | None = None
+    decryption_key: str | None = None
     locale: str | None = None
     service: str | None = None
     enrich_metadata: bool = False

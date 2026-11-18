@@ -1,5 +1,11 @@
 from audiobookdl import AudiobookFile, exceptions, logging
-from audiobookdl.utils.audiobook import AESEncryption
+from audiobookdl.utils.audiobook import (
+    AESCBCEncryption,
+    AESGCMEncryption,
+    CENCDecryption,
+    SampleAESEncryption,
+    parse_decryption_key_spec,
+)
 from audiobookdl.utils.concurrency import run_cancellable_pool
 from audiobookdl.utils.http import (
     DEFAULT_HTTP_TIMEOUT,
@@ -223,6 +229,57 @@ def _select_variant_playlist_uri(
     return best.absolute_uri
 
 
+_SUPPORTED_HLS_KEY_METHODS = frozenset(
+    {
+        "AES-128",
+        "AES-256",
+        "AES-256-GCM",
+        "SAMPLE-AES",
+        "SAMPLE-AES-CTR",
+        "SAMPLE-AES-CENC",
+    }
+)
+_W3C_CLEARKEY_FORMAT = "urn:uuid:1077efec-c0b2-4d02-ace3-3c1e52e2fb4b"
+_FMP4_EXTENSIONS = frozenset({"m4s", "mp4", "m4a", "m4b", "m4v", "mov"})
+
+
+def _hls_keyformat(key_obj) -> str:
+    return str(getattr(key_obj, "keyformat", None) or "identity").strip()
+
+
+def _parse_hls_iv(raw_iv: str | None, sequence_num: int, *, byte_length: int = 16) -> bytes:
+    if raw_iv is None:
+        return sequence_num.to_bytes(byte_length, byteorder="big")
+    value = int(raw_iv, 0)
+    # Trim leading zero bytes if a 16-byte hex literal was supplied for a 12-byte GCM nonce, or fit exact size
+    needed = max(byte_length, (value.bit_length() + 7) // 8)
+    raw_bytes = value.to_bytes(needed, byteorder="big")
+    if byte_length == 12 and len(raw_bytes) == 16 and raw_bytes[:4] == b"\x00\x00\x00\x00":
+        return raw_bytes[4:]
+    return raw_bytes
+
+
+def _validate_hls_key(
+    key_obj,
+    *,
+    has_user_key: bool,
+) -> tuple[str, str]:
+    key_method = str(getattr(key_obj, "method", "") or "").strip().upper()
+    if key_method not in _SUPPORTED_HLS_KEY_METHODS:
+        raise exceptions.GenericAudiobookDLException(
+            f"Unsupported HLS encryption method '{key_method}'"
+        )
+    key_format = _hls_keyformat(key_obj)
+    fmt_lower = key_format.lower()
+    if fmt_lower not in ("identity", _W3C_CLEARKEY_FORMAT):
+        if key_method in ("SAMPLE-AES", "SAMPLE-AES-CTR", "SAMPLE-AES-CENC") and has_user_key:
+            return key_method, fmt_lower
+        raise exceptions.GenericAudiobookDLException(
+            f"Unsupported or DRM-protected HLS KEYFORMAT '{key_format}'"
+        )
+    return key_method, fmt_lower
+
+
 def get_stream_files(
     self,
     url: str,
@@ -234,6 +291,13 @@ def get_stream_files(
 ) -> list[AudiobookFile]:
     """Creates a list of stream segment files from an m3u8 playlist"""
     base_headers = dict(headers) if headers else {}
+    raw_dec_key = getattr(getattr(self, "_options", None), "decryption_key", None)
+    user_default_key: bytes | None = None
+    user_key_map: dict[bytes, bytes] = {}
+    if isinstance(raw_dec_key, str) and raw_dec_key.strip():
+        user_default_key, user_key_map = parse_decryption_key_spec(raw_dec_key)
+    has_user_key = user_default_key is not None or bool(user_key_map)
+
     content = self.get(url, headers=base_headers).decode("utf-8")
     playlist = m3u8.loads(content, uri=url)
 
@@ -259,6 +323,9 @@ def get_stream_files(
             for seg in playlist.segments
             if seg.key is not None
             and getattr(seg.key, "method", None) not in (None, "NONE")
+            and str(getattr(seg.key, "method", "") or "").strip().upper() in _SUPPORTED_HLS_KEY_METHODS
+            and _hls_keyformat(seg.key).lower() in ("identity", _W3C_CLEARKEY_FORMAT)
+            and not user_default_key
             and getattr(seg.key, "absolute_uri", None)
             and not str(seg.key.absolute_uri).lower().startswith("data:")
         )
@@ -309,27 +376,63 @@ def get_stream_files(
             init_section=init_bytes,
         )
         if seg.key is not None and getattr(seg.key, "method", None) not in (None, "NONE"):
-            key_method = str(getattr(seg.key, "method", "") or "").strip().upper()
-            if key_method != "AES-128":
+            key_method, fmt_lower = _validate_hls_key(seg.key, has_user_key=has_user_key)
+            expected_key_len = 32 if key_method in ("AES-256", "AES-256-GCM") else 16
+            resolved_key: bytes | None = None
+            if user_default_key is not None and len(user_default_key) == expected_key_len:
+                resolved_key = user_default_key
+            elif key_method in ("SAMPLE-AES-CTR", "SAMPLE-AES-CENC") and user_key_map:
+                resolved_key = None
+            elif fmt_lower in ("identity", _W3C_CLEARKEY_FORMAT) and getattr(seg.key, "absolute_uri", None):
+                key_uri = str(seg.key.absolute_uri)
+                if key_uri not in key_cache:
+                    inline_key = _decode_key_data_uri(key_uri)
+                    key_cache[key_uri] = (
+                        inline_key
+                        if inline_key is not None
+                        else self._get_page(key_uri, headers=base_headers)
+                    )
+                resolved_key = key_cache[key_uri]
+            elif user_default_key is not None:
                 raise exceptions.GenericAudiobookDLException(
-                    f"Unsupported HLS encryption method '{key_method}'"
+                    f"Provided decryption key is {len(user_default_key)} bytes; "
+                    f"HLS {key_method} requires {expected_key_len} bytes"
                 )
-            if seg.key.iv is not None:
-                iv_bytes = int(seg.key.iv, 0).to_bytes(16, byteorder="big")
             else:
-                iv_bytes = (media_sequence + idx).to_bytes(16, byteorder="big")
-            key_uri = str(seg.key.absolute_uri)
-            if key_uri not in key_cache:
-                inline_key = _decode_key_data_uri(key_uri)
-                key_cache[key_uri] = (
-                    inline_key
-                    if inline_key is not None
-                    else self._get_page(key_uri, headers=base_headers)
+                raise exceptions.GenericAudiobookDLException(
+                    f"HLS {key_method} segment has no key URI and no decryption_key option was provided"
                 )
-            current.encryption_method = AESEncryption(
-                key=key_cache[key_uri],
-                iv=iv_bytes,
-            )
+
+            if resolved_key is not None and len(resolved_key) != expected_key_len:
+                raise exceptions.GenericAudiobookDLException(
+                    f"Invalid HLS {key_method} key length ({len(resolved_key)} bytes; expected {expected_key_len})"
+                )
+
+            if key_method in ("AES-128", "AES-256"):
+                assert resolved_key is not None
+                iv_bytes = _parse_hls_iv(seg.key.iv, media_sequence + idx, byte_length=16)
+                current.encryption_method = AESCBCEncryption(key=resolved_key, iv=iv_bytes)
+            elif key_method == "AES-256-GCM":
+                assert resolved_key is not None
+                nonce_bytes = _parse_hls_iv(seg.key.iv, media_sequence + idx, byte_length=12)
+                current.encryption_method = AESGCMEncryption(key=resolved_key, nonce=nonce_bytes)
+            elif key_method == "SAMPLE-AES":
+                is_fmp4 = init_bytes is not None or seg_ext.lstrip(".").lower() in _FMP4_EXTENSIONS
+                if is_fmp4:
+                    current.encryption_method = CENCDecryption(
+                        key=resolved_key,
+                        key_map=dict(user_key_map),
+                    )
+                else:
+                    assert resolved_key is not None
+                    iv_bytes = _parse_hls_iv(seg.key.iv, media_sequence + idx, byte_length=16)
+                    current.encryption_method = SampleAESEncryption(key=resolved_key, iv=iv_bytes)
+            else:
+                # SAMPLE-AES-CTR / SAMPLE-AES-CENC
+                current.encryption_method = CENCDecryption(
+                    key=resolved_key,
+                    key_map=dict(user_key_map),
+                )
         files.append(current)
     return files
 

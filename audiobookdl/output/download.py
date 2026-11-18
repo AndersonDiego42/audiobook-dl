@@ -6,7 +6,7 @@ from audiobookdl.exceptions import (
     FailedCombining,
     GenericAudiobookDLException,
 )
-from audiobookdl.output.encryption import AESStreamDecryptor
+from audiobookdl.output.encryption import StreamDecryptor
 from audiobookdl.output.metadata import id3
 from audiobookdl.output.metadata._chapters import (
     apply_intro_chapter_titles,
@@ -14,7 +14,6 @@ from audiobookdl.output.metadata._chapters import (
 )
 from audiobookdl.output.metadata._cover import apply_cover_postprocessing
 from audiobookdl.utils.audiobook import (
-    AESEncryption,
     AudiobookMetadata,
     TrackTagContext,
     is_ebook,
@@ -1102,7 +1101,7 @@ def download_file(
     reset_stale_tmp = False
     decrypted_inline = False
     inline_dec_tmp: str | None = None
-    allow_ciphertext_range = not isinstance(file.encryption_method, AESEncryption) or len(audiobook.files) == 1
+    allow_ciphertext_range = file.encryption_method is None or len(audiobook.files) == 1
     if file.file_writer is not None:
         logging.wait_if_paused(cancel_event=cancel_event)
         try:
@@ -1258,26 +1257,24 @@ def download_file(
                         update_progress(initial_progress)
                         advanced += initial_progress
 
-            # Stream AES-CBC decryption inline into an isolated temp path when reading
+            # Stream decryption inline into an isolated temp path when reading
             # from byte 0 so `filepath_tmp` only ever contains raw un-decrypted bytes.
-            stream_decryptor: AESStreamDecryptor | None = None
+            stream_decryptor: StreamDecryptor | None = None
             accept_ranges = (_get_header_ci(request.headers, "Accept-Ranges") or "").strip().lower()
-            can_inline_aes = (
+            can_inline_decrypt = (
                 not resume
                 or len(audiobook.files) > 1
                 or accept_ranges == "none"
             )
             if (
-                can_inline_aes
+                can_inline_decrypt
                 and open_mode == "wb"
-                and isinstance(file.encryption_method, AESEncryption)
+                and file.encryption_method is not None
             ):
-                stream_decryptor = AESStreamDecryptor(
-                    file.encryption_method.key,
-                    file.encryption_method.iv,
-                )
-                decrypted_inline = True
-                inline_dec_tmp = f"{filepath}.inline.{uuid.uuid4().hex[:8]}.tmp"
+                stream_decryptor = encryption.create_stream_decryptor(file.encryption_method)
+                if stream_decryptor is not None:
+                    decrypted_inline = True
+                    inline_dec_tmp = f"{filepath}.inline.{uuid.uuid4().hex[:8]}.tmp"
 
             # Download file to tmp file
             write_target = inline_dec_tmp if inline_dec_tmp is not None else filepath_tmp

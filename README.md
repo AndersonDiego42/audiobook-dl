@@ -32,6 +32,7 @@ audiobook-dl currently supports downloading from the following built-in sources:
 - [Saxo](https://saxo.com)
 - [Storytel](https://www.storytel.com/) / [Mofibo](https://mofibo.com)
 - [YourCloudLibrary](https://www.yourcloudlibrary.com/)
+- [YouTube Music](https://music.youtube.com/)
 
 [Capability matrix, service aliases, and plugin entry points](./docs/supported_sites.md)
 

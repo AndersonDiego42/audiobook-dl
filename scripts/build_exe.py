@@ -157,6 +157,8 @@ def build(
 
         if importlib.util.find_spec("tkinterdnd2") is not None:
             cmd.extend(["--collect-all", "tkinterdnd2"])
+        if importlib.util.find_spec("yt_dlp") is not None:
+            cmd.extend(["--collect-submodules", "yt_dlp"])
     except Exception:
         pass
 

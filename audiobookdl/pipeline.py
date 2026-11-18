@@ -46,8 +46,10 @@ from .utils.archive import DownloadArchive, default_archive_path, make_book_key
 from .utils.audiobook import (
     Audiobook,
     BookId,
+    CENCDecryption,
     Result,
     Series,
+    parse_decryption_key_spec,
     resolve_audiobook_output_format,
 )
 from .utils.enrichment import (
@@ -1131,6 +1133,29 @@ def enrich_audiobook_with_options(
     return result
 
 
+_CENC_CONTAINER_EXTENSIONS = frozenset({"mp4", "m4a", "m4b", "m4s", "m4v", "mov"})
+
+
+def _apply_user_decryption_key(audiobook: Audiobook, options: DownloadOptions) -> None:
+    """Apply user-supplied `options.decryption_key` to CENC files as fallback/override."""
+    raw_key = getattr(options, "decryption_key", None)
+    if not isinstance(raw_key, str) or not raw_key.strip():
+        return
+    default_key, key_map = parse_decryption_key_spec(raw_key)
+    for file in audiobook.files:
+        if isinstance(file.encryption_method, CENCDecryption):
+            if default_key is not None:
+                file.encryption_method.key = default_key
+            if key_map:
+                file.encryption_method.key_map.update(key_map)
+        elif (
+            file.encryption_method is None
+            and file.encryption_resolver is None
+            and file.ext.lstrip(".").lower() in _CENC_CONTAINER_EXTENSIONS
+        ):
+            file.encryption_method = CENCDecryption(key=default_key, key_map=dict(key_map))
+
+
 def process_audiobook(
     source: Source,
     audiobook: Audiobook,
@@ -1182,6 +1207,7 @@ def process_audiobook(
         )
 
     logging.wait_if_paused(cancel_event=cancel_event)
+    _apply_user_decryption_key(audiobook, options)
     download(audiobook, options, interaction=interaction, cancel_event=cancel_event)
     if source is not None:
         source.on_download_complete(audiobook)

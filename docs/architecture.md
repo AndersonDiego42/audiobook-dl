@@ -100,7 +100,7 @@ Source adapters subclass `Source` ([`audiobookdl/sources/source/__init__.py`](..
 - `_authentication_methods` (`"cookies"`, `"login"`, or `[]`) and `login_data`
 - `supports_search` / `search(query)` and `supports_library` / `list_library()`
 
-[`audiobookdl/sources/__init__.py`](../audiobookdl/sources/__init__.py) combines the 17 built-in `_BUILTIN_SOURCES` with external plugins registered under the `audiobookdl.sources` `importlib.metadata` entry point group. For HTTP requests, `networking.py` supports standard `requests.Session` as well as optional TLS/HTTP2 browser fingerprint impersonation via `curl_cffi` (`impersonate`).
+[`audiobookdl/sources/__init__.py`](../audiobookdl/sources/__init__.py) combines the 18 built-in `_BUILTIN_SOURCES` with external plugins registered under the `audiobookdl.sources` `importlib.metadata` entry point group. For HTTP requests, `networking.py` supports standard `requests.Session` as well as optional TLS/HTTP2 browser fingerprint impersonation via `curl_cffi` (`impersonate`).
 
 ## Configuration, Credentials & State Layout
 

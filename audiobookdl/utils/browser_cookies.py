@@ -41,6 +41,7 @@ SERVICE_COOKIE_DOMAINS: dict[str, tuple[str, ...]] = {
     "oreilly": ("oreilly.com", "learning.oreilly.com"),
     "overdrive": ("overdrive.com", "listen.overdrive.com", "libbyapp.com"),
     "yourcloudlibrary": ("yourcloudlibrary.com",),
+    "youtubemusic": ("music.youtube.com", "youtube.com", "google.com"),
 }
 
 _NETSCAPE_HEADER = (

@@ -199,6 +199,7 @@ class AudiobookDLApp:
     proxy_var: tk.StringVar
     timeout_var: tk.StringVar
     impersonate_var: tk.StringVar
+    decryption_key_var: tk.StringVar
     enrich_metadata_var: tk.BooleanVar
     enrich_providers_var: tk.StringVar
     enrich_interactive_var: tk.BooleanVar

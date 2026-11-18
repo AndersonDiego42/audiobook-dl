@@ -19,6 +19,7 @@
 | Saxo             |    ✗    |   ✓   |   ✓    |      ✓       |   ✗    | AES-encrypted streams with searchable premium catalog               |
 | Storytel         |    ✗    |   ✓   |   ✓    |      ✓       |   ✓    | Full `media_type` audiobook/ebook/both and bookshelf sync           |
 | YourCloudLibrary |    ✓    |   ✓   |   ✗    |      ✓       |   ✗    | Findaway v4 streams + library shelf listing                         |
+| YouTubeMusic     |    ✓    |   ✗   |   ✗    |      ✗       |   ✗    | Tracks, albums (chaptered), playlists, and podcasts on `music.youtube.com` |
 
 ## Service Keys & Aliases
 
@@ -32,6 +33,7 @@ When configuring `[sources.<name>]` in `audiobook-dl.toml` or selecting a servic
 - `mofibo` -> `storytel`
 - `o'reilly` / `oreillylearning` -> `oreilly`
 - `cloudlibrary` -> `yourcloudlibrary`
+- `ytmusic` / `youtube-music` -> `youtubemusic`
 
 ## Third-Party Source Plugins
 

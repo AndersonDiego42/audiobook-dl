@@ -1,4 +1,4 @@
-"""Source-to-tagging round-trip contract tests covering all 17 built-in source adapters."""
+"""Source-to-tagging round-trip contract tests covering all 18 built-in source adapters."""
 
 from __future__ import annotations
 
@@ -42,6 +42,7 @@ from audiobookdl.sources.saxo import SaxoSource
 from audiobookdl.sources.source import CatalogBook, Source
 from audiobookdl.sources.storytel import StorytelSource
 from audiobookdl.sources.yourcloudlibrary import YourCloudLibrarySource
+from audiobookdl.sources.youtubemusic import YouTubeMusicSource
 
 
 def _make_jpeg_bytes() -> bytes:
@@ -927,6 +928,28 @@ def _build_oreilly() -> tuple[Source, str]:
     return src, "https://learning.oreilly.com/audiobooks/-/9781000000009/"
 
 
+def _build_youtubemusic() -> tuple[Source, str]:
+    src = _new_source(YouTubeMusicSource)
+    src._extract_info = lambda url, **_kw: {  # type: ignore[method-assign]
+        "id": "ytm12345678",
+        "title": "Contract Audio Track",
+        "artists": ["Jane Artist"],
+        "album": "Contract Album",
+        "track_number": 1,
+        "release_date": "20240510",
+        "language": "en",
+        "description": "Audio track contract test",
+        "url": "https://cdn.example/ytm-track.m4a",
+        "ext": "m4a",
+        "protocol": "https",
+        "http_headers": {"User-Agent": "ContractTestAgent"},
+        "thumbnails": [{"url": "https://cdn.example/ytm-cover.jpg", "width": 500, "height": 500}],
+        "chapters": [{"start_time": 0.0, "title": "Opening"}],
+    }
+    src.get = lambda _url, **_kw: _SAMPLE_COVER  # type: ignore[method-assign]
+    return src, "https://music.youtube.com/watch?v=ytm12345678"
+
+
 _SOURCE_CONTRACT_BUILDERS: dict[type[Source], Callable[[], tuple[Source, str]]] = {
     ArchiveOrgSource: _build_archiveorg,
     AudiobooksdotcomSource: _build_audiobooksdotcom,
@@ -945,11 +968,12 @@ _SOURCE_CONTRACT_BUILDERS: dict[type[Source], Callable[[], tuple[Source, str]]] 
     SaxoSource: _build_saxo,
     StorytelSource: _build_storytel,
     YourCloudLibrarySource: _build_yourcloudlibrary,
+    YouTubeMusicSource: _build_youtubemusic,
 }
 
 
-def test_source_contract_matrix_covers_all_17_builtin_sources():
-    assert len(_BUILTIN_SOURCES) == 17
+def test_source_contract_matrix_covers_all_18_builtin_sources():
+    assert len(_BUILTIN_SOURCES) == 18
     assert set(_SOURCE_CONTRACT_BUILDERS) == set(_BUILTIN_SOURCES)
 
 

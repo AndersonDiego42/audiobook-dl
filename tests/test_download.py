@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from pathlib import Path
 import threading
 from unittest.mock import MagicMock, patch
@@ -19,7 +20,7 @@ from audiobookdl.output.download import (
     download_file,
     download_files,
 )
-from audiobookdl.utils.audiobook import AESEncryption, Cover
+from audiobookdl.utils.audiobook import AESCBCEncryption, Cover, TrackTagContext
 from audiobookdl.utils.http import DEFAULT_HTTP_TIMEOUT
 
 
@@ -229,6 +230,14 @@ def test_single_file_overwrite_guard_respects_confirmation(tmp_path):
         def confirm(self, message: str) -> bool:
             self.confirms.append(message)
             return self.confirm_value
+
+        def choose_index(
+            self,
+            title: str,
+            choices: Sequence[str],
+            default: int | None = None,
+        ) -> int | None:
+            return default
 
     existing = tmp_path / "Single Book.mp3"
     existing.write_bytes(b"original-audio")
@@ -546,7 +555,7 @@ def test_download_file_encrypted_resume_preserves_ciphertext_across_decrypt_fail
     iv = b"fedcba9876543210"
     plaintext = b"0123456789abcdef" * 4 + b"xyz"
     ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(pad(plaintext, AES.block_size))
-    enc = AESEncryption(key=key, iv=iv)
+    enc = AESCBCEncryption(key=key, iv=iv)
 
     output_dir = str(tmp_path / "enc_book")
     tmp_file = tmp_path / "enc_book.mp3.tmp"
@@ -611,6 +620,14 @@ def test_single_file_conversion_prompts_once_on_target_even_when_intermediate_ex
         def confirm(self, message: str) -> bool:
             self.confirms.append(message)
             return self.confirm_value
+
+        def choose_index(
+            self,
+            title: str,
+            choices: Sequence[str],
+            default: int | None = None,
+        ) -> int | None:
+            return default
 
     output_dir = str(tmp_path / "Converted Book")
     final_m4b = tmp_path / "Converted Book.m4b"
@@ -691,6 +708,14 @@ def test_single_file_conversion_resume_honors_existing_target_and_intermediate(t
 
         def confirm(self, message: str) -> bool:
             raise AssertionError(f"Should not prompt on resume: {message}")
+
+        def choose_index(
+            self,
+            title: str,
+            choices: Sequence[str],
+            default: int | None = None,
+        ) -> int | None:
+            raise AssertionError(f"Should not prompt on resume: {title}")
 
     output_dir = str(tmp_path / "Resumed Convert")
     final_m4b = tmp_path / "Resumed Convert.m4b"
@@ -792,6 +817,14 @@ def test_combined_multifile_overwrite_prompts_once_and_resume_skips_completed(tm
             self.confirms.append(message)
             return self.confirm_value
 
+        def choose_index(
+            self,
+            title: str,
+            choices: Sequence[str],
+            default: int | None = None,
+        ) -> int | None:
+            return default
+
     book_dir = tmp_path / "Combined Book"
     book_dir.mkdir()
     (book_dir / "Part 0.mp3").write_bytes(b"old0")
@@ -888,7 +921,7 @@ def test_write_json_metadata_uses_utf8_and_preserves_unicode(tmp_path):
 
 
 def test_download_file_streams_inline_aes_cbc_without_resume(tmp_path):
-    from audiobookdl.utils.audiobook import AESEncryption
+    from audiobookdl.utils.audiobook import AESCBCEncryption
 
     key = b"0123456789abcdef"
     iv = b"fedcba9876543210"
@@ -905,7 +938,7 @@ def test_download_file_streams_inline_aes_cbc_without_resume(tmp_path):
     book = Audiobook(
         session=session,
         metadata=AudiobookMetadata(title="AES Stream"),
-        files=[AudiobookFile(url="https://example.com/enc.ts", ext="ts", encryption_method=AESEncryption(key=key, iv=iv))],
+        files=[AudiobookFile(url="https://example.com/enc.ts", ext="ts", encryption_method=AESCBCEncryption(key=key, iv=iv))],
     )
     progress = []
     with patch("audiobookdl.output.download.encryption.decrypt_file") as mock_decrypt_file:
@@ -945,6 +978,14 @@ def test_overwrite_flag_bypasses_interactive_prompts(tmp_path):
 
         def confirm(self, message: str) -> bool:
             raise AssertionError("Unexpected confirm prompt")
+
+        def choose_index(
+            self,
+            title: str,
+            choices: Sequence[str],
+            default: int | None = None,
+        ) -> int | None:
+            raise AssertionError("Unexpected choice prompt")
 
     # overwrite=False cancels immediately without prompting
     opts_no = DownloadOptions(overwrite=False, skip_downloaded=False, resume=False, write_json_metadata=False, no_chapters=True)
@@ -1287,7 +1328,7 @@ def test_real_ffprobe_integrity_rejects_truncated_audio(tmp_path):
 
 
 def test_download_file_streams_inline_aes_on_multi_segment_hls_even_with_resume(tmp_path):
-    from audiobookdl.utils.audiobook import AESEncryption
+    from audiobookdl.utils.audiobook import AESCBCEncryption
 
     key = b"0123456789abcdef"
     iv = b"fedcba9876543210"
@@ -1303,8 +1344,8 @@ def test_download_file_streams_inline_aes_on_multi_segment_hls_even_with_resume(
         session=session,
         metadata=AudiobookMetadata(title="Multi HLS"),
         files=[
-            AudiobookFile(url="https://example.com/seg0.ts", ext="ts", encryption_method=AESEncryption(key=key, iv=iv)),
-            AudiobookFile(url="https://example.com/seg1.ts", ext="ts", encryption_method=AESEncryption(key=key, iv=iv)),
+            AudiobookFile(url="https://example.com/seg0.ts", ext="ts", encryption_method=AESCBCEncryption(key=key, iv=iv)),
+            AudiobookFile(url="https://example.com/seg1.ts", ext="ts", encryption_method=AESCBCEncryption(key=key, iv=iv)),
         ],
     )
     out_dir = tmp_path / "hls_dir"
@@ -1317,7 +1358,7 @@ def test_download_file_streams_inline_aes_on_multi_segment_hls_even_with_resume(
 
 
 def test_download_file_streams_inline_aes_when_accept_ranges_none_with_resume(tmp_path):
-    from audiobookdl.utils.audiobook import AESEncryption
+    from audiobookdl.utils.audiobook import AESCBCEncryption
 
     key = b"0123456789abcdef"
     iv = b"fedcba9876543210"
@@ -1332,7 +1373,7 @@ def test_download_file_streams_inline_aes_when_accept_ranges_none_with_resume(tm
     book = Audiobook(
         session=session,
         metadata=AudiobookMetadata(title="Single Resume Small"),
-        files=[AudiobookFile(url="https://example.com/single.ts", ext="ts", encryption_method=AESEncryption(key=key, iv=iv))],
+        files=[AudiobookFile(url="https://example.com/single.ts", ext="ts", encryption_method=AESCBCEncryption(key=key, iv=iv))],
     )
     out_dir = tmp_path / "single_small_dir"
     out_dir.mkdir()
@@ -1388,7 +1429,7 @@ def test_parse_byte_rate_and_token_bucket_rate_limiter():
 
 
 def test_download_file_handles_custom_byterange_206_and_init_section(tmp_path):
-    from audiobookdl.utils.audiobook import AESEncryption
+    from audiobookdl.utils.audiobook import AESCBCEncryption
 
     init_bytes = b"INIT_HEADER_"
     seg_payload = b"SEGMENT_AUDIO_FRAMES"
@@ -1433,7 +1474,7 @@ def test_download_file_handles_custom_byterange_206_and_init_section(tmp_path):
                 url="https://cdn.example.com/enc.m4s",
                 ext="m4s",
                 headers={"Range": "bytes=100-131"},
-                encryption_method=AESEncryption(key=key, iv=iv),
+                encryption_method=AESCBCEncryption(key=key, iv=iv),
                 init_section=init_bytes,
             )
         ],
@@ -1450,7 +1491,7 @@ def test_aes_cbc_multipart_resume_does_not_mix_plaintext_and_ciphertext(tmp_path
     iv = b"abcdef9876543210"
     plaintext = b"Chapter 1 secret audio stream payload!!"
     ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(pad(plaintext, 16))
-    enc = AESEncryption(key=key, iv=iv)
+    enc = AESCBCEncryption(key=key, iv=iv)
 
     part1 = AudiobookFile(url="https://example.com/p1.mp3", ext="mp3", encryption_method=enc)
     part2 = AudiobookFile(url="https://example.com/p2.mp3", ext="mp3", encryption_method=enc)
@@ -1627,7 +1668,12 @@ def test_add_metadata_to_dir_passes_track_context_and_cover(tmp_path, monkeypatc
 
     calls = []
 
-    def fake_add_metadata(filepath, meta, cover=None, track_context=None):
+    def fake_add_metadata(
+        filepath: str,
+        meta: AudiobookMetadata,
+        cover: Cover | None = None,
+        track_context: TrackTagContext | None = None,
+    ) -> bool:
         calls.append((filepath, meta, cover, track_context))
         return True
 
@@ -1648,11 +1694,15 @@ def test_add_metadata_to_dir_passes_track_context_and_cover(tmp_path, monkeypatc
 
     assert len(calls) == 2
     assert calls[0][2] is cover
-    assert calls[0][3].track_number == 1
-    assert calls[0][3].total_tracks == 2
-    assert calls[0][3].album == "Dir Book"
-    assert calls[1][3].track_number == 2
-    assert calls[1][3].total_tracks == 2
+    ctx0 = calls[0][3]
+    ctx1 = calls[1][3]
+    assert ctx0 is not None
+    assert ctx1 is not None
+    assert ctx0.track_number == 1
+    assert ctx0.total_tracks == 2
+    assert ctx0.album == "Dir Book"
+    assert ctx1.track_number == 2
+    assert ctx1.total_tracks == 2
 
 
 def test_download_reuses_probe_cache_from_download_file_for_combine(tmp_path, monkeypatch):
@@ -1881,7 +1931,14 @@ def test_download_audiobook_split_intro_chapter_mode_updates_filenames_tags_and_
 
     tagged_calls: list[tuple[str, str]] = []
 
-    def fake_add_metadata(filepath, _meta, cover=None, track_context=None, **_kw):
+    def fake_add_metadata(
+        filepath: str,
+        _meta: AudiobookMetadata,
+        cover: Cover | None = None,
+        track_context: TrackTagContext | None = None,
+        **_kw: object,
+    ) -> bool:
+        assert track_context is not None
         tagged_calls.append((os.path.basename(filepath), track_context.title))
         return True
 

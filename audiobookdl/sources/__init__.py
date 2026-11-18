@@ -17,6 +17,7 @@ from .saxo import SaxoSource
 from .everand import EverandSource
 from .storytel import StorytelSource
 from .yourcloudlibrary import YourCloudLibrarySource
+from .youtubemusic import YouTubeMusicSource
 
 from ..exceptions import NoSourceFound
 from dataclasses import dataclass
@@ -142,6 +143,7 @@ _BUILTIN_SOURCES: tuple[type[Source], ...] = (
     StorytelSource,
     YourCloudLibrarySource,
     RssSource,
+    YouTubeMusicSource,
 )
 
 
