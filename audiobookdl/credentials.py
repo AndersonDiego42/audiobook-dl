@@ -16,10 +16,29 @@ _PLAINTEXT_OPT_IN_ENV_ALIASES = (
     "AUDIOBOOKDL_ALLOW_PLAINTEXT_CREDENTIALS",
 )
 _CRYPTPROTECT_UI_FORBIDDEN = 0x1
+_OAUTH_KEY_SUFFIX = "#oauth"
+_OAUTH_USERNAME = "__oauth_token__"
+
+
+def make_oauth_vault_key(profile_key: str) -> str:
+    """Return the `CredentialStore` service key used to store OAuth tokens for `profile_key`."""
+    return f"{profile_key}{_OAUTH_KEY_SUFFIX}"
+
+
+def is_oauth_vault_key(service_key: str) -> bool:
+    """Return `True` if `service_key` belongs to an OAuth token bundle slot."""
+    return isinstance(service_key, str) and service_key.endswith(_OAUTH_KEY_SUFFIX)
+
+
+def strip_oauth_vault_key(service_key: str) -> str:
+    """Return the underlying `profile_key` for an OAuth vault key."""
+    if is_oauth_vault_key(service_key):
+        return service_key[: -len(_OAUTH_KEY_SUFFIX)]
+    return service_key
 
 
 class CredentialStore(ABC):
-    """Abstract storage backend for service passwords."""
+    """Abstract storage backend for service passwords and OAuth token bundles."""
 
     is_secure: bool = True
 
@@ -38,8 +57,24 @@ class CredentialStore(ABC):
         """Remove any stored password for `(service_key, username)`."""
 
     def stored_services(self) -> dict[str, str | None]:
-        """Return `{service_key: username}` for entries known to this store."""
+        """Return `{service_key: username}` for password entries known to this store."""
         return {}
+
+    def get_oauth_token(self, profile_key: str) -> str | None:
+        """Retrieve serialized OAuth token JSON for `profile_key`, or `None`."""
+        return self.get_password(make_oauth_vault_key(profile_key), _OAUTH_USERNAME)
+
+    def set_oauth_token(self, profile_key: str, token_json: str) -> None:
+        """Persist serialized OAuth token JSON for `profile_key`."""
+        self.set_password(make_oauth_vault_key(profile_key), _OAUTH_USERNAME, token_json)
+
+    def delete_oauth_token(self, profile_key: str) -> None:
+        """Remove any stored OAuth token bundle for `profile_key`."""
+        self.delete_password(make_oauth_vault_key(profile_key), _OAUTH_USERNAME)
+
+    def stored_oauth_profiles(self) -> set[str]:
+        """Return profile keys that have a persisted OAuth token bundle in this store."""
+        return set()
 
 
 class _DataBlob(ctypes.Structure):
@@ -232,7 +267,16 @@ class DpapiCredentialStore(CredentialStore):
         return {
             service_key: entry.get("username")
             for service_key, entry in entries.items()
-            if isinstance(entry, dict)
+            if isinstance(entry, dict) and not is_oauth_vault_key(service_key)
+        }
+
+    def stored_oauth_profiles(self) -> set[str]:
+        with file_lock(self.vault_path):
+            entries = self._read_entries()
+        return {
+            strip_oauth_vault_key(service_key)
+            for service_key, entry in entries.items()
+            if isinstance(entry, dict) and is_oauth_vault_key(service_key)
         }
 
 
@@ -327,9 +371,20 @@ class KeyringCredentialStore(CredentialStore):
             entries = self._read_index()
         active: dict[str, str | None] = {}
         for service_key, username in entries.items():
-            if self.get_password(service_key, username) is not None:
+            if not is_oauth_vault_key(service_key) and self.get_password(service_key, username) is not None:
                 active[service_key] = username
         return active
+
+    def stored_oauth_profiles(self) -> set[str]:
+        if not self.index_path:
+            return set()
+        with file_lock(self.index_path):
+            entries = self._read_index()
+        return {
+            strip_oauth_vault_key(service_key)
+            for service_key, username in entries.items()
+            if is_oauth_vault_key(service_key) and self.get_password(service_key, username) is not None
+        }
 
 
 class PlaintextFallbackCredentialStore(CredentialStore):
@@ -436,7 +491,21 @@ class PlaintextFallbackCredentialStore(CredentialStore):
         return {
             service_key: entry.get("username")
             for service_key, entry in entries.items()
-            if isinstance(entry, dict)
+            if isinstance(entry, dict) and not is_oauth_vault_key(service_key)
+        }
+
+    def stored_oauth_profiles(self) -> set[str]:
+        if not self.allow_plaintext:
+            return set()
+        if self.vault_path:
+            with file_lock(self.vault_path):
+                entries = self._read_vault()
+        else:
+            entries = self._entries
+        return {
+            strip_oauth_vault_key(service_key)
+            for service_key, entry in entries.items()
+            if isinstance(entry, dict) and is_oauth_vault_key(service_key)
         }
 
 

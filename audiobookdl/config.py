@@ -15,12 +15,16 @@ from audiobookdl.options_schema import (
 )
 from audiobookdl.utils.fs import atomic_write_text, file_lock
 from attrs import Factory, define
-
-from typing import Any
 from collections.abc import Sequence
 
 import os
+import re
+import shutil
 import sys
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from audiobookdl.utils.oauth import OAuthTokenBundle
 
 try:
     import tomllib
@@ -40,6 +44,9 @@ class SourceConfig:
     library: str | None
     cookie_file: str | None
     locale: str | None = None
+    oauth_client_id: str | None = None
+    oauth_scopes: tuple[str, ...] | None = None
+    oauth_token_present: bool = False
 
 
 @define
@@ -98,6 +105,7 @@ class Config:
     ffmpeg_dir: str | None = None
     resume: bool | None = None
     audio_bitrate: str | None = None
+    sample_rate: int | None = None
     overwrite: bool | None = None
     max_workers: int | None = None
     book_delay: float | None = None
@@ -137,6 +145,7 @@ class Config:
     gui: GuiConfig = Factory(GuiConfig)
     audiobookshelf: AudiobookshelfConfig = Factory(AudiobookshelfConfig)
     custom_metadata_providers: dict[str, CustomMetadataProviderConfig] = Factory(dict)
+    config_location: str | None = None
 
     def clone(self) -> "Config":
         """Return an isolated copy of this configuration for background jobs."""
@@ -147,6 +156,9 @@ class Config:
                 library=src.library,
                 cookie_file=src.cookie_file,
                 locale=src.locale,
+                oauth_client_id=src.oauth_client_id,
+                oauth_scopes=src.oauth_scopes,
+                oauth_token_present=src.oauth_token_present,
             )
             for name, src in self.sources.items()
         }
@@ -195,6 +207,7 @@ class Config:
             "gui": gui_copy,
             "audiobookshelf": abs_copy,
             "custom_metadata_providers": custom_providers_copy,
+            "config_location": self.config_location,
         }
         for spec in CONFIG_OPTION_SPECS:
             if spec.config_key is not None:
@@ -264,6 +277,23 @@ def split_source_profile_key(raw_key: str) -> tuple[str, str]:
         service_part, profile_part = raw_key.split(":", 1)
         return normalize_source_key(service_part), normalize_profile_name(profile_part)
     return normalize_source_key(raw_key), DEFAULT_PROFILE
+
+
+def sanitize_profile_filename_part(profile: str | None) -> str | None:
+    """Return a filesystem-safe profile suffix for non-default profiles, or `None`."""
+    norm = normalize_profile_name(profile)
+    if norm == DEFAULT_PROFILE:
+        return None
+    return re.sub(r"[^a-z0-9_-]", "_", norm)
+
+
+def profile_scoped_filename(filename: str, profile: str | None) -> str:
+    """Inject `_<profile>` before the extension of `filename` for non-default profiles."""
+    safe_profile = sanitize_profile_filename_part(profile)
+    if not safe_profile:
+        return filename
+    stem, ext = os.path.splitext(filename)
+    return f"{stem}_{safe_profile}{ext}"
 
 
 def get_source_config(
@@ -538,6 +568,19 @@ def _migrate_legacy_passwords(
                 )
 
 
+def _parse_oauth_scopes(raw: Any, section_label: str) -> tuple[str, ...] | None:
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        scopes = tuple(part.strip() for part in raw.replace(",", " ").split() if part.strip())
+        return scopes or None
+    if isinstance(raw, (list, tuple)) and all(isinstance(item, str) for item in raw):
+        scopes = tuple(item.strip() for item in raw if item.strip())
+        return scopes or None
+    logging.log(f"Warning: invalid 'oauth_scopes' in '{section_label}'; ignoring")
+    return None
+
+
 def _build_source_config_from_dict(
     *,
     section_label: str,
@@ -570,12 +613,25 @@ def _build_source_config_from_dict(
     if raw_locale is not None and not isinstance(raw_locale, str):
         logging.log(f"Warning: invalid 'locale' in '{section_label}'; ignoring")
         raw_locale = None
+    raw_client_id = values.get("oauth_client_id")
+    if raw_client_id is not None and not isinstance(raw_client_id, str):
+        logging.log(f"Warning: invalid 'oauth_client_id' in '{section_label}'; ignoring")
+        raw_client_id = None
+    oauth_scopes = _parse_oauth_scopes(values.get("oauth_scopes"), section_label)
+    oauth_token_present = False
+    if credential_store is not None:
+        oauth_token_present = credential_store.get_oauth_token(profile_key) is not None
+        if not oauth_token_present and raw_source_name != profile_key:
+            oauth_token_present = credential_store.get_oauth_token(raw_source_name) is not None
     return SourceConfig(
         username=username if isinstance(username, str) or username is None else str(username),
         password=password if isinstance(password, str) or password is None else str(password),
         library=values.get("library"),
         cookie_file=cookie_file,
         locale=raw_locale.strip() or None if isinstance(raw_locale, str) else None,
+        oauth_client_id=raw_client_id.strip() or None if isinstance(raw_client_id, str) else None,
+        oauth_scopes=oauth_scopes,
+        oauth_token_present=oauth_token_present,
     )
 
 
@@ -745,7 +801,23 @@ def structure_config(
                         password=stored_pw,
                         library=None,
                         cookie_file=None,
+                        oauth_token_present=credential_store.get_oauth_token(profile_key) is not None,
                     )
+        for raw_oauth_key in credential_store.stored_oauth_profiles():
+            if raw_oauth_key.startswith("integration:"):
+                continue
+            svc, prof = split_source_profile_key(raw_oauth_key)
+            profile_key = make_source_profile_key(svc, prof)
+            if profile_key in sources:
+                sources[profile_key].oauth_token_present = True
+            else:
+                sources[profile_key] = SourceConfig(
+                    username=None,
+                    password=None,
+                    library=None,
+                    cookie_file=None,
+                    oauth_token_present=True,
+                )
 
     gui_section = config_dict.get("gui")
     gui_config = GuiConfig()
@@ -919,6 +991,7 @@ def structure_config(
         gui=gui_config,
         audiobookshelf=abs_config,
         custom_metadata_providers=custom_providers,
+        config_location=config_location,
         **parsed_options,
     )
 
@@ -1036,6 +1109,196 @@ def _write_config_dict(config_location: str, config_dict: dict[str, Any]) -> str
     )
 
 
+_UNSET: Any = object()
+_PERSISTED_GUI_SPEC_BY_NAME = {spec.name: spec for spec in PERSISTED_GUI_OPTION_SPECS}
+
+
+def _read_profile_entry(
+    sources_dict: dict[str, Any],
+    canonical_key: str,
+    norm_profile: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    service_table = dict(sources_dict.get(canonical_key) or {})
+    if norm_profile == DEFAULT_PROFILE:
+        prev_entry = {k: v for k, v in service_table.items() if k != "profiles"}
+    else:
+        profiles_dict = dict(service_table.get("profiles") or {})
+        raw_profile = profiles_dict.get(norm_profile)
+        prev_entry = dict(raw_profile) if isinstance(raw_profile, dict) else {}
+    return service_table, prev_entry
+
+
+def _write_profile_entry(
+    config_dict: dict[str, Any],
+    sources_dict: dict[str, Any],
+    canonical_key: str,
+    norm_profile: str,
+    entry: dict[str, Any] | None,
+) -> None:
+    service_table = dict(sources_dict.get(canonical_key) or {})
+    if norm_profile == DEFAULT_PROFILE:
+        existing_profiles = service_table.get("profiles")
+        new_service_table = dict(entry) if entry else {}
+        if isinstance(existing_profiles, dict) and existing_profiles:
+            new_service_table["profiles"] = existing_profiles
+        if new_service_table:
+            sources_dict[canonical_key] = new_service_table
+        else:
+            sources_dict.pop(canonical_key, None)
+    else:
+        profiles_dict = dict(service_table.get("profiles") or {})
+        if entry:
+            profiles_dict[norm_profile] = dict(entry)
+        else:
+            profiles_dict.pop(norm_profile, None)
+        if profiles_dict:
+            service_table["profiles"] = profiles_dict
+        else:
+            service_table.pop("profiles", None)
+        if service_table:
+            sources_dict[canonical_key] = service_table
+        else:
+            sources_dict.pop(canonical_key, None)
+    if sources_dict:
+        config_dict["sources"] = sources_dict
+    else:
+        config_dict.pop("sources", None)
+
+
+def _profile_runtime_files(
+    database_directory: str | None,
+    canonical_key: str,
+    profile: str,
+) -> list[str]:
+    if not database_directory:
+        return []
+    service_dir = os.path.join(database_directory, canonical_key)
+    if not os.path.isdir(service_dir):
+        return []
+    norm_profile = normalize_profile_name(profile)
+    safe_suffix = sanitize_profile_filename_part(norm_profile)
+    matches: list[str] = []
+    cookie_path = os.path.join(service_dir, profile_scoped_filename("session_cookies.txt", norm_profile))
+    if os.path.isfile(cookie_path):
+        matches.append(cookie_path)
+    try:
+        entries = os.listdir(service_dir)
+    except OSError:
+        return matches
+    for name in entries:
+        if safe_suffix is None:
+            if name.endswith("_device_id.txt"):
+                matches.append(os.path.join(service_dir, name))
+        else:
+            target_suffix = f"_device_id_{safe_suffix}.txt"
+            if name.endswith(target_suffix):
+                matches.append(os.path.join(service_dir, name))
+    return matches
+
+
+def _delete_profile_runtime_files(
+    database_directory: str | None,
+    canonical_key: str,
+    profile: str,
+) -> None:
+    for path in _profile_runtime_files(database_directory, canonical_key, profile):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _rename_profile_runtime_files(
+    database_directory: str | None,
+    canonical_key: str,
+    old_profile: str,
+    new_profile: str,
+) -> None:
+    if not database_directory:
+        return
+    old_norm = normalize_profile_name(old_profile)
+    new_norm = normalize_profile_name(new_profile)
+    if old_norm == new_norm:
+        return
+    service_dir = os.path.join(database_directory, canonical_key)
+    if not os.path.isdir(service_dir):
+        return
+    old_suffix = sanitize_profile_filename_part(old_norm)
+    for src in _profile_runtime_files(database_directory, canonical_key, old_norm):
+        base = os.path.basename(src)
+        if base.startswith("session_cookies"):
+            dst_name = profile_scoped_filename("session_cookies.txt", new_norm)
+        elif old_suffix is None and base.endswith("_device_id.txt"):
+            dst_name = profile_scoped_filename(base, new_norm)
+        elif old_suffix is not None and base.endswith(f"_device_id_{old_suffix}.txt"):
+            prefix = base[: -len(f"_device_id_{old_suffix}.txt")]
+            dst_name = profile_scoped_filename(f"{prefix}_device_id.txt", new_norm)
+        else:
+            continue
+        dst = os.path.join(service_dir, dst_name)
+        try:
+            os.makedirs(service_dir, exist_ok=True)
+            shutil.move(src, dst)
+        except OSError:
+            pass
+
+
+def load_source_oauth_token(
+    service_key: str,
+    *,
+    profile: str | None = None,
+    overwrite: str | None = None,
+    credential_store: CredentialStore | None = None,
+) -> "OAuthTokenBundle | None":
+    """Load persisted OAuth token bundle for `(service_key, profile)` from `CredentialStore`."""
+    from audiobookdl.utils.oauth import OAuthTokenBundle
+
+    config_location = overwrite or get_config_location(None)
+    canonical_key = normalize_source_key(service_key)
+    norm_profile = normalize_profile_name(profile)
+    profile_key = make_source_profile_key(canonical_key, norm_profile)
+    store = credential_store or get_credential_store(config_location)
+    raw = store.get_oauth_token(profile_key)
+    if raw is None and profile_key != canonical_key:
+        return None
+    if raw is None:
+        raw = store.get_oauth_token(canonical_key)
+    return OAuthTokenBundle.from_json(raw) if raw else None
+
+
+def save_source_oauth_token(
+    service_key: str,
+    token: "OAuthTokenBundle",
+    *,
+    profile: str | None = None,
+    overwrite: str | None = None,
+    credential_store: CredentialStore | None = None,
+) -> None:
+    """Persist serialized `OAuthTokenBundle` for `(service_key, profile)` in `CredentialStore`."""
+    config_location = overwrite or get_config_location(None)
+    canonical_key = normalize_source_key(service_key)
+    norm_profile = normalize_profile_name(profile)
+    profile_key = make_source_profile_key(canonical_key, norm_profile)
+    store = credential_store or get_credential_store(config_location)
+    store.set_oauth_token(profile_key, token.to_json())
+
+
+def delete_source_oauth_token(
+    service_key: str,
+    *,
+    profile: str | None = None,
+    overwrite: str | None = None,
+    credential_store: CredentialStore | None = None,
+) -> None:
+    """Delete any persisted OAuth token bundle for `(service_key, profile)` from `CredentialStore`."""
+    config_location = overwrite or get_config_location(None)
+    canonical_key = normalize_source_key(service_key)
+    norm_profile = normalize_profile_name(profile)
+    profile_key = make_source_profile_key(canonical_key, norm_profile)
+    store = credential_store or get_credential_store(config_location)
+    store.delete_oauth_token(profile_key)
+
+
 def save_source_credentials(
     service_key: str,
     username: str | None = None,
@@ -1046,13 +1309,16 @@ def save_source_credentials(
     credential_store: CredentialStore | None = None,
     *,
     profile: str | None = None,
+    locale: Any = _UNSET,
+    oauth_client_id: Any = _UNSET,
+    oauth_scopes: Any = _UNSET,
 ) -> str:
     """
     Save or clear credentials for `(service_key, profile)` in the configuration file.
 
-    Non-secret fields (`username`, `library`, `cookie_file`) are stored in
-    `audiobook-dl.toml` while `password` is persisted in the OS credential store.
-    Preserves existing global settings and credentials for other services/profiles.
+    Non-secret fields (`username`, `library`, `cookie_file`, `locale`, `oauth_client_id`,
+    `oauth_scopes`) are stored in `audiobook-dl.toml` while `password` and OAuth tokens are
+    persisted in the OS credential store. Preserves existing settings for other fields/profiles.
     Returns the path to the configuration file written.
     """
     config_location = overwrite or get_config_location(None)
@@ -1063,25 +1329,53 @@ def save_source_credentials(
     with file_lock(config_location):
         config_dict = read_config(config_location)
         sources_dict = dict(config_dict.get("sources") or {})
-        service_table = dict(sources_dict.get(canonical_key) or {})
-
-        if norm_profile == DEFAULT_PROFILE:
-            prev_entry = service_table
-        else:
-            profiles_dict = dict(service_table.get("profiles") or {})
-            raw_profile = profiles_dict.get(norm_profile)
-            prev_entry = raw_profile if isinstance(raw_profile, dict) else {}
+        _, prev_entry = _read_profile_entry(sources_dict, canonical_key, norm_profile)
         prev_username = prev_entry.get("username") if isinstance(prev_entry, dict) else None
 
-        entry: dict[str, Any] = {
-            k: v
-            for k, v in (
-                ("username", username),
-                ("library", library),
-                ("cookie_file", cookie_file),
-            )
-            if v is not None and v != ""
-        }
+        clearing_credentials = (
+            not (username or "")
+            and not (password or "")
+            and not (library or "")
+            and not (cookie_file or "")
+            and locale is _UNSET
+            and oauth_client_id is _UNSET
+            and oauth_scopes is _UNSET
+        )
+
+        if clearing_credentials:
+            entry: dict[str, Any] = {}
+        else:
+            entry = {
+                k: v
+                for k, v in (
+                    ("username", username),
+                    ("library", library),
+                    ("cookie_file", cookie_file),
+                )
+                if v is not None and v != ""
+            }
+            for optional_key, raw_override in (
+                ("locale", locale),
+                ("oauth_client_id", oauth_client_id),
+                ("oauth_scopes", oauth_scopes),
+            ):
+                if raw_override is _UNSET:
+                    prev_val = prev_entry.get(optional_key)
+                    if prev_val is not None and prev_val != "" and prev_val != []:
+                        entry[optional_key] = prev_val
+                elif raw_override is not None and raw_override != "" and raw_override != [] and raw_override != ():
+                    if optional_key == "oauth_scopes" and isinstance(raw_override, str):
+                        parsed_scopes = [p.strip() for p in raw_override.replace(",", " ").split() if p.strip()]
+                        if parsed_scopes:
+                            entry[optional_key] = parsed_scopes
+                    elif optional_key == "oauth_scopes" and isinstance(raw_override, tuple):
+                        entry[optional_key] = list(raw_override)
+                    elif isinstance(raw_override, str):
+                        cleaned = raw_override.strip()
+                        if cleaned:
+                            entry[optional_key] = cleaned
+                    else:
+                        entry[optional_key] = raw_override
 
         if prev_username != username:
             store.delete_password(vault_key, prev_username)
@@ -1097,40 +1391,91 @@ def save_source_credentials(
         else:
             store.delete_password(vault_key, username)
 
-        if norm_profile == DEFAULT_PROFILE:
-            existing_profiles = service_table.get("profiles")
-            new_service_table = dict(entry)
-            if isinstance(existing_profiles, dict) and existing_profiles:
-                new_service_table["profiles"] = existing_profiles
-            if new_service_table:
-                sources_dict[canonical_key] = new_service_table
-            else:
-                sources_dict.pop(canonical_key, None)
-        else:
-            profiles_dict = dict(service_table.get("profiles") or {})
-            if entry:
-                profiles_dict[norm_profile] = entry
-            else:
-                profiles_dict.pop(norm_profile, None)
-            if profiles_dict:
-                service_table["profiles"] = profiles_dict
-            else:
-                service_table.pop("profiles", None)
-            if service_table:
-                sources_dict[canonical_key] = service_table
-            else:
-                sources_dict.pop(canonical_key, None)
-
-        if sources_dict:
-            config_dict["sources"] = sources_dict
-        else:
-            config_dict.pop("sources", None)
-
+        _write_profile_entry(config_dict, sources_dict, canonical_key, norm_profile, entry)
         return _write_config_dict(config_location, config_dict)
 
 
-_UNSET: Any = object()
-_PERSISTED_GUI_SPEC_BY_NAME = {spec.name: spec for spec in PERSISTED_GUI_OPTION_SPECS}
+def delete_source_profile(
+    service_key: str,
+    *,
+    profile: str | None = None,
+    overwrite: str | None = None,
+    credential_store: CredentialStore | None = None,
+    database_directory: str | None = None,
+) -> str:
+    """Remove a `(service_key, profile)` configuration, vault secrets, OAuth tokens, and runtime caches."""
+    config_location = overwrite or get_config_location(None)
+    canonical_key = normalize_source_key(service_key)
+    norm_profile = normalize_profile_name(profile)
+    vault_key = make_source_profile_key(canonical_key, norm_profile)
+    store = credential_store or get_credential_store(config_location)
+    with file_lock(config_location):
+        config_dict = read_config(config_location)
+        sources_dict = dict(config_dict.get("sources") or {})
+        _, prev_entry = _read_profile_entry(sources_dict, canonical_key, norm_profile)
+        prev_username = prev_entry.get("username") if isinstance(prev_entry, dict) else None
+        store.delete_password(vault_key, prev_username)
+        store.delete_password(vault_key, None)
+        store.delete_oauth_token(vault_key)
+        _write_profile_entry(config_dict, sources_dict, canonical_key, norm_profile, None)
+        written = _write_config_dict(config_location, config_dict)
+    _delete_profile_runtime_files(database_directory, canonical_key, norm_profile)
+    return written
+
+
+def rename_source_profile(
+    service_key: str,
+    old_profile: str,
+    new_profile: str,
+    *,
+    overwrite: str | None = None,
+    credential_store: CredentialStore | None = None,
+    database_directory: str | None = None,
+) -> str:
+    """Rename `(service_key, old_profile)` to `new_profile`, migrating TOML, vault secrets, OAuth tokens, and caches."""
+    canonical_key = normalize_source_key(service_key)
+    old_norm = normalize_profile_name(old_profile)
+    new_norm = normalize_profile_name(new_profile)
+    if not new_profile or not new_profile.strip():
+        raise ValueError("New profile name cannot be empty")
+    if old_norm == new_norm:
+        return overwrite or get_config_location(None)
+
+    config_location = overwrite or get_config_location(None)
+    old_vault_key = make_source_profile_key(canonical_key, old_norm)
+    new_vault_key = make_source_profile_key(canonical_key, new_norm)
+    store = credential_store or get_credential_store(config_location)
+    with file_lock(config_location):
+        config_dict = read_config(config_location)
+        sources_dict = dict(config_dict.get("sources") or {})
+        _, old_entry = _read_profile_entry(sources_dict, canonical_key, old_norm)
+        _, existing_target = _read_profile_entry(sources_dict, canonical_key, new_norm)
+        old_username = old_entry.get("username") if isinstance(old_entry, dict) else None
+        old_pw = store.get_password(old_vault_key, old_username)
+        old_oauth = store.get_oauth_token(old_vault_key)
+
+        if (
+            existing_target
+            or store.get_password(new_vault_key, None) is not None
+            or store.get_oauth_token(new_vault_key) is not None
+        ):
+            raise ValueError(f"Profile '{new_norm}' already exists for {canonical_key}")
+        if not old_entry and old_pw is None and old_oauth is None:
+            raise ValueError(f"Profile '{old_norm}' does not exist for {canonical_key}")
+
+        if old_pw is not None:
+            store.set_password(new_vault_key, old_username, old_pw)
+            store.delete_password(old_vault_key, old_username)
+        if old_oauth is not None:
+            store.set_oauth_token(new_vault_key, old_oauth)
+            store.delete_oauth_token(old_vault_key)
+
+        _write_profile_entry(config_dict, sources_dict, canonical_key, old_norm, None)
+        if old_entry:
+            _write_profile_entry(config_dict, sources_dict, canonical_key, new_norm, old_entry)
+        written = _write_config_dict(config_location, config_dict)
+    _rename_profile_runtime_files(database_directory, canonical_key, old_norm, new_norm)
+    return written
 
 
 def save_output_preferences(

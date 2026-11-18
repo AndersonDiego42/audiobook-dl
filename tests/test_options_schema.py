@@ -85,6 +85,7 @@ def test_config_clone_copies_all_fields_independently():
         ffmpeg_dir="/usr/local/bin",
         resume=True,
         audio_bitrate="128k",
+        sample_rate=22050,
         overwrite=False,
         max_workers=4,
         book_delay=1.5,
@@ -185,6 +186,14 @@ def test_validate_config_value_variants():
     val, warn = validate_config_value("intro_chapter_mode", "intro_chapter_mode", "invalid")
     assert val is None and warn is not None
 
+    assert validate_config_value("sample_rate", "sample_rate", 44100) == (44100, None)
+    assert validate_config_value("sample_rate", "sample_rate", "44.1kHz") == (44100, None)
+    assert validate_config_value("sample_rate", "sample_rate", "auto") == (None, None)
+    val, warn = validate_config_value("sample_rate", "sample_rate", True)
+    assert val is None and warn is not None
+    val, warn = validate_config_value("sample_rate", "sample_rate", 1000)
+    assert val is None and warn is not None
+
     with pytest.raises(ValueError, match="Unknown config value kind"):
         validate_config_value("foo", "unknown_kind", "bar")
 
@@ -201,6 +210,7 @@ def test_schema_driven_merge_and_preset_precedence(tmp_path):
             "output_format": "mp3",
             "media_type": "ebook",
             "audio_bitrate": "96k",
+            "sample_rate": 22050,
             "overwrite": True,
             "max_workers": 3,
             "book_delay": 2,

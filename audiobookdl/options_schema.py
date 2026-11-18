@@ -7,7 +7,7 @@ import shlex
 from typing import Any
 from collections.abc import Callable, Mapping
 
-from audiobookdl.utils import normalize_audio_bitrate
+from audiobookdl.utils import normalize_audio_bitrate, normalize_sample_rate
 from audiobookdl.utils.http import DEFAULT_MAX_RETRIES
 
 
@@ -45,7 +45,17 @@ GUI_CONFIG_KEYS: frozenset[str] = frozenset(
         "minimize_to_tray",
     }
 )
-SOURCE_CONFIG_KEYS: frozenset[str] = frozenset({"username", "password", "library", "cookie_file", "locale"})
+SOURCE_CONFIG_KEYS: frozenset[str] = frozenset(
+    {
+        "username",
+        "password",
+        "library",
+        "cookie_file",
+        "locale",
+        "oauth_client_id",
+        "oauth_scopes",
+    }
+)
 
 
 def default_database_directory() -> str:
@@ -155,6 +165,15 @@ def _validate_audio_bitrate(key: str, raw: Any) -> tuple[str | None, str | None]
         return None, f"Warning: invalid '{key}' in config ('{val}'); ignoring"
 
 
+def _validate_sample_rate(key: str, raw: Any) -> tuple[int | None, str | None]:
+    if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+        return None, f"Warning: invalid '{key}' in config (expected integer Hz or string); ignoring"
+    try:
+        return normalize_sample_rate(raw), None
+    except ValueError:
+        return None, f"Warning: invalid '{key}' in config ({raw!r}); ignoring"
+
+
 def _validate_enrich_providers(
     key: str,
     raw: Any,
@@ -230,6 +249,7 @@ _CONFIG_VALIDATORS: Mapping[str, Callable[[str, Any], tuple[Any, str | None]]] =
     "positive_float": _validate_positive_float,
     "silence_noise_db": _validate_silence_noise_db,
     "audio_bitrate": _validate_audio_bitrate,
+    "sample_rate": _validate_sample_rate,
     "media_type": _validate_media_type,
     "intro_chapter_mode": _validate_intro_chapter_mode,
     "enrich_providers": _validate_enrich_providers,
@@ -267,6 +287,11 @@ def _serialize_non_empty_str(val: Any) -> tuple[bool, Any]:
 def _serialize_audio_bitrate(val: Any) -> tuple[bool, Any]:
     normalized = normalize_audio_bitrate(val)
     return (True, normalized) if normalized else (False, None)
+
+
+def _serialize_sample_rate(val: Any) -> tuple[bool, Any]:
+    normalized = normalize_sample_rate(val)
+    return (True, normalized) if normalized is not None else (False, None)
 
 
 def _serialize_media_type(val: Any) -> tuple[bool, Any]:
@@ -379,7 +404,25 @@ def _gui_init_audio_bitrate(cfg_val: Any) -> str:
 
 def _gui_read_audio_bitrate(raw: Any) -> str | None:
     cleaned = str(raw).strip()
-    return None if cleaned in ("", "Auto", "auto") else cleaned
+    if not cleaned or cleaned.lower() == "auto":
+        return None
+    return normalize_audio_bitrate(cleaned)
+
+
+def _gui_init_sample_rate(cfg_val: Any) -> str:
+    if cfg_val is None:
+        return "Auto"
+    try:
+        normalized = normalize_sample_rate(cfg_val)
+    except ValueError:
+        return "Auto"
+    return str(normalized) if normalized is not None else "Auto"
+
+
+def _gui_read_sample_rate(raw: Any) -> int | None:
+    if raw is None:
+        return None
+    return normalize_sample_rate(str(raw))
 
 
 def _gui_init_bool_default_true(cfg_val: Any) -> bool:
@@ -991,7 +1034,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="audio_bitrate",
         default=None,
-        help="Target AAC bitrate when converting to .m4b/.m4a (auto, 64k, 128k, 192k, etc.)",
+        help="Target audio bitrate when encoding lossy formats (auto, 64k, 128k, 192k, 320k, etc.)",
         config_key="audio_bitrate",
         config_kind="audio_bitrate",
         toml_serializer=_serialize_audio_bitrate,
@@ -1004,6 +1047,25 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
             gui_default="Auto",
             from_config=_gui_init_audio_bitrate,
             to_option=_gui_read_audio_bitrate,
+            persisted_in_output_prefs=True,
+        ),
+    ),
+    OptionSpec(
+        name="sample_rate",
+        default=None,
+        help="Target output audio sample rate in Hz (auto, 22050, 44100, 48000, etc.)",
+        config_key="sample_rate",
+        config_kind="sample_rate",
+        toml_serializer=_serialize_sample_rate,
+        merge_from_config=True,
+        merge_only_if_default=True,
+        merge_require_truthy=True,
+        gui=GuiBinding(
+            var_attr="sample_rate_var",
+            var_type="str",
+            gui_default="Auto",
+            from_config=_gui_init_sample_rate,
+            to_option=_gui_read_sample_rate,
             persisted_in_output_prefs=True,
         ),
     ),
@@ -1503,6 +1565,7 @@ class DownloadOptions:
     config_location: str | None = None
     resume: bool = False
     audio_bitrate: str | None = None
+    sample_rate: int | None = None
     overwrite: bool | None = None
     series_items: str | None = None
     max_workers: int | None = None

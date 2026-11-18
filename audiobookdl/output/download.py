@@ -13,6 +13,7 @@ from audiobookdl.output.metadata._chapters import (
     resolve_audio_duration_ms,
 )
 from audiobookdl.output.metadata._cover import apply_cover_postprocessing
+from audiobookdl.utils import normalize_audio_bitrate, normalize_sample_rate
 from audiobookdl.utils.audiobook import (
     AudiobookMetadata,
     TrackTagContext,
@@ -335,11 +336,15 @@ def download_audiobook(
         )
         use_loudnorm = bool(getattr(options, "loudnorm", False))
         use_mono = bool(getattr(options, "mono", False))
+        explicit_bitrate = normalize_audio_bitrate(getattr(options, "audio_bitrate", None))
+        target_sample_rate = normalize_sample_rate(getattr(options, "sample_rate", None))
         audio_filter_kwargs: dict[str, Any] = {}
         if use_loudnorm:
             audio_filter_kwargs["loudnorm"] = True
         if use_mono:
             audio_filter_kwargs["mono"] = True
+        if target_sample_rate is not None:
+            audio_filter_kwargs["sample_rate"] = target_sample_rate
         segment_groups = (
             _build_chapter_segment_groups(audiobook, filepaths)
             if not ebook and not options.combine and not defer_chapters_for_silence
@@ -402,17 +407,23 @@ def download_audiobook(
                             )
                     splitting = wants_split and len(audiobook.chapters) > 1
                     if splitting:
+                        split_filter_kwargs: dict[str, Any] = (
+                            {"sample_rate": target_sample_rate}
+                            if target_sample_rate is not None
+                            else {}
+                        )
                         split_result = output.split_audio_by_chapters(
                             master_path,
                             work_output_dir,
                             audiobook.chapters,
                             output_format=output_format,
                             cancel_event=cancel_event,
-                            audio_bitrate=options.audio_bitrate,
+                            audio_bitrate=None if explicit_bitrate is not None else options.audio_bitrate,
                             probe_cache=probe_cache,
                             preserve_video=video,
                             max_workers=max_workers,
                             intro_chapter_mode=intro_chapter_mode,
+                            **split_filter_kwargs,
                         )
                         for src_part in filepaths:
                             if src_part not in split_result and os.path.exists(src_part):
@@ -563,7 +574,16 @@ def download_audiobook(
             current_format = output_format
         if cancel_event is not None and cancel_event.is_set():
             raise DownloadCancelled
-        needs_audio_reencode = use_loudnorm or use_mono
+        needs_bitrate_reencode = (
+            explicit_bitrate is not None
+            and output_format not in metadata.ffmpeg.LOSSLESS_CONTAINERS
+        )
+        needs_audio_reencode = (
+            use_loudnorm
+            or use_mono
+            or needs_bitrate_reencode
+            or (target_sample_rate is not None)
+        )
         if (
             (current_format != output_format or needs_audio_reencode)
             and not splitting
@@ -765,11 +785,16 @@ def embed_metadata_to_file(
         # Chapters must be muxed before container metadata/cover because ffmpeg's remux drops unmapped MP4 atoms
         if needs_chapters:
             logging.book_update("Adding chapters")
+            extra_chapter_kwargs: dict[str, Any] = {}
+            opt_sample_rate = getattr(options, "sample_rate", None)
+            if opt_sample_rate is not None:
+                extra_chapter_kwargs["sample_rate"] = opt_sample_rate
             cover_written_with_other = metadata.add_chapters(
                 filepath,
                 audiobook.chapters,
                 cancel_event=cancel_event,
                 audio_bitrate=options.audio_bitrate,
+                **extra_chapter_kwargs,
             )
         # General metadata (and inline cover for MP4/Vorbis in a single Mutagen save)
         if not ebook_file:

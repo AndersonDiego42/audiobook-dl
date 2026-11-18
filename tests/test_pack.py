@@ -1202,6 +1202,54 @@ def test_pack_book_override_chapters_replaces_existing_with_silence_detection(tm
     assert meta_calls == [detected]
 
 
+def test_pack_book_forwards_bitrate_and_sample_rate_on_same_format(tmp_path):
+    src_mp3 = tmp_path / "Track.mp3"
+    _create_empty_id3_mp3(src_mp3)
+    out_dir = tmp_path / "out"
+
+    cached_info = AudioProbeInfo(
+        duration=25.0,
+        bitrate=192_000,
+        codec_name="mp3",
+        format_name="mp3",
+        sample_rate=44100,
+    )
+    probe_cache = {str(src_mp3.resolve()): cached_info}
+    opts = build_default_options(
+        output_format="mp3",
+        output_template="{title}",
+        overwrite=True,
+        audio_bitrate="96k",
+        sample_rate=22050,
+    )
+    convert_calls = []
+
+    def fake_convert(old_path, output_format, *, output_path=None, **kwargs):
+        convert_calls.append((old_path, output_format, kwargs))
+        assert output_path is not None
+        Path(output_path).write_bytes(b"mp3-reencoded")
+        return output_path, False
+
+    with (
+        patch("audiobookdl.pack.output.convert_single_file", side_effect=fake_convert),
+        patch("audiobookdl.pack.output_download.add_metadata_to_file"),
+    ):
+        spec = inspect_local_book(
+            str(src_mp3),
+            [str(src_mp3)],
+            opts,
+            output_dir=str(out_dir),
+            probe_cache=probe_cache,
+        )
+        out_path = pack_book(spec, opts, output_dir=str(out_dir), probe_cache=probe_cache)
+
+    assert Path(out_path).is_file()
+    assert len(convert_calls) == 1
+    assert convert_calls[0][1] == "mp3"
+    assert convert_calls[0][2]["audio_bitrate"] == "96k"
+    assert convert_calls[0][2]["sample_rate"] == 22050
+
+
 
 
 

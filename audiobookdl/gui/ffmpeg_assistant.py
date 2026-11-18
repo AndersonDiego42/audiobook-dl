@@ -10,7 +10,13 @@ from collections.abc import Callable
 from audiobookdl import logging
 from audiobookdl.options_schema import DownloadOptions
 from audiobookdl.gui.controller import GuiController
-from audiobookdl.utils import find_executable, validate_executable, validate_ffmpeg_dir
+from audiobookdl.utils import (
+    find_executable,
+    normalize_audio_bitrate,
+    normalize_sample_rate,
+    validate_executable,
+    validate_ffmpeg_dir,
+)
 from audiobookdl.utils.updater import winget_available
 
 
@@ -174,10 +180,22 @@ class FFmpegAssistant:
             return True
         if getattr(options, "media_type", "auto") == "ebook":
             return True
+        try:
+            has_explicit_bitrate = normalize_audio_bitrate(getattr(options, "audio_bitrate", None)) is not None
+        except ValueError:
+            has_explicit_bitrate = False
+        try:
+            has_sample_rate = normalize_sample_rate(getattr(options, "sample_rate", None)) is not None
+        except ValueError:
+            has_sample_rate = False
         needs_ffmpeg = bool(
             options.combine
             or options.output_format
             or options.split_chapters
+            or getattr(options, "loudnorm", False)
+            or getattr(options, "mono", False)
+            or has_explicit_bitrate
+            or has_sample_rate
             or getattr(options, "media_type", "auto") == "video"
         )
         ffmpeg_path, ffmpeg_err = self.check_tool("ffmpeg")
@@ -227,7 +245,14 @@ class FFmpegAssistant:
             reasons.append("split chapters")
         if options.output_format:
             reasons.append(f"convert to .{options.output_format}")
-        reason_text = " and ".join(reasons)
+        if (
+            getattr(options, "loudnorm", False)
+            or getattr(options, "mono", False)
+            or has_explicit_bitrate
+            or has_sample_rate
+        ):
+            reasons.append("process audio")
+        reason_text = " and ".join(reasons) if reasons else "process media"
         issue_text = "\n".join(issues)
 
         choice = messagebox.askyesnocancel(

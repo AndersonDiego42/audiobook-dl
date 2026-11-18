@@ -61,6 +61,7 @@ def add_chapters(
     cancel_event: threading.Event | None = None,
     audio_bitrate: str | None = None,
     cover: Cover | None = None,
+    sample_rate: int | str | None = None,
 ) -> bool:
     """Adds chapters (and optional ID3 cover art in one save) to `filepath`.
 
@@ -69,11 +70,13 @@ def add_chapters(
     if id3.is_id3_file(filepath):
         return id3.add_id3_chapters_and_cover(filepath, chapters=chapters, cover=cover)
     elif program_in_path("ffmpeg"):
+        extra_kwargs = {"sample_rate": sample_rate} if sample_rate is not None else {}
         ffmpeg.add_chapters_ffmpeg(
             filepath,
             chapters,
             cancel_event=cancel_event,
             audio_bitrate=audio_bitrate,
+            **extra_kwargs,
         )
         return False
     else:

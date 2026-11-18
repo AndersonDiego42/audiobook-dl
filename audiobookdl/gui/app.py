@@ -72,6 +72,7 @@ class AudiobookDLApp:
     write_cue_var: tk.BooleanVar
     resume_var: tk.BooleanVar
     audio_bitrate_var: tk.StringVar
+    sample_rate_var: tk.StringVar
     overwrite_var: tk.StringVar
     max_workers_var: tk.StringVar
     book_delay_var: tk.StringVar
@@ -305,6 +306,7 @@ class AudiobookDLApp:
             is_syncing_provider=lambda: self.is_syncing,
             on_preview_done=self._preview.handle_preview_done,
             on_auth_verified=self._auth.handle_auth_verified,
+            on_oauth_connected=self._auth.handle_oauth_connected,
             on_ffmpeg_install_done=self._ffmpeg_assistant.handle_install_done,
             on_sync_done=self._sync.handle_sync_done,
             on_sync_enqueue_ready=self._sync.handle_sync_enqueue_ready,

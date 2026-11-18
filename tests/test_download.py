@@ -2418,6 +2418,43 @@ def test_download_files_with_progress_reports_live_size_estimates_and_byte_eta(t
     assert estimates[-1] == (3000, True, 2, 2)
 
 
+def test_download_audiobook_forwards_bitrate_and_sample_rate_on_original_format(tmp_path, monkeypatch):
+    from audiobookdl.output import download as dl_mod
+    from audiobookdl.output import output as out_mod
+
+    src_mp3 = tmp_path / "book.mp3"
+    src_mp3.write_bytes(b"fake-mp3")
+
+    monkeypatch.setattr(dl_mod, "download_files_with_progress", lambda *a, **kw: [str(src_mp3)])
+    monkeypatch.setattr(dl_mod, "add_metadata_to_file", lambda *a, **kw: None)
+
+    convert_calls = []
+
+    def fake_convert_single(old_path, output_format, **kwargs):
+        convert_calls.append((old_path, output_format, kwargs))
+        return old_path, False
+
+    monkeypatch.setattr(out_mod, "convert_single_file", fake_convert_single)
+
+    audiobook = Audiobook(
+        session=MagicMock(),
+        metadata=AudiobookMetadata(title="Sample Rate Book"),
+        files=[AudiobookFile(url="https://example.com/single.mp3", ext="mp3")],
+    )
+    opts = DownloadOptions(
+        output_format=None,
+        audio_bitrate="96k",
+        sample_rate=22050,
+    )
+    download_audiobook(audiobook, str(tmp_path / "Sample Rate Book"), opts)
+
+    assert len(convert_calls) == 1
+    _path, target_fmt, kwargs = convert_calls[0]
+    assert target_fmt == "mp3"
+    assert kwargs["audio_bitrate"] == "96k"
+    assert kwargs["sample_rate"] == 22050
+
+
 
 
 

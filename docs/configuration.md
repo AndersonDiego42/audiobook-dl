@@ -39,7 +39,8 @@ All runtime keys below map directly from `audiobookdl/options_schema.py` and may
 | `upload_to_abs` | `bool` | `false` | Upload completed audiobooks to the configured Audiobookshelf server |
 | `write_cue` | `bool` | `false` | Write chapter timestamps as a `.cue` sheet sidecar |
 | `resume` | `bool` | `false` | Resume interrupted downloads using existing part files and HTTP `Range` requests |
-| `audio_bitrate` | `audio_bitrate` | unset (`None`) | Target AAC bitrate when encoding `.m4b`/`.m4a` (`auto`, `64k`, `128k`, `192k`, etc.) |
+| `audio_bitrate` | `audio_bitrate` | unset (`None`) | Target audio bitrate when encoding lossy formats (`auto`, `64k`, `128k`, `192k`, `320k`, etc.) |
+| `sample_rate` | `sample_rate` | unset (`None`) | Target output audio sample rate in Hz (`auto`, `22050`, `44100`, `48000`, etc.) |
 | `overwrite` | `bool` | unset (`None`) | Non-interactive overwrite decision (`true` overwrite, `false` keep existing, unset prompt) |
 | `max_workers` | `positive_int` | unset (`None`) | Maximum concurrent segment/file download and remux worker threads |
 | `book_delay` | `non_negative_float` | `0.0` | Seconds to wait between consecutive books in a batch or series |
@@ -104,7 +105,11 @@ Each source table (and optional named profile `[sources.<service>.profiles.<name
 | `password` | `str` | Legacy fallback only; automatically migrated into Windows DPAPI / OS keyring and scrubbed on load |
 | `library` | `str` | Library card / profile identifier (for eReolen, Overdrive/Libby, Nextory, etc.) |
 | `cookie_file` | `str` | Path to a Netscape-format cookies file |
-| `locale` | `str` | Per-source locale override |
+| `locale` | `str` | Per-source/profile locale override |
+| `oauth_client_id` | `str` | Optional OAuth 2.0 client ID override for the profile |
+| `oauth_scopes` | `list[str]` or `str` | Optional OAuth 2.0 scopes override for the profile |
+
+OAuth tokens (`access_token`, `refresh_token`), cached session cookies (`session_cookies_<profile>.txt`), and persistent device identifiers (`*_device_id_<profile>.txt`) are isolated per profile and stored in the OS credential vault or source database directory.
 
 ---
 

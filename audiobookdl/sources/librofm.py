@@ -10,6 +10,7 @@ from urllib.parse import quote, urlparse
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover
 from audiobookdl.exceptions import BookNotFound, RequestError, UserNotAuthorized
+from audiobookdl.utils.oauth import OAuthProviderConfig, OAuthTokenBundle
 
 
 def _join_people(raw: Any) -> str:
@@ -38,6 +39,11 @@ class LibrofmSource(Source):
     login_data = ["username", "password"]
     supports_search = True
     supports_library = True
+    oauth_provider = OAuthProviderConfig(
+        authorization_url="https://libro.fm/oauth/token",
+        token_url="https://libro.fm/oauth/token",
+        client_id="",
+    )
 
     match = [
         r"https?://(?:www\.)?libro\.fm/audiobooks/([^/?#]+)",
@@ -60,6 +66,16 @@ class LibrofmSource(Source):
         except (RequestError, UserNotAuthorized, ValueError):
             return False
 
+    def apply_oauth_token(
+        self,
+        token: OAuthTokenBundle,
+        *,
+        set_auth_header: bool = True,
+    ) -> None:
+        """Apply a persisted Libro.fm OAuth token bundle to this session."""
+        self._access_token = token.access_token
+        super().apply_oauth_token(token, set_auth_header=set_auth_header)
+
     def _login(self, url: str, username: str, password: str) -> None:
         resp = self.request(
             "POST",
@@ -75,11 +91,10 @@ class LibrofmSource(Source):
         if resp.status_code != 200:
             raise RequestError
         payload = resp.json() if hasattr(resp, "json") else {}
-        token = str((payload or {}).get("access_token") or "").strip()
-        if not token:
+        if not isinstance(payload, dict) or not str(payload.get("access_token") or "").strip():
             raise UserNotAuthorized
-        self._access_token = token
-        self._session.headers.update({"Authorization": f"Bearer {token}"})
+        token = OAuthTokenBundle.from_token_response(payload)
+        self.apply_oauth_token(token)
 
     def _fetch_raw_library(self) -> list[dict[str, Any]]:
         if self._library_cache is not None:

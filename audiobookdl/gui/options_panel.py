@@ -9,7 +9,12 @@ from audiobookdl.gui.formatting import MEDIA_TYPE_OPTIONS, OUTPUT_FORMATS, OVERW
 from audiobookdl.gui.theme import ThemePalette
 from audiobookdl.gui.widgets import attach_tooltip
 from audiobookdl.options_schema import GUI_INTRO_CHAPTER_MODES, OPTIONS_BY_NAME
-from audiobookdl.utils import AUDIO_BITRATE_PRESETS
+from audiobookdl.utils import (
+    AUDIO_BITRATE_PRESETS,
+    AUDIO_SAMPLE_RATE_PRESETS,
+    normalize_audio_bitrate,
+    normalize_sample_rate,
+)
 from audiobookdl.utils.audiobook import parse_decryption_key_spec
 from audiobookdl.utils.http import parse_byte_rate
 
@@ -127,7 +132,7 @@ class OptionsPanel(ttk.LabelFrame):
         media_combo.grid(row=2, column=1, sticky="w", padx=(0, 12), pady=(4, 0))
         media_combo.bind("<<ComboboxSelected>>", self._on_media_selected)
 
-        ttk.Label(general_tab, text="M4B Quality:").grid(
+        ttk.Label(general_tab, text="Bitrate:").grid(
             row=2, column=2, sticky="w", padx=(0, 4), pady=(4, 0)
         )
         bitrate_values = list(AUDIO_BITRATE_PRESETS)
@@ -137,20 +142,25 @@ class OptionsPanel(ttk.LabelFrame):
             general_tab,
             textvariable=self._vars.audio_bitrate_var,
             values=bitrate_values,
-            state="readonly",
+            state="normal",
             width=10,
         )
         bitrate_combo.grid(row=2, column=3, sticky="w", padx=(0, 12), pady=(4, 0))
 
-        cb_enrich = ttk.Checkbutton(
-            general_tab,
-            text="Enrich metadata",
-            variable=self._vars.enrich_metadata_var,
+        ttk.Label(general_tab, text="Sample rate:").grid(
+            row=2, column=4, sticky="w", padx=(0, 4), pady=(4, 0)
         )
-        cb_enrich.grid(row=2, column=4, sticky="w", padx=(0, 12), pady=(4, 0))
-
-        cb_debug = ttk.Checkbutton(general_tab, text="Debug logs", variable=self._vars.debug_var)
-        cb_debug.grid(row=2, column=5, sticky="w", pady=(4, 0))
+        sample_rate_values = list(AUDIO_SAMPLE_RATE_PRESETS)
+        if self._vars.sample_rate_var.get() not in sample_rate_values:
+            sample_rate_values.append(self._vars.sample_rate_var.get())
+        sample_rate_combo = ttk.Combobox(
+            general_tab,
+            textvariable=self._vars.sample_rate_var,
+            values=sample_rate_values,
+            state="normal",
+            width=10,
+        )
+        sample_rate_combo.grid(row=2, column=5, sticky="w", pady=(4, 0))
 
         self.notify_cb = ttk.Checkbutton(
             general_tab,
@@ -159,19 +169,29 @@ class OptionsPanel(ttk.LabelFrame):
         )
         self.notify_cb.grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
+        cb_enrich = ttk.Checkbutton(
+            general_tab,
+            text="Enrich metadata",
+            variable=self._vars.enrich_metadata_var,
+        )
+        cb_enrich.grid(row=3, column=2, sticky="w", padx=(0, 12), pady=(4, 0))
+
         cb_enrich_interactive = ttk.Checkbutton(
             general_tab,
             text="Interactive enrich",
             variable=self._vars.enrich_interactive_var,
         )
-        cb_enrich_interactive.grid(row=3, column=2, columnspan=2, sticky="w", padx=(0, 12), pady=(4, 0))
+        cb_enrich_interactive.grid(row=3, column=3, sticky="w", padx=(0, 12), pady=(4, 0))
 
         cb_skip_unavailable = ttk.Checkbutton(
             general_tab,
             text="Skip unavailable",
             variable=self._vars.skip_unavailable_var,
         )
-        cb_skip_unavailable.grid(row=3, column=4, columnspan=2, sticky="w", pady=(4, 0))
+        cb_skip_unavailable.grid(row=3, column=4, sticky="w", padx=(0, 12), pady=(4, 0))
+
+        cb_debug = ttk.Checkbutton(general_tab, text="Debug logs", variable=self._vars.debug_var)
+        cb_debug.grid(row=3, column=5, sticky="w", pady=(4, 0))
 
         enrich_row = ttk.Frame(general_tab)
         enrich_row.grid(row=4, column=0, columnspan=6, sticky="ew", pady=(4, 0))
@@ -416,6 +436,7 @@ class OptionsPanel(ttk.LabelFrame):
         self._format_combo = format_combo
         self._cb_combine = cb_combine
         self._bitrate_combo = bitrate_combo
+        self._sample_rate_combo = sample_rate_combo
         self._cb_enrich_interactive = cb_enrich_interactive
         self._enrich_providers_entry = enrich_providers_entry
         self._cb_split_chapters = cb_split_chapters
@@ -443,6 +464,7 @@ class OptionsPanel(ttk.LabelFrame):
             (cb_cover_only, _option_help("cover")),
             (media_combo, _option_help("media_type")),
             (bitrate_combo, _option_help("audio_bitrate")),
+            (sample_rate_combo, _option_help("sample_rate")),
             (cb_enrich, _option_help("enrich_metadata")),
             (cb_enrich_interactive, _option_help("enrich_interactive")),
             (enrich_providers_entry, _option_help("enrich_providers")),
@@ -482,6 +504,7 @@ class OptionsPanel(ttk.LabelFrame):
             format_combo,
             overwrite_combo,
             bitrate_combo,
+            sample_rate_combo,
             media_combo,
             cb_combine,
             cb_skip,
@@ -539,6 +562,8 @@ class OptionsPanel(ttk.LabelFrame):
         ):
             var.trace_add("write", lambda *_args: self.sync_dependency_states())
         for entry in (
+            self._bitrate_combo,
+            self._sample_rate_combo,
             self._chapter_offset_entry,
             self._max_cover_entry,
             self._max_retries_spin,
@@ -547,6 +572,8 @@ class OptionsPanel(ttk.LabelFrame):
         ):
             entry.bind("<KeyRelease>", lambda _e: self._validate_inline_fields(), add="+")
             entry.bind("<FocusOut>", lambda _e: self._validate_inline_fields(), add="+")
+        self._bitrate_combo.bind("<<ComboboxSelected>>", lambda _e: self._validate_inline_fields(), add="+")
+        self._sample_rate_combo.bind("<<ComboboxSelected>>", lambda _e: self._validate_inline_fields(), add="+")
 
     def _toggle_decryption_key_visibility(self) -> None:
         self._decryption_key_entry.configure(
@@ -573,6 +600,18 @@ class OptionsPanel(ttk.LabelFrame):
 
     def _validate_inline_fields(self) -> None:
         errors: list[str] = []
+        raw_bitrate = self._vars.audio_bitrate_var.get().strip()
+        if raw_bitrate:
+            try:
+                normalize_audio_bitrate(raw_bitrate)
+            except ValueError:
+                errors.append("Bitrate is invalid (e.g. Auto, 128k, 192k)")
+        raw_sr = self._vars.sample_rate_var.get().strip()
+        if raw_sr:
+            try:
+                normalize_sample_rate(raw_sr)
+            except ValueError:
+                errors.append("Sample rate is invalid (e.g. Auto, 22050, 44100)")
         raw_offset = self._vars.chapter_offset_ms_var.get().strip()
         if raw_offset:
             try:
@@ -643,7 +682,8 @@ class OptionsPanel(ttk.LabelFrame):
 
         _set_widget(self._cb_m4b, not cover_only)
         _set_widget(self._format_combo, not cover_only, readonly_combo=True)
-        _set_widget(self._bitrate_combo, not cover_only, readonly_combo=True)
+        _set_widget(self._bitrate_combo, not cover_only)
+        _set_widget(self._sample_rate_combo, not cover_only)
         _set_widget(self._cb_loudnorm, not cover_only)
         _set_widget(self._cb_mono, not cover_only)
         _set_widget(self._cb_combine, (not cover_only) and (not split_on))
@@ -657,8 +697,9 @@ class OptionsPanel(ttk.LabelFrame):
     def set_enabled(self, enabled: bool) -> None:
         """Enable or disable interactive option controls cleanly."""
         self._panel_enabled = enabled
+        editable_combos = (self._impersonate_combo, self._bitrate_combo, self._sample_rate_combo)
         for widget in self._widgets:
-            if isinstance(widget, ttk.Combobox) and widget is not self._impersonate_combo:
+            if isinstance(widget, ttk.Combobox) and widget not in editable_combos:
                 widget.configure(state="readonly" if enabled else "disabled")
             else:
                 widget.configure(state="normal" if enabled else "disabled")

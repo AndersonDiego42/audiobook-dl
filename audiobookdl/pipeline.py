@@ -17,10 +17,13 @@ from .config import (
     DEFAULT_PROFILE,
     Config,
     SourceConfig,
+    delete_source_oauth_token,
     get_source_config,
     load_config,
+    load_source_oauth_token,
     normalize_profile_name,
     resolve_effective_source_profile,
+    save_source_oauth_token,
 )
 from .options_schema import (
     MERGEABLE_OPTION_SPECS,
@@ -708,16 +711,42 @@ def prepare_source_result(
         try:
             result = source.download(url)
         except UserNotAuthorized:
-            if not (
-                getattr(source, "_loaded_cached_cookies", False)
-                and getattr(source, "supports_login", False)
-            ):
+            loaded_cookies = bool(getattr(source, "_loaded_cached_cookies", False))
+            loaded_oauth = bool(getattr(source, "_loaded_cached_oauth", False))
+            if not (loaded_oauth or (loaded_cookies and getattr(source, "supports_login", False))):
                 raise
+
+            vault_loc = _resolve_vault_config_location(options, config, source)
+            req_profile = _resolve_request_profile(options, config, source)
+
+            if loaded_oauth:
+                oauth_tok = getattr(source, "oauth_token", None)
+                refresh_fn = getattr(source, "refresh_oauth_token_if_needed", None)
+                if oauth_tok is not None and getattr(oauth_tok, "can_refresh", False) and callable(refresh_fn):
+                    try:
+                        refreshed = refresh_fn(force=True)
+                    except UserNotAuthorized:
+                        refreshed = None
+                    if refreshed is not None:
+                        if vault_loc is not None or getattr(source, "supports_oauth", False):
+                            save_source_oauth_token(
+                                source.name,
+                                refreshed,
+                                profile=req_profile,
+                                overwrite=vault_loc,
+                            )
+                        return source, source.download(url)
+                if vault_loc is not None or getattr(source, "supports_oauth", False):
+                    delete_source_oauth_token(source.name, profile=req_profile, overwrite=vault_loc)
+
+            if not (getattr(source, "supports_login", False) or getattr(source, "supports_oauth", False)):
+                raise
+
             logging.debug(
-                f"Cached session cookies for {source.name} were rejected; clearing stale jar and re-authenticating"
+                f"Cached session credentials for {source.name} were rejected; clearing stale cache and re-authenticating"
             )
             cached_path_fn = getattr(source, "cached_cookie_path", None)
-            if callable(cached_path_fn):
+            if loaded_cookies and callable(cached_path_fn):
                 try:
                     os.remove(cached_path_fn())
                 except OSError:
@@ -727,6 +756,7 @@ def prepare_source_result(
                 reset_fn(clear_cookies=True)
             else:
                 source._loaded_cached_cookies = False
+                source._loaded_cached_oauth = False
             authenticate(
                 url,
                 source,
@@ -734,6 +764,7 @@ def prepare_source_result(
                 config,
                 interaction=handler,
                 use_cached_cookies=False,
+                use_cached_oauth=False,
             )
             if (
                 active_pool is not None
@@ -1001,6 +1032,55 @@ def login(
     source.login(url, **login_data)
 
 
+def _explicit_inline_credentials(options: DownloadOptions) -> bool:
+    return bool(
+        getattr(options, "username", None)
+        or getattr(options, "password", None)
+        or getattr(options, "cookie_file", None)
+    )
+
+
+def _resolve_request_profile(
+    options: DownloadOptions,
+    config: Config,
+    source: Source,
+) -> str:
+    requested_profile = getattr(options, "profile", None)
+    if _explicit_inline_credentials(options) and not (requested_profile and str(requested_profile).strip()):
+        return DEFAULT_PROFILE
+    return resolve_effective_source_profile(
+        config,
+        source.name,
+        requested_profile,
+        aliases=getattr(source, "names", ()),
+    )
+
+
+def _resolve_vault_config_location(
+    options: DownloadOptions,
+    config: Config,
+    source: Any = None,
+) -> str | None:
+    raw = getattr(options, "config_location", None) or getattr(config, "config_location", None)
+    if raw:
+        return str(raw)
+    if source is not None and getattr(source, "supports_oauth", False):
+        from .config import get_config_location
+        return get_config_location(None)
+    return None
+
+
+def _apply_source_config_overrides(source: Source, source_config: SourceConfig | None) -> None:
+    if source_config is None:
+        return
+    if getattr(source_config, "locale", None):
+        source._configured_locale = source_config.locale  # type: ignore[attr-defined]
+    if getattr(source_config, "oauth_client_id", None):
+        source._oauth_client_id_override = source_config.oauth_client_id
+    if getattr(source_config, "oauth_scopes", None):
+        source._oauth_scopes_override = source_config.oauth_scopes
+
+
 def authenticate(
     url: str,
     source: Source,
@@ -1009,23 +1089,11 @@ def authenticate(
     interaction: logging.InteractionHandler | None = None,
     *,
     use_cached_cookies: bool = True,
+    use_cached_oauth: bool = True,
 ) -> None:
-    """Authenticate `source` using cookie file and/or login credentials."""
-    explicit_inline_creds = bool(
-        getattr(options, "username", None)
-        or getattr(options, "password", None)
-        or getattr(options, "cookie_file", None)
-    )
-    requested_profile = getattr(options, "profile", None)
-    if explicit_inline_creds and not (requested_profile and str(requested_profile).strip()):
-        req_profile = DEFAULT_PROFILE
-    else:
-        req_profile = resolve_effective_source_profile(
-            config,
-            source.name,
-            requested_profile,
-            aliases=getattr(source, "names", ()),
-        )
+    """Authenticate `source` using cookie file, persisted OAuth tokens, OAuth flow, or login credentials."""
+    explicit_inline_creds = _explicit_inline_credentials(options)
+    req_profile = _resolve_request_profile(options, config, source)
     profile_label = f" ({req_profile})" if req_profile != DEFAULT_PROFILE else ""
     logging.log(f"Authenticating with [magenta]{source.name}{profile_label}[/]")
     source_config = get_source_config(
@@ -1034,19 +1102,18 @@ def authenticate(
         req_profile,
         aliases=getattr(source, "names", ()),
     )
-    if source_config is not None and getattr(source_config, "locale", None):
-        source._configured_locale = source_config.locale  # type: ignore[attr-defined]
+    _apply_source_config_overrides(source, source_config)
     if (
         req_profile != DEFAULT_PROFILE
         and source_config is None
-        and not getattr(options, "username", None)
-        and not getattr(options, "password", None)
-        and not getattr(options, "cookie_file", None)
+        and not explicit_inline_creds
     ):
         logging.log(
             f"Warning: profile '{req_profile}' not found in config for {source.name}"
         )
     source._loaded_cached_cookies = False
+    source._loaded_cached_oauth = False
+
     cookie_path = get_cookie_path(options, source_config)
     if cookie_path is not None:
         source.load_cookie_file(cookie_path)
@@ -1058,9 +1125,88 @@ def authenticate(
     ):
         source.load_cookie_file(source.cached_cookie_path())
         source._loaded_cached_cookies = bool(source.authenticated)
+
+    vault_loc = _resolve_vault_config_location(options, config, source)
+    can_use_vault_oauth = bool(
+        use_cached_oauth
+        and not explicit_inline_creds
+        and not source.authenticated
+        and (
+            vault_loc is not None
+            or (source_config is not None and getattr(source_config, "oauth_token_present", False))
+            or getattr(source, "supports_oauth", False)
+        )
+    )
+    if can_use_vault_oauth and hasattr(source, "apply_oauth_token"):
+        cached_token = load_source_oauth_token(
+            source.name,
+            profile=req_profile,
+            overwrite=vault_loc,
+        )
+        if cached_token is not None:
+            try:
+                source.apply_oauth_token(cached_token)
+                if cached_token.is_expired():
+                    refreshed = source.refresh_oauth_token_if_needed(force=True)
+                    if refreshed is not None:
+                        save_source_oauth_token(
+                            source.name,
+                            refreshed,
+                            profile=req_profile,
+                            overwrite=vault_loc,
+                        )
+                        source._loaded_cached_oauth = True
+                    else:
+                        delete_source_oauth_token(
+                            source.name,
+                            profile=req_profile,
+                            overwrite=vault_loc,
+                        )
+                        source.reset_authentication(clear_cookies=False)
+                else:
+                    source._loaded_cached_oauth = True
+            except UserNotAuthorized:
+                delete_source_oauth_token(
+                    source.name,
+                    profile=req_profile,
+                    overwrite=vault_loc,
+                )
+                source.reset_authentication(clear_cookies=False)
+
+    prefer_inline_login = bool(
+        explicit_inline_creds
+        and getattr(options, "username", None)
+        and getattr(source, "supports_login", False)
+    )
+    if getattr(source, "supports_oauth", False) and not source.authenticated and not prefer_inline_login:
+        try:
+            new_token = source.oauth_authorize(url, interaction=interaction)
+        except UserNotAuthorized:
+            if not getattr(source, "supports_login", False):
+                raise
+        else:
+            if vault_loc is not None or getattr(source, "supports_oauth", False):
+                save_source_oauth_token(
+                    source.name,
+                    new_token,
+                    profile=req_profile,
+                    overwrite=vault_loc,
+                )
+
     if getattr(source, "supports_login", False) and not source.authenticated:
         login(url, source, options, source_config, interaction=interaction)
         source._loaded_cached_cookies = False
+        issued_token = getattr(source, "oauth_token", None)
+        if issued_token is not None and vault_loc is not None and not explicit_inline_creds:
+            try:
+                save_source_oauth_token(
+                    source.name,
+                    issued_token,
+                    profile=req_profile,
+                    overwrite=vault_loc,
+                )
+            except Exception as exc:
+                logging.debug(f"Could not persist OAuth token for {source.name}: {exc}")
         if (
             getattr(source, "supports_cookies", False)
             and hasattr(source, "save_cookie_file")
@@ -1071,6 +1217,91 @@ def authenticate(
                 source.save_cookie_file()
             except OSError as exc:
                 logging.debug(f"Could not persist session cookies for {source.name}: {exc}")
+
+
+def authorize_service_oauth(
+    service_name: str,
+    options: DownloadOptions,
+    config: Config,
+    *,
+    profile: str | None = None,
+    interaction: logging.InteractionHandler | None = None,
+    cancel_event: threading.Event | None = None,
+    open_browser: bool = True,
+) -> Any:
+    """Run OAuth 2.0 interactive authorization for `(service_name, profile)` and persist tokens."""
+    from dataclasses import replace as _dc_replace
+
+    source_class = find_source_by_name(service_name)
+    norm_profile = normalize_profile_name(profile if profile is not None else getattr(options, "profile", None))
+    run_options = _dc_replace(options, profile=None if norm_profile == DEFAULT_PROFILE else norm_profile)
+    with logging.job_context(apply_runtime_options(run_options, config)):
+        source = source_class(run_options)
+        try:
+            source_config = get_source_config(
+                config,
+                source.name,
+                norm_profile,
+                aliases=getattr(source, "names", ()),
+            )
+            _apply_source_config_overrides(source, source_config)
+            token = source.oauth_authorize(
+                interaction=interaction,
+                cancel_event=cancel_event,
+                open_browser=open_browser,
+            )
+            vault_loc = _resolve_vault_config_location(run_options, config, source)
+            save_source_oauth_token(
+                source.name,
+                token,
+                profile=norm_profile,
+                overwrite=vault_loc,
+            )
+            return token
+        finally:
+            _close_source(source)
+
+
+def disconnect_service_oauth(
+    service_name: str,
+    options: DownloadOptions,
+    config: Config,
+    *,
+    profile: str | None = None,
+) -> bool:
+    """Revoke (best-effort) and remove any persisted OAuth token bundle for `(service_name, profile)`."""
+    from audiobookdl.utils.oauth import revoke_oauth_token
+
+    source_class = find_source_by_name(service_name)
+    norm_profile = normalize_profile_name(profile if profile is not None else getattr(options, "profile", None))
+    vault_loc = _resolve_vault_config_location(options, config)
+    token = load_source_oauth_token(
+        source_class.names[0].lower() if source_class.names else service_name,
+        profile=norm_profile,
+        overwrite=vault_loc,
+    )
+    revoked = False
+    if token is not None:
+        source = source_class(options)
+        try:
+            source_config = get_source_config(
+                config,
+                source.name,
+                norm_profile,
+                aliases=getattr(source, "names", ()),
+            )
+            _apply_source_config_overrides(source, source_config)
+            provider = source.get_oauth_provider_config()
+            if provider is not None:
+                revoked = revoke_oauth_token(provider, token, session=getattr(source, "_session", None))
+        finally:
+            _close_source(source)
+        delete_source_oauth_token(
+            source_class.names[0].lower() if source_class.names else service_name,
+            profile=norm_profile,
+            overwrite=vault_loc,
+        )
+    return revoked
 
 
 def _init_service_source(

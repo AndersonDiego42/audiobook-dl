@@ -16,7 +16,9 @@ from audiobookdl.options_schema import PERSISTED_GUI_OPTION_SPECS, DownloadOptio
 from audiobookdl.config import (
     Config,
     delete_custom_metadata_provider,
+    delete_source_profile,
     load_config,
+    rename_source_profile,
     save_check_updates,
     save_custom_metadata_provider,
     save_ffmpeg_dir,
@@ -45,6 +47,7 @@ from audiobookdl.gui.events import (
     JobStatusEvent,
     LogBatchEvent,
     LogEvent,
+    OAuthConnectedEvent,
     PreviewDoneEvent,
     ProgressAdvanceEvent,
     ProgressFinishEvent,
@@ -70,7 +73,9 @@ from audiobookdl.pack import (
 from audiobookdl.pipeline import (
     DownloadSummary,
     SessionPool,
+    authorize_service_oauth,
     close_session_pool,
+    disconnect_service_oauth,
     list_service_library,
     prepare_source_result,
     run_downloads,
@@ -588,7 +593,18 @@ class GuiController:
         library: str | None = None,
         cookie_file: str | None = None,
         profile: str | None = None,
+        locale: str | None = None,
+        oauth_client_id: str | None = None,
+        oauth_scopes: Any = None,
+        preserve_optional: bool = True,
     ) -> Config:
+        extra_kwargs: dict[str, Any] = {}
+        if not preserve_optional or locale is not None:
+            extra_kwargs["locale"] = locale
+        if not preserve_optional or oauth_client_id is not None:
+            extra_kwargs["oauth_client_id"] = oauth_client_id
+        if not preserve_optional or oauth_scopes is not None:
+            extra_kwargs["oauth_scopes"] = oauth_scopes
         save_source_credentials(
             service_key,
             username=username,
@@ -597,6 +613,42 @@ class GuiController:
             cookie_file=cookie_file,
             overwrite=self.config_location,
             profile=profile,
+            **extra_kwargs,
+        )
+        return self.reload_config()
+
+    def delete_source_profile(
+        self,
+        service_key: str,
+        *,
+        profile: str | None = None,
+    ) -> Config:
+        """Delete a profile's config, vault secrets, OAuth tokens, and cached session/device files."""
+        cfg = self.config_snapshot()
+        db_dir = resolve_database_directory(cfg.database_directory)
+        delete_source_profile(
+            service_key,
+            profile=profile,
+            overwrite=self.config_location,
+            database_directory=db_dir,
+        )
+        return self.reload_config()
+
+    def rename_source_profile(
+        self,
+        service_key: str,
+        old_profile: str,
+        new_profile: str,
+    ) -> Config:
+        """Rename a configured service profile and migrate its secrets, OAuth tokens, and caches."""
+        cfg = self.config_snapshot()
+        db_dir = resolve_database_directory(cfg.database_directory)
+        rename_source_profile(
+            service_key,
+            old_profile,
+            new_profile,
+            overwrite=self.config_location,
+            database_directory=db_dir,
         )
         return self.reload_config()
 
@@ -1094,6 +1146,7 @@ class GuiController:
         "media_type",
         "output_template",
         "audio_bitrate",
+        "sample_rate",
         "overwrite",
         "skip_downloaded",
         "write_abs_metadata",
@@ -2022,6 +2075,68 @@ class GuiController:
                 self._unregister_aux_interaction(interaction)
 
         self._submit_bg_task(_worker)
+
+    def start_oauth_connect(
+        self,
+        service_key: str,
+        service_label: str,
+        profile: str,
+        options: DownloadOptions,
+    ) -> threading.Event:
+        """Run interactive OAuth 2.0 flow for `(service_key, profile)` in a background thread."""
+        cfg = self.config_snapshot()
+        cancel_ev = threading.Event()
+        interaction = GuiInteractionHandler(self.event_queue, cancel_ev)
+        self._register_aux_interaction(interaction)
+
+        def _worker() -> None:
+            try:
+                authorize_service_oauth(
+                    service_key,
+                    options,
+                    cfg,
+                    profile=profile,
+                    interaction=interaction,
+                    cancel_event=cancel_ev,
+                )
+                self.event_queue.put(
+                    OAuthConnectedEvent(
+                        service_key=service_key,
+                        service_label=service_label,
+                        profile=profile,
+                        ok=True,
+                        error=None,
+                    )
+                )
+            except Exception as exc:
+                self.event_queue.put(
+                    OAuthConnectedEvent(
+                        service_key=service_key,
+                        service_label=service_label,
+                        profile=profile,
+                        ok=False,
+                        error=exc,
+                    )
+                )
+            finally:
+                cancel_ev.set()
+                interaction.release_all()
+                self._unregister_aux_interaction(interaction)
+
+        self._submit_bg_task(_worker)
+        return cancel_ev
+
+    def disconnect_oauth(
+        self,
+        service_key: str,
+        options: DownloadOptions,
+        *,
+        profile: str | None = None,
+    ) -> tuple[bool, Config]:
+        """Revoke and delete stored OAuth tokens for `(service_key, profile)` and reload config."""
+        cfg = self.config_snapshot()
+        revoked = disconnect_service_oauth(service_key, options, cfg, profile=profile)
+        return revoked, self.reload_config()
 
     def cancel_catalog_fetch(self) -> bool:
         """Cancel the currently in-flight catalog search/list request, if any."""

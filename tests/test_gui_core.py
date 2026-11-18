@@ -6538,6 +6538,212 @@ def test_gui_skip_unavailable_and_download_size_estimate_displays(tmp_path):
         root.destroy()
 
 
+@pytest.mark.gui
+def test_gui_profile_management_crud_and_smart_service_select(tmp_path, monkeypatch):
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    app = AudiobookDLApp(root, config_location=str(cfg_path))
+    try:
+        accounts = app.open_accounts("storytel")
+
+        # Create named profile via coordinator & save credentials with locale
+        assert app._auth.create_new_profile("work") is True
+        app.username_var.set("alice@example.com")
+        app.password_var.set("pw-work")
+        app._auth.locale_var.set("sv")
+        app._auth.save_current_credentials()
+
+        # Smart service selection auto-picks sole named profile ("work")
+        app._auth.select_service_smart("storytel")
+        assert app.profile_var.get() == "work"
+        assert app._auth.locale_var.get() == "sv"
+
+        # Rename profile cleanly migrates config and updates form + table
+        monkeypatch.setattr("audiobookdl.gui.pages.accounts_page.messagebox.askyesno", lambda *_a, **_kw: True)
+        assert app._auth.rename_current_profile("family") is True
+        assert app.profile_var.get() == "family"
+        assert "storytel:family" in app.controller.config_snapshot().sources
+        assert "storytel:work" not in app.controller.config_snapshot().sources
+        assert app.controller.config_snapshot().sources["storytel:family"].locale == "sv"
+
+        # Delete profile via AccountsPage removes profile and refreshes table
+        accounts.refresh()
+        accounts._tree.selection_set("storytel:family")
+        accounts._delete_selected_profile()
+        assert "storytel:family" not in app.controller.config_snapshot().sources
+    finally:
+        app.controller.shutdown(is_running=False, is_previewing=False)
+        root.destroy()
+
+
+@pytest.mark.gui
+def test_gui_oauth_panel_connect_disconnect_and_accounts_status(tmp_path, monkeypatch):
+    from audiobookdl.config import load_source_oauth_token, save_source_oauth_token
+    from audiobookdl.sources import ServiceInfo
+    from audiobookdl.utils.oauth import OAuthTokenBundle
+
+    oauth_svc = ServiceInfo(
+        key="customoauth",
+        label="CustomOAuth",
+        auth_methods=("oauth", "login"),
+        login_fields=("username", "password"),
+        supports_search=True,
+        supports_library=True,
+    )
+    monkeypatch.setattr(
+        "audiobookdl.gui.app.get_available_services",
+        lambda: [oauth_svc],
+    )
+    monkeypatch.setattr(
+        "audiobookdl.gui.auth_panel.messagebox.showinfo",
+        lambda *_a, **_kw: None,
+    )
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    app = AudiobookDLApp(root, config_location=str(cfg_path))
+    try:
+        accounts = app.open_accounts("customoauth")
+        panel = accounts.auth_panel
+        assert panel._oauth_row.winfo_manager() == "grid"
+        assert app._auth.oauth_status_var.get() == "Not connected"
+
+        # Trigger OAuth connect -> verify background invocation and completion event handling
+        called: list[tuple[str, str]] = []
+
+        def _fake_start_oauth(svc_key, svc_label, prof, opts):
+            called.append((svc_key, prof))
+            save_source_oauth_token(
+                svc_key,
+                OAuthTokenBundle(access_token="gui-oauth-tok", refresh_token="gui-ref"),
+                profile=prof,
+                overwrite=str(cfg_path),
+            )
+            import threading
+            return threading.Event()
+
+        monkeypatch.setattr(app.controller, "start_oauth_connect", _fake_start_oauth)
+        app._auth.oauth_client_id_var.set("my-gui-client")
+        panel.oauth_connect_btn.invoke()
+        assert called == [("customoauth", "default")]
+
+        app._auth.handle_oauth_connected("customoauth", "CustomOAuth", "default", True, None)
+        assert app._auth.oauth_status_var.get() == "Connected"
+        assert app.saved_badge_var.get() == "Saved"
+        accounts.refresh()
+        assert accounts._tree.item("customoauth:default", "values")[5] == "OAuth Connected"
+
+        # Disconnect OAuth cleanly removes persisted token
+        monkeypatch.setattr(
+            app.controller,
+            "disconnect_oauth",
+            lambda svc_key, _opts, profile=None: (
+                True,
+                app.controller.delete_source_profile(svc_key, profile=profile),
+            ),
+        )
+        panel.oauth_disconnect_btn.invoke()
+        assert app._auth.oauth_status_var.get() == "Not connected"
+        assert load_source_oauth_token("customoauth", profile="default", overwrite=str(cfg_path)) is None
+    finally:
+        app.controller.shutdown(is_running=False, is_previewing=False)
+        root.destroy()
+
+
+@pytest.mark.gui
+def test_gui_custom_bitrate_and_sample_rate_validation_persistence_and_ffmpeg_check(tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    try:
+        app = AudiobookDLApp(root, config_location=str(cfg_path))
+        try:
+            assert app.sample_rate_var.get() == "Auto"
+            assert app.build_options().sample_rate is None
+
+            panel = app.download_page.options_panel
+            assert str(panel._bitrate_combo.cget("state")) == "normal"
+            assert str(panel._sample_rate_combo.cget("state")) == "normal"
+
+            # Inline validation catches malformed bitrate & sample rate
+            app.audio_bitrate_var.set("bad-bitrate")
+            app.sample_rate_var.set("123")
+            panel._validate_inline_fields()
+            validation_msg = panel._validation_var.get()
+            assert "Bitrate" in validation_msg
+            assert "Sample rate" in validation_msg
+
+            # Custom valid values clear validation and build DownloadOptions cleanly
+            app.audio_bitrate_var.set("160k")
+            app.sample_rate_var.set("22050")
+            panel._validate_inline_fields()
+            assert panel._validation_var.get() == ""
+
+            opts = app.build_options()
+            assert opts.audio_bitrate == "160k"
+            assert opts.sample_rate == 22050
+
+            # FFmpegAssistant treats explicit bitrate or sample_rate as needing ffmpeg even on Original format
+            with (
+                patch.object(app._ffmpeg_assistant, "check_tool", return_value=(None, None)),
+                patch("audiobookdl.gui.ffmpeg_assistant.messagebox.askyesnocancel", return_value=False) as mock_prompt,
+            ):
+                assert app._ffmpeg_assistant.ensure_available(build_default_options(sample_rate=22050)) is True
+                mock_prompt.assert_called_once()
+                assert "process audio" in mock_prompt.call_args[0][1]
+
+            # Per-job queue override supports sample_rate
+            interaction = GuiInteractionHandler(app.controller.event_queue, app.controller.cancel_event)
+            job = QueuedJob(
+                job_id="dl-sr-1",
+                run_id=1,
+                url="https://librivox.org/book-sr",
+                options=build_default_options(),
+                interaction=interaction,
+            )
+            app.controller.pending_jobs.append(job)
+            app.download_page.queue_panel.register_queue_job(job, persist=False)
+            app.controller.update_queue_job_config(
+                "dl-sr-1",
+                job_overrides={"audio_bitrate": "160k", "sample_rate": 22050},
+            )
+            assert job.options.audio_bitrate == "160k"
+            assert job.options.sample_rate == 22050
+
+            app._options.save_run_preferences(opts)
+        finally:
+            app.controller.shutdown(is_running=False, is_previewing=False)
+    finally:
+        root.destroy()
+
+    root2 = tk.Tk()
+    root2.withdraw()
+    try:
+        app2 = AudiobookDLApp(root2, config_location=str(cfg_path))
+        try:
+            assert app2.audio_bitrate_var.get() == "160k"
+            assert app2.sample_rate_var.get() == "22050"
+            opts2 = app2.build_options()
+            assert opts2.audio_bitrate == "160k"
+            assert opts2.sample_rate == 22050
+        finally:
+            app2.controller.shutdown(is_running=False, is_previewing=False)
+    finally:
+        root2.destroy()
+
+
 
 
 

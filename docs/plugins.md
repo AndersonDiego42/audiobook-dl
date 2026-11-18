@@ -111,9 +111,10 @@ class MyServiceSource(Source):
 
 ### Helpful `Source` Base Utilities
 
-- `self.get_or_create_device_id(filename, factory)`: Atomically reads/writes a private persistent device ID inside `self.database_directory`.
+- `self.get_or_create_device_id(filename, factory)`: Atomically reads/writes a private persistent device ID inside `self.database_directory`, scoped automatically per active profile.
 - `self.fetch_cover_safe(url, *, default_ext="jpg", headers=None)`: Non-fatally downloads artwork bytes and sniffs the image extension via magic bytes.
-- `self.cached_cookie_path()` / `self.save_cookie_file()`: Used automatically by the pipeline to persist login session cookies with restricted permissions and retry once if cached cookies expire.
+- `self.cached_cookie_path()` / `self.save_cookie_file()`: Used automatically by the pipeline to persist profile-scoped login session cookies with restricted permissions and retry once if cached cookies expire.
+- `_authentication_methods = ["oauth"]` + `oauth_provider = OAuthProviderConfig(...)`: Enables OAuth 2.0 PKCE loopback (or Device Authorization Grant) sign-in, encrypted per-profile token storage in `CredentialStore`, automatic token refresh, and override hooks `oauth_authorize()` / `apply_oauth_token()`.
 - `self.get(url)` / `self.get_json(url)` / `self.post_json(url, ...)` / `self.get_stream_files(m3u8_url)`: Inherit configured timeouts, proxy, TLS/HTTP2 impersonation, and HLS decryption.
 
 ---

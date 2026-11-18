@@ -31,6 +31,22 @@ def create_download_page(app: AudiobookDLApp, parent: ttk.Frame) -> DownloadPage
     def _open_path(path: str, reveal: bool = False) -> None:
         open_path_in_os(app.root, path, reveal_in_folder=reveal)
 
+    def _active_service_profiles() -> list[str]:
+        svc = app._auth.selected_service()
+        if svc is None:
+            return [DEFAULT_PROFILE]
+        cfg = app.controller.config_snapshot()
+        profiles = list_source_profiles(cfg, svc.key)
+        return [DEFAULT_PROFILE] + [p for p in profiles if p != DEFAULT_PROFILE]
+
+    def _select_active_profile(prof: str) -> None:
+        svc = app._auth.selected_service()
+        if svc is not None:
+            app._auth.select_service_profile(svc.key, prof)
+        else:
+            app.profile_var.set(normalize_profile_name(prof))
+        app._options.update_download_summaries(page)
+
     cfg_gui = app.controller.config.gui
     options_collapsed = True if cfg_gui.options_collapsed is None else cfg_gui.options_collapsed
     naming_collapsed = (
@@ -73,6 +89,8 @@ def create_download_page(app: AudiobookDLApp, parent: ttk.Frame) -> DownloadPage
         active_job_var=app.active_job_var,
         concurrency_var=app.queue_concurrency_var,
         on_concurrency_changed=app._runs.on_queue_concurrency_changed,
+        profile_choices_provider=_active_service_profiles,
+        on_select_profile=_select_active_profile,
     )
     page.preset_combo.bind("<<ComboboxSelected>>", app._options.on_preset_selected)
     app._urls.bind_drop_target(page.urls_text, stop_prop=True)

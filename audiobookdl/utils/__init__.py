@@ -19,14 +19,16 @@ from ssl import SSLContext
 DEFAULT_M4B_BITRATE = "128k"
 MIN_AUTO_M4B_BITRATE_KBPS = 64
 MAX_AUTO_M4B_BITRATE_KBPS = 192
-AUDIO_BITRATE_PRESETS = ("Auto", "64k", "96k", "128k", "192k", "256k")
+AUDIO_BITRATE_PRESETS = ("Auto", "64k", "96k", "128k", "192k", "256k", "320k")
+AUDIO_SAMPLE_RATE_PRESETS = ("Auto", "16000", "22050", "24000", "32000", "44100", "48000")
 MP4_CONTAINERS = ("mp4", "m4a", "m4b", "mov", "m4v")
 _BITRATE_RE = re.compile(r"^(\d+)k?$", re.IGNORECASE)
+_SAMPLE_RATE_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*(k|khz|hz)?$", re.IGNORECASE)
 
 
 def normalize_audio_bitrate(bitrate: str | None) -> str | None:
     """
-    Normalize an AAC bitrate option (`None`/`"auto"` -> `None`, `"128k"`/`"128"` -> `"128k"`).
+    Normalize an audio bitrate option (`None`/`"auto"` -> `None`, `"128k"`/`"128"` -> `"128k"`).
 
     Raises `ValueError` for malformed or out-of-range bitrate strings.
     """
@@ -46,6 +48,45 @@ def normalize_audio_bitrate(bitrate: str | None) -> str | None:
             f"Audio bitrate {bitrate!r} out of range (must be between 8k and 1024k)"
         )
     return f"{kbps}k"
+
+
+def normalize_sample_rate(sample_rate: int | str | None) -> int | None:
+    """
+    Normalize an audio sample rate option (`None`/`"auto"`/`"original"` -> `None`,
+    `"44100"`/`"44100 Hz"`/`"44.1kHz"`/`44100` -> `44100`).
+
+    Raises `ValueError` for malformed or out-of-range sample rates (outside 8000..192000 Hz).
+    """
+    if sample_rate is None:
+        return None
+    if isinstance(sample_rate, bool):
+        raise ValueError(f"Invalid sample rate {sample_rate!r}: expected Hz integer or 'auto'")
+    if isinstance(sample_rate, int):
+        hz = sample_rate
+    else:
+        cleaned = str(sample_rate).strip()
+        if not cleaned or cleaned.lower() in ("auto", "original"):
+            return None
+        match = _SAMPLE_RATE_RE.fullmatch(cleaned)
+        if not match:
+            raise ValueError(
+                f"Invalid sample rate {sample_rate!r}: expected 'auto' or Hz (e.g. '44100', '22050')"
+            )
+        num = float(match.group(1))
+        unit = (match.group(2) or "").lower()
+        if unit in ("k", "khz"):
+            hz = round(num * 1000)
+        elif num.is_integer():
+            hz = int(num)
+        else:
+            raise ValueError(
+                f"Invalid sample rate {sample_rate!r}: expected whole Hz or kHz value"
+            )
+    if hz < 8000 or hz > 192000:
+        raise ValueError(
+            f"Sample rate {sample_rate!r} out of range (must be between 8000 and 192000 Hz)"
+        )
+    return hz
 
 
 @functools.lru_cache(maxsize=64)

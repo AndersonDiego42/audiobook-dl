@@ -22,6 +22,7 @@ from audiobookdl.gui.events import (
     JobStatusEvent,
     LogBatchEvent,
     LogEvent,
+    OAuthConnectedEvent,
     PreviewDoneEvent,
     ProgressAdvanceEvent,
     ProgressFinishEvent,
@@ -67,6 +68,7 @@ class EventDispatcher:
         is_syncing_provider: Callable[[], bool],
         on_preview_done: Callable[[str, tuple[Source, Result] | None, Exception | None], None],
         on_auth_verified: Callable[[str, bool, Exception | None], None],
+        on_oauth_connected: Callable[[str, str, str, bool, Exception | None], None] | None = None,
         on_ffmpeg_install_done: Callable[[bool, str], None],
         on_sync_done: Callable[[Any, Exception | None], None],
         on_sync_enqueue_ready: Callable[
@@ -87,6 +89,7 @@ class EventDispatcher:
         self._is_syncing_provider = is_syncing_provider
         self._on_preview_done = on_preview_done
         self._on_auth_verified = on_auth_verified
+        self._on_oauth_connected = on_oauth_connected
         self._on_ffmpeg_install_done = on_ffmpeg_install_done
         self._on_sync_done = on_sync_done
         self._on_sync_enqueue_ready = on_sync_enqueue_ready
@@ -295,6 +298,15 @@ class EventDispatcher:
             self._on_preview_done(item.url, item.prepared, item.error)
         elif isinstance(item, AuthVerifiedEvent):
             self._on_auth_verified(item.service_label, item.ok, item.error)
+        elif isinstance(item, OAuthConnectedEvent):
+            if self._on_oauth_connected is not None:
+                self._on_oauth_connected(
+                    item.service_key,
+                    item.service_label,
+                    item.profile,
+                    item.ok,
+                    item.error,
+                )
         elif isinstance(item, CatalogLoadedEvent):
             if item.request_id != self._controller.catalog_request_id:
                 return

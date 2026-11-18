@@ -171,6 +171,8 @@ class OptionsCoordinator:
             o.profile_var,
             o.saved_badge_var,
             o.output_format_var,
+            o.audio_bitrate_var,
+            o.sample_rate_var,
             o.combine_var,
             o.enrich_metadata_var,
             o.cover_only_var,
@@ -279,6 +281,12 @@ class OptionsCoordinator:
         flags: list[str] = []
         if o.combine_var.get():
             flags.append("Combine")
+        bitrate_val = o.audio_bitrate_var.get().strip()
+        if bitrate_val and bitrate_val.lower() != "auto":
+            flags.append(bitrate_val)
+        sr_val = o.sample_rate_var.get().strip()
+        if sr_val and sr_val.lower() not in ("auto", "original"):
+            flags.append(f"{sr_val} Hz" if sr_val.isdigit() else sr_val)
         if o.enrich_metadata_var.get():
             flags.append("Enrich")
         if o.cover_only_var.get():

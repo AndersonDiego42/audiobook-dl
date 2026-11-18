@@ -51,6 +51,12 @@ from audiobookdl.options_schema import (
 )
 from audiobookdl.pipeline import DownloadSummary
 from audiobookdl.sources import detect_service_key
+from audiobookdl.utils import (
+    AUDIO_BITRATE_PRESETS,
+    AUDIO_SAMPLE_RATE_PRESETS,
+    normalize_audio_bitrate,
+    normalize_sample_rate,
+)
 
 
 def export_queue_to_path(records: Sequence[Mapping[str, Any]], path: str) -> int:
@@ -123,8 +129,8 @@ class _JobOptionsDialog(ModalDialog):
             parent,
             "Edit Job Options",
             palette=palette,
-            default_size=(460, 380),
-            min_size=(400, 340),
+            default_size=(460, 415),
+            min_size=(400, 360),
             resizable=(True, False),
         )
         self.result: tuple[str, dict[str, Any]] | None = None
@@ -147,6 +153,8 @@ class _JobOptionsDialog(ModalDialog):
         if cur_media not in GUI_MEDIA_TYPE_OPTIONS:
             cur_media = "Auto"
         cur_bitrate = str(ov_map.get("audio_bitrate") or "").strip()
+        raw_sr = ov_map.get("sample_rate")
+        cur_sample_rate = "" if raw_sr is None else str(raw_sr).strip()
         raw_skip = ov_map.get("skip_downloaded")
         cur_skip = "On" if raw_skip is True else ("Off" if raw_skip is False else "Default")
 
@@ -158,6 +166,7 @@ class _JobOptionsDialog(ModalDialog):
         self._format_var = tk.StringVar(value=cur_fmt)
         self._media_var = tk.StringVar(value=cur_media)
         self._bitrate_var = tk.StringVar(value=cur_bitrate)
+        self._sample_rate_var = tk.StringVar(value=cur_sample_rate)
         self._skip_dl_var = tk.StringVar(value=cur_skip)
         self._intro_mode_var = tk.StringVar(value=cur_intro_mode)
         self._combine_var = tk.BooleanVar(value=bool(ov_map.get("combine", False)))
@@ -200,28 +209,36 @@ class _JobOptionsDialog(ModalDialog):
         ttk.Combobox(
             body,
             textvariable=self._bitrate_var,
-            values=("", "64k", "96k", "128k", "192k", "256k", "320k"),
+            values=("", *(p for p in AUDIO_BITRATE_PRESETS if p != "Auto")),
             state="normal",
         ).grid(row=3, column=1, sticky="ew", pady=4)
 
-        ttk.Label(body, text="Skip Downloaded:").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Label(body, text="Sample Rate (Hz):").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Combobox(
+            body,
+            textvariable=self._sample_rate_var,
+            values=("", *(p for p in AUDIO_SAMPLE_RATE_PRESETS if p != "Auto")),
+            state="normal",
+        ).grid(row=4, column=1, sticky="ew", pady=4)
+
+        ttk.Label(body, text="Skip Downloaded:").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Combobox(
             body,
             textvariable=self._skip_dl_var,
             values=("Default", "On", "Off"),
             state="disabled" if is_pack else "readonly",
-        ).grid(row=4, column=1, sticky="ew", pady=4)
+        ).grid(row=5, column=1, sticky="ew", pady=4)
 
-        ttk.Label(body, text="Intro Numbering:").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Label(body, text="Intro Numbering:").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Combobox(
             body,
             textvariable=self._intro_mode_var,
             values=GUI_INTRO_CHAPTER_MODES,
             state="readonly",
-        ).grid(row=5, column=1, sticky="ew", pady=4)
+        ).grid(row=6, column=1, sticky="ew", pady=4)
 
         toggles = ttk.Frame(body)
-        toggles.grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 2))
+        toggles.grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 2))
         ttk.Checkbutton(
             toggles,
             text="Combine parts",
@@ -236,7 +253,7 @@ class _JobOptionsDialog(ModalDialog):
         ).pack(side=tk.LEFT)
 
         toggles2 = ttk.Frame(body)
-        toggles2.grid(row=7, column=0, columnspan=2, sticky="w", pady=(2, 4))
+        toggles2.grid(row=8, column=0, columnspan=2, sticky="w", pady=(2, 4))
         ttk.Checkbutton(toggles2, text="Overwrite", variable=self._overwrite_var).pack(
             side=tk.LEFT, padx=(0, 12)
         )
@@ -248,7 +265,7 @@ class _JobOptionsDialog(ModalDialog):
         )
 
         btns = ttk.Frame(body)
-        btns.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        btns.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         ttk.Button(btns, text="Save", command=self._save, style="Accent.TButton").pack(side=tk.RIGHT)
         ttk.Button(btns, text="Cancel", command=self.destroy).pack(side=tk.RIGHT, padx=(0, 6))
 
@@ -259,7 +276,12 @@ class _JobOptionsDialog(ModalDialog):
         fmt_raw = self._format_var.get().strip()
         fmt = None if fmt_raw in ("", "Original") else fmt_raw
         media = (self._media_var.get() or "Auto").strip().lower()
-        bitrate = (self._bitrate_var.get() or "").strip() or None
+        try:
+            bitrate = normalize_audio_bitrate(self._bitrate_var.get())
+            sample_rate = normalize_sample_rate(self._sample_rate_var.get())
+        except ValueError as exc:
+            messagebox.showwarning("Invalid Option", str(exc), parent=self)
+            return
         skip_dl = {"On": True, "Off": False}.get(self._skip_dl_var.get())
         intro_binding = OPTIONS_BY_NAME["intro_chapter_mode"].gui
         assert intro_binding is not None
@@ -271,6 +293,7 @@ class _JobOptionsDialog(ModalDialog):
             "intro_chapter_mode": intro_mode,
             "media_type": media,
             "audio_bitrate": bitrate,
+            "sample_rate": sample_rate,
             "overwrite": self._overwrite_var.get(),
             "skip_downloaded": skip_dl,
             "write_abs_metadata": self._write_abs_var.get(),

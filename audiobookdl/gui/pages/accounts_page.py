@@ -111,6 +111,12 @@ class AccountsPage(ttk.Frame):
             ttk.Button(btn_bar, text="Import Cookies...", command=self._import_cookies).pack(
                 side=tk.LEFT, padx=(0, 6)
             )
+        ttk.Button(btn_bar, text="+ New Profile...", command=self._new_profile).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        ttk.Button(btn_bar, text="Rename Profile...", command=self._rename_selected_profile).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
         ttk.Button(btn_bar, text="Delete Profile", command=self._delete_selected_profile).pack(
             side=tk.LEFT, padx=(0, 6)
         )
@@ -184,7 +190,7 @@ class AccountsPage(ttk.Frame):
             profiles = list_source_profiles(cfg, svc.key)
             if not profiles:
                 profiles = [DEFAULT_PROFILE]
-            auth_label = ", ".join(m.capitalize() for m in svc.auth_methods) if svc.auth_methods else "None"
+            auth_label = ", ".join(m.upper() if m == "oauth" else m.capitalize() for m in svc.auth_methods) if svc.auth_methods else "None"
             caps: list[str] = []
             if svc.supports_search:
                 caps.append("Search")
@@ -192,14 +198,36 @@ class AccountsPage(ttk.Frame):
                 caps.append("Library")
             if "cookies" in svc.auth_methods:
                 caps.append("Cookies")
+            if "oauth" in svc.auth_methods:
+                caps.append("OAuth")
             caps_label = ", ".join(caps) if caps else "URL Only"
 
             for prof in profiles:
                 src_cfg = cfg.sources.get(make_source_profile_key(svc.key, prof))
+                oauth_connected = bool(src_cfg and getattr(src_cfg, "oauth_token_present", False))
                 has_creds = bool(
-                    src_cfg and any((src_cfg.username, src_cfg.password, src_cfg.library, src_cfg.cookie_file))
+                    src_cfg
+                    and any(
+                        (
+                            src_cfg.username,
+                            src_cfg.password,
+                            src_cfg.library,
+                            src_cfg.cookie_file,
+                            src_cfg.oauth_client_id,
+                            oauth_connected,
+                        )
+                    )
                 )
-                status = "Configured" if has_creds else ("No auth needed" if not svc.auth_methods else "Unconfigured")
+                if oauth_connected and src_cfg and not any((src_cfg.username, src_cfg.password, src_cfg.cookie_file)):
+                    status = "OAuth Connected"
+                elif oauth_connected:
+                    status = "Configured (OAuth)"
+                elif has_creds:
+                    status = "Configured"
+                elif not svc.auth_methods:
+                    status = "No auth needed"
+                else:
+                    status = "Unconfigured"
                 iid = f"{svc.key}:{prof}"
                 self._rows.append((svc.key, prof))
                 self._tree.insert(
@@ -234,6 +262,23 @@ class AccountsPage(ttk.Frame):
         self._auth_coord.select_service_profile(picked[0], picked[1])
         self._sync_active_row_and_breadcrumb()
 
+    def _new_profile(self) -> None:
+        picked = self._selected_service_profile()
+        if picked is not None:
+            self._auth_coord.select_service_profile(picked[0], picked[1])
+        if self._auth_coord.create_new_profile():
+            self.refresh()
+            self._sync_active_row_and_breadcrumb()
+
+    def _rename_selected_profile(self) -> None:
+        picked = self._selected_service_profile()
+        if picked is None:
+            return
+        self._auth_coord.select_service_profile(picked[0], picked[1])
+        if self._auth_coord.rename_current_profile():
+            self.refresh()
+            self._sync_active_row_and_breadcrumb()
+
     def _delete_selected_profile(self) -> None:
         picked = self._selected_service_profile()
         if picked is None:
@@ -241,11 +286,11 @@ class AccountsPage(ttk.Frame):
         svc_key, prof = picked
         if not messagebox.askyesno(
             "Delete Credentials",
-            f"Remove saved credentials for {svc_key} ({prof})?",
+            f"Remove saved credentials and OAuth tokens for {svc_key} ({prof})?",
             parent=self.winfo_toplevel(),
         ):
             return
-        self._controller.save_source_credentials(svc_key, profile=prof)
+        self._controller.delete_source_profile(svc_key, profile=prof)
         self._auth_coord.load_service_into_form()
         self._auth_coord.update_field_states()
         self.refresh()
@@ -271,7 +316,14 @@ class AccountsPage(ttk.Frame):
                 continue
             for prof in list_source_profiles(cfg, svc.key):
                 src_cfg = cfg.sources.get(make_source_profile_key(svc.key, prof))
-                if src_cfg and any((src_cfg.username, src_cfg.password, src_cfg.cookie_file)):
+                if src_cfg and any(
+                    (
+                        src_cfg.username,
+                        src_cfg.password,
+                        src_cfg.cookie_file,
+                        getattr(src_cfg, "oauth_token_present", False),
+                    )
+                ):
                     targets.append((svc.key, prof))
         if not targets:
             self._status_var.set("No configured accounts with credentials to verify.")

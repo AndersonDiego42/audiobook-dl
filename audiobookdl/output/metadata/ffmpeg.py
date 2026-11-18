@@ -69,16 +69,19 @@ def create_tmp_chapter_file(filepath: str, chapters: Sequence[Chapter]) -> str:
 def _build_fallback_codec_args(
     filepath: str,
     audio_bitrate: str | None = None,
+    sample_rate: int | str | None = None,
 ) -> list[str]:
-    """Return FFmpeg encoding flags matching `filepath`'s container and `audio_bitrate`."""
+    """Return FFmpeg encoding flags matching `filepath`'s container, `audio_bitrate`, and `sample_rate`."""
     ext = os.path.splitext(filepath)[1].lstrip(".").lower()
+    normalized_sr = utils.normalize_sample_rate(sample_rate)
+    sr_args = ["-ar", str(normalized_sr)] if normalized_sr is not None else []
     if not ext or ext in utils.MP4_CONTAINERS:
         bitrate = utils.resolve_audio_bitrate(filepath, audio_bitrate)
-        return ["-c:v", "copy", "-c:a", "aac", "-b:a", bitrate]
+        return ["-c:v", "copy", "-c:a", "aac", "-b:a", bitrate, *sr_args]
     explicit_bitrate = utils.normalize_audio_bitrate(audio_bitrate)
     if explicit_bitrate is not None and ext not in LOSSLESS_CONTAINERS:
-        return ["-c:v", "copy", "-b:a", explicit_bitrate]
-    return ["-c:v", "copy"]
+        return ["-c:v", "copy", "-b:a", explicit_bitrate, *sr_args]
+    return ["-c:v", "copy", *sr_args]
 
 
 def add_chapters_ffmpeg(
@@ -86,10 +89,12 @@ def add_chapters_ffmpeg(
     chapters: Sequence[Chapter],
     cancel_event: threading.Event | None = None,
     audio_bitrate: str | None = None,
+    sample_rate: int | str | None = None,
 ):
     if not chapters:
         return
     utils.normalize_audio_bitrate(audio_bitrate)
+    normalized_sr = utils.normalize_sample_rate(sample_rate)
     ffmpeg = utils.find_executable("ffmpeg")
     if ffmpeg is None:
         logging.log("ffmpeg not found; skipping chapter embedding")
@@ -130,7 +135,7 @@ def add_chapters_ffmpeg(
                  "-i", filepath,
                  "-i", tmp_chapter_file,
                  "-map_chapters", "1",
-                 *_build_fallback_codec_args(filepath, audio_bitrate),
+                 *_build_fallback_codec_args(filepath, audio_bitrate, normalized_sr),
                  "-map", "0",
                  "-metadata:s:a:0", "title=",
                  *faststart_args,

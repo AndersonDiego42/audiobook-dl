@@ -122,6 +122,15 @@ class AuthVerifiedEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class OAuthConnectedEvent:
+    service_key: str
+    service_label: str
+    profile: str
+    ok: bool
+    error: Exception | None
+
+
+@dataclass(frozen=True, slots=True)
 class CatalogLoadedEvent:
     request_id: int
     target_tab: Any
@@ -185,6 +194,7 @@ ControllerEvent: TypeAlias = (
     | PromptChoiceEvent
     | PreviewDoneEvent
     | AuthVerifiedEvent
+    | OAuthConnectedEvent
     | CatalogLoadedEvent
     | FfmpegInstallDoneEvent
     | UpdateCheckedEvent

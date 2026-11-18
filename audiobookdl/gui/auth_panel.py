@@ -1,8 +1,9 @@
 """Service selection, multi-profile credentials, and cookie import panel."""
 
 import os
+import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from collections.abc import Callable, Sequence
 
 from audiobookdl.options_schema import DownloadOptions
@@ -53,6 +54,8 @@ class ServiceAuthCoordinator:
         self._services_by_key = {s.key: s for s in self._services}
         self._last_detected_service: str | None = None
         self._is_verifying_auth = False
+        self._is_connecting_oauth = False
+        self._oauth_cancel_event: threading.Event | None = None
         self._cookie_dialog: CookieImportDialog | None = None
         self._panel: ServiceAuthPanel | None = None
 
@@ -65,6 +68,9 @@ class ServiceAuthCoordinator:
         self.username_var = username_var
         self.password_var = password_var
         self.library_var = library_var
+        self.locale_var = tk.StringVar(master=root, value="")
+        self.oauth_client_id_var = tk.StringVar(master=root, value="")
+        self.oauth_status_var = tk.StringVar(master=root, value="Not connected")
         self.show_password_var = show_password_var
         self.remember_login_var = remember_login_var
 
@@ -131,6 +137,18 @@ class ServiceAuthCoordinator:
         self.load_service_into_form()
         self.update_field_states()
 
+    def select_service_smart(self, service_key: str | None = None) -> None:
+        """Select a service and resolve its effective profile automatically."""
+        svc = self._services_by_key.get(service_key) if service_key else self.selected_service()
+        if svc is None:
+            return
+        if self.service_label_var.get() != svc.label:
+            self.service_label_var.set(svc.label)
+        resolved = resolve_effective_source_profile(self._controller.config_snapshot(), svc.key)
+        self.profile_var.set(resolved)
+        self.load_service_into_form()
+        self.update_field_states()
+
     def on_urls_changed(self, urls: Sequence[str]) -> None:
         if not urls:
             self._last_detected_service = None
@@ -158,38 +176,58 @@ class ServiceAuthCoordinator:
             return
         cfg = self._controller.config
         configured_profiles = list_source_profiles(cfg, service.key)
-        combo_values = [DEFAULT_PROFILE] + [p for p in configured_profiles if p != DEFAULT_PROFILE]
-        panel = self._active_panel()
-        if panel is not None:
-            panel.profile_combo.configure(values=combo_values)
         active_profile = normalize_profile_name(self.profile_var.get())
         if self.profile_var.get() != active_profile:
             self.profile_var.set(active_profile)
+        combo_values = [DEFAULT_PROFILE] + [p for p in configured_profiles if p != DEFAULT_PROFILE]
+        if active_profile not in combo_values:
+            combo_values.append(active_profile)
+        panel = self._active_panel()
+        if panel is not None:
+            panel.profile_combo.configure(values=combo_values)
 
         saved: SourceConfig | None = get_source_config(cfg, service.key, active_profile)
         self.username_var.set((saved.username or "") if saved else "")
         self.password_var.set((saved.password or "") if saved else "")
         self.library_var.set((saved.library or "") if saved else "")
         self.cookie_file_var.set((saved.cookie_file or "") if saved else "")
+        self.locale_var.set((saved.locale or "") if saved else "")
+        self.oauth_client_id_var.set((saved.oauth_client_id or "") if saved else "")
+
+        oauth_connected = bool(saved and getattr(saved, "oauth_token_present", False))
+        self.oauth_status_var.set("Connected" if oauth_connected else "Not connected")
 
         has_saved = bool(
-            saved and any((saved.username, saved.password, saved.library, saved.cookie_file))
+            saved
+            and any(
+                (
+                    saved.username,
+                    saved.password,
+                    saved.library,
+                    saved.cookie_file,
+                    saved.locale,
+                    saved.oauth_client_id,
+                    getattr(saved, "oauth_token_present", False),
+                )
+            )
         )
         self.saved_badge_var.set("Saved" if has_saved else "")
 
+        supports_oauth = "oauth" in service.auth_methods
         supports_cookies = "cookies" in service.auth_methods
         supports_login = "login" in service.auth_methods
         needs_library = "library" in service.login_fields
         if not service.auth_methods:
             self.service_hint_var.set("No authentication required")
-        elif supports_cookies and supports_login:
-            suffix = " (+ Library)" if needs_library else ""
-            self.service_hint_var.set(f"Login{suffix} or Cookies file")
-        elif supports_login:
-            suffix = " (+ Library)" if needs_library else ""
-            self.service_hint_var.set(f"Username & Password{suffix}")
         else:
-            self.service_hint_var.set("Cookies file required")
+            parts: list[str] = []
+            if supports_oauth:
+                parts.append("OAuth 2.0")
+            if supports_login:
+                parts.append("Login (+ Library)" if needs_library else "Username & Password")
+            if supports_cookies:
+                parts.append("Cookies file")
+            self.service_hint_var.set(" / ".join(parts))
 
     def update_field_states(self) -> None:
         panel = self._active_panel()
@@ -241,18 +279,21 @@ class ServiceAuthCoordinator:
         self._on_log(f"Imported {count} browser cookie(s) to {cookie_path}")
 
     def save_current_credentials(self, quiet: bool = False) -> None:
-        """Persist the selected service's login, password, library, and cookie path."""
+        """Persist the selected service's login, password, library, locale, OAuth client, and cookie path."""
         service = self.selected_service()
         if service is None or not service.auth_methods:
             return
         supports_cookies = "cookies" in service.auth_methods
         supports_login = "login" in service.auth_methods
+        supports_oauth = "oauth" in service.auth_methods
         needs_library = supports_login and "library" in service.login_fields
 
         username = self.username_var.get().strip() or None if supports_login else None
         password = self.password_var.get() or None if supports_login else None
         library = self.library_var.get().strip() or None if needs_library else None
         cookie_file = self.cookie_file_var.get().strip() or None if supports_cookies else None
+        locale = self.locale_var.get().strip() or None
+        oauth_client_id = self.oauth_client_id_var.get().strip() or None if supports_oauth else None
 
         if quiet and not any((username, password, library, cookie_file)):
             return
@@ -265,6 +306,9 @@ class ServiceAuthCoordinator:
             library=library,
             cookie_file=cookie_file,
             profile=active_profile,
+            locale=locale,
+            oauth_client_id=oauth_client_id,
+            preserve_optional=quiet,
         )
         has_saved = get_source_config(cfg, service.key, active_profile) is not None
         self.saved_badge_var.set("Saved" if has_saved else "")
@@ -281,16 +325,19 @@ class ServiceAuthCoordinator:
                 self._status_var.set(f"Cleared credentials for {service.label}{profile_suffix}")
 
     def forget_current_credentials(self) -> None:
-        """Remove saved credentials for the currently selected service and profile."""
+        """Remove saved credentials, OAuth tokens, and cached session files for the active profile."""
         service = self.selected_service()
         if service is None:
             return
         active_profile = normalize_profile_name(self.profile_var.get())
-        self._controller.save_source_credentials(service.key, profile=active_profile)
+        self._controller.delete_source_profile(service.key, profile=active_profile)
         self.username_var.set("")
         self.password_var.set("")
         self.library_var.set("")
         self.cookie_file_var.set("")
+        self.locale_var.set("")
+        self.oauth_client_id_var.set("")
+        self.oauth_status_var.set("Not connected")
         self.saved_badge_var.set("")
         self.load_service_into_form()
         self.update_field_states()
@@ -299,6 +346,154 @@ class ServiceAuthCoordinator:
         profile_suffix = f" ({active_profile})" if active_profile != DEFAULT_PROFILE else ""
         self._status_var.set(f"Removed saved login for {service.label}{profile_suffix}")
         self._on_log(f"Removed saved login settings for {service.label}{profile_suffix}.")
+
+    def create_new_profile(self, profile_name: str | None = None) -> bool:
+        """Create/select a new named profile for the currently selected service."""
+        service = self.selected_service()
+        if service is None or not service.auth_methods:
+            return False
+        raw_name = profile_name
+        if raw_name is None:
+            raw_name = simpledialog.askstring(
+                "New Profile",
+                f"Enter profile name for {service.label}:",
+                parent=self._window,
+            )
+        if raw_name is None or not raw_name.strip():
+            return False
+        normalized = normalize_profile_name(raw_name)
+        existing = list_source_profiles(self._controller.config_snapshot(), service.key)
+        self.profile_var.set(normalized)
+        self.load_service_into_form()
+        self.update_field_states()
+        if normalized in existing:
+            self._status_var.set(f"Switched to existing profile '{normalized}' for {service.label}")
+        else:
+            self._status_var.set(
+                f"Created draft profile '{normalized}' for {service.label}; enter credentials and click Save."
+            )
+        return True
+
+    def rename_current_profile(self, new_name: str | None = None) -> bool:
+        """Rename the active profile for the selected service."""
+        service = self.selected_service()
+        if service is None or not service.auth_methods:
+            return False
+        old_profile = normalize_profile_name(self.profile_var.get())
+        raw_new = new_name
+        if raw_new is None:
+            raw_new = simpledialog.askstring(
+                "Rename Profile",
+                f"Rename profile '{old_profile}' for {service.label} to:",
+                initialvalue=old_profile,
+                parent=self._window,
+            )
+        if raw_new is None or not raw_new.strip():
+            return False
+        new_profile = normalize_profile_name(raw_new)
+        if new_profile == old_profile:
+            return False
+        try:
+            self._controller.rename_source_profile(service.key, old_profile, new_profile)
+        except Exception as exc:
+            messagebox.showerror("Rename Profile Failed", str(exc), parent=self._window)
+            return False
+        self.profile_var.set(new_profile)
+        self.load_service_into_form()
+        self.update_field_states()
+        if self._on_credentials_changed is not None:
+            self._on_credentials_changed()
+        self._status_var.set(f"Renamed {service.label} profile '{old_profile}' to '{new_profile}'")
+        return True
+
+    def connect_oauth(self) -> None:
+        """Start OAuth 2.0 authorization for the currently selected service and profile."""
+        if self._is_connecting_oauth or self._is_running_provider():
+            return
+        service = self.selected_service()
+        if service is None or "oauth" not in service.auth_methods:
+            return
+        options = self._build_verify_options()
+        if options is None:
+            return
+        active_profile = normalize_profile_name(self.profile_var.get())
+        client_id = self.oauth_client_id_var.get().strip() or None
+        locale = self.locale_var.get().strip() or None
+        if client_id or locale:
+            self._controller.save_source_credentials(
+                service.key,
+                username=self.username_var.get().strip() or None if "login" in service.auth_methods else None,
+                password=self.password_var.get() or None if "login" in service.auth_methods else None,
+                library=self.library_var.get().strip() or None if "library" in service.login_fields else None,
+                cookie_file=self.cookie_file_var.get().strip() or None if "cookies" in service.auth_methods else None,
+                profile=active_profile,
+                locale=locale,
+                oauth_client_id=client_id,
+            )
+        self._is_connecting_oauth = True
+        self.oauth_status_var.set("Authorizing in browser...")
+        self.update_field_states()
+        self._status_var.set(f"Authorizing {service.label} ({active_profile}) via OAuth...")
+        self._oauth_cancel_event = self._controller.start_oauth_connect(
+            service.key,
+            service.label,
+            active_profile,
+            options,
+        )
+
+    def cancel_oauth_connect(self) -> None:
+        """Cancel an in-progress interactive OAuth authorization."""
+        if self._oauth_cancel_event is not None:
+            self._oauth_cancel_event.set()
+            self._status_var.set("Cancelling OAuth authorization...")
+
+    def disconnect_oauth(self) -> None:
+        """Revoke and delete stored OAuth tokens for the active profile."""
+        service = self.selected_service()
+        if service is None:
+            return
+        options = self._build_verify_options()
+        if options is None:
+            return
+        active_profile = normalize_profile_name(self.profile_var.get())
+        self._controller.disconnect_oauth(service.key, options, profile=active_profile)
+        self.oauth_status_var.set("Not connected")
+        self.load_service_into_form()
+        self.update_field_states()
+        if self._on_credentials_changed is not None:
+            self._on_credentials_changed()
+        self._status_var.set(f"Disconnected OAuth for {service.label} ({active_profile})")
+        self._on_log(f"Disconnected OAuth tokens for {service.label} ({active_profile}).")
+
+    def handle_oauth_connected(
+        self,
+        service_key: str,
+        service_label: str,
+        profile: str,
+        ok: bool,
+        auth_exc: Exception | None,
+    ) -> None:
+        """Handle completion of background OAuth 2.0 connection flow."""
+        self._is_connecting_oauth = False
+        self._oauth_cancel_event = None
+        if ok:
+            self._controller.reload_config()
+        self.load_service_into_form()
+        self.update_field_states()
+        if self._on_credentials_changed is not None:
+            self._on_credentials_changed()
+        if auth_exc is not None:
+            self._status_var.set(f"OAuth connection failed for {service_label} ({profile})")
+            self._on_log(f"[ERROR] OAuth authorization failed for {service_label} ({profile}): {auth_exc}")
+            messagebox.showerror("OAuth Sign-In Failed", str(auth_exc), parent=self._window)
+        elif ok:
+            self._status_var.set(f"OAuth connected: {service_label} ({profile})")
+            self._on_log(f"Connected OAuth account for {service_label} ({profile}).")
+            messagebox.showinfo(
+                "OAuth Connected",
+                f"Successfully authorized {service_label} ({profile}).",
+                parent=self._window,
+            )
 
     def verify_current_auth(self) -> None:
         """Test authentication for the currently selected service in the background."""
@@ -394,6 +589,7 @@ class ServiceAuthCoordinator:
                 src_cfg.password,
                 src_cfg.cookie_file,
                 src_cfg.library,
+                getattr(src_cfg, "oauth_token_present", False),
             ))
             if not has_creds:
                 missing.append(info.label)
@@ -470,6 +666,9 @@ class ServiceAuthPanel(ttk.LabelFrame):
         self.username_var = coordinator.username_var
         self.password_var = coordinator.password_var
         self.library_var = coordinator.library_var
+        self.locale_var = coordinator.locale_var
+        self.oauth_client_id_var = coordinator.oauth_client_id_var
+        self.oauth_status_var = coordinator.oauth_status_var
         self.show_password_var = coordinator.show_password_var
         self.remember_login_var = coordinator.remember_login_var
 
@@ -499,7 +698,7 @@ class ServiceAuthPanel(ttk.LabelFrame):
         ttk.Label(self, text="Service:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
         service_row = ttk.Frame(self)
         service_row.grid(row=0, column=1, columnspan=4, sticky="ew", pady=(0, 4))
-        service_row.columnconfigure(3, weight=1)
+        service_row.columnconfigure(5, weight=1)
 
         self.service_combo = ttk.Combobox(
             service_row,
@@ -519,16 +718,31 @@ class ServiceAuthPanel(ttk.LabelFrame):
             state="normal",
             width=12,
         )
-        self.profile_combo.grid(row=0, column=2, sticky="w", padx=(0, 10))
+        self.profile_combo.grid(row=0, column=2, sticky="w", padx=(0, 4))
         self.profile_combo.bind("<<ComboboxSelected>>", self.on_profile_changed)
         self.profile_combo.bind("<Return>", self.on_profile_changed)
         self.profile_combo.bind("<FocusOut>", self.on_profile_changed)
 
+        self.new_profile_btn = ttk.Button(
+            service_row,
+            text="+ New",
+            width=6,
+            command=self._coord.create_new_profile,
+        )
+        self.new_profile_btn.grid(row=0, column=3, sticky="w", padx=(0, 4))
+        self.rename_profile_btn = ttk.Button(
+            service_row,
+            text="Rename",
+            width=7,
+            command=self._coord.rename_current_profile,
+        )
+        self.rename_profile_btn.grid(row=0, column=4, sticky="w", padx=(0, 8))
+
         ttk.Label(service_row, textvariable=self.service_hint_var, style="Muted.TLabel").grid(
-            row=0, column=3, sticky="w"
+            row=0, column=5, sticky="w"
         )
         ttk.Label(service_row, textvariable=self.saved_badge_var, style="Success.TLabel").grid(
-            row=0, column=4, sticky="e", padx=(8, 0)
+            row=0, column=6, sticky="e", padx=(8, 0)
         )
 
         ttk.Label(self, text="Cookies File:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
@@ -563,15 +777,46 @@ class ServiceAuthPanel(ttk.LabelFrame):
         ttk.Label(self, text="Library:").grid(row=3, column=0, sticky="w", padx=(0, 8))
         self.lib_entry = ttk.Entry(self, textvariable=self.library_var, width=14)
         self.lib_entry.grid(row=3, column=1, sticky="ew", padx=(0, 10))
+        ttk.Label(self, text="Locale:").grid(row=3, column=2, sticky="w", padx=(0, 8))
+        self.locale_entry = ttk.Entry(self, textvariable=self.locale_var, width=10)
+        self.locale_entry.grid(row=3, column=3, sticky="ew")
         self.remember_cb = ttk.Checkbutton(
             self,
             text="Remember login",
             variable=self.remember_login_var,
         )
-        self.remember_cb.grid(row=3, column=2, columnspan=3, sticky="w")
+        self.remember_cb.grid(row=3, column=4, sticky="w", padx=(8, 0))
+
+        self._oauth_row = ttk.Frame(self)
+        self._oauth_row.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(4, 0))
+        self._oauth_row.columnconfigure(3, weight=1)
+        ttk.Label(self._oauth_row, text="OAuth 2.0:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.oauth_status_label = ttk.Label(
+            self._oauth_row,
+            textvariable=self.oauth_status_var,
+            style="Muted.TLabel",
+            width=18,
+        )
+        self.oauth_status_label.grid(row=0, column=1, sticky="w", padx=(0, 8))
+        ttk.Label(self._oauth_row, text="Client ID:").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        self.oauth_client_entry = ttk.Entry(self._oauth_row, textvariable=self.oauth_client_id_var)
+        self.oauth_client_entry.grid(row=0, column=3, sticky="ew", padx=(0, 8))
+        self.oauth_connect_btn = ttk.Button(
+            self._oauth_row,
+            text="Connect OAuth...",
+            command=self._coord.connect_oauth,
+        )
+        self.oauth_connect_btn.grid(row=0, column=4, sticky="e", padx=(0, 4))
+        self.oauth_disconnect_btn = ttk.Button(
+            self._oauth_row,
+            text="Disconnect",
+            command=self._coord.disconnect_oauth,
+        )
+        self.oauth_disconnect_btn.grid(row=0, column=5, sticky="e")
+        self._oauth_row.grid_remove()
 
         auth_actions = ttk.Frame(self)
-        auth_actions.grid(row=4, column=1, columnspan=4, sticky="ew", pady=(4, 0))
+        auth_actions.grid(row=5, column=1, columnspan=4, sticky="ew", pady=(4, 0))
         self.forget_auth_btn = ttk.Button(
             auth_actions, text="Forget", command=self.forget_current_credentials
         )
@@ -592,9 +837,7 @@ class ServiceAuthPanel(ttk.LabelFrame):
         return self._coord.service_label_for_url(url)
 
     def on_service_selected(self, _event: tk.Event | None = None) -> None:
-        self.profile_var.set(DEFAULT_PROFILE)
-        self.load_service_into_form()
-        self.update_field_states()
+        self._coord.select_service_smart()
 
     def on_profile_changed(self, _event: tk.Event | None = None) -> None:
         normalized = normalize_profile_name(self.profile_var.get())
@@ -615,6 +858,8 @@ class ServiceAuthPanel(ttk.LabelFrame):
             for widget in (
                 self.service_combo,
                 self.profile_combo,
+                self.new_profile_btn,
+                self.rename_profile_btn,
                 self.cookie_entry,
                 self.cookie_browse,
                 self.cookie_import_btn,
@@ -622,6 +867,10 @@ class ServiceAuthPanel(ttk.LabelFrame):
                 self.password_entry,
                 self.show_pw_btn,
                 self.lib_entry,
+                self.locale_entry,
+                self.oauth_client_entry,
+                self.oauth_connect_btn,
+                self.oauth_disconnect_btn,
                 self.remember_cb,
                 self.test_auth_btn,
                 self.save_auth_btn,
@@ -640,6 +889,7 @@ class ServiceAuthPanel(ttk.LabelFrame):
         service = self.selected_service()
         if service is None:
             return
+        supports_oauth = "oauth" in service.auth_methods
         supports_cookies = "cookies" in service.auth_methods
         supports_login = "login" in service.auth_methods
         needs_library = supports_login and "library" in service.login_fields
@@ -649,8 +899,14 @@ class ServiceAuthPanel(ttk.LabelFrame):
         login_state = "normal" if supports_login else "disabled"
         library_state = "normal" if needs_library else "disabled"
         save_state = "normal" if has_auth else "disabled"
+        active_profile = normalize_profile_name(self.profile_var.get())
+        saved_cfg = get_source_config(self._controller.config, service.key, active_profile)
+        has_saved = saved_cfg is not None
+        oauth_connected = bool(saved_cfg and getattr(saved_cfg, "oauth_token_present", False))
 
         self.profile_combo.configure(state="normal" if has_auth else "disabled")
+        self.new_profile_btn.configure(state=save_state)
+        self.rename_profile_btn.configure(state="normal" if has_saved else "disabled")
         self.cookie_entry.configure(state=cookie_state)
         self.cookie_browse.configure(state=cookie_state)
         self.cookie_import_btn.configure(state=cookie_state)
@@ -658,12 +914,21 @@ class ServiceAuthPanel(ttk.LabelFrame):
         self.password_entry.configure(state=login_state)
         self.show_pw_btn.configure(state=login_state)
         self.lib_entry.configure(state=library_state)
+        self.locale_entry.configure(state=save_state)
+        if supports_oauth:
+            self._oauth_row.grid()
+            connecting = self._coord._is_connecting_oauth
+            self.oauth_client_entry.configure(state="disabled" if connecting else "normal")
+            self.oauth_connect_btn.configure(state="disabled" if connecting else "normal")
+            self.oauth_disconnect_btn.configure(
+                state="normal" if (oauth_connected and not connecting) else "disabled"
+            )
+        else:
+            self._oauth_row.grid_remove()
         self.test_auth_btn.configure(
             state="disabled" if self._coord.is_verifying_auth else save_state
         )
         self.save_auth_btn.configure(state=save_state)
-        active_profile = normalize_profile_name(self.profile_var.get())
-        has_saved = get_source_config(self._controller.config, service.key, active_profile) is not None
         self.forget_auth_btn.configure(state="normal" if has_saved else "disabled")
 
     def toggle_password_visibility(self) -> None:

@@ -21,7 +21,13 @@ from audiobookdl.output.output import (
     get_extension,
 )
 from audiobookdl.output.download import get_output_audio_format
-from audiobookdl.utils import AudioProbeInfo, find_executable, normalize_audio_bitrate, resolve_audio_bitrate
+from audiobookdl.utils import (
+    AudioProbeInfo,
+    find_executable,
+    normalize_audio_bitrate,
+    normalize_sample_rate,
+    resolve_audio_bitrate,
+)
 from audiobookdl.utils.concurrency import run_cancellable_subprocess
 
 class _OutputTestCase(TypedDict):
@@ -1584,6 +1590,161 @@ def test_split_and_merge_segment_groups_respect_intro_chapter_mode(tmp_path, mon
         "01 - Chapter 1.mp3",
         "02 - Chapter 2.mp3",
     ]
+
+
+def test_normalize_sample_rate():
+    assert normalize_sample_rate(None) is None
+    assert normalize_sample_rate("") is None
+    assert normalize_sample_rate("auto") is None
+    assert normalize_sample_rate("Original") is None
+    assert normalize_sample_rate(44100) == 44100
+    assert normalize_sample_rate("22050") == 22050
+    assert normalize_sample_rate("44100 Hz") == 44100
+    assert normalize_sample_rate("44.1kHz") == 44100
+    assert normalize_sample_rate("48k") == 48000
+
+    for bad in (True, False, "fast", "4000", "256000", "-44100", "44.1"):
+        with pytest.raises(ValueError):
+            normalize_sample_rate(bad)
+
+
+def test_mux_codec_args_and_convert_single_file_respect_explicit_bitrate_and_sample_rate(tmp_path):
+    from pathlib import Path
+    from unittest.mock import MagicMock
+
+    # 1. Explicit audio_bitrate forces re-encode even on same codec/container (AAC -> M4B, MP3 -> MP3)
+    aac_info = AudioProbeInfo(duration=60.0, bitrate=192000, codec_name="aac", sample_rate=44100, channels=2)
+    aac_args = output._build_mux_codec_args("m4b", "m4b", aac_info, "64k")
+    assert aac_args[aac_args.index("-c:a") + 1] == "aac"
+    assert aac_args[aac_args.index("-b:a") + 1] == "64k"
+
+    mp3_info = AudioProbeInfo(duration=60.0, bitrate=192000, codec_name="mp3", sample_rate=44100, channels=2)
+    mp3_args = output._build_mux_codec_args("mp3", "mp3", mp3_info, "96k")
+    assert mp3_args[mp3_args.index("-c:a") + 1] == "libmp3lame"
+    assert mp3_args[mp3_args.index("-b:a") + 1] == "96k"
+
+    # 2. Matching sample_rate without explicit bitrate preserves stream copy
+    same_sr_args = output._build_mux_codec_args("mp3", "mp3", mp3_info, None, sample_rate=44100)
+    assert same_sr_args == ["-c:a", "copy"]
+
+    # 3. Differing sample_rate triggers re-encode with -ar <Hz>
+    diff_sr_args = output._build_mux_codec_args("mp3", "mp3", mp3_info, None, sample_rate=22050)
+    assert diff_sr_args[diff_sr_args.index("-c:a") + 1] == "libmp3lame"
+    assert diff_sr_args[diff_sr_args.index("-ar") + 1] == "22050"
+
+    # 4. Lossless target ignores explicit bitrate but still resamples when sample_rate differs
+    flac_info = AudioProbeInfo(duration=60.0, codec_name="flac", sample_rate=48000, channels=2)
+    flac_bitrate_only = output._build_mux_codec_args("flac", "flac", flac_info, "128k")
+    assert flac_bitrate_only == ["-c:a", "copy"]
+    flac_resample = output._build_mux_codec_args("flac", "flac", flac_info, "128k", sample_rate=44100)
+    assert flac_resample[flac_resample.index("-c:a") + 1] == "flac"
+    assert flac_resample[flac_resample.index("-ar") + 1] == "44100"
+    assert "-b:a" not in flac_resample
+
+    # 5. convert_single_file skips when sample_rate already matches, and re-encodes when it differs
+    mp3_file = tmp_path / "book.mp3"
+    mp3_file.write_bytes(b"mp3-orig")
+    cmds: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        cmds.append(cmd)
+        Path(cmd[-1]).write_bytes(b"mp3-new")
+        return MagicMock(returncode=0, stderr=b"")
+
+    with (
+        patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
+        patch("audiobookdl.output.output._probe_audio_info", return_value=mp3_info),
+        patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run),
+    ):
+        new_p, _ = output.convert_single_file(str(mp3_file), "mp3", sample_rate=44100)
+        assert new_p == str(mp3_file)
+        assert cmds == []
+
+        output.convert_single_file(str(mp3_file), "mp3", audio_bitrate="64k", sample_rate=22050)
+        assert len(cmds) == 1
+        assert cmds[0][cmds[0].index("-b:a") + 1] == "64k"
+        assert cmds[0][cmds[0].index("-ar") + 1] == "22050"
+
+
+def test_combine_audiofiles_honors_explicit_bitrate_and_sample_rate_on_uniform_aac(tmp_path):
+    from pathlib import Path
+    from unittest.mock import MagicMock
+
+    p0 = tmp_path / "01.m4a"
+    p1 = tmp_path / "02.m4a"
+    p0.write_bytes(b"a0")
+    p1.write_bytes(b"a1")
+    out_m4b = tmp_path / "Book.m4b"
+    cmds: list[list[str]] = []
+
+    def fake_probe(path: str) -> AudioProbeInfo:
+        if path == str(out_m4b):
+            return AudioProbeInfo(duration=10.0, bitrate=64000, codec_name="aac", format_name="mp4", sample_rate=22050, channels=2)
+        return AudioProbeInfo(duration=5.0, bitrate=192000, codec_name="aac", format_name="mp4", sample_rate=44100, channels=2)
+
+    def fake_run(cmd, **_kwargs):
+        cmds.append(cmd)
+        Path(cmd[-1]).write_bytes(b"data")
+        return MagicMock(returncode=0, stderr=b"")
+
+    with (
+        patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
+        patch("audiobookdl.output.output._probe_audio_info", side_effect=fake_probe),
+        patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run),
+    ):
+        combine_audiofiles(
+            [str(p0), str(p1)],
+            str(tmp_path / "work"),
+            str(out_m4b),
+            audio_bitrate="64k",
+            sample_rate=22050,
+        )
+
+    part_cmds = [c for c in cmds if c[-1].endswith(".ts")]
+    mux_cmds = [c for c in cmds if c[-1] == str(out_m4b)]
+    assert len(part_cmds) == 2
+    for p_cmd in part_cmds:
+        assert p_cmd[p_cmd.index("-c:a") + 1] == "aac"
+        assert p_cmd[p_cmd.index("-b:a") + 1] == "64k"
+        assert p_cmd[p_cmd.index("-ar") + 1] == "22050"
+    assert len(mux_cmds) == 1
+    assert mux_cmds[0][mux_cmds[0].index("-c:a") + 1] == "copy"
+
+
+@pytest.mark.ffmpeg
+def test_real_ffmpeg_custom_sample_rate_and_same_format_bitrate(tmp_path):
+    ffmpeg = find_executable("ffmpeg")
+    ffprobe = find_executable("ffprobe")
+    if not ffmpeg or not ffprobe:
+        pytest.skip("ffmpeg/ffprobe not available")
+    assert ffmpeg is not None
+
+    src_mp3 = tmp_path / "tone.mp3"
+    subprocess.run(
+        [
+            ffmpeg,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100:duration=1.0",
+            "-threads",
+            "1",
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "192k",
+            str(src_mp3),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    converted = convert_output([str(src_mp3)], "mp3", audio_bitrate="64k", sample_rate=22050)
+    assert converted == [str(src_mp3)]
+    info = output._probe_audio_info(converted[0])
+    assert info.codec_name == "mp3"
+    assert info.sample_rate == 22050
+    assert info.bitrate is not None and 48000 <= info.bitrate <= 85000
 
 
 

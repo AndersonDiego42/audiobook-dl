@@ -42,6 +42,8 @@ from audiobookdl.pipeline import (
 from audiobookdl.utils import (
     AudioProbeInfo,
     find_executable,
+    normalize_audio_bitrate,
+    normalize_sample_rate,
     probe_audio_info,
     subprocess_kwargs,
 )
@@ -599,12 +601,28 @@ def _pack_single_track(
     chapters = None if options.no_chapters else (spec.audiobook.chapters or None)
     use_loudnorm = bool(getattr(options, "loudnorm", False))
     use_mono = bool(getattr(options, "mono", False))
+    explicit_bitrate = normalize_audio_bitrate(getattr(options, "audio_bitrate", None))
+    target_sample_rate = normalize_sample_rate(getattr(options, "sample_rate", None))
+    needs_bitrate_reencode = (
+        explicit_bitrate is not None
+        and target_ext not in output.ffmpeg_metadata.LOSSLESS_CONTAINERS
+    )
     needs_mp4_mux = (
         src_ext == target_ext
         and target_ext in output.MP4_CONTAINERS
         and (chapters is not None or spec.audiobook.cover is not None)
     )
-    if src_ext == target_ext and not needs_mp4_mux and not use_loudnorm and not use_mono:
+    can_copy = (
+        src_ext == target_ext
+        and not needs_mp4_mux
+        and not use_loudnorm
+        and not use_mono
+        and not needs_bitrate_reencode
+    )
+    if can_copy and target_sample_rate is not None:
+        src_info = output._get_cached_probe(src_path, probe_cache)
+        can_copy = src_info.sample_rate == target_sample_rate
+    if can_copy:
         shutil.copy2(src_path, staged_path)
         return False, False
 
@@ -613,6 +631,8 @@ def _pack_single_track(
         extra_filter_kwargs["loudnorm"] = True
     if use_mono:
         extra_filter_kwargs["mono"] = True
+    if target_sample_rate is not None:
+        extra_filter_kwargs["sample_rate"] = target_sample_rate
     _converted_path, chapters_embedded = output.convert_single_file(
         src_path,
         target_ext,
@@ -736,11 +756,14 @@ def pack_book(
 
     use_loudnorm = bool(getattr(options, "loudnorm", False))
     use_mono = bool(getattr(options, "mono", False))
+    target_sample_rate = normalize_sample_rate(getattr(options, "sample_rate", None))
     extra_filter_kwargs: dict[str, Any] = {}
     if use_loudnorm:
         extra_filter_kwargs["loudnorm"] = True
     if use_mono:
         extra_filter_kwargs["mono"] = True
+    if target_sample_rate is not None:
+        extra_filter_kwargs["sample_rate"] = target_sample_rate
 
     try:
         chapters = None if options.no_chapters else (spec.audiobook.chapters or None)

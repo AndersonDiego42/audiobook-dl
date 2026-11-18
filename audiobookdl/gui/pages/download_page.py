@@ -90,10 +90,15 @@ class DownloadPage(ttk.Frame):
         concurrency_var: tk.IntVar | None = None,
         on_concurrency_changed: Callable[[int], None] | None = None,
         on_retry_selected: Callable[[Sequence[str]], None] | None = None,
+        profile_choices_provider: Callable[[], list[str]] | None = None,
+        on_select_profile: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__(parent, padding=(scale_px(parent, 12), scale_px(parent, 8)))
         self._window = root
         self._palette_provider = palette_provider
+        self._on_open_accounts = on_open_accounts
+        self._profile_choices_provider = profile_choices_provider
+        self._on_select_profile = on_select_profile
         self._split_ratio: float | None = (
             float(initial_split_ratio)
             if (initial_split_ratio is not None and 0.0 < float(initial_split_ratio) < 1.0)
@@ -208,11 +213,12 @@ class DownloadPage(ttk.Frame):
             style="Chip.TButton",
             command=on_open_accounts,
         )
+        self.account_chip_btn.bind("<Button-3>", self.show_profile_menu)
         self._apply_folder_bar_layout("wide")
         self._folder_bar.bind("<Configure>", self._on_folder_bar_configure, add="+")
         attach_tooltip(
             self.account_chip_btn,
-            "Active service and profile (click to edit credentials on the Accounts page)",
+            "Active service and profile (click to edit credentials on Accounts page; right-click to switch profile)",
             palette_provider=palette_provider,
         )
         attach_tooltip(
@@ -373,6 +379,33 @@ class DownloadPage(ttk.Frame):
         prof = profile or "default"
         status = saved_badge if saved_badge else "Not set"
         self.account_chip_var.set(f"{svc} \u2022 {prof} [{status}]")
+
+    def show_profile_menu(self, event: tk.Event | None = None) -> None:
+        """Open a quick context menu to switch active profile or manage accounts."""
+        menu = tk.Menu(self, tearoff=False)
+        profiles = self._profile_choices_provider() if self._profile_choices_provider is not None else ["default"]
+        if not profiles:
+            profiles = ["default"]
+        for prof in profiles:
+            def _select_cb(target: str = prof) -> None:
+                if self._on_select_profile is not None:
+                    self._on_select_profile(target)
+
+            menu.add_command(
+                label=f"Profile: {prof}",
+                command=_select_cb,
+            )
+        menu.add_separator()
+        menu.add_command(label="Manage Accounts...", command=self._on_open_accounts)
+        if event is not None:
+            x, y = event.x_root, event.y_root
+        else:
+            x = self.account_chip_btn.winfo_rootx()
+            y = self.account_chip_btn.winfo_rooty() + self.account_chip_btn.winfo_height()
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
 
     def insert_template_token(self, token: str) -> None:
         entry = self.tpl_entry

@@ -19,6 +19,7 @@ from audiobookdl.utils import (
     MP4_CONTAINERS,
     find_executable,
     normalize_audio_bitrate,
+    normalize_sample_rate,
     probe_audio_info,
 )
 from audiobookdl.utils.concurrency import (
@@ -434,13 +435,17 @@ def _build_reencode_codec_args(
     *,
     loudnorm: bool = False,
     mono: bool = False,
+    sample_rate: int | str | None = None,
     preserve_video: bool = False,
 ) -> list[str]:
     """Return FFmpeg codec/container flags forcing re-encode into `target_ext`."""
     explicit_bitrate = normalize_audio_bitrate(audio_bitrate)
+    target_sample_rate = normalize_sample_rate(sample_rate)
     filter_args: list[str] = []
     if loudnorm:
         filter_args += ["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"]
+    if target_sample_rate is not None:
+        filter_args += ["-ar", str(target_sample_rate)]
     if mono:
         filter_args += ["-ac", "1"]
     video_args = ["-c:v", "copy"] if preserve_video else []
@@ -456,13 +461,31 @@ def _build_reencode_codec_args(
             args += ["-movflags", "+faststart"]
         return args
     if target_ext == "mp3":
+        if video_only:
+            return [*video_args]
         bitrate = explicit_bitrate or (
             f"{max(64, min(round(info.bitrate / 1000), 320))}k"
             if info.bitrate and info.bitrate > 0
             else "192k"
         )
         return [*video_args, *filter_args, "-c:a", "libmp3lame", "-b:a", bitrate]
-    if explicit_bitrate is not None and target_ext not in ffmpeg_metadata.LOSSLESS_CONTAINERS and not video_only:
+    if video_only:
+        return [*video_args]
+    if target_ext == "opus":
+        args = [*video_args, *filter_args, "-c:a", "libopus"]
+        if explicit_bitrate is not None:
+            args += ["-b:a", explicit_bitrate]
+        return args
+    if target_ext == "ogg":
+        args = [*video_args, *filter_args, "-c:a", "libvorbis"]
+        if explicit_bitrate is not None:
+            args += ["-b:a", explicit_bitrate]
+        return args
+    if target_ext == "flac":
+        return [*video_args, *filter_args, "-c:a", "flac"]
+    if target_ext == "wav":
+        return [*video_args, *filter_args, "-c:a", "pcm_s16le"]
+    if explicit_bitrate is not None and target_ext not in ffmpeg_metadata.LOSSLESS_CONTAINERS:
         return [*video_args, *filter_args, "-b:a", explicit_bitrate]
     return [*video_args, *filter_args]
 
@@ -476,23 +499,36 @@ def _build_mux_codec_args(
     *,
     loudnorm: bool = False,
     mono: bool = False,
+    sample_rate: int | str | None = None,
     preserve_video: bool = False,
 ) -> list[str]:
     """Return FFmpeg codec/container flags for muxing or transcoding to `target_ext`."""
-    if loudnorm or mono:
+    explicit_bitrate = normalize_audio_bitrate(audio_bitrate)
+    target_sample_rate = normalize_sample_rate(sample_rate)
+    video_only = preserve_video and not info.codec_name
+    needs_bitrate_reencode = (
+        not video_only
+        and explicit_bitrate is not None
+        and target_ext not in ffmpeg_metadata.LOSSLESS_CONTAINERS
+    )
+    needs_sample_rate_reencode = (
+        not video_only
+        and target_sample_rate is not None
+        and info.sample_rate != target_sample_rate
+    )
+    if loudnorm or mono or needs_bitrate_reencode or needs_sample_rate_reencode:
         return _build_reencode_codec_args(
             target_ext,
             info,
-            audio_bitrate,
+            explicit_bitrate,
             faststart=faststart,
             loudnorm=loudnorm,
             mono=mono,
+            sample_rate=target_sample_rate,
             preserve_video=preserve_video,
         )
-    explicit_bitrate = normalize_audio_bitrate(audio_bitrate)
     codec = info.codec_name
     video_args = ["-c:v", "copy"] if preserve_video else []
-    video_only = preserve_video and not codec
     if target_ext in MP4_CONTAINERS:
         if video_only:
             args = [*video_args]
@@ -672,6 +708,7 @@ def combine_audiofiles(
     faststart: bool = True,
     loudnorm: bool = False,
     mono: bool = False,
+    sample_rate: int | str | None = None,
     preserve_video: bool = False,
     show_progress: bool = True,
     max_workers: int | None = None,
@@ -687,10 +724,15 @@ def combine_audiofiles(
         raise FailedCombining
     if cancel_event is not None and cancel_event.is_set():
         raise DownloadCancelled
-    normalize_audio_bitrate(audio_bitrate)
+    explicit_bitrate = normalize_audio_bitrate(audio_bitrate)
+    target_sample_rate = normalize_sample_rate(sample_rate)
     ffmpeg = _require_executable("ffmpeg")
     cache: dict[str, AudioProbeInfo] = probe_cache if probe_cache is not None else {}
     output_extension = get_extension(output_path)
+    needs_bitrate_reencode = (
+        explicit_bitrate is not None
+        and output_extension not in ffmpeg_metadata.LOSSLESS_CONTAINERS
+    )
     work_dir = f"{os.path.normpath(tmp_dir)}.work"
     ts_dir = os.path.join(work_dir, "ts_parts")
     chapter_file = os.path.join(work_dir, "ffmetadata.txt")
@@ -734,6 +776,7 @@ def combine_audiofiles(
         )
 
         concat_demuxer_mode = False
+        parts_encoded_audio = False
         ffmpeg_input_flags: list[str] = []
         mux_source_ext = get_extension(filepaths[0])
         sample_info: AudioProbeInfo
@@ -758,11 +801,14 @@ def combine_audiofiles(
                     channel_counts = {i.channels for i in input_infos if i.channels}
                     any_non_aac = any(i.codec_name != "aac" for i in input_infos)
                     mixed_stream_params = len(sample_rates) > 1 or len(channel_counts) > 1
-                    if any_non_aac or mixed_stream_params:
+                    needs_sr_encode = target_sample_rate is not None and any(
+                        i.sample_rate != target_sample_rate for i in input_infos
+                    )
+                    if any_non_aac or mixed_stream_params or needs_bitrate_reencode or needs_sr_encode:
                         parallel_aac_encoded = True
                         bitrate_info = next((i for i in input_infos if i.bitrate and i.bitrate > 0), input_infos[0])
-                        target_bitrate = _resolve_aac_bitrate_from_info(bitrate_info, audio_bitrate)
-                        target_sr = max(sample_rates) if sample_rates else None
+                        target_bitrate = _resolve_aac_bitrate_from_info(bitrate_info, explicit_bitrate)
+                        target_sr = target_sample_rate or (max(sample_rates) if sample_rates else None)
                         target_ch = max(channel_counts) if channel_counts else None
 
                 padding = len(str(len(filepaths)))
@@ -785,6 +831,8 @@ def combine_audiofiles(
                         needs_encode = parallel_aac_encoded and (
                             src_info is None
                             or src_info.codec_name != "aac"
+                            or needs_bitrate_reencode
+                            or (target_sample_rate is not None and src_info.sample_rate != target_sample_rate)
                             or (target_sr is not None and src_info.sample_rate not in (None, target_sr))
                             or (target_ch is not None and src_info.channels not in (None, target_ch))
                         )
@@ -847,6 +895,7 @@ def combine_audiofiles(
                         raise FailedCombining
                     ts_paths.append(ts_path)
 
+            parts_encoded_audio = parallel_aac_encoded and not loudnorm and not mono
             sample_info = _get_cached_probe(ts_paths[0], cache)
             if len(ts_paths) == 1:
                 ffmpeg_input = ts_paths[0]
@@ -884,7 +933,7 @@ def combine_audiofiles(
                 assert input_infos is not None
                 sample_rates = {i.sample_rate for i in input_infos if i.sample_rate}
                 channel_counts = {i.channels for i in input_infos if i.channels}
-                target_sr = max(sample_rates) if sample_rates else None
+                target_sr = target_sample_rate or (max(sample_rates) if sample_rates else None)
                 target_ch = 1 if mono else (max(channel_counts) if channel_counts else None)
                 if output_extension == "wav":
                     inter_ext, inter_codec, inter_bitrate = "wav", "pcm_s16le", None
@@ -978,10 +1027,11 @@ def combine_audiofiles(
             mux_source_ext,
             output_extension,
             sample_info,
-            audio_bitrate,
+            None if parts_encoded_audio else explicit_bitrate,
             faststart=faststart,
             loudnorm=loudnorm,
             mono=mono,
+            sample_rate=None if parts_encoded_audio else target_sample_rate,
             preserve_video=preserve_video,
         )
         capture = not logging.is_ffmpeg_output()
@@ -1063,6 +1113,7 @@ def convert_single_file(
     faststart: bool = True,
     loudnorm: bool = False,
     mono: bool = False,
+    sample_rate: int | str | None = None,
     preserve_video: bool = False,
     show_progress: bool = True,
 ) -> tuple[str, bool]:
@@ -1072,17 +1123,28 @@ def convert_single_file(
     Returns `(new_path, chapters_embedded)`.
     """
     explicit_bitrate = normalize_audio_bitrate(audio_bitrate)
+    target_sample_rate = normalize_sample_rate(sample_rate)
     target_format = output_format.lstrip(".").lower()
     path_without_ext, old_ext_raw = os.path.splitext(old_path)
     old_ext = old_ext_raw.lstrip(".").lower()
     new_path = output_path or f"{path_without_ext}.{target_format}"
+    needs_bitrate_reencode = (
+        explicit_bitrate is not None
+        and target_format not in ffmpeg_metadata.LOSSLESS_CONTAINERS
+    )
+    same_path = output_path is None or os.path.abspath(new_path) == os.path.abspath(old_path)
     if (
         not loudnorm
         and not mono
+        and not needs_bitrate_reencode
         and target_format == old_ext
-        and (output_path is None or os.path.abspath(new_path) == os.path.abspath(old_path))
+        and same_path
     ):
-        return new_path, False
+        if target_sample_rate is None:
+            return new_path, False
+        pre_info = _get_cached_probe(old_path, probe_cache)
+        if pre_info.sample_rate == target_sample_rate:
+            return new_path, False
 
     ffmpeg = _require_executable("ffmpeg")
     capture = not logging.is_ffmpeg_output()
@@ -1125,6 +1187,7 @@ def convert_single_file(
         faststart=faststart,
         loudnorm=loudnorm,
         mono=mono,
+        sample_rate=target_sample_rate,
         preserve_video=preserve_video,
     )
     if show_progress and capture and info.duration > 0:
@@ -1376,6 +1439,7 @@ def split_audio_by_chapters(
     probe_cache: dict[str, AudioProbeInfo] | None = None,
     loudnorm: bool = False,
     mono: bool = False,
+    sample_rate: int | str | None = None,
     preserve_video: bool = False,
     max_workers: int | None = None,
     intro_chapter_mode: str = "auto",
@@ -1383,6 +1447,8 @@ def split_audio_by_chapters(
     """
     Split `master_path` into individual zero-padded chapter files inside `output_dir`.
     """
+    explicit_bitrate = normalize_audio_bitrate(audio_bitrate)
+    target_sample_rate = normalize_sample_rate(sample_rate)
     if not chapters:
         return [master_path]
     ffmpeg = _require_executable("ffmpeg")
@@ -1390,22 +1456,37 @@ def split_audio_by_chapters(
     src_ext = get_extension(master_path)
     target_format = (output_format or src_ext).lstrip(".").lower()
     info = _get_cached_probe(master_path, probe_cache)
-    effective_accurate = accurate or loudnorm or mono
+    needs_bitrate_reencode = (
+        explicit_bitrate is not None
+        and target_format not in ffmpeg_metadata.LOSSLESS_CONTAINERS
+    )
+    needs_sample_rate_reencode = (
+        target_sample_rate is not None and info.sample_rate != target_sample_rate
+    )
+    effective_accurate = (
+        accurate
+        or loudnorm
+        or mono
+        or needs_bitrate_reencode
+        or needs_sample_rate_reencode
+    )
     fast_codec_args = _build_mux_codec_args(
         src_ext,
         target_format,
         info,
-        audio_bitrate,
+        explicit_bitrate,
         loudnorm=loudnorm,
         mono=mono,
+        sample_rate=target_sample_rate,
         preserve_video=preserve_video,
     )
     reencode_codec_args = _build_reencode_codec_args(
         target_format,
         info,
-        audio_bitrate,
+        explicit_bitrate,
         loudnorm=loudnorm,
         mono=mono,
+        sample_rate=target_sample_rate,
         preserve_video=preserve_video,
     )
     format_args = ["-f", "mp4"] if target_format == "m4b" else []
@@ -1520,6 +1601,7 @@ def merge_segment_groups_into_chapters(
     probe_cache: dict[str, AudioProbeInfo] | None = None,
     loudnorm: bool = False,
     mono: bool = False,
+    sample_rate: int | str | None = None,
     preserve_video: bool = False,
     max_workers: int | None = None,
     intro_chapter_mode: str = "auto",
@@ -1527,12 +1609,18 @@ def merge_segment_groups_into_chapters(
     """
     Merge pre-grouped segment lists directly into per-chapter/per-lesson files in `output_dir`.
     """
+    explicit_bitrate = normalize_audio_bitrate(audio_bitrate)
+    target_sample_rate = normalize_sample_rate(sample_rate)
     non_empty = [(title, list(paths)) for title, paths in segment_groups if paths]
     if not non_empty:
         return []
     os.makedirs(output_dir, exist_ok=True)
     cache: dict[str, AudioProbeInfo] = probe_cache if probe_cache is not None else {}
     target_format = (output_format or get_extension(non_empty[0][1][0])).lstrip(".").lower()
+    needs_bitrate_reencode = (
+        explicit_bitrate is not None
+        and target_format not in ffmpeg_metadata.LOSSLESS_CONTAINERS
+    )
     total = len(non_empty)
     resolved_entries = resolve_split_chapter_entries(
         [title for title, _paths in non_empty],
@@ -1565,24 +1653,30 @@ def merge_segment_groups_into_chapters(
                     try:
                         if len(group_paths) == 1:
                             src = group_paths[0]
-                            if (
+                            can_copy = (
                                 not loudnorm
                                 and not mono
+                                and not needs_bitrate_reencode
                                 and get_extension(src) == target_format
-                            ):
+                            )
+                            if can_copy and target_sample_rate is not None:
+                                src_info = _get_cached_probe(src, cache)
+                                can_copy = src_info.sample_rate == target_sample_rate
+                            if can_copy:
                                 shutil.copy2(src, out_path)
                             else:
                                 convert_single_file(
                                     src,
                                     target_format,
                                     cancel_event=effective_cancel,
-                                    audio_bitrate=audio_bitrate,
+                                    audio_bitrate=explicit_bitrate,
                                     remove_source=False,
                                     probe_cache=cache,
                                     output_path=out_path,
                                     faststart=True,
                                     loudnorm=loudnorm,
                                     mono=mono,
+                                    sample_rate=target_sample_rate,
                                     preserve_video=preserve_video,
                                     show_progress=False,
                                 )
@@ -1594,11 +1688,12 @@ def merge_segment_groups_into_chapters(
                                 group_tmp,
                                 out_path,
                                 cancel_event=effective_cancel,
-                                audio_bitrate=audio_bitrate,
+                                audio_bitrate=explicit_bitrate,
                                 probe_cache=cache,
                                 faststart=True,
                                 loudnorm=loudnorm,
                                 mono=mono,
+                                sample_rate=target_sample_rate,
                                 preserve_video=preserve_video,
                                 show_progress=False,
                                 max_workers=max_workers,
@@ -1653,6 +1748,7 @@ def merge_hls_segments_into_chapters(
     probe_cache: dict[str, AudioProbeInfo] | None = None,
     loudnorm: bool = False,
     mono: bool = False,
+    sample_rate: int | str | None = None,
     preserve_video: bool = False,
     max_workers: int | None = None,
     intro_chapter_mode: str = "auto",
@@ -1660,6 +1756,8 @@ def merge_hls_segments_into_chapters(
     """
     Combine fine-grained HLS segment files seamlessly and split cleanly by `chapters`.
     """
+    explicit_bitrate = normalize_audio_bitrate(audio_bitrate)
+    target_sample_rate = normalize_sample_rate(sample_rate)
     if not filepaths:
         return []
     cache: dict[str, AudioProbeInfo] = probe_cache if probe_cache is not None else {}
@@ -1681,10 +1779,11 @@ def merge_hls_segments_into_chapters(
             combine_work,
             master_path,
             cancel_event=cancel_event,
-            audio_bitrate=audio_bitrate,
+            audio_bitrate=explicit_bitrate,
             probe_cache=cache,
             loudnorm=loudnorm,
             mono=mono,
+            sample_rate=target_sample_rate,
             preserve_video=preserve_video,
             max_workers=max_workers,
         )
@@ -1694,8 +1793,8 @@ def merge_hls_segments_into_chapters(
             chapters,
             output_format=target_format,
             cancel_event=cancel_event,
-            audio_bitrate=audio_bitrate,
             probe_cache=cache,
+            sample_rate=target_sample_rate,
             preserve_video=preserve_video,
             max_workers=max_workers,
             intro_chapter_mode=intro_chapter_mode,
@@ -1716,12 +1815,14 @@ def convert_output(
     audio_bitrate: str | None = None,
     loudnorm: bool = False,
     mono: bool = False,
+    sample_rate: int | str | None = None,
     probe_cache: dict[str, AudioProbeInfo] | None = None,
     preserve_video: bool = False,
     max_workers: int | None = None,
 ):
     """Converts a list of media files into another format and returns new files"""
     explicit_bitrate = normalize_audio_bitrate(audio_bitrate)
+    target_sample_rate = normalize_sample_rate(sample_rate)
     if not filenames:
         return []
     _require_executable("ffmpeg")
@@ -1736,6 +1837,7 @@ def convert_output(
             probe_cache=probe_cache,
             loudnorm=loudnorm,
             mono=mono,
+            sample_rate=target_sample_rate,
             preserve_video=preserve_video,
         )
         return [new_path]
@@ -1764,6 +1866,7 @@ def convert_output(
                 probe_cache=probe_cache,
                 loudnorm=loudnorm,
                 mono=mono,
+                sample_rate=target_sample_rate,
                 preserve_video=preserve_video,
             )
         except BaseException as exc:

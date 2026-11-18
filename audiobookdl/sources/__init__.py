@@ -38,6 +38,11 @@ class ServiceInfo:
     supports_search: bool = False
     supports_library: bool = False
 
+    @property
+    def supports_oauth(self) -> bool:
+        """Return `True` when this service declares OAuth authentication."""
+        return "oauth" in self.auth_methods
+
 
 def get_available_services() -> list[ServiceInfo]:
     """Return sorted metadata for all supported audiobook services."""

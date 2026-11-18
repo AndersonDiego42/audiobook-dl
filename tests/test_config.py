@@ -62,26 +62,37 @@ def test_save_output_preferences_preserves_sources(tmp_path):
         True,
         config_location=str(cfg_path),
         audio_bitrate="192k",
+        sample_rate=44100,
         resume=True,
     )
     loaded_with_opts = load_config(str(cfg_path))
     assert loaded_with_opts.audio_bitrate == "192k"
+    assert loaded_with_opts.sample_rate == 44100
     assert loaded_with_opts.resume is True
 
-    # Updating only format/combine without passing audio_bitrate/resume preserves them
+    # Updating only format/combine without passing audio_bitrate/sample_rate/resume preserves them
     save_output_preferences("mp3", False, config_location=str(cfg_path))
     preserved = load_config(str(cfg_path))
     assert preserved.output_format == "mp3"
     assert preserved.combine is False
     assert preserved.audio_bitrate == "192k"
+    assert preserved.sample_rate == 44100
     assert preserved.resume is True
 
-    # Passing None clears audio_bitrate
-    save_output_preferences(None, False, config_location=str(cfg_path), audio_bitrate=None, resume=False)
+    # Passing None clears audio_bitrate and sample_rate
+    save_output_preferences(
+        None,
+        False,
+        config_location=str(cfg_path),
+        audio_bitrate=None,
+        sample_rate=None,
+        resume=False,
+    )
     reloaded = load_config(str(cfg_path))
     assert reloaded.output_format is None
     assert reloaded.combine is False
     assert reloaded.audio_bitrate is None
+    assert reloaded.sample_rate is None
     assert reloaded.resume is False
 
 
@@ -707,4 +718,118 @@ def test_tomlkit_preserves_multiline_strings_arrays_inline_tables_and_aot(tmp_pa
     assert parsed["custom_tools"]["layout"] == {"mode": "compact", "columns": 2}
     assert parsed["custom_tools"]["targets"] == ["storytel:us", "audible:uk"]
     assert parsed["custom_tools"]["hooks"] == [{"name": "first"}]
+
+
+def test_save_source_credentials_preserves_locale_and_oauth_overrides(tmp_path):
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    cfg_path.write_text(
+        '[sources.storytel.profiles.work]\n'
+        'username = "alice"\n'
+        'locale = "sv"\n'
+        'oauth_client_id = "cid-1"\n'
+        'oauth_scopes = ["read", "write"]\n',
+        encoding="utf-8",
+    )
+    save_source_credentials(
+        "storytel",
+        username="alice2",
+        password="secret",
+        overwrite=str(cfg_path),
+        profile="work",
+    )
+    cfg = load_config(str(cfg_path))
+    work = cfg.sources["storytel:work"]
+    assert work.username == "alice2"
+    assert work.password == "secret"
+    assert work.locale == "sv"
+    assert work.oauth_client_id == "cid-1"
+    assert work.oauth_scopes == ("read", "write")
+
+
+def test_rename_and_delete_source_profile_migrates_secrets_and_caches(tmp_path):
+    from audiobookdl.config import (
+        delete_source_profile,
+        load_source_oauth_token,
+        rename_source_profile,
+        save_source_oauth_token,
+    )
+    from audiobookdl.utils.oauth import OAuthTokenBundle
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    db_dir = tmp_path / "db"
+    svc_dir = db_dir / "bookbeat"
+    svc_dir.mkdir(parents=True)
+
+    save_source_credentials(
+        "bookbeat",
+        username="bob",
+        password="pw1",
+        locale="en",
+        overwrite=str(cfg_path),
+        profile="work",
+    )
+    save_source_oauth_token(
+        "bookbeat",
+        OAuthTokenBundle(access_token="tok-work", refresh_token="ref-work"),
+        profile="work",
+        overwrite=str(cfg_path),
+    )
+    (svc_dir / "session_cookies_work.txt").write_text("# cookies", encoding="utf-8")
+    (svc_dir / "bookbeat_device_id_work.txt").write_text("dev-work-1\n", encoding="utf-8")
+
+    rename_source_profile(
+        "bookbeat",
+        "work",
+        "personal",
+        overwrite=str(cfg_path),
+        database_directory=str(db_dir),
+    )
+    cfg_after_rename = load_config(str(cfg_path))
+    assert "bookbeat:work" not in cfg_after_rename.sources
+    assert cfg_after_rename.sources["bookbeat:personal"].username == "bob"
+    assert cfg_after_rename.sources["bookbeat:personal"].password == "pw1"
+    assert cfg_after_rename.sources["bookbeat:personal"].locale == "en"
+    assert cfg_after_rename.sources["bookbeat:personal"].oauth_token_present is True
+    assert not (svc_dir / "session_cookies_work.txt").exists()
+    assert (svc_dir / "session_cookies_personal.txt").is_file()
+    assert not (svc_dir / "bookbeat_device_id_work.txt").exists()
+    assert (svc_dir / "bookbeat_device_id_personal.txt").read_text(encoding="utf-8").strip() == "dev-work-1"
+    assert load_source_oauth_token("bookbeat", profile="personal", overwrite=str(cfg_path)).access_token == "tok-work"
+
+    delete_source_profile(
+        "bookbeat",
+        profile="personal",
+        overwrite=str(cfg_path),
+        database_directory=str(db_dir),
+    )
+    cfg_after_del = load_config(str(cfg_path))
+    assert "bookbeat:personal" not in cfg_after_del.sources
+    assert load_source_oauth_token("bookbeat", profile="personal", overwrite=str(cfg_path)) is None
+    assert not (svc_dir / "session_cookies_personal.txt").exists()
+    assert not (svc_dir / "bookbeat_device_id_personal.txt").exists()
+
+
+def test_source_device_id_is_isolated_per_profile(tmp_path):
+    from audiobookdl.options_schema import build_default_options
+    from audiobookdl.sources.source import Source
+
+    class _DevSource(Source[str]):
+        names = ["DevSrc"]
+        match = [r"https?://devsrc\.example\.com/\d+"]
+
+    default_opts = build_default_options(database_directory=str(tmp_path / "db"))
+    work_opts = build_default_options(database_directory=str(tmp_path / "db"), profile="work")
+
+    s_default = _DevSource(default_opts)
+    s_work = _DevSource(work_opts)
+    try:
+        id_def = s_default.get_or_create_device_id("my_device_id.txt", lambda: "dev-default")
+        id_work = s_work.get_or_create_device_id("my_device_id.txt", lambda: "dev-work")
+        assert id_def == "dev-default"
+        assert id_work == "dev-work"
+        assert (tmp_path / "db" / "devsrc" / "my_device_id.txt").is_file()
+        assert (tmp_path / "db" / "devsrc" / "my_device_id_work.txt").is_file()
+    finally:
+        s_default.close()
+        s_work.close()
 

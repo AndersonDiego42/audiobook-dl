@@ -7,6 +7,7 @@ from audiobookdl.utils.audiobook import (
     parse_language,
     parse_release_date,
 )
+from audiobookdl.utils.oauth import OAuthProviderConfig, OAuthTokenBundle
 
 import os
 import re
@@ -19,6 +20,11 @@ class SaxoSource(Source):
     names = ["Saxo"]
     supports_search = True
     supports_library = True
+    oauth_provider = OAuthProviderConfig(
+        authorization_url="https://auth-read.saxo.com/auth/token",
+        token_url="https://auth-read.saxo.com/auth/token",
+        client_id="",
+    )
     match = [
         r"https?://(?:www\.)?saxo\.(?:com|dk)/[^/]+/.+",
     ]
@@ -46,6 +52,20 @@ class SaxoSource(Source):
         except (RequestError, UserNotAuthorized, ValueError):
             return False
 
+    def apply_oauth_token(
+        self,
+        token: OAuthTokenBundle,
+        *,
+        set_auth_header: bool = False,
+    ) -> None:
+        """Apply a persisted Saxo OAuth token bundle (`access_token` + user `id`)."""
+        user_id = token.extra.get("id") or token.extra.get("user_id") or getattr(self, "user_id", None)
+        if not user_id:
+            raise UserNotAuthorized(detail="Cached Saxo OAuth token is missing user id")
+        self.bearer_token = token.access_token
+        self.user_id = user_id
+        super().apply_oauth_token(token, set_auth_header=set_auth_header)
+
     def _login(self, url: str, username: str, password: str) -> None:
         resp = self.post_json(
             "https://auth-read.saxo.com/auth/token",
@@ -58,8 +78,10 @@ class SaxoSource(Source):
                 "Content-Type": "application/x-www-form-urlencoded",
             },
         )
-        self.bearer_token = resp["access_token"]
+        token = OAuthTokenBundle.from_token_response(resp)
+        self.bearer_token = token.access_token
         self.user_id = resp["id"]
+        self.apply_oauth_token(token, set_auth_header=False)
         logging.debug(f"bearer_token={logging.mask_secret(self.bearer_token)}")
         logging.debug(f"{self.user_id=}")
 

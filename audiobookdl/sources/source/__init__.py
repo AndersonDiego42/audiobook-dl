@@ -3,7 +3,8 @@ from __future__ import annotations
 # Internal imports
 from . import networking
 from audiobookdl import logging, Result, Audiobook, Cover
-from audiobookdl.exceptions import DataNotPresent, GenericAudiobookDLException
+from audiobookdl.config import profile_scoped_filename
+from audiobookdl.exceptions import DataNotPresent, GenericAudiobookDLException, UserNotAuthorized
 from audiobookdl.utils import CustomSSLContextHTTPAdapter
 from audiobookdl.utils.audiobook import detect_image_extension
 from audiobookdl.utils.fs import atomic_write_text
@@ -33,6 +34,7 @@ import urllib3
 
 if TYPE_CHECKING:
     from audiobookdl.options_schema import DownloadOptions
+    from audiobookdl.utils.oauth import OAuthProviderConfig, OAuthTokenBundle
 
 T = TypeVar("T")
 
@@ -120,6 +122,8 @@ class Source(Generic[T]):
     names: list[str] = []
     # Methods for authenticating
     _authentication_methods: list[str] = [ "cookies" ]
+    # Optional OAuth 2.0 provider configuration for `"oauth"`-capable sources
+    oauth_provider: OAuthProviderConfig | None = None
     # Create database directory for source
     create_storage_dir: bool = False
     # Discovery capabilities
@@ -132,6 +136,10 @@ class Source(Generic[T]):
     def __init__(self, options: DownloadOptions):
         self.__authenticated: bool = False
         self._loaded_cached_cookies: bool = False
+        self._loaded_cached_oauth: bool = False
+        self._oauth_token: OAuthTokenBundle | None = None
+        self._oauth_client_id_override: str | None = None
+        self._oauth_scopes_override: tuple[str, ...] | None = None
         self.__pages: OrderedDict[str, bytes] = OrderedDict()
         self.__pages_bytes: int = 0
         self._options: DownloadOptions = options
@@ -200,12 +208,19 @@ class Source(Generic[T]):
         """Reset authentication state (and optionally session cookies) before re-login."""
         self.__authenticated = False
         self._loaded_cached_cookies = False
+        self._loaded_cached_oauth = False
+        had_oauth = self._oauth_token is not None
+        self._oauth_token = None
         if clear_cookies and hasattr(self, "_session"):
             self._session.cookies.clear()
+        if had_oauth and hasattr(self, "_session") and hasattr(self._session, "headers"):
+            for existing_key in [k for k in list(self._session.headers.keys()) if str(k).lower() == "authorization"]:
+                self._session.headers.pop(existing_key, None)
 
     def get_or_create_device_id(self, filename: str, factory: Callable[[], str]) -> str:
-        """Return a persisted device identifier in `database_directory`, creating one if absent."""
-        device_file = os.path.join(self.database_directory, filename)
+        """Return a per-profile persisted device identifier in `database_directory`."""
+        scoped_name = profile_scoped_filename(filename, getattr(self._options, "profile", None))
+        device_file = os.path.join(self.database_directory, scoped_name)
         if os.path.isfile(device_file):
             try:
                 with open(device_file, encoding="utf-8") as fh:
@@ -226,6 +241,99 @@ class Source(Generic[T]):
     def supports_cookies(self):
         """Returns `True` if the source supports authentication with cookies"""
         return "cookies" in self._authentication_methods
+
+
+    @property
+    def supports_oauth(self) -> bool:
+        """Return `True` if the source supports OAuth 2.0 authentication."""
+        return "oauth" in self._authentication_methods
+
+
+    @property
+    def oauth_token(self) -> OAuthTokenBundle | None:
+        """Return the active `OAuthTokenBundle` on this source instance, if any."""
+        return self._oauth_token
+
+
+    def get_oauth_provider_config(self) -> OAuthProviderConfig | None:
+        """Return effective `OAuthProviderConfig` with per-profile config overrides applied."""
+        provider = getattr(self, "oauth_provider", None)
+        if provider is None:
+            return None
+        return provider.with_overrides(
+            client_id=self._oauth_client_id_override,
+            scopes=self._oauth_scopes_override,
+        )
+
+
+    def apply_oauth_token(
+        self,
+        token: OAuthTokenBundle,
+        *,
+        set_auth_header: bool = True,
+    ) -> None:
+        """Apply `token` to `self._session` and mark this source as authenticated."""
+        self._oauth_token = token
+        provider = self.get_oauth_provider_config()
+        scheme = provider.auth_scheme if provider is not None else "Bearer"
+        if set_auth_header and hasattr(self, "_session") and hasattr(self._session, "headers"):
+            # Remove any lowercase/mixed-case Authorization header before setting canonical header.
+            for existing_key in [k for k in list(self._session.headers.keys()) if str(k).lower() == "authorization"]:
+                self._session.headers.pop(existing_key, None)
+            self._session.headers["Authorization"] = token.authorization_header(scheme)
+        self.__authenticated = True
+
+
+    def refresh_oauth_token_if_needed(self, *, force: bool = False) -> OAuthTokenBundle | None:
+        """Refresh `self._oauth_token` when expired (or when `force=True`) and re-apply it."""
+        from audiobookdl.utils.oauth import refresh_oauth_token
+
+        token = self._oauth_token
+        if token is None:
+            return None
+        if not force and not token.is_expired():
+            return token
+        provider = self.get_oauth_provider_config()
+        if provider is None or not token.can_refresh:
+            return None
+        refreshed = refresh_oauth_token(provider, token, session=getattr(self, "_session", None))
+        self.apply_oauth_token(refreshed)
+        return refreshed
+
+
+    def oauth_authorize(
+        self,
+        url: str = "",
+        *,
+        interaction: Any | None = None,
+        cancel_event: Any | None = None,
+        open_browser: bool = True,
+    ) -> OAuthTokenBundle:
+        """Run interactive OAuth 2.0 authorization for this source and apply the obtained token."""
+        from audiobookdl.utils.oauth import (
+            run_device_authorization_flow,
+            run_pkce_authorization_code_flow,
+        )
+
+        provider = self.get_oauth_provider_config()
+        if provider is None:
+            raise UserNotAuthorized(detail=f"{self.name} does not define OAuth provider configuration")
+        if provider.device_authorization_url:
+            token = run_device_authorization_flow(
+                provider,
+                session=getattr(self, "_session", None),
+                cancel_event=cancel_event,
+            )
+        else:
+            token = run_pkce_authorization_code_flow(
+                provider,
+                interaction=interaction,
+                open_browser=open_browser,
+                session=getattr(self, "_session", None),
+                cancel_event=cancel_event,
+            )
+        self.apply_oauth_token(token)
+        return token
 
 
     def load_cookie_file(self, cookie_file: str):
@@ -252,11 +360,8 @@ class Source(Generic[T]):
 
     def cached_cookie_path(self) -> str:
         """Return the per-source, per-profile persistent session cookie jar file path."""
-        profile = (getattr(self._options, "profile", None) or "").strip().lower()
-        if profile and profile != "default":
-            safe_profile = re.sub(r"[^a-z0-9_-]", "_", profile)
-            return os.path.join(self.database_directory, f"session_cookies_{safe_profile}.txt")
-        return os.path.join(self.database_directory, "session_cookies.txt")
+        scoped_name = profile_scoped_filename("session_cookies.txt", getattr(self._options, "profile", None))
+        return os.path.join(self.database_directory, scoped_name)
 
     def save_cookie_file(self, cookie_file: str | None = None) -> str:
         """Atomically persist current session cookies in Netscape format and return path written."""
