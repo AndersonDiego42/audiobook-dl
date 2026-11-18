@@ -407,16 +407,6 @@ class ChapterEditorFrame(ttk.Frame):
         self._source_label = source_label
         self._render()
 
-    def set_audition_sources(self, tracks: Sequence[tuple[str, int]] | None) -> None:
-        """Bind local `(path, duration_ms)` tracks used for 5-second boundary auditioning."""
-        self.stop_audition()
-        self._audition_tracks = (
-            [(str(path), max(0, int(dur_ms))) for path, dur_ms in tracks if str(path).strip()]
-            if tracks
-            else []
-        )
-        self._update_audition_button_state()
-
     def _update_audition_button_state(self) -> None:
         if self._audition_proc is not None and self._audition_proc.poll() is None:
             self._audition_btn.configure(text="Stop Audition", state="normal")

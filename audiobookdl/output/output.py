@@ -20,7 +20,6 @@ from audiobookdl.utils import (
     find_executable,
     normalize_audio_bitrate,
     probe_audio_info,
-    resolve_audio_bitrate,
 )
 from audiobookdl.utils.concurrency import (
     ffmpeg_progress_callback,
@@ -148,16 +147,6 @@ def _get_cached_probe(
     return info
 
 
-def _ffmpeg_audio_codec(path: str) -> str:
-    """Returns the codec name of the first audio stream in `path` (empty on failure)"""
-    return _probe_audio_info(path).codec_name
-
-
-def _ffprobe_duration(path: str) -> float:
-    """Returns the duration of `path` in seconds (0.0 on failure)"""
-    return _probe_audio_info(path).duration
-
-
 def verify_audio_integrity(
     path: str,
     *,
@@ -211,13 +200,7 @@ def verify_audio_integrity(
     return info
 
 
-def _ffprobe_audio_bitrate(path: str) -> int | None:
-    """Return the bitrate of `path` in bits/sec via `ffprobe`, or `None` if unavailable."""
-    return _probe_audio_info(path).bitrate
-
-
 def _resolve_aac_bitrate_from_info(
-    source_path: str,
     info: AudioProbeInfo,
     audio_bitrate: str | None = None,
 ) -> str:
@@ -230,17 +213,6 @@ def _resolve_aac_bitrate_from_info(
         return DEFAULT_M4B_BITRATE
     kbps = max(MIN_AUTO_M4B_BITRATE_KBPS, min(round(bps / 1000), MAX_AUTO_M4B_BITRATE_KBPS))
     return f"{kbps}k"
-
-
-def resolve_aac_bitrate(source_path: str, audio_bitrate: str | None = None) -> str:
-    """
-    Determine the target AAC bitrate when transcoding `source_path` to an MP4 container.
-
-    Uses `audio_bitrate` directly when set (e.g. `"192k"`), or probes `source_path`
-    via `ffprobe` in `"auto"`/`None` mode and clamps to `[64k, 192k]` (falling back
-    to `128k` if probing fails).
-    """
-    return resolve_audio_bitrate(source_path, audio_bitrate, probe_bps=_ffprobe_audio_bitrate)
 
 
 def _run_mpegts_part(
@@ -400,21 +372,6 @@ def _write_ffmetadata(
     return bool(chapters_text), bool(meta_text)
 
 
-def _write_ffmetadata_chapters(
-    chapter_path: str,
-    chapters: Sequence[Chapter],
-    duration_sec: float,
-) -> bool:
-    """Write FFMETADATA1 chapter entries bounded to `duration_sec`; return True if any written."""
-    chapters_written, _ = _write_ffmetadata(
-        chapter_path,
-        chapters=chapters,
-        duration_sec=duration_sec,
-        metadata=None,
-    )
-    return chapters_written
-
-
 def _prepare_ffmpeg_cover_file(
     cover: Cover | None,
     output_ext: str,
@@ -471,7 +428,6 @@ def _append_ffmetadata_and_cover_args(
 
 def _build_reencode_codec_args(
     target_ext: str,
-    source_path: str,
     info: AudioProbeInfo,
     audio_bitrate: str | None,
     faststart: bool = True,
@@ -494,7 +450,7 @@ def _build_reencode_codec_args(
         if video_only:
             args = [*video_args]
         else:
-            target_bitrate = _resolve_aac_bitrate_from_info(source_path, info, explicit_bitrate)
+            target_bitrate = _resolve_aac_bitrate_from_info(info, explicit_bitrate)
             args = [*video_args, *filter_args, "-c:a", "aac", "-b:a", target_bitrate]
         if faststart:
             args += ["-movflags", "+faststart"]
@@ -514,7 +470,6 @@ def _build_reencode_codec_args(
 def _build_mux_codec_args(
     source_ext: str,
     target_ext: str,
-    source_path: str,
     info: AudioProbeInfo,
     audio_bitrate: str | None,
     faststart: bool = True,
@@ -527,7 +482,6 @@ def _build_mux_codec_args(
     if loudnorm or mono:
         return _build_reencode_codec_args(
             target_ext,
-            source_path,
             info,
             audio_bitrate,
             faststart=faststart,
@@ -547,7 +501,7 @@ def _build_mux_codec_args(
             if source_ext in ("ts", "aac"):
                 args += ["-bsf:a", "aac_adtstoasc"]
         else:
-            target_bitrate = _resolve_aac_bitrate_from_info(source_path, info, explicit_bitrate)
+            target_bitrate = _resolve_aac_bitrate_from_info(info, explicit_bitrate)
             args = [*video_args, "-c:a", "aac", "-b:a", target_bitrate]
         if faststart:
             args += ["-movflags", "+faststart"]
@@ -657,11 +611,6 @@ def resolve_ffmpeg_pool_workers(
     io_cap = max(2, cpus * 2)
     requested_io = options_max_workers if has_explicit else COMBINE_REMUX_THREADS
     return max(1, min(int(requested_io), min(COMBINE_REMUX_THREADS, io_cap)))  # type: ignore[arg-type]
-
-
-def _transcode_pool_workers(options_max_workers: int | None = None) -> int:
-    """Return bounded worker count for CPU-bound parallel FFmpeg transcodes."""
-    return resolve_ffmpeg_pool_workers(options_max_workers, cpu_bound=True)
 
 
 def _write_concat_list_file(concat_path: str, filepaths: Sequence[str]) -> None:
@@ -812,7 +761,7 @@ def combine_audiofiles(
                     if any_non_aac or mixed_stream_params:
                         parallel_aac_encoded = True
                         bitrate_info = next((i for i in input_infos if i.bitrate and i.bitrate > 0), input_infos[0])
-                        target_bitrate = _resolve_aac_bitrate_from_info(filepaths[0], bitrate_info, audio_bitrate)
+                        target_bitrate = _resolve_aac_bitrate_from_info(bitrate_info, audio_bitrate)
                         target_sr = max(sample_rates) if sample_rates else None
                         target_ch = max(channel_counts) if channel_counts else None
 
@@ -1028,7 +977,6 @@ def combine_audiofiles(
         command += _build_mux_codec_args(
             mux_source_ext,
             output_extension,
-            concat_sources[0] if not use_mpegts_pipeline else ts_paths[0],
             sample_info,
             audio_bitrate,
             faststart=faststart,
@@ -1099,36 +1047,6 @@ def get_extension(path: str) -> str:
     :returns: Extension of path
     """
     return os.path.splitext(path)[1][1:].lower()
-
-
-def combine_supports_direct_output(
-    sample_path: str,
-    output_format: str,
-    probe_cache: dict[str, AudioProbeInfo] | None = None,
-) -> bool:
-    """Return True when `combine_audiofiles` can remux directly into `output_format`."""
-    current = get_extension(sample_path).lower()
-    target = output_format.lstrip(".").lower()
-    if current == target:
-        return True
-    if target in MP4_CONTAINERS and _get_cached_probe(sample_path, probe_cache).codec_name == "aac":
-        return True
-    return False
-
-
-def can_copy_codec(input_format: str, output_format: str) -> bool:
-    """
-    Checks whether the codec can be copies to the new output
-
-    :param input_format: Input file filetype
-    :param output_format: Output file filetype
-    :returns: True if the codec can be copied
-    """
-    src = input_format.lstrip(".").lower()
-    dst = output_format.lstrip(".").lower()
-    return dst == "mkv" \
-        or dst == "mka" \
-        or (src == "ts" and dst == "mp3")
 
 
 def convert_single_file(
@@ -1202,7 +1120,6 @@ def convert_single_file(
     command += _build_mux_codec_args(
         old_ext,
         target_format,
-        old_path,
         info,
         explicit_bitrate,
         faststart=faststart,
@@ -1477,7 +1394,6 @@ def split_audio_by_chapters(
     fast_codec_args = _build_mux_codec_args(
         src_ext,
         target_format,
-        master_path,
         info,
         audio_bitrate,
         loudnorm=loudnorm,
@@ -1486,7 +1402,6 @@ def split_audio_by_chapters(
     )
     reencode_codec_args = _build_reencode_codec_args(
         target_format,
-        master_path,
         info,
         audio_bitrate,
         loudnorm=loudnorm,

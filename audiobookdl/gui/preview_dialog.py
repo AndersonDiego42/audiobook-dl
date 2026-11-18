@@ -287,7 +287,6 @@ class PreviewDialog(ModalDialog):
         )
         self._url = url
         self._source = source
-        self._result = result
         self._is_running = is_running
         self._skip_downloaded = skip_downloaded
         self._series_book_exists = series_book_exists

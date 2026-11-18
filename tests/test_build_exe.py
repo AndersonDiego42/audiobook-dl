@@ -104,7 +104,7 @@ def test_gui_launcher_parses_gui_args_and_launches_self_test():
         mock_self_test.assert_called_once_with(check_gui=True)
 
 
-def test_build_exe_onedir_builds_gui_only_without_cli_companion(tmp_path, monkeypatch):
+def test_build_exe_onedir_builds_single_gui_executable(tmp_path, monkeypatch):
     build_exe = _load_build_exe()
     dist_dir = tmp_path / "dist"
     monkeypatch.setattr(build_exe, "DIST_DIR", dist_dir)
@@ -126,5 +126,4 @@ def test_build_exe_onedir_builds_gui_only_without_cli_companion(tmp_path, monkey
     assert len(captured_cmds) == 1
     assert "--windowed" in captured_cmds[0]
     assert str(build_exe.ENTRY_POINT) == captured_cmds[0][-1]
-    cli_suffix = ".exe" if os.name == "nt" else ""
-    assert not (exe_path.parent / f"audiobook-dl-cli{cli_suffix}").exists()
+    assert [p.name for p in exe_path.parent.iterdir()] == [exe_path.name]

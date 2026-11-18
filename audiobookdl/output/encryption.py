@@ -223,7 +223,6 @@ class ChaCha20StreamDecryptor:
             raise ValueError(
                 f"ChaCha20 nonce must be 8, 12, or 24 bytes (got {len(nonce)})"
             )
-        self._poly1305 = poly1305
         if poly1305:
             aead_cipher = ChaCha20_Poly1305.new(key=key, nonce=nonce)
             if aad:
@@ -681,24 +680,6 @@ def _decrypt_file_stream(
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
         raise
-
-
-def decrypt_file_aes(
-    path: str,
-    key: bytes,
-    iv: bytes,
-    output_path: str | None = None,
-    *,
-    prefix: bytes = b"",
-    padding: Literal["pkcs7", "none"] = "pkcs7",
-) -> None:
-    """Stream-decrypt an AES-CBC file via a sibling temp file and replace atomically."""
-    _decrypt_file_stream(
-        path,
-        AESCBCStreamDecryptor(key, iv, padding=padding),
-        output_path=output_path,
-        prefix=prefix,
-    )
 
 
 def decrypt_file(

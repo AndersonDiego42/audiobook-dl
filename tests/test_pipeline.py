@@ -513,7 +513,8 @@ def test_resolve_redirect_url_fallback_and_prepare_source_result(tmp_path, monke
 
 def test_enrich_metadata_from_openlibrary_fills_missing_without_overwriting():
     from datetime import date
-    from audiobookdl.utils.enrichment import enrich_metadata_from_openlibrary
+    from audiobookdl import AudiobookFile
+    from audiobookdl.utils.enrichment import enrich_audiobook_metadata
 
     payload = {
         "docs": [
@@ -541,8 +542,18 @@ def test_enrich_metadata_from_openlibrary_fills_missing_without_overwriting():
             return _Resp()
 
     meta = AudiobookMetadata(title="Dune", authors=["Frank Herbert"], publisher="Existing Pub")
-    updated = enrich_metadata_from_openlibrary(meta, session=cast(requests.Session, _OkSession()))
-    assert updated is True
+    book = Audiobook(
+        session=cast(requests.Session, _OkSession()),
+        metadata=meta,
+        files=[AudiobookFile(url="https://example.com/a.mp3", ext="mp3")],
+    )
+    res = enrich_audiobook_metadata(
+        book,
+        providers=("openlibrary",),
+        session=cast(requests.Session, _OkSession()),
+        include_chapters=False,
+    )
+    assert res.updated is True
     assert meta.publisher == "Existing Pub"
     assert meta.isbn == "9780441172719"
     assert meta.release_date == date(1965, 1, 1)
@@ -553,13 +564,18 @@ def test_enrich_metadata_from_openlibrary_fills_missing_without_overwriting():
         def get(self, *_args, **_kwargs):
             raise requests.ConnectionError("offline")
 
-    assert (
-        enrich_metadata_from_openlibrary(
-            AudiobookMetadata(title="Dune"),
-            session=cast(requests.Session, _OfflineSession()),
-        )
-        is False
+    offline_book = Audiobook(
+        session=cast(requests.Session, _OfflineSession()),
+        metadata=AudiobookMetadata(title="Dune"),
+        files=[],
     )
+    offline_res = enrich_audiobook_metadata(
+        offline_book,
+        providers=("openlibrary",),
+        session=cast(requests.Session, _OfflineSession()),
+        include_chapters=False,
+    )
+    assert offline_res.updated is False
 
 
 def test_verify_service_auth_caches_and_reloads_cookies(tmp_path, monkeypatch):
@@ -773,7 +789,7 @@ def test_download_result_series_handles_book_has_no_ebook_and_dual_format_series
 def test_enrichment_and_updater_close_auto_sessions_and_process_reuses_source_session(tmp_path, monkeypatch):
     from unittest.mock import MagicMock, patch
     from audiobookdl import AudiobookFile
-    from audiobookdl.utils.enrichment import EnrichmentResult, enrich_metadata_from_openlibrary
+    from audiobookdl.utils.enrichment import EnrichmentResult, enrich_audiobook_metadata
     from audiobookdl.utils.updater import check_for_updates
 
     closed_count = 0
@@ -823,7 +839,11 @@ def test_enrichment_and_updater_close_auto_sessions_and_process_reuses_source_se
     assert enriched_sessions == [fake_session]
 
     monkeypatch.setattr("audiobookdl.utils.enrichment.requests.Session", _FakeAutoSession)
-    enrich_metadata_from_openlibrary(AudiobookMetadata(title="Fallback Close"))
+    enrich_audiobook_metadata(
+        Audiobook(session=None, metadata=AudiobookMetadata(title="Fallback Close"), files=[]),
+        providers=("openlibrary",),
+        include_chapters=False,
+    )
     assert closed_count == 2
 
 

@@ -29,7 +29,6 @@ from audiobookdl.utils.audiobook import (
     parse_language,
     parse_release_date,
 )
-from audiobookdl.utils.enrichment import EnrichmentCandidate
 
 
 OUTPUT_FORMATS = GUI_OUTPUT_FORMATS
@@ -594,25 +593,6 @@ def default_output_dir() -> str:
     if downloads.is_dir():
         return str(downloads)
     return os.getcwd()
-
-
-def format_enrichment_candidate(candidate: EnrichmentCandidate) -> str:
-    """Format an `EnrichmentCandidate` summary for GUI and interactive pickers."""
-    pct = round(candidate.score * 100)
-    authors = ", ".join(candidate.authors) or "Unknown author"
-    extras: list[str] = []
-    if candidate.narrators:
-        extras.append(f"Narr: {', '.join(candidate.narrators)}")
-    if candidate.release_date:
-        extras.append(str(candidate.release_date.year))
-    if candidate.asin:
-        extras.append(f"ASIN:{candidate.asin}")
-    if candidate.isbn:
-        extras.append(f"ISBN:{candidate.isbn}")
-    if candidate.cover_url:
-        extras.append("cover")
-    suffix = f" ({'; '.join(extras)})" if extras else ""
-    return f"[{candidate.provider} {pct}%] {candidate.title} — {authors}{suffix}"
 
 
 def parse_url_text(raw: str) -> list[str]:

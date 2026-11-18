@@ -9,8 +9,6 @@ import lxml.html
 import re
 from urllib.parse import urljoin
 
-LOGIN_URL = "https://www.chirpbooks.com/users/sign_in"
-
 
 class ChirpSource(Source):
     match = [

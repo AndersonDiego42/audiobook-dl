@@ -336,7 +336,6 @@ class Source(Generic[T]):
     
     def on_download_complete(self, audiobook: Audiobook):
         """Called after the download is complete"""
-        pass
 
 
     def clear_page_cache(self) -> None:
@@ -405,14 +404,6 @@ class Source(Generic[T]):
             logging.debug(f"Could not find match from {url} with {regex}")
             raise DataNotPresent
         return m.group(group_index)
-
-
-    def find_all_in_page(self, url: str, regex: str, **kwargs) -> list:
-        """
-        Find all places in a page that matches the regex.
-        Will cache the page.
-        """
-        return re.findall(regex, self._get_page(url, **kwargs).decode("utf-8", errors="replace"))
 
     # Networking
     request = networking.request

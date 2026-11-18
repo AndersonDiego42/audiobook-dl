@@ -1250,23 +1250,6 @@ class DownloadArchive:
             tags = self._fetch_tags_for_ids(conn, [int(entry_id)]).get(int(entry_id), ())
             return self._build_entry(row, tags)
 
-    def get_entry_by_key(self, source: str, book_key: str) -> ArchiveEntry | None:
-        """Fetch a single `ArchiveEntry` by `(source, book_key)` or return `None`."""
-        with self._connection() as conn:
-            row = conn.execute(
-                """
-                SELECT id, source, book_key, url, title, author, output_path, format, downloaded_at,
-                       profile, status, series, series_order, narrator, duration_seconds, isbn, asin, last_seen_at
-                FROM downloads WHERE source = ? AND book_key = ? LIMIT 1
-                """,
-                (source, book_key),
-            ).fetchone()
-            if row is None:
-                return None
-            entry_id = int(row["id"])
-            tags = self._fetch_tags_for_ids(conn, [entry_id]).get(entry_id, ())
-            return self._build_entry(row, tags)
-
     def get_entries_by_keys(
         self,
         keys: Iterable[tuple[str, str]],

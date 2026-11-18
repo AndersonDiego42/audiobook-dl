@@ -19,10 +19,9 @@ from audiobookdl.output.output import (
     convert_output,
     gen_output_location,
     get_extension,
-    resolve_aac_bitrate,
 )
 from audiobookdl.output.download import get_output_audio_format
-from audiobookdl.utils import AudioProbeInfo, find_executable, normalize_audio_bitrate
+from audiobookdl.utils import AudioProbeInfo, find_executable, normalize_audio_bitrate, resolve_audio_bitrate
 from audiobookdl.utils.concurrency import run_cancellable_subprocess
 
 class _OutputTestCase(TypedDict):
@@ -130,7 +129,7 @@ def test_real_ffmpeg_mp3_and_combine_to_m4b(tmp_path):
     converted = convert_output([str(mp3)], "m4b")
     assert converted == [str(tmp_path / "single.m4b")]
     assert (tmp_path / "single.m4b").stat().st_size > 0
-    assert output._ffmpeg_audio_codec(converted[0]) == "aac"
+    assert output._probe_audio_info(converted[0]).codec_name == "aac"
 
     # 2. Combine AAC parts directly into M4B
     parts_dir = tmp_path / "parts"
@@ -146,7 +145,7 @@ def test_real_ffmpeg_mp3_and_combine_to_m4b(tmp_path):
     combined_m4b = tmp_path / "combined.m4b"
     combine_audiofiles([str(p1), str(p2)], str(parts_dir), str(combined_m4b))
     assert combined_m4b.exists() and combined_m4b.stat().st_size > 0
-    assert output._ffmpeg_audio_codec(str(combined_m4b)) == "aac"
+    assert output._probe_audio_info(str(combined_m4b)).codec_name == "aac"
 
 
 def test_gen_output_location_sanitizes_all_metadata_fields_and_traversal():
@@ -410,22 +409,14 @@ def test_normalize_and_resolve_aac_bitrate(monkeypatch):
         with pytest.raises(ValueError):
             normalize_audio_bitrate(bad)
 
-    # Explicit bitrate bypasses ffprobe
-    monkeypatch.setattr(output, "_ffprobe_audio_bitrate", lambda _p: 32000)
-    assert resolve_aac_bitrate("dummy.mp3", "192k") == "192k"
+    # Explicit bitrate bypasses probe
+    assert resolve_audio_bitrate("dummy.mp3", "192k", probe_bps=lambda _p: 32000) == "192k"
 
     # Auto mode probes and clamps to [64k, 192k]
-    monkeypatch.setattr(output, "_ffprobe_audio_bitrate", lambda _p: 32000)
-    assert resolve_aac_bitrate("dummy.mp3", "auto") == "64k"
-
-    monkeypatch.setattr(output, "_ffprobe_audio_bitrate", lambda _p: 96000)
-    assert resolve_aac_bitrate("dummy.mp3", None) == "96k"
-
-    monkeypatch.setattr(output, "_ffprobe_audio_bitrate", lambda _p: 320000)
-    assert resolve_aac_bitrate("dummy.mp3", None) == "192k"
-
-    monkeypatch.setattr(output, "_ffprobe_audio_bitrate", lambda _p: None)
-    assert resolve_aac_bitrate("dummy.mp3", None) == "128k"
+    assert resolve_audio_bitrate("dummy.mp3", "auto", probe_bps=lambda _p: 32000) == "64k"
+    assert resolve_audio_bitrate("dummy.mp3", None, probe_bps=lambda _p: 96000) == "96k"
+    assert resolve_audio_bitrate("dummy.mp3", None, probe_bps=lambda _p: 320000) == "192k"
+    assert resolve_audio_bitrate("dummy.mp3", None, probe_bps=lambda _p: None) == "128k"
 
 
 def test_convert_output_passes_auto_and_explicit_aac_bitrate(tmp_path):
@@ -479,14 +470,14 @@ def test_real_ffprobe_and_m4b_bitrate_conversion(tmp_path):
         check=True,
         capture_output=True,
     )
-    probed_bps = output._ffprobe_audio_bitrate(str(mp3))
+    probed_bps = output._probe_audio_info(str(mp3)).bitrate
     assert probed_bps is not None
     assert 48000 <= probed_bps <= 80000
-    assert resolve_aac_bitrate(str(mp3)) == "64k"
+    assert resolve_audio_bitrate(str(mp3)) == "64k"
 
     converted = convert_output([str(mp3)], "m4b", audio_bitrate="192k")
     assert converted == [str(tmp_path / "speech_64k.m4b")]
-    assert output._ffmpeg_audio_codec(converted[0]) == "aac"
+    assert output._probe_audio_info(converted[0]).codec_name == "aac"
 
 
 def test_gen_output_location_missing_optional_metadata_and_collapsed_segments():
@@ -1146,7 +1137,6 @@ def test_chapter_offset_loudnorm_mono_and_silence_detection():
     codec_args = output._build_mux_codec_args(
         "m4b",
         "m4b",
-        "book.m4b",
         AudioProbeInfo(duration=60.0, bitrate=96000, codec_name="aac"),
         None,
         loudnorm=True,

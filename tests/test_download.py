@@ -1564,7 +1564,7 @@ def test_download_audiobook_forwards_loudnorm_mono_and_silence_split(tmp_path, m
     src_mp3 = tmp_path / "book.mp3"
     src_mp3.write_bytes(b"fake-mp3")
 
-    monkeypatch.setattr(dl_mod, "download_files_with_cli_output", lambda *a, **kw: [str(src_mp3)])
+    monkeypatch.setattr(dl_mod, "download_files_with_progress", lambda *a, **kw: [str(src_mp3)])
     monkeypatch.setattr(dl_mod, "add_metadata_to_file", lambda *a, **kw: None)
     monkeypatch.setattr(dl_mod, "add_metadata_to_dir", lambda *a, **kw: None)
     monkeypatch.setattr(
@@ -1618,7 +1618,7 @@ def test_download_audiobook_combine_silence_chapters_embeds_cover_after_combine(
     p1.write_bytes(b"a")
     p2.write_bytes(b"b")
 
-    monkeypatch.setattr(dl_mod, "download_files_with_cli_output", lambda *a, **kw: [str(p1), str(p2)])
+    monkeypatch.setattr(dl_mod, "download_files_with_progress", lambda *a, **kw: [str(p1), str(p2)])
     monkeypatch.setattr(
         out_mod,
         "combine_audiofiles",

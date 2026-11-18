@@ -163,23 +163,6 @@ class EnrichmentCache:
                 (cache_key, provider.strip().lower(), serialized, timestamp),
             )
 
-    def prune_expired(
-        self,
-        *,
-        ttl_seconds: float | None = None,
-        now: float | None = None,
-    ) -> int:
-        """Delete expired cache entries and return the number of rows removed."""
-        effective_ttl = self.ttl_seconds if ttl_seconds is None else float(ttl_seconds)
-        current_ts = time.time() if now is None else float(now)
-        cutoff = current_ts - max(0.0, effective_ttl)
-        with self._connection() as conn:
-            cursor = conn.execute(
-                "DELETE FROM enrichment_cache WHERE fetched_at < ?",
-                (cutoff,),
-            )
-            return int(cursor.rowcount)
-
     def clear(self, provider: str | None = None) -> int:
         """Delete cached entries (optionally scoped to `provider`) and return row count."""
         with self._connection() as conn:

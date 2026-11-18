@@ -1648,7 +1648,7 @@ def test_gui_failed_job_formats_book_error_tuple_as_string(tmp_path, monkeypatch
 
 
 @pytest.mark.gui
-def test_gui_cli_parity_controls_build_options_and_config_loading(tmp_path, monkeypatch):
+def test_gui_controls_build_options_and_config_loading(tmp_path, monkeypatch):
     from audiobookdl.utils.archive import default_archive_path
 
     try:
@@ -1679,7 +1679,7 @@ def test_gui_cli_parity_controls_build_options_and_config_loading(tmp_path, monk
         assert app.timeout_var.get() == "45"
         assert app.download_archive_var.get() is False
 
-        # Set all 12 parity controls and verify DownloadOptions output
+        # Set all 12 option controls and verify DownloadOptions output
         app.split_chapters_var.set(True)
         app.write_opf_var.set(True)
         app.write_cue_var.set(True)

@@ -386,11 +386,8 @@ class OptionsPanel(ttk.LabelFrame):
         self._format_combo = format_combo
         self._cb_combine = cb_combine
         self._bitrate_combo = bitrate_combo
-        self._cb_enrich = cb_enrich
         self._cb_enrich_interactive = cb_enrich_interactive
         self._enrich_providers_entry = enrich_providers_entry
-        self._cb_cover_only = cb_cover_only
-        self._cb_no_chapters = cb_no_chapters
         self._cb_split_chapters = cb_split_chapters
         self._cb_silence_chapters = cb_silence_chapters
         self._chapter_offset_entry = chapter_offset_entry

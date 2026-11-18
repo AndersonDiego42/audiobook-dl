@@ -191,9 +191,9 @@ def test_id3_cover_type_3_webp_conversion_and_ctoc_chap_frames(tmp_path):
         str(mp3_path),
         Cover(image=_make_image_bytes("WEBP", mode="RGBA"), extension="webp"),
     )
-    id3.add_id3_chapters(
+    id3.add_id3_chapters_and_cover(
         str(mp3_path),
-        [
+        chapters=[
             Chapter(start=0, title="Intro"),
             Chapter(start=1000, title="Chapter 2"),
         ],
@@ -299,9 +299,9 @@ def test_id3_chapters_mutagen_none_fallback_and_bounds(tmp_path, monkeypatch):
     monkeypatch.setattr(id3, "MutagenFile", lambda _: None)
     monkeypatch.setattr(_chapters, "ffprobe_duration", lambda _: 2.0)
 
-    id3.add_id3_chapters(
+    id3.add_id3_chapters_and_cover(
         str(mp3_path),
-        [
+        chapters=[
             Chapter(start=5000, title="Out of range"),
             Chapter(start=1000, title="Second"),
             Chapter(start=-100, title="First"),
@@ -319,9 +319,9 @@ def test_id3_chapters_mutagen_none_fallback_and_bounds(tmp_path, monkeypatch):
         ("chp2", 1000, 2000),
     ]
 
-    # When both Mutagen and ffprobe fail, add_id3_chapters skips without crashing
+    # When both Mutagen and ffprobe fail, add_id3_chapters_and_cover skips without crashing
     monkeypatch.setattr(_chapters, "ffprobe_duration", lambda _: 0.0)
-    id3.add_id3_chapters(str(mp3_path), [Chapter(start=0, title="Ignored")])
+    id3.add_id3_chapters_and_cover(str(mp3_path), chapters=[Chapter(start=0, title="Ignored")])
     tags_after = ID3(str(mp3_path))
     assert len(tags_after.getall("CHAP")) == 2
 

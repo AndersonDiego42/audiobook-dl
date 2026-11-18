@@ -243,7 +243,7 @@ def test_schema_driven_merge_and_preset_precedence(tmp_path):
     assert preset_opts.output_template != "{title} - cfg"
 
 
-def test_gui_cli_parity_bindings_converters():
+def test_gui_option_bindings_converters():
     overwrite_binding = OPTIONS_BY_NAME["overwrite"].gui
     assert overwrite_binding is not None
     assert overwrite_binding.init_value(None) == "Ask"

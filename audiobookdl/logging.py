@@ -77,18 +77,6 @@ def get_job_context() -> JobContext | None:
     return _job_context.get()
 
 
-def set_job_context(
-    ctx: JobContext | None,
-) -> contextvars.Token[JobContext | None]:
-    """Bind `ctx` to the current task/thread and return the reset token."""
-    return _job_context.set(ctx)
-
-
-def reset_job_context(token: contextvars.Token[JobContext | None]) -> None:
-    """Restore the previous `JobContext` using `token`."""
-    _job_context.reset(token)
-
-
 @contextmanager
 def job_context(ctx: JobContext) -> Generator[JobContext]:
     """Context manager binding `ctx` for the duration of a download job."""
@@ -183,7 +171,7 @@ def emit_item_progress(current: int, total: int, title: str = "") -> None:
 
 
 class _SinkTask:
-    """Minimal task representation mirroring Rich Task's `remaining` attribute."""
+    """Task progress state tracking completed and remaining units."""
 
     def __init__(self, total: float) -> None:
         now = time.monotonic()
@@ -332,7 +320,7 @@ def mask_secret(value: str | None) -> str:
     return f"<redacted len={len(value)} tail=...{value[-4:]}>"
 
 
-def debug(msg: str, remove_styling=False):
+def debug(msg: str) -> None:
     """Emit debug message to the active UI sink or stderr."""
     if is_debug_mode():
         if _emit_to_sink("DEBUG", msg):
@@ -371,15 +359,6 @@ def print_error_file(name: str, **kwargs):
     msg = read_asset_file(f"assets/errors/{name}.txt").format(**kwargs)
     msg = msg.strip()
     error(msg)
-
-
-def print_asset_file(path: str):
-    """Read asset file and print it"""
-    content = read_asset_file(path)
-    if _emit_to_sink("INFO", content):
-        return
-    if sys.stderr is not None:
-        print(strip_markup(content), file=sys.stderr)
 
 
 @dataclass

@@ -440,14 +440,6 @@ class AudiobookDLApp:
             pass
 
     @property
-    def is_maximized(self) -> bool:
-        return self._is_window_maximized()
-
-    @property
-    def normal_geometry(self) -> str | None:
-        return self._normal_geometry
-
-    @property
     def theme_mode(self) -> str:
         return self._theme_mode
 
@@ -2910,11 +2902,6 @@ def _enable_high_dpi_awareness() -> None:
 def parse_gui_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse startup arguments supported by the desktop GUI application."""
     parser = argparse.ArgumentParser(prog="audiobook-dl")
-    parser.add_argument(
-        "--gui",
-        action="store_true",
-        help="Launch the desktop GUI window explicitly",
-    )
     parser.add_argument(
         "--self-test",
         action="store_true",

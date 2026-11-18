@@ -498,8 +498,8 @@ class Downloader:
         ctx = self._build_context()
         summary = DownloadSummary()
         with logging.job_context(ctx):
-            logging.debug(f"audiobook-dl {__version__}", remove_styling=True)
-            logging.debug(f"python {sys.version}", remove_styling=True)
+            logging.debug(f"audiobook-dl {__version__}")
+            logging.debug(f"python {sys.version}")
             for index, url in enumerate(url_list):
                 try:
                     logging.wait_if_paused(
@@ -1104,22 +1104,6 @@ def _flatten_resolved_books(source: Source, resolved: Result) -> list[Audiobook]
             nested = source.download_from_id(entry.id)
             items.extend(_flatten_resolved_books(source, nested))
     return items
-
-
-def audiobook_from_series(
-    source: Source,
-    book: BookId[Any] | Audiobook,
-) -> Audiobook:
-    """Make an `Audiobook` object from a book entry in a `Series`."""
-    if isinstance(book, Audiobook):
-        return book
-    resolved = source.download_from_id(book.id)
-    if isinstance(resolved, Audiobook):
-        return resolved
-    items = _flatten_resolved_books(source, resolved)
-    if not items:
-        raise BookHasNoAudiobook
-    return items[0]
 
 
 def _format_candidate_choice(candidate: EnrichmentCandidate) -> str:

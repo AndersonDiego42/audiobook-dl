@@ -1,9 +1,8 @@
 """State, queue, background worker, and event-bridge controller for the desktop GUI."""
 
 from collections import deque
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 import json
 import os
@@ -1977,19 +1976,6 @@ class GuiController:
             handlers = list(self._aux_interactions)
         for handler in handlers:
             handler.release_all()
-
-    @contextmanager
-    def auxiliary_interaction(self) -> Generator[tuple[GuiInteractionHandler, threading.Event]]:
-        """Yield a registered `(GuiInteractionHandler, cancel_event)` pair for an auxiliary worker."""
-        cancel_ev = threading.Event()
-        interaction = GuiInteractionHandler(self.event_queue, cancel_ev)
-        self._register_aux_interaction(interaction)
-        try:
-            yield interaction, cancel_ev
-        finally:
-            cancel_ev.set()
-            interaction.release_all()
-            self._unregister_aux_interaction(interaction)
 
     def start_auth_verification(
         self,

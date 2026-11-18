@@ -40,7 +40,6 @@ _EXT_TO_MIME_REVERSE = {
 
 _CUE_TRACK_RE = re.compile(r"^\s*TRACK\s+\d+\s+AUDIO\b", re.IGNORECASE)
 _CUE_TITLE_RE = re.compile(r'^\s*TITLE\s+"(.*)"\s*$', re.IGNORECASE)
-_CUE_PERFORMER_RE = re.compile(r'^\s*PERFORMER\s+"(.*)"\s*$', re.IGNORECASE)
 _CUE_INDEX01_RE = re.compile(r"^\s*INDEX\s+01\s+(\d+):(\d{2}):(\d{2})\s*$", re.IGNORECASE)
 _TRACK_INT_RE = re.compile(r"^\s*(\d+)")
 _SERIES_HASH_RE = re.compile(r"^(.*?)\s*#\s*(\d+(?:\.\d+)?)\s*$")

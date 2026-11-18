@@ -91,7 +91,6 @@ class DownloadPage(ttk.Frame):
     ) -> None:
         super().__init__(parent, padding=(scale_px(parent, 12), scale_px(parent, 8)))
         self._window = root
-        self._app = app
         self._palette_provider = palette_provider
         self._split_ratio: float | None = (
             float(initial_split_ratio)
@@ -164,7 +163,7 @@ class DownloadPage(ttk.Frame):
         bind_text_tab_navigation(self.urls_text)
         self.urls_text.bind("<Control-Return>", lambda _e: on_start_download())
         self.urls_text.bind("<<Modified>>", on_urls_modified)
-        self.url_menu = attach_url_context_menu(
+        attach_url_context_menu(
             self.urls_text,
             on_paste=on_paste_urls,
             on_paste_and_queue=on_paste_and_queue,

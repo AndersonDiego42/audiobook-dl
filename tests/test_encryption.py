@@ -20,7 +20,6 @@ from audiobookdl.output.encryption import (
     TS_PACKET_SIZE,
     create_stream_decryptor,
     decrypt_file,
-    decrypt_file_aes,
     decrypt_mpegts_sample_aes,
 )
 from audiobookdl.pipeline import _apply_user_decryption_key
@@ -188,19 +187,19 @@ def test_decrypt_file_streams_across_multiple_64k_chunks(tmp_path):
     assert not (tmp_path / "segment.ts.tmp.dec.tmp").exists()
 
 
-def test_decrypt_file_aes_handles_empty_file(tmp_path):
+def test_decrypt_file_handles_empty_file(tmp_path):
     key = b"0123456789abcdef"
     iv = b"fedcba9876543210"
     target = tmp_path / "empty.mp3"
     target.write_bytes(b"")
 
-    decrypt_file_aes(str(target), key, iv)
+    decrypt_file(str(target), AESCBCEncryption(key=key, iv=iv))
 
     assert target.read_bytes() == b""
     assert not (tmp_path / "empty.mp3.dec.tmp").exists()
 
 
-def test_decrypt_file_aes_preserves_original_and_cleans_tmp_on_error(tmp_path):
+def test_decrypt_file_preserves_original_and_cleans_tmp_on_error(tmp_path):
     key = b"0123456789abcdef"
     iv = b"fedcba9876543210"
     bad_payload = b"short-not-16-bytes"
@@ -208,7 +207,7 @@ def test_decrypt_file_aes_preserves_original_and_cleans_tmp_on_error(tmp_path):
     target.write_bytes(bad_payload)
 
     with pytest.raises(ValueError):
-        decrypt_file_aes(str(target), key, iv)
+        decrypt_file(str(target), AESCBCEncryption(key=key, iv=iv))
 
     assert target.read_bytes() == bad_payload
     assert not (tmp_path / "broken.mp3.dec.tmp").exists()
@@ -284,7 +283,7 @@ def test_aes_stream_decryptor_rejects_unaligned_tail_and_bad_padding():
         decryptor.finalize()
 
 
-def test_decrypt_file_aes_preserves_original_on_invalid_pkcs7_padding(tmp_path):
+def test_decrypt_file_preserves_original_on_invalid_pkcs7_padding(tmp_path):
     key = b"0123456789abcdef"
     iv = b"fedcba9876543210"
     bad_ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(b"0123456789abcdef")
@@ -292,7 +291,7 @@ def test_decrypt_file_aes_preserves_original_on_invalid_pkcs7_padding(tmp_path):
     target.write_bytes(bad_ciphertext)
 
     with pytest.raises(ValueError):
-        decrypt_file_aes(str(target), key, iv)
+        decrypt_file(str(target), AESCBCEncryption(key=key, iv=iv))
 
     assert target.read_bytes() == bad_ciphertext
     assert not (tmp_path / "bad_padding.mp3.dec.tmp").exists()

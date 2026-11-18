@@ -363,13 +363,6 @@ class ScrolledTreeview(ttk.Frame):
         if self._empty_cmd is not None:
             self._empty_cmd()
 
-    def clear_sort_indicator(self) -> None:
-        """Reset column sort indicators without altering current row order."""
-        self._sort_col = None
-        self._sort_desc = False
-        for spec in self._columns:
-            self.tree.heading(spec.key, text=spec.heading)
-
     def sort_by_column(self, col_key: str, *, descending: bool | None = None) -> None:
         """Sort rows by `col_key`, preserving parent group hierarchy when present."""
         if not self._enable_sorting:
@@ -865,9 +858,6 @@ class Tooltip:
         widget.bind("<FocusIn>", self._schedule_focus, add="+")
         widget.bind("<FocusOut>", self._cancel_and_hide, add="+")
         widget.bind("<Destroy>", self._on_destroy, add="+")
-
-    def set_text(self, text: str) -> None:
-        self._text = text
 
     def _schedule(self, _event: tk.Event | None = None) -> None:
         self._cancel_timer()

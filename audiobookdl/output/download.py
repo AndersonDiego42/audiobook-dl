@@ -230,7 +230,7 @@ def download_audiobook(
     try:
         probe_cache: dict[str, Any] = {}
         # Downloading files
-        filepaths = download_files_with_cli_output(
+        filepaths = download_files_with_progress(
             audiobook,
             download_output_dir,
             interaction=interaction,
@@ -952,7 +952,7 @@ def add_metadata_to_dir(
         )
 
 
-def download_files_with_cli_output(
+def download_files_with_progress(
     audiobook: Audiobook,
     output_dir: str,
     interaction: logging.InteractionHandler | None = None,

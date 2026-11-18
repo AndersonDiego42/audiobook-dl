@@ -21,7 +21,6 @@ MIN_AUTO_M4B_BITRATE_KBPS = 64
 MAX_AUTO_M4B_BITRATE_KBPS = 192
 AUDIO_BITRATE_PRESETS = ("Auto", "64k", "96k", "128k", "192k", "256k")
 MP4_CONTAINERS = ("mp4", "m4a", "m4b", "mov", "m4v")
-VIDEO_CONTAINERS = ("mp4", "mkv", "mov", "m4v")
 _BITRATE_RE = re.compile(r"^(\d+)k?$", re.IGNORECASE)
 
 

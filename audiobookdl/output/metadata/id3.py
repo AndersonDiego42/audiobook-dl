@@ -226,11 +226,6 @@ def add_id3_chapter(audio: ID3, start: int, end: int, title: str, index: int) ->
     ))
 
 
-def add_id3_chapters(filepath: str, chapters: Sequence[Chapter]) -> None:
-    """Adds chapters to the given audio file"""
-    add_id3_chapters_and_cover(filepath, chapters=chapters, cover=None)
-
-
 def add_id3_chapters_and_cover(
     filepath: str,
     chapters: Sequence[Chapter] | None = None,

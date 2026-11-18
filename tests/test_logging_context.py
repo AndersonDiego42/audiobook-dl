@@ -110,7 +110,7 @@ def test_job_context_isolates_ffmpeg_output_flag():
     assert observed == {"verbose": True, "quiet": False}
 
 
-def test_cli_progress_adapter_tracks_bytes_and_speed():
+def test_progress_adapter_tracks_bytes_and_speed():
     with logging.progress([]) as prog:
         task = prog.add_task("Downloading", total=2.0)
         assert prog.get_byte_metrics(task) is None
