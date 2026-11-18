@@ -16,6 +16,7 @@ from audiobookdl.output.metadata._cover import apply_cover_postprocessing
 from audiobookdl.utils.audiobook import (
     AudiobookMetadata,
     TrackTagContext,
+    format_bytes,
     is_ebook,
     is_ebook_extension,
     is_video,
@@ -35,6 +36,7 @@ from audiobookdl.utils.http import (
 from . import metadata, output, encryption
 from .metadata import sidecars
 
+from dataclasses import dataclass
 import os
 import re
 import shutil
@@ -966,6 +968,170 @@ def add_metadata_to_dir(
         )
 
 
+@dataclass(frozen=True)
+class DownloadSizeEstimate:
+    """Estimated total transfer size across an `Audiobook`'s files."""
+
+    estimated_bytes: int | None
+    known_bytes: int
+    known_files: int
+    total_files: int
+    is_exact: bool
+    per_file_bytes: tuple[int | None, ...]
+
+
+_HEADER_BYTE_RANGE_RE = re.compile(r"^bytes\s*=\s*(\d+)\s*-\s*(\d+)$", re.IGNORECASE)
+
+
+def _known_file_byte_size(file: Any) -> int | None:
+    raw_size = getattr(file, "size", None)
+    if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size > 0:
+        return raw_size
+    headers = getattr(file, "headers", None)
+    if headers:
+        range_val = _get_header_ci(headers, "Range")
+        if isinstance(range_val, str):
+            match = _HEADER_BYTE_RANGE_RE.fullmatch(range_val.strip())
+            if match:
+                start = int(match.group(1))
+                end = int(match.group(2))
+                if end >= start:
+                    return (end - start) + 1
+    return None
+
+
+def _probe_remote_file_size(
+    audiobook: Audiobook,
+    index: int,
+    *,
+    timeout: float,
+    cancel_event: threading.Event | None,
+) -> int | None:
+    if cancel_event is not None and cancel_event.is_set():
+        return None
+    file = audiobook.files[index]
+    if file.file_writer is not None or file.url_resolver is not None or not file.url:
+        return None
+    req_headers = dict(file.headers) if file.headers else {}
+    head_fn = getattr(audiobook.session, "head", None)
+    if not callable(head_fn):
+        return None
+    resp = None
+    try:
+        resp = head_fn(
+            file.url,
+            headers=req_headers,
+            allow_redirects=True,
+            timeout=timeout,
+        )
+        status = int(getattr(resp, "status_code", 0) or 0)
+        if status not in (200, 206):
+            return None
+        headers = getattr(resp, "headers", None)
+        if not headers:
+            return None
+        _, _, range_total = _parse_content_range(_get_header_ci(headers, "Content-Range"))
+        if range_total is not None and range_total > 0:
+            return range_total
+        content_len = _parse_content_length(headers)
+        return content_len if content_len > 0 else None
+    except Exception:
+        return None
+    finally:
+        close_fn = getattr(resp, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                pass
+
+
+def estimate_download_size(
+    audiobook: Audiobook,
+    *,
+    probe_remote: bool = False,
+    timeout: float = 5.0,
+    max_probe_files: int = 10,
+    cancel_event: threading.Event | None = None,
+) -> DownloadSizeEstimate:
+    """Estimate expected download bytes from file metadata, `Range` headers, and optional `HEAD` probes."""
+    files = list(getattr(audiobook, "files", ()) or ())
+    total_files = len(files)
+    if total_files == 0:
+        return DownloadSizeEstimate(
+            estimated_bytes=0,
+            known_bytes=0,
+            known_files=0,
+            total_files=0,
+            is_exact=True,
+            per_file_bytes=(),
+        )
+
+    per_file: list[int | None] = [_known_file_byte_size(f) for f in files]
+    if probe_remote:
+        unknown_indices = [
+            idx
+            for idx, sz in enumerate(per_file)
+            if sz is None
+            and files[idx].file_writer is None
+            and files[idx].url_resolver is None
+            and bool(files[idx].url)
+        ]
+        if unknown_indices and max_probe_files > 0:
+            if len(unknown_indices) <= max_probe_files:
+                probe_indices = unknown_indices
+            else:
+                step = (len(unknown_indices) - 1) / max(1, max_probe_files - 1)
+                probe_indices = [unknown_indices[round(i * step)] for i in range(max_probe_files)]
+            if len(probe_indices) == 1:
+                idx = probe_indices[0]
+                per_file[idx] = _probe_remote_file_size(
+                    audiobook,
+                    idx,
+                    timeout=timeout,
+                    cancel_event=cancel_event,
+                )
+            else:
+                probed = run_cancellable_pool(
+                    lambda idx: _probe_remote_file_size(
+                        audiobook,
+                        idx,
+                        timeout=timeout,
+                        cancel_event=cancel_event,
+                    ),
+                    probe_indices,
+                    max_workers=min(6, len(probe_indices)),
+                    cancel_event=cancel_event,
+                )
+                for idx, sz in zip(probe_indices, probed, strict=True):
+                    per_file[idx] = sz
+
+    known_sizes = [sz for sz in per_file if sz is not None and sz > 0]
+    known_files = len(known_sizes)
+    known_bytes = sum(known_sizes)
+    if known_files == 0:
+        return DownloadSizeEstimate(
+            estimated_bytes=None,
+            known_bytes=0,
+            known_files=0,
+            total_files=total_files,
+            is_exact=False,
+            per_file_bytes=tuple(per_file),
+        )
+    is_exact = known_files == total_files
+    estimated_bytes = (
+        known_bytes if is_exact else round((known_bytes / known_files) * total_files)
+    )
+    return DownloadSizeEstimate(
+        estimated_bytes=estimated_bytes,
+        known_bytes=known_bytes,
+        known_files=known_files,
+        total_files=total_files,
+        is_exact=is_exact,
+        per_file_bytes=tuple(per_file),
+    )
+
+
 def download_files_with_progress(
     audiobook: Audiobook,
     output_dir: str,
@@ -1013,11 +1179,21 @@ def download_files_with_progress(
         if not parent.exists():
             os.makedirs(parent, exist_ok=True)
     try:
+        size_estimate = estimate_download_size(audiobook, probe_remote=False)
+        if size_estimate.estimated_bytes is not None and size_estimate.estimated_bytes > 0:
+            prefix = "" if size_estimate.is_exact else "~"
+            logging.book_update(
+                f"Estimated download size: {prefix}{format_bytes(size_estimate.estimated_bytes)} "
+                f"({size_estimate.total_files} file{'s' if size_estimate.total_files != 1 else ''})"
+            )
         with logging.progress() as progress:
             task = progress.add_task(
                 f"Downloading [blue]{audiobook.title}",
                 total = len(audiobook.files)
             )
+            set_estimates_fn = getattr(progress, "set_file_size_estimates", None)
+            if callable(set_estimates_fn):
+                set_estimates_fn(task, size_estimate.per_file_bytes)
             update_progress = partial(progress.advance, task)
             record_bytes_fn = getattr(progress, "record_bytes", None)
             record_bytes: Callable[[int], None] | None = None
@@ -1027,12 +1203,23 @@ def download_files_with_progress(
                     _fn(task, num_bytes)
 
                 record_bytes = _record_bytes
+            report_size_fn = getattr(progress, "report_file_size", None)
+            report_file_size: Callable[[int, int], None] | None = None
+            if callable(report_size_fn):
+
+                def _report_file_size(
+                    file_index: int, total_bytes: int, _fn: Any = report_size_fn
+                ) -> None:
+                    _fn(task, file_index, total_bytes)
+
+                report_file_size = _report_file_size
             filepaths = download_files(
                 audiobook,
                 output_dir,
                 update_progress,
                 cancel_event=cancel_event,
                 record_bytes=record_bytes,
+                report_file_size=report_file_size,
                 resume=resume,
                 max_workers=max_workers,
                 timeout=timeout,
@@ -1160,6 +1347,7 @@ def download_file(
     max_retries: int | None = None,
     rate_limiter: TokenBucketRateLimiter | None = None,
     probe_cache: dict[str, Any] | None = None,
+    report_file_size: Callable[[int, int], None] | None = None,
 ) -> str:
     # Prepare download
     if len(args) == 6:
@@ -1361,6 +1549,8 @@ def download_file(
                         initial_progress = min(1.0, existing_bytes / total_filesize)
                         update_progress(initial_progress)
                         advanced += initial_progress
+            if report_file_size is not None and total_filesize > 0:
+                report_file_size(index, total_filesize)
 
             # Stream decryption inline into an isolated temp path when reading
             # from byte 0 so `filepath_tmp` only ever contains raw un-decrypted bytes.
@@ -1572,6 +1762,7 @@ def download_files(
     update_progress,
     cancel_event: threading.Event | None = None,
     record_bytes: Callable[[int], None] | None = None,
+    report_file_size: Callable[[int, int], None] | None = None,
     resume: bool = False,
     max_workers: int | None = None,
     timeout: float | None = None,
@@ -1602,6 +1793,8 @@ def download_files(
         worker_kwargs["max_retries"] = max_retries
     if probe_cache is not None:
         worker_kwargs["probe_cache"] = probe_cache
+    if report_file_size is not None:
+        worker_kwargs["report_file_size"] = report_file_size
     rate_bps = parse_byte_rate(limit_rate)
     if rate_bps is not None:
         worker_kwargs["rate_limiter"] = TokenBucketRateLimiter(rate_bps)

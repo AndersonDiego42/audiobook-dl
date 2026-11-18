@@ -148,6 +148,7 @@ def _build_sync_download_options(
         "config_location": sync_opts.config_location,
         "download_archive": archive_path,
         "skip_downloaded": True,
+        "skip_unavailable": True,
         "profile": None if profile == DEFAULT_PROFILE else profile,
     }
     if sync_opts.output_template is not None:
@@ -308,8 +309,10 @@ def run_sync_once(
                 if callable(close_fn):
                     close_fn()
             stats.downloaded = dl_summary.books_completed
+            stats.skipped += dl_summary.books_skipped
             stats.failed += dl_summary.failed
             cycle.downloaded += dl_summary.books_completed
+            cycle.skipped += dl_summary.books_skipped
             cycle.failed += dl_summary.failed
             if dl_summary.cancelled:
                 cycle.cancelled = True

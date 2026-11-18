@@ -166,6 +166,13 @@ class OptionsPanel(ttk.LabelFrame):
         )
         cb_enrich_interactive.grid(row=3, column=2, columnspan=2, sticky="w", padx=(0, 12), pady=(4, 0))
 
+        cb_skip_unavailable = ttk.Checkbutton(
+            general_tab,
+            text="Skip unavailable",
+            variable=self._vars.skip_unavailable_var,
+        )
+        cb_skip_unavailable.grid(row=3, column=4, columnspan=2, sticky="w", pady=(4, 0))
+
         enrich_row = ttk.Frame(general_tab)
         enrich_row.grid(row=4, column=0, columnspan=6, sticky="ew", pady=(4, 0))
         ttk.Label(enrich_row, text="Enrich providers:").pack(side=tk.LEFT, padx=(0, 6))
@@ -429,6 +436,7 @@ class OptionsPanel(ttk.LabelFrame):
             (format_combo, _option_help("output_format")),
             (cb_combine, _option_help("combine")),
             (cb_skip, _option_help("skip_downloaded")),
+            (cb_skip_unavailable, _option_help("skip_unavailable")),
             (cb_resume, _option_help("resume")),
             (overwrite_combo, _option_help("overwrite")),
             (cb_archive, _option_help("download_archive")),
@@ -477,6 +485,7 @@ class OptionsPanel(ttk.LabelFrame):
             media_combo,
             cb_combine,
             cb_skip,
+            cb_skip_unavailable,
             cb_resume,
             cb_archive,
             cb_cover_only,

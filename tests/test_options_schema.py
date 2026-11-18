@@ -196,6 +196,7 @@ def test_schema_driven_merge_and_preset_precedence(tmp_path):
             "output_template": "{title} - cfg",
             "combine": True,
             "skip_downloaded": True,
+            "skip_unavailable": True,
             "resume": True,
             "output_format": "mp3",
             "media_type": "ebook",

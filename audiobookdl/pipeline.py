@@ -32,12 +32,42 @@ from .exceptions import (
     AudiobookDLException,
     BookHasNoAudiobook,
     BookHasNoEbook,
+    BookNotFound,
     BookNotReleased,
     DownloadCancelled,
     GenericAudiobookDLException,
+    MissingBookAccess,
+    NoFilesFound,
     NoSourceFound,
     UserNotAuthorized,
 )
+
+
+UNAVAILABLE_BOOK_EXCEPTIONS: tuple[type[AudiobookDLException], ...] = (
+    MissingBookAccess,
+    BookNotFound,
+    BookNotReleased,
+    BookHasNoAudiobook,
+    BookHasNoEbook,
+    NoFilesFound,
+)
+
+
+def _describe_unavailable_reason(exc: AudiobookDLException) -> str:
+    """Return a concise human-readable reason for skipping an unavailable book."""
+    if isinstance(exc, BookNotReleased):
+        return "not released"
+    if isinstance(exc, BookHasNoAudiobook):
+        return "no audiobook available"
+    if isinstance(exc, BookHasNoEbook):
+        return "no ebook available"
+    if isinstance(exc, MissingBookAccess):
+        return "inaccessible"
+    if isinstance(exc, BookNotFound):
+        return "not found"
+    if isinstance(exc, NoFilesFound):
+        return "no files available"
+    return exc.error_description.replace("_", " ")
 from .output.download import download
 from .sources import find_compatible_source, find_source_by_name
 from .sources.source import CatalogBook, Source, bind_pooled_session
@@ -236,6 +266,21 @@ class _EventLogSink:
 
     def on_item_progress(self, current: int, total: int, title: str) -> None:
         self._emit("item_progress", current=current, total=total, title=title)
+
+    def on_download_estimate(
+        self,
+        estimated_bytes: int | None,
+        is_exact: bool,
+        known_files: int,
+        total_files: int,
+    ) -> None:
+        self._emit(
+            "download_estimate",
+            estimated_bytes=estimated_bytes,
+            is_exact=is_exact,
+            known_files=known_files,
+            total_files=total_files,
+        )
 
     def on_progress_finish(self) -> None:
         self._emit("progress_finish")
@@ -495,6 +540,9 @@ class Downloader:
     ) -> DownloadSummary:
         """Download one URL or a sequence of URLs and return a `DownloadSummary`."""
         url_list: Sequence[str] = [urls] if isinstance(urls, str) else urls
+        should_skip_unavailable = (
+            bool(getattr(self.options, "skip_unavailable", False)) or len(url_list) > 1
+        )
         ctx = self._build_context()
         summary = DownloadSummary()
         with logging.job_context(ctx):
@@ -550,8 +598,25 @@ class Downloader:
                     summary.cancelled = True
                     logging.log("Download cancelled")
                     break
+                except UNAVAILABLE_BOOK_EXCEPTIONS as e:
+                    if should_skip_unavailable:
+                        summary.books_skipped += 1
+                        summary.completed += 1
+                        reason = _describe_unavailable_reason(e)
+                        logging.log(f"Skipped [blue]{url}[/] ({reason})")
+                        if logging.is_debug_mode():
+                            logging.print_traceback()
+                        continue
+                    summary.failed += 1
+                    summary.books_failed += 1
+                    detail = str(e).strip() or e.error_description
+                    summary.book_errors.append((url, detail))
+                    e.print()
+                    if logging.is_debug_mode():
+                        logging.print_traceback()
                 except AudiobookDLException as e:
                     summary.failed += 1
+                    summary.books_failed += 1
                     detail = str(e).strip() or e.error_description
                     summary.book_errors.append((url, detail))
                     e.print()
@@ -817,17 +882,9 @@ def download_result(
                         done_count += 1
                         if summary is not None:
                             summary.outputs.append(_audiobook_output_entry(audiobook, options))
-            except BookNotReleased:
+            except UNAVAILABLE_BOOK_EXCEPTIONS as e:
                 skip_count += 1
-                logging.log(f"Skipped [blue]{book}[/] (not released)")
-                continue
-            except BookHasNoAudiobook:
-                skip_count += 1
-                logging.log(f"Skipped [blue]{book}[/] (no audiobook available)")
-                continue
-            except BookHasNoEbook:
-                skip_count += 1
-                logging.log(f"Skipped [blue]{book}[/] (no ebook available)")
+                logging.log(f"Skipped [blue]{book}[/] ({_describe_unavailable_reason(e)})")
                 continue
             except AudiobookDLException as e:
                 if isinstance(e, DownloadCancelled):

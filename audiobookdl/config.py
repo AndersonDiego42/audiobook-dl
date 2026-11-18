@@ -91,6 +91,7 @@ class Config:
     output_template: str | None
     database_directory: str | None
     skip_downloaded: bool | None
+    skip_unavailable: bool | None = None
     output_format: str | None = None
     media_type: str | None = None
     combine: bool | None = None

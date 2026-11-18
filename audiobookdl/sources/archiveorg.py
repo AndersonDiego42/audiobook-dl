@@ -259,7 +259,9 @@ class ArchiveOrgSource(Source):
             ext = os.path.splitext(fname)[1].lstrip(".").lower() or "mp3"
             track_title = str(entry.get("title") or os.path.splitext(os.path.basename(fname))[0]).strip()
             file_url = f"https://archive.org/download/{quote(identifier)}/{quote(fname)}"
-            files.append(AudiobookFile(url=file_url, ext=ext, title=track_title))
+            raw_size_str = str(entry.get("size") or "").strip()
+            file_size = int(raw_size_str) if raw_size_str.isdigit() and int(raw_size_str) > 0 else None
+            files.append(AudiobookFile(url=file_url, ext=ext, title=track_title, size=file_size))
             if all_have_lengths and dur_ms is not None:
                 chapters.append(Chapter(start=running_ms, title=track_title))
                 running_ms += dur_ms

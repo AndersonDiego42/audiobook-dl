@@ -13,9 +13,11 @@ from audiobookdl.gui.formatting import (
     describe_series_book,
     format_audiobook_preview,
     format_multi_metadata_values,
+    format_size_estimate,
     load_cover_from_file,
     render_cover_thumbnail,
 )
+from audiobookdl.output.download import DownloadSizeEstimate, estimate_download_size
 from audiobookdl.gui.theme import (
     ThemePalette,
     apply_theme_to_widget_tree,
@@ -307,6 +309,7 @@ class PreviewDialog(ModalDialog):
         self._cover_label: ttk.Label | None = None
         self._clear_cover_btn: ttk.Button | None = None
         self._readonly_frame: ttk.Frame | None = None
+        self._probed_size_estimate: DownloadSizeEstimate | None = None
         self._enrich_btn: ttk.Button | None = None
         self._enrich_status_var = tk.StringVar(value="")
 
@@ -580,6 +583,7 @@ class PreviewDialog(ModalDialog):
         self._readonly_frame.grid(row=row_idx, column=0, columnspan=4, sticky="ew")
         self._readonly_frame.columnconfigure(1, weight=1)
         self._render_readonly_metadata(audiobook)
+        self._start_size_estimate_probe(audiobook)
 
         chapters_tab = ttk.Frame(right_nb, padding=scale_px(self, 6))
         chapters_tab.columnconfigure(0, weight=1)
@@ -643,6 +647,21 @@ class PreviewDialog(ModalDialog):
             for label, value in format_audiobook_preview(audiobook)
             if label not in _EDITABLE_PREVIEW_LABELS
         ]
+        if (
+            self._probed_size_estimate is not None
+            and self._probed_size_estimate.estimated_bytes is not None
+            and self._probed_size_estimate.estimated_bytes > 0
+            and not any(label == "Est. Size" for label, _ in readonly_rows)
+        ):
+            est_text = format_size_estimate(
+                self._probed_size_estimate.estimated_bytes,
+                is_exact=self._probed_size_estimate.is_exact,
+            )
+            insert_at = next(
+                (i + 1 for i, (lbl, _) in enumerate(readonly_rows) if lbl == "Parts"),
+                len(readonly_rows),
+            )
+            readonly_rows.insert(insert_at, ("Est. Size", est_text))
         row_idx = 0
         for label, value in readonly_rows:
             ttk.Label(
@@ -659,6 +678,39 @@ class PreviewDialog(ModalDialog):
             row_idx += 1
 
         apply_theme_to_widget_tree(self._readonly_frame, self._palette)
+
+    def _start_size_estimate_probe(self, audiobook: Audiobook) -> None:
+        initial = estimate_download_size(audiobook, probe_remote=False)
+        if initial.is_exact:
+            return
+        needs_probe = any(
+            sz is None
+            and f.file_writer is None
+            and f.url_resolver is None
+            and bool(f.url)
+            for f, sz in zip(audiobook.files, initial.per_file_bytes, strict=True)
+        )
+        if not needs_probe:
+            return
+        self._cb_queue.begin_task()
+
+        def _worker() -> None:
+            est: DownloadSizeEstimate | None = None
+            try:
+                est = estimate_download_size(audiobook, probe_remote=True, timeout=4.0)
+            except Exception:
+                est = None
+            finally:
+                def _post() -> None:
+                    if not self._is_alive() or est is None or est.estimated_bytes is None:
+                        return
+                    self._probed_size_estimate = est
+                    self._render_readonly_metadata(audiobook)
+
+                self._cb_queue.post(_post)
+                self._cb_queue.finish_worker()
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _is_alive(self) -> bool:
         try:

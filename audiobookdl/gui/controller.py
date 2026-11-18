@@ -38,6 +38,7 @@ from audiobookdl.gui.events import (
     BatchItemEvent,
     CatalogLoadedEvent,
     ControllerEvent,
+    DownloadEstimateEvent,
     FfmpegInstallDoneEvent,
     ItemProgressEvent,
     JobMetaEvent,
@@ -289,6 +290,22 @@ class GuiLogSink:
                 speed_bps=speed_bps,
                 elapsed_seconds=elapsed_seconds,
                 eta_seconds=eta_seconds,
+            )
+        )
+
+    def on_download_estimate(
+        self,
+        estimated_bytes: int | None,
+        is_exact: bool,
+        known_files: int,
+        total_files: int,
+    ) -> None:
+        self._queue.put(
+            DownloadEstimateEvent(
+                estimated_bytes=estimated_bytes,
+                is_exact=is_exact,
+                known_files=known_files,
+                total_files=total_files,
             )
         )
 

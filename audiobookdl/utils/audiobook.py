@@ -190,6 +190,8 @@ class AudiobookFile:
     init_section: bytes | None = None
     # Optional 0-based chapter/lesson index for grouping fine-grained stream segments
     chapter_index: int | None = None
+    # Optional expected transfer size in bytes (when provided by source metadata or range)
+    size: int | None = None
 
 
 _LANGUAGE_ALIASES: dict[str, str] = {
@@ -623,3 +625,17 @@ def resolve_audiobook_output_format(
     if is_video(audiobook):
         return req if req in VIDEO_EXTENSIONS else "mp4"
     return req or raw_ext
+
+
+def format_bytes(num_bytes: int | float | None) -> str:
+    """Format a byte count into human-readable B, KB, MB, or GB."""
+    if num_bytes is None or num_bytes < 0:
+        return "--"
+    value = float(num_bytes)
+    if value < 1024:
+        return f"{value:.0f} B"
+    if value < 1024 * 1024:
+        return f"{value / 1024:.1f} KB"
+    if value < 1024 * 1024 * 1024:
+        return f"{value / (1024 * 1024):.1f} MB"
+    return f"{value / (1024 * 1024 * 1024):.2f} GB"

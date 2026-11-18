@@ -15,6 +15,7 @@ from audiobookdl.gui.events import (
     BatchItemEvent,
     CatalogLoadedEvent,
     ControllerEvent,
+    DownloadEstimateEvent,
     FfmpegInstallDoneEvent,
     ItemProgressEvent,
     JobMetaEvent,
@@ -187,7 +188,7 @@ class EventDispatcher:
         if isinstance(item, ProgressFinishEvent):
             self._progress_var.set(100.0)
             return True
-        return isinstance(item, (BatchItemEvent, ItemProgressEvent))
+        return isinstance(item, (BatchItemEvent, ItemProgressEvent, DownloadEstimateEvent))
 
     def schedule_poll_soon(self, delay_ms: int = 10) -> None:
         self.cancel_poll_timer()
@@ -249,6 +250,7 @@ class EventDispatcher:
                 ProgressAdvanceEvent,
                 ProgressMetricsEvent,
                 ProgressFinishEvent,
+                DownloadEstimateEvent,
             ),
         ):
             dl_page = self._shell.get_page("download")

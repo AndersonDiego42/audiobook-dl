@@ -825,6 +825,23 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         ),
     ),
     OptionSpec(
+        name="skip_unavailable",
+        default=False,
+        help="Skip unavailable or inaccessible books and continue bulk downloads",
+        config_key="skip_unavailable",
+        config_kind="bool",
+        toml_serializer=_serialize_bool,
+        merge_from_config=True,
+        merge_only_if_default=True,
+        gui=GuiBinding(
+            var_attr="skip_unavailable_var",
+            var_type="bool",
+            gui_default=True,
+            from_config=_gui_init_bool_default_true,
+            persisted_in_output_prefs=True,
+        ),
+    ),
+    OptionSpec(
         name="download_archive",
         default=None,
         help="Path to SQLite download archive file to record and skip previously downloaded books",
@@ -1473,6 +1490,7 @@ class DownloadOptions:
     library: str | None = None
     profile: str | None = None
     skip_downloaded: bool = False
+    skip_unavailable: bool = False
     download_archive: str | None = None
     no_download_archive: bool = False
     database_directory: str = field(default_factory=default_database_directory)

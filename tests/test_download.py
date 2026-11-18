@@ -2316,6 +2316,109 @@ def test_download_file_retries_curl_cffi_transient_and_refreshes_url_resolver(tm
     ]
 
 
+def test_estimate_download_size_from_metadata_ranges_and_head_probes():
+    from audiobookdl.output.download import estimate_download_size
+
+    # 1. Exact sum from file.size and Range headers (no HTTP calls)
+    session_unused = MagicMock()
+    book_known = Audiobook(
+        session=session_unused,
+        metadata=AudiobookMetadata(title="Known Sizes"),
+        files=[
+            AudiobookFile(url="https://cdn.example.com/a.mp3", ext="mp3", size=1000),
+            AudiobookFile(
+                url="https://cdn.example.com/b.m4s",
+                ext="m4s",
+                headers={"Range": "bytes=100-599"},
+            ),
+        ],
+    )
+    est_known = estimate_download_size(book_known, probe_remote=True)
+    assert est_known.estimated_bytes == 1500
+    assert est_known.known_bytes == 1500
+    assert est_known.known_files == 2
+    assert est_known.total_files == 2
+    assert est_known.is_exact is True
+    session_unused.head.assert_not_called()
+
+    # 2. Sampled HEAD probing extrapolates across large multi-segment streams
+    session_probe = MagicMock()
+    session_probe.head.side_effect = lambda *_a, **_kw: MagicMock(
+        status_code=200,
+        headers={"Content-Length": "50000"},
+    )
+    book_hls = Audiobook(
+        session=session_probe,
+        metadata=AudiobookMetadata(title="Large Stream"),
+        files=[
+            AudiobookFile(url=f"https://cdn.example.com/seg{i}.ts", ext="ts")
+            for i in range(25)
+        ],
+    )
+    est_hls = estimate_download_size(book_hls, probe_remote=True, max_probe_files=5)
+    assert session_probe.head.call_count == 5
+    assert est_hls.known_files == 5
+    assert est_hls.total_files == 25
+    assert est_hls.is_exact is False
+    assert est_hls.estimated_bytes == 25 * 50000
+
+
+def test_download_files_with_progress_reports_live_size_estimates_and_byte_eta(tmp_path, monkeypatch):
+    from audiobookdl import logging as dl_logging
+    from audiobookdl.output.download import download_files_with_progress
+
+    clock = [10.0]
+    monkeypatch.setattr("audiobookdl.logging.time.monotonic", lambda: clock[0])
+
+    estimates: list[tuple[int | None, bool, int, int]] = []
+
+    class _EstimateSink:
+        def on_log(self, _lvl: str, _msg: str) -> None:
+            pass
+
+        def on_progress_start(self, _desc: str, _total: float) -> None:
+            pass
+
+        def on_progress_advance(self, _completed: float, _total: float) -> None:
+            pass
+
+        def on_progress_finish(self) -> None:
+            pass
+
+        def on_download_estimate(
+            self,
+            estimated_bytes: int | None,
+            is_exact: bool,
+            known_files: int,
+            total_files: int,
+        ) -> None:
+            estimates.append((estimated_bytes, is_exact, known_files, total_files))
+
+    session = MagicMock()
+    session.get.side_effect = [
+        _mock_response(headers={"Content-Length": "1000"}, chunks=[b"a" * 1000]),
+        _mock_response(headers={"Content-Length": "2000"}, chunks=[b"b" * 2000]),
+    ]
+    book = Audiobook(
+        session=session,
+        metadata=AudiobookMetadata(title="Live Size"),
+        files=[
+            AudiobookFile(url="https://cdn.example.com/1.mp3", ext="mp3"),
+            AudiobookFile(url="https://cdn.example.com/2.mp3", ext="mp3"),
+        ],
+    )
+    monkeypatch.setattr("audiobookdl.output.output.verify_audio_integrity", lambda *_a, **_kw: None)
+
+    sink = _EstimateSink()
+    with dl_logging.job_context(dl_logging.JobContext(sink=sink)):
+        download_files_with_progress(book, str(tmp_path / "live"), max_workers=1)
+
+    # First GET learns file 0 = 1000 -> extrapolates 2000; second GET learns file 1 = 2000 -> exact 3000
+    assert (2000, False, 1, 2) in estimates
+    assert estimates[-1] == (3000, True, 2, 2)
+
+
+
 
 
 

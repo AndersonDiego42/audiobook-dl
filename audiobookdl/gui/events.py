@@ -76,6 +76,14 @@ class ProgressFinishEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class DownloadEstimateEvent:
+    estimated_bytes: int | None
+    is_exact: bool
+    known_files: int
+    total_files: int
+
+
+@dataclass(frozen=True, slots=True)
 class PromptInputEvent:
     prompt: str
     hidden: bool
@@ -171,6 +179,7 @@ ControllerEvent: TypeAlias = (
     | ProgressAdvanceEvent
     | ProgressMetricsEvent
     | ProgressFinishEvent
+    | DownloadEstimateEvent
     | PromptInputEvent
     | PromptConfirmEvent
     | PromptChoiceEvent

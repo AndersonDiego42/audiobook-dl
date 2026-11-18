@@ -231,13 +231,13 @@ def test_rss_atom_iso8601_and_podcast_chapters(tmp_path):
     <title>Episode 2</title>
     <updated>2024-03-16T10:30:00Z</updated>
     <itunes:duration>00:02:00</itunes:duration>
-    <link rel="enclosure" type="audio/mpeg" href="https://cdn.example.com/ep2.mp3" />
+    <link rel="enclosure" type="audio/mpeg" href="https://cdn.example.com/ep2.mp3" length="234567" />
   </entry>
   <entry>
     <title>Episode 1</title>
     <published>2024-03-15T10:30:00Z</published>
     <itunes:duration>00:01:00</itunes:duration>
-    <link rel="enclosure" type="audio/mpeg" href="https://cdn.example.com/ep1.mp3" />
+    <link rel="enclosure" type="audio/mpeg" href="https://cdn.example.com/ep1.mp3" length="123456" />
     <podcast:chapters url="https://cdn.example.com/chapters.json" type="application/json+chapters" />
   </entry>
 </feed>
@@ -269,6 +269,7 @@ def test_rss_atom_iso8601_and_podcast_chapters(tmp_path):
         "https://cdn.example.com/ep1.mp3",
         "https://cdn.example.com/ep2.mp3",
     ]
+    assert [f.size for f in book.files] == [123456, 234567]
     assert [(c.start, c.title) for c in book.chapters] == [
         (0, "Opening"),
         (42500, "Plot Twist"),

@@ -138,8 +138,8 @@ def _normalize_ytm_track_url(entry: dict[str, Any]) -> str | None:
     return None
 
 
-def _select_audio_stream(info: dict[str, Any]) -> tuple[str, str, dict[str, str], bool]:
-    """Select direct audio `(stream_url, ext, http_headers, is_hls)` from a `yt-dlp` info dict."""
+def _choose_audio_format_dict(info: dict[str, Any]) -> dict[str, Any]:
+    """Select the preferred audio format dictionary from a `yt-dlp` info payload."""
     chosen: dict[str, Any] = info
     if not chosen.get("url"):
         req_formats = chosen.get("requested_formats")
@@ -170,6 +170,23 @@ def _select_audio_stream(info: dict[str, Any]) -> tuple[str, str, dict[str, str]
                         reverse=True,
                     )
                     chosen = candidates[0]
+    return chosen
+
+
+def _extract_stream_filesize(info: dict[str, Any]) -> int | None:
+    """Return known or approximate stream byte size from a `yt-dlp` info dict."""
+    chosen = _choose_audio_format_dict(info)
+    for source in (chosen, info):
+        for key in ("filesize", "filesize_approx"):
+            raw = source.get(key)
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
+                return int(raw)
+    return None
+
+
+def _select_audio_stream(info: dict[str, Any]) -> tuple[str, str, dict[str, str], bool]:
+    """Select direct audio `(stream_url, ext, http_headers, is_hls)` from a `yt-dlp` info dict."""
+    chosen = _choose_audio_format_dict(info)
 
     stream_url = str(chosen.get("url") or "").strip()
     if not stream_url:
@@ -484,6 +501,7 @@ class YouTubeMusicSource(Source[dict[str, Any]]):
                 ext=ext,
                 title=meta.title,
                 headers=dict(headers),
+                size=_extract_stream_filesize(info),
             )
             audio_file.url_resolver = self._make_stream_resolver(
                 canonical_url,

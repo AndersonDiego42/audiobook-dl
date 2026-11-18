@@ -63,6 +63,7 @@ class AudiobookDLApp:
     output_format_var: tk.StringVar
     media_type_var: tk.StringVar
     skip_downloaded_var: tk.BooleanVar
+    skip_unavailable_var: tk.BooleanVar
     download_archive_var: tk.BooleanVar
     write_json_var: tk.BooleanVar
     write_cover_var: tk.BooleanVar

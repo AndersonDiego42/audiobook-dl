@@ -364,12 +364,14 @@ def get_stream_files(
         seg_ext = extension if extension is not None else _segment_extension(seg.absolute_uri)
         seg_headers: MutableMapping[str, str | bytes] = dict(base_headers)
 
+        seg_size: int | None = None
         raw_byterange = getattr(seg, "byterange", None)
         if raw_byterange:
             prev_end = last_byterange_end.get(seg.absolute_uri)
             start, end = _parse_hls_byterange(str(raw_byterange), default_offset=prev_end)
             last_byterange_end[seg.absolute_uri] = end + 1
             seg_headers["Range"] = f"bytes={start}-{end}"
+            seg_size = (end - start) + 1
 
         init_bytes: bytes | None = None
         init_section = getattr(seg, "init_section", None)
@@ -396,6 +398,7 @@ def get_stream_files(
             headers=seg_headers,
             expected_content_type=expected_content_type,
             init_section=init_bytes,
+            size=seg_size,
         )
         if seg.key is not None and getattr(seg.key, "method", None) not in (None, "NONE"):
             key_method, fmt_lower = _validate_hls_key(seg.key, has_user_key=has_user_key)

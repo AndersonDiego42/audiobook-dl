@@ -168,13 +168,14 @@ class RssSource(Source):
         self,
         channel: etree._Element,
         base_url: str,
-    ) -> list[tuple[str, str, str, int | None, int | None, float | None, str | None]]:
-        """Return list of `(url, ext, title, duration_ms, episode_num, pub_ts, chapters_url)`."""
-        episodes: list[tuple[str, str, str, int | None, int | None, float | None, str | None]] = []
+    ) -> list[tuple[str, str, str, int | None, int | None, float | None, str | None, int | None]]:
+        """Return list of `(url, ext, title, duration_ms, episode_num, pub_ts, chapters_url, size_bytes)`."""
+        episodes: list[tuple[str, str, str, int | None, int | None, float | None, str | None, int | None]] = []
         raw_items = [c for c in channel if _local_tag(c) in ("item", "entry")]
         for idx, item in enumerate(raw_items, start=1):
             enclosure_url: str | None = None
             enclosure_type: str | None = None
+            enclosure_length: int | None = None
             chapters_url: str | None = None
             for child in item:
                 ctag = _local_tag(child)
@@ -186,14 +187,23 @@ class RssSource(Source):
                 elif ctag == "enclosure" and not enclosure_url:
                     enclosure_url = (child.get("url") or "").strip() or None
                     enclosure_type = (child.get("type") or "").strip() or None
+                    raw_len = (child.get("length") or "").strip()
+                    if raw_len.isdigit() and int(raw_len) > 0:
+                        enclosure_length = int(raw_len)
                 elif ctag == "link" and not enclosure_url and (child.get("rel") or "").lower() == "enclosure":
                     enclosure_url = (child.get("href") or "").strip() or None
                     enclosure_type = (child.get("type") or "").strip() or None
+                    raw_len = (child.get("length") or "").strip()
+                    if raw_len.isdigit() and int(raw_len) > 0:
+                        enclosure_length = int(raw_len)
                 elif ctag == "content" and not enclosure_url and child.get("url"):
                     ctype = (child.get("type") or "").lower()
                     if not ctype or ctype.startswith("audio/"):
                         enclosure_url = (child.get("url") or "").strip() or None
                         enclosure_type = ctype or None
+                        raw_len = (child.get("fileSize") or "").strip()
+                        if raw_len.isdigit() and int(raw_len) > 0:
+                            enclosure_length = int(raw_len)
             if not enclosure_url:
                 continue
             abs_url = urljoin(base_url, enclosure_url)
@@ -209,13 +219,13 @@ class RssSource(Source):
             ep_num = int(raw_ep) if (raw_ep and raw_ep.isdigit()) else None
             pub_raw = _find_child_text(item, ("pubdate", "published", "updated"))
             pub_ts = _parse_feed_timestamp(pub_raw)
-            episodes.append((abs_url, ext, ep_title, duration_ms, ep_num, pub_ts, chapters_url))
+            episodes.append((abs_url, ext, ep_title, duration_ms, ep_num, pub_ts, chapters_url, enclosure_length))
         return episodes
 
     def _order_episodes(
         self,
-        episodes: list[tuple[str, str, str, int | None, int | None, float | None, str | None]],
-    ) -> list[tuple[str, str, str, int | None, int | None, float | None, str | None]]:
+        episodes: list[tuple[str, str, str, int | None, int | None, float | None, str | None, int | None]],
+    ) -> list[tuple[str, str, str, int | None, int | None, float | None, str | None, int | None]]:
         if len(episodes) <= 1:
             return episodes
         if all(ep[4] is not None for ep in episodes):
@@ -261,8 +271,8 @@ class RssSource(Source):
         chapters: list[Chapter] = []
         running_ms = 0
         all_have_duration = all(ep[3] is not None and ep[3] > 0 for ep in episodes)
-        for ep_url, ext, ep_title, duration_ms, _ep_num, _pub_ts, ch_url in episodes:
-            files.append(AudiobookFile(url=ep_url, ext=ext, title=ep_title))
+        for ep_url, ext, ep_title, duration_ms, _ep_num, _pub_ts, ch_url, ep_size in episodes:
+            files.append(AudiobookFile(url=ep_url, ext=ext, title=ep_title, size=ep_size))
             if len(episodes) == 1 and ch_url:
                 chapters.extend(self._fetch_podcast_chapters(ch_url))
             elif all_have_duration and duration_ms is not None:

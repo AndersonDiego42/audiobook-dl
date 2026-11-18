@@ -25,6 +25,7 @@ from audiobookdl.utils.audiobook import (
     AudiobookMetadata,
     BookId,
     Cover,
+    format_bytes,
     is_ebook,
     parse_language,
     parse_release_date,
@@ -241,6 +242,18 @@ def format_speed(bytes_per_sec: float) -> str:
     return f"{bytes_per_sec / (1024 * 1024):.1f} MB/s"
 
 
+def format_size_estimate(
+    estimated_bytes: int | None,
+    *,
+    is_exact: bool = True,
+) -> str:
+    """Format an estimated byte total as `'142.3 MB'` or `'~142.3 MB'`."""
+    if estimated_bytes is None or estimated_bytes <= 0:
+        return "Unknown"
+    prefix = "" if is_exact else "~"
+    return f"{prefix}{format_bytes(estimated_bytes)}"
+
+
 def format_duration(seconds: float | None) -> str:
     """Format a duration in seconds as `MM:SS` or `H:MM:SS`."""
     if seconds is None or seconds < 0:
@@ -318,6 +331,13 @@ def format_audiobook_preview(audiobook: Audiobook) -> list[tuple[str, str]]:
     exts = sorted({f.ext.lstrip(".").lower() for f in audiobook.files if f.ext})
     ext_suffix = f" ({', '.join(exts)})" if exts else ""
     rows.append(("Parts", f"{file_count} file{'s' if file_count != 1 else ''}{ext_suffix}"))
+    from audiobookdl.output.download import estimate_download_size
+
+    size_est = estimate_download_size(audiobook, probe_remote=False)
+    if size_est.estimated_bytes is not None and size_est.estimated_bytes > 0:
+        rows.append(
+            ("Est. Size", format_size_estimate(size_est.estimated_bytes, is_exact=size_est.is_exact))
+        )
     chap_count = len(audiobook.chapters)
     if not (is_ebook(audiobook) and chap_count == 0):
         rows.append(("Chapters", f"{chap_count} chapter{'s' if chap_count != 1 else ''}"))

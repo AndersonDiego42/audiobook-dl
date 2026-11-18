@@ -1483,6 +1483,115 @@ def test_process_audiobook_override_chapters_passes_flags_to_enrichment_and_down
     assert [(c.start, c.title) for c in book.chapters] == [(0, "Audible Ch 1")]
 
 
+def test_bulk_downloads_skip_unavailable_books_and_fail_on_auth_errors(monkeypatch):
+    from audiobookdl.exceptions import (
+        BookNotFound,
+        MissingBookAccess,
+        NoFilesFound,
+        UserNotAuthorized,
+    )
+
+    cfg = Config(sources={}, output_template=None, database_directory=None, skip_downloaded=None)
+    processed: list[str] = []
+
+    def fake_process_url(url, _opts, _cfg, **kwargs):
+        if url.endswith("/locked"):
+            raise MissingBookAccess
+        if url.endswith("/missing"):
+            raise BookNotFound
+        if url.endswith("/empty"):
+            raise NoFilesFound
+        if url.endswith("/auth"):
+            raise UserNotAuthorized
+        processed.append(url)
+        kwargs["summary"].books_completed += 1
+
+    monkeypatch.setattr("audiobookdl.pipeline.process_url", fake_process_url)
+
+    # Multi-URL bulk run skips unavailable books and continues to later valid URLs
+    summary = Downloader(cfg, build_default_options()).download(
+        [
+            "https://example.com/locked",
+            "https://example.com/ok1",
+            "https://example.com/missing",
+            "https://example.com/empty",
+            "https://example.com/ok2",
+        ]
+    )
+    assert processed == ["https://example.com/ok1", "https://example.com/ok2"]
+    assert summary.books_completed == 2
+    assert summary.books_skipped == 3
+    assert summary.failed == 0
+    assert summary.books_failed == 0
+
+    # Account auth error still fails rather than being silently skipped
+    processed.clear()
+    auth_summary = Downloader(cfg, build_default_options(skip_unavailable=True)).download(
+        ["https://example.com/auth", "https://example.com/ok3"]
+    )
+    assert processed == ["https://example.com/ok3"]
+    assert auth_summary.books_completed == 1
+    assert auth_summary.failed == 1
+    assert auth_summary.books_failed == 1
+
+    # Single URL with skip_unavailable=True skips cleanly
+    single_skip = Downloader(cfg, build_default_options(skip_unavailable=True)).download(
+        ["https://example.com/locked"]
+    )
+    assert single_skip.books_skipped == 1
+    assert single_skip.failed == 0
+
+
+def test_series_skips_inaccessible_and_missing_books(monkeypatch):
+    from audiobookdl.exceptions import BookNotFound, MissingBookAccess, NoFilesFound
+
+    b1 = Audiobook(session=requests.Session(), metadata=AudiobookMetadata(title="Available Book"), files=[])
+    series = Series(
+        title="Series",
+        books=[BookId("locked"), BookId("missing"), BookId("empty"), BookId("ok")],
+    )
+
+    class _FakeSeriesSource:
+        name = "fakesource"
+        names = ["FakeSource"]
+        requires_authentication = False
+        authenticated = True
+
+        def __init__(self, _options) -> None:
+            pass
+
+        def download(self, _url: str) -> Series:
+            return series
+
+        def download_from_id(self, book_id: str) -> Audiobook:
+            if book_id == "locked":
+                raise MissingBookAccess
+            if book_id == "missing":
+                raise BookNotFound
+            if book_id == "empty":
+                raise NoFilesFound
+            return b1
+
+        def on_download_complete(self, _ab: Audiobook) -> None:
+            pass
+
+    monkeypatch.setattr("audiobookdl.pipeline.find_compatible_source", lambda _url: _FakeSeriesSource)
+    downloaded: list[str] = []
+    monkeypatch.setattr(
+        "audiobookdl.pipeline.process_audiobook",
+        lambda _s, ab, _o, **_kw: downloaded.append(ab.title) or True,
+    )
+
+    cfg = Config(sources={}, output_template=None, database_directory=None, skip_downloaded=None)
+    summary = Downloader(cfg, build_default_options()).download(["https://example.com/series"])
+    assert downloaded == ["Available Book"]
+    assert summary.books_completed == 1
+    assert summary.books_skipped == 3
+    assert summary.books_failed == 0
+    assert summary.failed == 0
+
+
+
 
 
 

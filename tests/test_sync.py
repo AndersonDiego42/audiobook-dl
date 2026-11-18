@@ -131,4 +131,36 @@ def test_sync_once_preserves_config_output_template_and_format_when_sync_opts_un
     assert len(captured_options) == 1
     assert captured_options[0].output_template == "custom/{author}/{title}"
     assert captured_options[0].output_format == "m4b"
+    assert captured_options[0].skip_unavailable is True
+
+
+def test_sync_once_propagates_skipped_unavailable_books(tmp_path):
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    db_path = tmp_path / "downloads.db"
+    cfg_path.write_text('[sources.storytel]\nusername = "demo"\n', encoding="utf-8")
+
+    class _FakeDownloader:
+        def __init__(self, config, options, cancel_event=None):
+            self.options = options
+
+        def download(self, _urls):
+            from audiobookdl.pipeline import DownloadSummary
+
+            assert self.options.skip_unavailable is True
+            return DownloadSummary(completed=2, failed=0, books_completed=1, books_skipped=1)
+
+    books = [
+        CatalogBook(title="Good", url="https://storytel.com/good", author="Author"),
+        CatalogBook(title="Locked", url="https://storytel.com/locked", author="Author"),
+    ]
+    sync_opts = SyncOptions(config_location=str(cfg_path), archive_path=str(db_path))
+    with patch("audiobookdl.sync.list_service_library", return_value=books), patch(
+        "audiobookdl.sync.Downloader", _FakeDownloader
+    ):
+        cycle = run_sync_once(sync_opts)
+
+    assert cycle.downloaded == 1
+    assert cycle.skipped == 1
+    assert cycle.failed == 0
+
 

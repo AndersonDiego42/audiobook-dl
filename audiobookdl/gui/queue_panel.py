@@ -16,6 +16,7 @@ from audiobookdl.gui.controller import GuiController, QueuedJob
 from audiobookdl.gui.events import (
     BatchItemEvent,
     ControllerEvent,
+    DownloadEstimateEvent,
     ItemProgressEvent,
     JobMetaEvent,
     JobStatusEvent,
@@ -26,7 +27,13 @@ from audiobookdl.gui.events import (
     ProgressMetricsEvent,
     ProgressStartEvent,
 )
-from audiobookdl.gui.formatting import format_duration, format_speed, parse_url_text
+from audiobookdl.gui.formatting import (
+    format_duration,
+    format_size_estimate,
+    format_speed,
+    parse_url_text,
+)
+from audiobookdl.utils.audiobook import format_bytes
 from audiobookdl.gui.notifications import format_completion_notification, send_os_notification_async
 from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, make_bold_font, scale_px
 from audiobookdl.gui.widgets import (
@@ -487,6 +494,9 @@ class ActivityQueuePanel(ttk.LabelFrame):
         self._last_pct = 0.0
         self._last_speed_bps = 0.0
         self._last_eta_seconds: float | None = None
+        self._last_bytes_downloaded = 0
+        self._last_estimated_bytes: int | None = None
+        self._last_estimated_exact = False
         self._last_metrics_render_at = 0.0
         self._last_row_progress_render_at = 0.0
         self._active_job_id: str | None = None
@@ -1170,6 +1180,16 @@ class ActivityQueuePanel(ttk.LabelFrame):
         parts = []
         if self._last_pct > 0:
             parts.append(f"{self._last_pct:.0f}%")
+        if self._last_estimated_bytes is not None and self._last_estimated_bytes > 0:
+            est_str = format_size_estimate(
+                self._last_estimated_bytes, is_exact=self._last_estimated_exact
+            )
+            if self._last_bytes_downloaded > 0:
+                parts.append(f"{format_bytes(self._last_bytes_downloaded)} / {est_str}")
+            else:
+                parts.append(f"Est. {est_str}")
+        elif self._last_bytes_downloaded > 0:
+            parts.append(format_bytes(self._last_bytes_downloaded))
         if self._last_speed_bps > 0:
             parts.append(format_speed(self._last_speed_bps))
         parts.append(f"Elapsed {format_duration(elapsed)}")
@@ -1205,9 +1225,18 @@ class ActivityQueuePanel(ttk.LabelFrame):
         stage = self.stage_var.get().strip()
         if stage == "Stage: Downloading":
             pct_str = f"Downloading {self._last_pct:.0f}%"
+            extras: list[str] = []
+            if self._last_estimated_bytes is not None and self._last_estimated_bytes > 0:
+                est_str = format_size_estimate(
+                    self._last_estimated_bytes, is_exact=self._last_estimated_exact
+                )
+                if self._last_bytes_downloaded > 0:
+                    extras.append(f"{format_bytes(self._last_bytes_downloaded)} / {est_str}")
+                else:
+                    extras.append(f"Est. {est_str}")
             if self._last_speed_bps > 0:
-                return f"{pct_str} \u2022 {format_speed(self._last_speed_bps)}"
-            return pct_str
+                extras.append(format_speed(self._last_speed_bps))
+            return " \u2022 ".join([pct_str, *extras])
         return stage or "Running"
 
     def _update_active_row_live_detail(self, *, force: bool = False) -> None:
@@ -1244,6 +1273,9 @@ class ActivityQueuePanel(ttk.LabelFrame):
         self._last_pct = 0.0
         self._last_speed_bps = 0.0
         self._last_eta_seconds = None
+        self._last_bytes_downloaded = 0
+        self._last_estimated_bytes = None
+        self._last_estimated_exact = False
         self._last_metrics_render_at = 0.0
         self.current_ui_run_id = run_id
         self.ui_item_index = 1
@@ -1937,6 +1969,9 @@ class ActivityQueuePanel(ttk.LabelFrame):
             self._last_pct = 0.0
             self._last_speed_bps = 0.0
             self._last_eta_seconds = None
+            self._last_bytes_downloaded = 0
+            self._last_estimated_bytes = None
+            self._last_estimated_exact = False
             self.stage_var.set("Stage: Downloading")
             self.update_metrics_display(is_running=True, force=True)
             self._update_active_row_live_detail(force=True)
@@ -1944,6 +1979,12 @@ class ActivityQueuePanel(ttk.LabelFrame):
             self.status_var.set(item.description[:80])
             if item.description.strip():
                 self.active_job_var.set(item.description.strip()[:60])
+            return True
+        if isinstance(item, DownloadEstimateEvent):
+            self._last_estimated_bytes = item.estimated_bytes
+            self._last_estimated_exact = item.is_exact
+            self.update_metrics_display(is_running=True, force=True)
+            self._update_active_row_live_detail(force=True)
             return True
         if isinstance(item, ProgressAdvanceEvent):
             pct = (item.completed / item.total * 100.0) if item.total > 0 else 0.0
@@ -1956,6 +1997,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
             pct = (item.completed / item.total * 100.0) if item.total > 0 else 0.0
             self._last_pct = min(100.0, max(0.0, pct))
             self.progress_var.set(self._last_pct)
+            self._last_bytes_downloaded = item.bytes_downloaded
             self._last_speed_bps = item.speed_bps
             self._last_eta_seconds = item.eta_seconds
             self.update_metrics_display(is_running=True, force=True)

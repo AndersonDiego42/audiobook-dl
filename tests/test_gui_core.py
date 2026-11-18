@@ -6462,6 +6462,83 @@ def test_gui_contextual_account_jump_and_view_in_download_action(tmp_path, monke
         root.destroy()
 
 
+@pytest.mark.gui
+def test_gui_skip_unavailable_and_download_size_estimate_displays(tmp_path):
+    from tkinter import ttk
+    from audiobookdl.gui.events import DownloadEstimateEvent, ProgressMetricsEvent, ProgressStartEvent
+    from audiobookdl.gui.preview_dialog import PreviewDialog
+    from audiobookdl.utils.audiobook import AudiobookFile
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+        assert app.skip_unavailable_var.get() is True
+        app.skip_unavailable_var.set(False)
+        opts = app.build_options(urls_override=["https://example.com/book"])
+        assert opts.skip_unavailable is False
+
+        # Live DownloadEstimateEvent + ProgressMetricsEvent surface expected size in metrics_var
+        dl_page = app.shell.ensure_page("download")
+        qp = dl_page.queue_panel
+        qp.prepare_run_ui_state(1, 1, "--- Start ---")
+        qp.handle_activity_event(ProgressStartEvent(description="Downloading Test", total=2.0))
+        qp.handle_activity_event(
+            DownloadEstimateEvent(
+                estimated_bytes=10 * 1024 * 1024,
+                is_exact=False,
+                known_files=1,
+                total_files=2,
+            )
+        )
+        qp.handle_activity_event(
+            ProgressMetricsEvent(
+                completed=1.0,
+                total=2.0,
+                bytes_downloaded=5 * 1024 * 1024,
+                speed_bps=1024 * 1024,
+                elapsed_seconds=5.0,
+                eta_seconds=5.0,
+            )
+        )
+        metrics_text = app.metrics_var.get()
+        assert "5.0 MB / ~10.0 MB" in metrics_text
+
+        # PreviewDialog renders Est. Size row for books with known file sizes
+        src = MagicMock()
+        src.name = "rss"
+        ab = Audiobook(
+            session=MagicMock(),
+            metadata=AudiobookMetadata(title="Sized Book", authors=["Author"]),
+            files=[AudiobookFile(url="https://cdn.example.com/1.mp3", ext="mp3", size=20 * 1024 * 1024)],
+        )
+        dlg = PreviewDialog(
+            root,
+            "https://example.com/rss",
+            src,
+            ab,
+            is_running=False,
+            skip_downloaded=False,
+            series_book_exists=lambda _b: False,
+            on_confirm=lambda *_a: None,
+        )
+        labels = [
+            str(w.cget("text"))
+            for w in dlg._readonly_frame.winfo_children()
+            if isinstance(w, ttk.Label)
+        ]
+        assert "Est. Size:" in labels
+        assert "20.0 MB" in labels
+        dlg.destroy()
+    finally:
+        app.controller.shutdown(is_running=False, is_previewing=False)
+        root.destroy()
+
+
+
 
 
 

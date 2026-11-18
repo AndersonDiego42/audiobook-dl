@@ -183,6 +183,11 @@ class _SinkTask:
         self.bytes_downloaded = 0
         self.byte_samples: deque[tuple[float, int]] = deque()
         self.last_metrics_time = 0.0
+        self.total_files: int = int(round(total)) if total > 0 else 0
+        self.known_file_sizes: dict[int, int] = {}
+        self.estimated_total_bytes: int | None = None
+        self.estimated_total_is_exact: bool = False
+        self.last_emitted_estimate: tuple[int | None, bool, int, int] | None = None
 
     @property
     def remaining(self) -> float:
@@ -211,6 +216,71 @@ class _SinkProgressAdapter:
         self._sink.on_progress_start(strip_markup(description), float(total))
         return task_id
 
+    @staticmethod
+    def _recompute_estimate_locked(
+        task: _SinkTask,
+    ) -> tuple[int | None, bool, int, int] | None:
+        total_files = task.total_files or (int(round(task.total)) if task.total > 0 else 0)
+        known_count = len(task.known_file_sizes)
+        if known_count <= 0 or total_files <= 0:
+            task.estimated_total_bytes = None
+            task.estimated_total_is_exact = False
+            payload: tuple[int | None, bool, int, int] = (None, False, 0, total_files)
+        else:
+            known_sum = sum(task.known_file_sizes.values())
+            is_exact = known_count >= total_files
+            est_bytes = known_sum if is_exact else round((known_sum / known_count) * total_files)
+            task.estimated_total_bytes = est_bytes
+            task.estimated_total_is_exact = is_exact
+            payload = (est_bytes, is_exact, known_count, total_files)
+        if payload == task.last_emitted_estimate:
+            return None
+        task.last_emitted_estimate = payload
+        return payload
+
+    def _emit_estimate(
+        self,
+        estimate: tuple[int | None, bool, int, int] | None,
+    ) -> None:
+        if estimate is None:
+            return
+        handler = getattr(self._sink, "on_download_estimate", None)
+        if callable(handler):
+            handler(*estimate)
+
+    def set_file_size_estimates(
+        self,
+        task_id: int,
+        per_file_bytes: Sequence[int | None],
+    ) -> None:
+        """Seed pre-known per-file byte sizes on `task_id` and emit initial estimate."""
+        estimate = None
+        with self._lock:
+            if not (0 <= task_id < len(self.tasks)):
+                return
+            task = self.tasks[task_id]
+            task.total_files = len(per_file_bytes)
+            for idx, size in enumerate(per_file_bytes):
+                if isinstance(size, int) and size > 0:
+                    task.known_file_sizes[idx] = size
+            estimate = self._recompute_estimate_locked(task)
+        self._emit_estimate(estimate)
+
+    def report_file_size(self, task_id: int, file_index: int, total_bytes: int) -> None:
+        """Record discovered byte size for `file_index` and emit updated download estimate."""
+        if total_bytes <= 0:
+            return
+        estimate = None
+        with self._lock:
+            if not (0 <= task_id < len(self.tasks)):
+                return
+            task = self.tasks[task_id]
+            if task.known_file_sizes.get(file_index) == total_bytes:
+                return
+            task.known_file_sizes[file_index] = total_bytes
+            estimate = self._recompute_estimate_locked(task)
+        self._emit_estimate(estimate)
+
     def _build_metrics_locked(
         self,
         task: _SinkTask,
@@ -228,10 +298,21 @@ class _SinkProgressAdapter:
         else:
             speed_bps = 0.0
         eta_seconds: float | None = None
-        if task.total > 0 and task.completed > 0:
-            if task.completed >= task.total:
+        if task.total > 0 and task.completed >= task.total:
+            eta_seconds = 0.0
+        elif (
+            task.estimated_total_bytes is not None
+            and task.estimated_total_bytes > 0
+            and task.bytes_downloaded > 0
+        ):
+            if task.bytes_downloaded >= task.estimated_total_bytes:
                 eta_seconds = 0.0
-            elif elapsed >= 0.5 and (task.completed / task.total) >= 0.002:
+            elif speed_bps > 0 and elapsed >= 0.5:
+                eta_seconds = max(
+                    0.0, (task.estimated_total_bytes - task.bytes_downloaded) / speed_bps
+                )
+        if eta_seconds is None and task.total > 0 and task.completed > 0:
+            if elapsed >= 0.5 and (task.completed / task.total) >= 0.002:
                 eta_seconds = elapsed * ((task.total - task.completed) / task.completed)
         return (
             task.completed,

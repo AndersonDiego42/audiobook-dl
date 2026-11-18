@@ -29,6 +29,7 @@ All runtime keys below map directly from `audiobookdl/options_schema.py` and may
 | `output_format` | `str` | unset (`None`) | Target audio container format (for example `m4b`, `mp3`, `m4a`, `flac`, `opus`) |
 | `media_type` | `media_type` | `"auto"` | Media selection when a source offers multiple formats (`auto`, `audiobook`, `ebook`, `video`, `both`) |
 | `skip_downloaded` | `bool` | `false` | Skip downloading books whose output file/directory or archive record already exists |
+| `skip_unavailable` | `bool` | `false` | Skip unavailable or inaccessible books and continue bulk downloads |
 | `download_archive` | `str` | unset (`None`) | Path to SQLite download archive database (`downloads.db`) |
 | `database_directory` | `str` | unset (`None`) | Base directory for per-source state, cached cookies, and default databases |
 | `write_json_metadata` | `bool` | `false` | Write raw metadata JSON sidecar beside downloaded files |
