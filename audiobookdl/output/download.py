@@ -25,22 +25,23 @@ from mutagen import File as MutagenFile
 from audiobookdl.utils.concurrency import run_cancellable_pool
 from audiobookdl.utils.http import (
     DEFAULT_HTTP_TIMEOUT,
+    DEFAULT_MAX_RETRIES,
     TokenBucketRateLimiter,
+    compute_retry_delay,
+    is_transient_network_error,
     parse_byte_rate,
+    sleep_or_cancel,
 )
 from . import metadata, output, encryption
 from .metadata import sidecars
 
-import email.utils
 import os
-import random
 import re
 import shutil
 import tempfile
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
 import requests
 from functools import partial
 from typing import Any, cast
@@ -49,16 +50,15 @@ from pathlib import Path
 from math import log10
 
 
-# Per-file download attempts before giving up (retries transient network/TLS errors and 429/5xx)
-DOWNLOAD_ATTEMPTS = 5
+# Default per-file retries after the initial attempt (5 total attempts by default)
+DEFAULT_DOWNLOAD_RETRIES = DEFAULT_MAX_RETRIES
+DOWNLOAD_ATTEMPTS = DEFAULT_DOWNLOAD_RETRIES + 1
 # 64 KiB read chunks balance throughput with prompt cancel_event checks
 DOWNLOAD_CHUNK_SIZE = 64 * 1024
 # Conservative default parallel workers per book to reduce CDN 429/anti-abuse throttling
 DEFAULT_DOWNLOAD_WORKERS = 6
 # Upper bound on parallel file download workers (matched to Session pool_maxsize)
 MAX_DOWNLOAD_WORKERS = 20
-# Cap exponential backoff and server-supplied Retry-After sleeps
-MAX_RETRY_DELAY = 60.0
 
 
 def download(
@@ -254,6 +254,7 @@ def download_audiobook(
             overwrite=options.overwrite,
             max_workers=options.max_workers,
             timeout=options.timeout,
+            max_retries=getattr(options, "max_retries", None),
             limit_rate=getattr(options, "limit_rate", None),
             probe_cache=probe_cache,
         )
@@ -975,6 +976,7 @@ def download_files_with_progress(
     overwrite: bool | None = None,
     max_workers: int | None = None,
     timeout: float | None = None,
+    max_retries: int | None = None,
     limit_rate: str | None = None,
     probe_cache: dict[str, Any] | None = None,
 ) -> list[str]:
@@ -1034,6 +1036,7 @@ def download_files_with_progress(
                 resume=resume,
                 max_workers=max_workers,
                 timeout=timeout,
+                max_retries=max_retries,
                 limit_rate=limit_rate,
                 probe_cache=probe_cache,
             )
@@ -1109,47 +1112,6 @@ def _normalize_content_type(value: Any) -> str | None:
     return media_type or None
 
 
-def _parse_retry_after(value: Any | None) -> float | None:
-    """Parse an HTTP `Retry-After` header (delta seconds or HTTP-date) clamped to `MAX_RETRY_DELAY`."""
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    try:
-        seconds = float(text)
-    except ValueError:
-        try:
-            dt = email.utils.parsedate_to_datetime(text)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        seconds = (dt - datetime.now(timezone.utc)).total_seconds()
-    return max(0.0, min(MAX_RETRY_DELAY, seconds))
-
-
-def _compute_retry_delay(attempt: int, retry_after: Any | None = None) -> float:
-    """Compute bounded exponential backoff (with jitter) or honor `Retry-After`."""
-    header_delay = _parse_retry_after(retry_after)
-    if header_delay is not None:
-        return header_delay
-    return min(MAX_RETRY_DELAY, float(2 ** attempt) + random.uniform(0.0, 0.5))
-
-
-def _sleep_or_cancel(delay: float, cancel_event: threading.Event | None) -> None:
-    """Sleep for `delay` seconds while respecting `cancel_event`."""
-    if delay <= 0:
-        if cancel_event is not None and cancel_event.is_set():
-            raise DownloadCancelled
-        return
-    if cancel_event is not None:
-        if cancel_event.wait(delay):
-            raise DownloadCancelled
-    else:
-        time.sleep(delay)
-
-
 def _parse_content_length(headers: Any) -> int:
     """Parse Content-Length header safely, returning 0 when missing or invalid."""
     raw_length = _get_header_ci(headers, "Content-Length")
@@ -1195,6 +1157,7 @@ def download_file(
     *,
     resume: bool = False,
     timeout: float | None = None,
+    max_retries: int | None = None,
     rate_limiter: TokenBucketRateLimiter | None = None,
     probe_cache: dict[str, Any] | None = None,
 ) -> str:
@@ -1219,6 +1182,12 @@ def download_file(
     logging.debug(f"Starting downloading file: {file.url}")
     # Retry transient network failures (e.g. a dropped TLS connection) so one
     # flaky segment does not crash the whole batch via the thread pool.
+    effective_retries = (
+        max(0, int(max_retries))
+        if max_retries is not None and not isinstance(max_retries, bool)
+        else DEFAULT_DOWNLOAD_RETRIES
+    )
+    max_attempts = 1 + effective_retries
     attempt = 0
     reset_stale_tmp = False
     decrypted_inline = False
@@ -1236,9 +1205,11 @@ def download_file(
                     pass
             raise
         update_progress(1.0)
-        attempt = DOWNLOAD_ATTEMPTS
-    while attempt < DOWNLOAD_ATTEMPTS:
+        attempt = max_attempts
+    while attempt < max_attempts:
         logging.wait_if_paused(cancel_event=cancel_event)
+        if attempt > 0 and file.url_resolver is not None:
+            file.url = file.url_resolver()
         advanced = 0.0
         request = None
         decrypted_inline = False
@@ -1312,19 +1283,27 @@ def download_file(
                 )
             retryable_status = (
                 invalid_status_code
-                and (request.status_code == 429 or 500 <= request.status_code < 600)
+                and (
+                    request.status_code == 429
+                    or 500 <= request.status_code < 600
+                    or (file.url_resolver is not None and request.status_code in (403, 410))
+                )
                 and request.status_code != file.expected_status_code
             )
-            if retryable_status and attempt + 1 < DOWNLOAD_ATTEMPTS:
-                delay = _compute_retry_delay(
+            if retryable_status and attempt + 1 < max_attempts:
+                delay = compute_retry_delay(
                     attempt,
                     _get_header_ci(request.headers, "Retry-After"),
                 )
+                logging.log(
+                    f"[yellow]Retrying[/yellow] {os.path.basename(filepath)} "
+                    f"(HTTP {request.status_code}, attempt {attempt + 2}/{max_attempts}, waiting {delay:.1f}s)"
+                )
                 logging.debug(
-                    f"Download attempt {attempt + 1}/{DOWNLOAD_ATTEMPTS} received HTTP "
+                    f"Download attempt {attempt + 1}/{max_attempts} received HTTP "
                     f"{request.status_code} for {file.url}; retrying in {delay:.2f}s"
                 )
-                _sleep_or_cancel(delay, cancel_event)
+                sleep_or_cancel(delay, cancel_event, sleep_fn=time.sleep)
                 attempt += 1
                 continue
             if invalid_content_type or invalid_status_code:
@@ -1472,23 +1451,6 @@ def download_file(
                 update_progress(1.0)
                 advanced = 1.0
             break
-        except requests.exceptions.RequestException as error:
-            if inline_dec_tmp and os.path.exists(inline_dec_tmp):
-                try:
-                    os.remove(inline_dec_tmp)
-                except OSError:
-                    pass
-            # Undo this attempt's progress before retrying so the bar stays accurate
-            update_progress(-advanced)
-            if attempt + 1 >= DOWNLOAD_ATTEMPTS:
-                raise
-            delay = _compute_retry_delay(attempt)
-            logging.debug(
-                f"Download attempt {attempt + 1}/{DOWNLOAD_ATTEMPTS} failed for "
-                f"{file.url} ({error}); retrying in {delay:.2f}s"
-            )
-            _sleep_or_cancel(delay, cancel_event)
-            attempt += 1
         except DownloadCancelled:
             if inline_dec_tmp and os.path.exists(inline_dec_tmp):
                 try:
@@ -1501,13 +1463,32 @@ def download_file(
                 except OSError:
                     pass
             raise
-        except Exception:
+        except Exception as error:
             if inline_dec_tmp and os.path.exists(inline_dec_tmp):
                 try:
                     os.remove(inline_dec_tmp)
                 except OSError:
                     pass
-            raise
+            if not (
+                isinstance(error, requests.exceptions.RequestException)
+                or is_transient_network_error(error)
+            ):
+                raise
+            # Undo this attempt's progress before retrying so the bar stays accurate
+            update_progress(-advanced)
+            if attempt + 1 >= max_attempts:
+                raise
+            delay = compute_retry_delay(attempt)
+            logging.log(
+                f"[yellow]Retrying[/yellow] {os.path.basename(filepath)} "
+                f"(attempt {attempt + 2}/{max_attempts}, waiting {delay:.1f}s): {error}"
+            )
+            logging.debug(
+                f"Download attempt {attempt + 1}/{max_attempts} failed for "
+                f"{file.url} ({error}); retrying in {delay:.2f}s"
+            )
+            sleep_or_cancel(delay, cancel_event, sleep_fn=time.sleep)
+            attempt += 1
         finally:
             if request is not None:
                 request.close()
@@ -1594,6 +1575,7 @@ def download_files(
     resume: bool = False,
     max_workers: int | None = None,
     timeout: float | None = None,
+    max_retries: int | None = None,
     limit_rate: str | None = None,
     probe_cache: dict[str, Any] | None = None,
 ) -> list[str]:
@@ -1616,6 +1598,8 @@ def download_files(
         worker_kwargs["resume"] = True
     if timeout is not None:
         worker_kwargs["timeout"] = timeout
+    if max_retries is not None:
+        worker_kwargs["max_retries"] = max_retries
     if probe_cache is not None:
         worker_kwargs["probe_cache"] = probe_cache
     rate_bps = parse_byte_rate(limit_rate)

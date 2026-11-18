@@ -9,15 +9,19 @@ from audiobookdl.utils.audiobook import (
 from audiobookdl.utils.concurrency import run_cancellable_pool
 from audiobookdl.utils.http import (
     DEFAULT_HTTP_TIMEOUT,
+    DEFAULT_MAX_RETRIES,
+    compute_retry_delay,
     extract_session_cookies,
     is_transient_network_error,
+    resolve_max_retries,
+    sleep_or_cancel,
 )
 
 import base64
 from collections.abc import MutableMapping
 import json
 import os
-import random
+import threading
 import time
 from urllib.parse import unquote_to_bytes, urlparse
 import m3u8
@@ -25,30 +29,6 @@ import requests
 
 
 RETRIABLE_STATUS_CODES = frozenset({429, 502, 503, 504})
-DEFAULT_MAX_RETRIES = 3
-MAX_RETRY_DELAY = 30.0
-
-
-def _retry_delay_seconds(attempt: int, resp: requests.Response | None) -> float:
-    """Compute retry backoff with jitter, honoring numeric `Retry-After` when present."""
-    if resp is not None:
-        raw_retry = resp.headers.get("Retry-After") if hasattr(resp, "headers") and resp.headers else None
-        if isinstance(raw_retry, str) and raw_retry.strip().isdigit():
-            return min(MAX_RETRY_DELAY * 2, float(int(raw_retry.strip())))
-    base = min(MAX_RETRY_DELAY, 0.5 * (2 ** attempt))
-    return base + random.uniform(0.0, 0.25 * (attempt + 1))
-
-
-def _sleep_cancellable(seconds: float) -> None:
-    if seconds <= 0:
-        return
-    ctx = logging.get_job_context()
-    cancel_event = ctx.cancel_event if ctx is not None else None
-    if cancel_event is not None:
-        if cancel_event.wait(seconds):
-            raise exceptions.DownloadCancelled
-    else:
-        time.sleep(seconds)
 
 
 def request(
@@ -57,7 +37,7 @@ def request(
     url: str,
     *,
     force_cookies: bool = False,
-    max_retries: int = DEFAULT_MAX_RETRIES,
+    max_retries: int | None = None,
     **kwargs,
 ) -> requests.Response:
     """Make an HTTP request with retry/backoff for transient errors and configurable timeout."""
@@ -69,6 +49,11 @@ def request(
     if force_cookies:
         kwargs["cookies"] = _get_all_cookies(self._session)
 
+    effective_retries = (
+        max(0, int(max_retries))
+        if max_retries is not None and not isinstance(max_retries, bool)
+        else resolve_max_retries(getattr(self, "_options", None), default=DEFAULT_MAX_RETRIES)
+    )
     upper_method = method.upper()
 
     def _send() -> requests.Response:
@@ -78,25 +63,31 @@ def request(
             return self._session.post(url, timeout=timeout, **kwargs)
         return self._session.request(method, url, timeout=timeout, **kwargs)
 
+    def _cancel_event() -> threading.Event | None:
+        ctx = logging.get_job_context()
+        return ctx.cancel_event if ctx is not None else None
+
     last_exc: BaseException | None = None
-    for attempt in range(max_retries + 1):
+    for attempt in range(effective_retries + 1):
         try:
             resp = _send()
         except Exception as exc:
             if not is_transient_network_error(exc):
                 raise
             last_exc = exc
-            if attempt >= max_retries:
+            if attempt >= effective_retries:
                 raise exceptions.RequestError from exc
-            delay = _retry_delay_seconds(attempt, None)
+            delay = compute_retry_delay(attempt)
             logging.debug(
                 f"Transient network error for {upper_method} {url} ({exc}); retrying in {delay:.2f}s"
             )
-            _sleep_cancellable(delay)
+            sleep_or_cancel(delay, _cancel_event(), sleep_fn=time.sleep)
             continue
 
-        if resp.status_code in RETRIABLE_STATUS_CODES and attempt < max_retries:
-            delay = _retry_delay_seconds(attempt, resp)
+        if resp.status_code in RETRIABLE_STATUS_CODES and attempt < effective_retries:
+            raw_headers = getattr(resp, "headers", None)
+            retry_after = raw_headers.get("Retry-After") if raw_headers else None
+            delay = compute_retry_delay(attempt, retry_after)
             logging.debug(
                 f"HTTP {resp.status_code} for {upper_method} {url}; retrying in {delay:.2f}s"
             )
@@ -104,7 +95,7 @@ def request(
                 resp.close()
             except Exception:
                 pass
-            _sleep_cancellable(delay)
+            sleep_or_cancel(delay, _cancel_event(), sleep_fn=time.sleep)
             continue
         return resp
 

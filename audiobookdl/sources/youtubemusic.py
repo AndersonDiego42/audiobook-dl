@@ -30,7 +30,7 @@ from audiobookdl.utils.audiobook import (
     parse_series_order,
 )
 from audiobookdl.utils.browser_cookies import export_cookies_netscape
-from audiobookdl.utils.http import extract_session_cookies
+from audiobookdl.utils.http import extract_session_cookies, resolve_max_retries
 
 _YTMUSIC_BASE = "https://music.youtube.com"
 _AUTH_COOKIE_NAMES = frozenset(
@@ -309,6 +309,9 @@ class YouTubeMusicSource(Source[dict[str, Any]]):
         timeout = getattr(self._options, "timeout", None)
         if timeout:
             opts["socket_timeout"] = float(timeout)
+        retries = resolve_max_retries(getattr(self, "_options", None))
+        opts["retries"] = retries
+        opts["extractor_retries"] = retries
         return opts
 
     def _map_ytdlp_error(self, exc: Exception) -> Exception:

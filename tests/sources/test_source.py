@@ -257,6 +257,41 @@ def test_source_retries_transient_429_and_connection_errors_with_proxy_and_timeo
             source.get("https://example.com/cancelled")
 
 
+def test_source_respects_configurable_max_retries_and_exponential_backoff(tmp_path, monkeypatch):
+    import requests
+    from audiobookdl.options_schema import build_default_options
+
+    delays: list[float] = []
+    monkeypatch.setattr("audiobookdl.sources.source.networking.time.sleep", delays.append)
+    monkeypatch.setattr("audiobookdl.utils.http.random.uniform", lambda _a, _b: 0.0)
+
+    # max_retries=0 disables retries and makes a single attempt
+    opts_zero = build_default_options(database_directory=str(tmp_path), max_retries=0)
+    src_zero = _DummySource(opts_zero)
+    src_zero._session.get = MagicMock(side_effect=requests.exceptions.Timeout("boom"))
+    with pytest.raises(RequestError):
+        src_zero.get("https://example.com/no-retry")
+    assert src_zero._session.get.call_count == 1
+    assert delays == []
+
+    # max_retries=3 retries up to 3 times with exponential backoff (1s, 2s, 4s)
+    opts_three = build_default_options(database_directory=str(tmp_path), max_retries=3)
+    src_three = _DummySource(opts_three)
+    calls = 0
+
+    def fake_get(_url, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls <= 3:
+            return MagicMock(status_code=503, headers={}, content=b"busy")
+        return MagicMock(status_code=200, headers={}, content=b"ok")
+
+    src_three._session.get = MagicMock(side_effect=fake_get)
+    assert src_three.get("https://example.com/backoff") == b"ok"
+    assert calls == 4
+    assert delays == [1.0, 2.0, 4.0]
+
+
 def test_source_close_closes_child_sessions_and_save_cookie_file_is_atomic(tmp_path):
     source = _make_source(tmp_path)
     primary_close = MagicMock()

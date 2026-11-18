@@ -169,6 +169,13 @@ def test_validate_config_value_variants():
     val, warn = validate_config_value("max_workers", "positive_int", True)
     assert val is None and warn is not None
 
+    assert validate_config_value("max_retries", "non_negative_int", 0) == (0, None)
+    assert validate_config_value("max_retries", "non_negative_int", 6) == (6, None)
+    val, warn = validate_config_value("max_retries", "non_negative_int", -1)
+    assert val is None and warn is not None
+    val, warn = validate_config_value("max_retries", "non_negative_int", True)
+    assert val is None and warn is not None
+
     assert validate_config_value("media_type", "media_type", " EBOOK ") == ("ebook", None)
     val, warn = validate_config_value("media_type", "media_type", "vinyl")
     assert val is None and warn is not None
@@ -199,6 +206,7 @@ def test_schema_driven_merge_and_preset_precedence(tmp_path):
             "limit_rate": "2M",
             "proxy": "http://127.0.0.1:8888",
             "timeout": 45,
+            "max_retries": 7,
             "post_exec": "echo done",
             "loudnorm": True,
             "mono": True,

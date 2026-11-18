@@ -129,7 +129,7 @@ def test_download_single_track_with_chapters_and_lazy_refresh(tmp_path, monkeypa
         },
     ]
 
-    src = YouTubeMusicSource(_opts(tmp_path, proxy="http://127.0.0.1:8080", timeout=15.0))
+    src = YouTubeMusicSource(_opts(tmp_path, proxy="http://127.0.0.1:8080", timeout=15.0, max_retries=7))
     cover_bytes = b"\xff\xd8\xff\xe0fake-jpeg"
     fetched_cover_urls: list[str] = []
     src.get = lambda url, **_kw: fetched_cover_urls.append(url) or cover_bytes  # type: ignore[method-assign]
@@ -156,6 +156,8 @@ def test_download_single_track_with_chapters_and_lazy_refresh(tmp_path, monkeypa
     assert opts0["noplaylist"] is True
     assert opts0["proxy"] == "http://127.0.0.1:8080"
     assert opts0["socket_timeout"] == 15.0
+    assert opts0["retries"] == 7
+    assert opts0["extractor_retries"] == 7
 
     # First url_resolver invocation returns already-extracted URL; second refreshes it
     assert len(res.files) == 1

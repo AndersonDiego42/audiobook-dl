@@ -103,6 +103,7 @@ class Config:
     limit_rate: str | None = None
     proxy: str | None = None
     timeout: float | None = None
+    max_retries: int | None = None
     impersonate: str | None = None
     locale: str | None = None
     post_exec: str | list[str] | None = None

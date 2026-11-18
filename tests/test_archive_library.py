@@ -234,7 +234,7 @@ def test_gui_archive_dialog_tags_hide_trash_and_queue(tmp_path):
 
 @pytest.mark.gui
 def test_gui_series_and_podcast_grouping_in_catalog_and_archive(tmp_path):
-    from audiobookdl.gui.pages.library_page import CatalogTab
+    from audiobookdl.gui.pages.catalog_tab import CatalogTab
     from audiobookdl.sources import ServiceInfo
 
     try:

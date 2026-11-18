@@ -330,14 +330,27 @@ class OptionsPanel(ttk.LabelFrame):
         )
         timeout_spin.grid(row=0, column=5, sticky="w")
 
-        ttk.Label(network_tab, text="Limit rate:").grid(
+        ttk.Label(network_tab, text="Max retries:").grid(
             row=1, column=0, sticky="w", padx=(0, 4), pady=(6, 0)
         )
+        max_retries_spin = ttk.Spinbox(
+            network_tab,
+            from_=0,
+            to=20,
+            increment=1,
+            textvariable=self._vars.max_retries_var,
+            width=6,
+        )
+        max_retries_spin.grid(row=1, column=1, sticky="w", padx=(0, 14), pady=(6, 0))
+
+        ttk.Label(network_tab, text="Limit rate:").grid(
+            row=1, column=2, sticky="w", padx=(0, 4), pady=(6, 0)
+        )
         limit_rate_entry = ttk.Entry(network_tab, textvariable=self._vars.limit_rate_var, width=10)
-        limit_rate_entry.grid(row=1, column=1, sticky="w", padx=(0, 14), pady=(6, 0))
+        limit_rate_entry.grid(row=1, column=3, sticky="w", padx=(0, 14), pady=(6, 0))
 
         ttk.Label(network_tab, text="Impersonate:").grid(
-            row=1, column=2, sticky="w", padx=(0, 4), pady=(6, 0)
+            row=1, column=4, sticky="w", padx=(0, 4), pady=(6, 0)
         )
         self._impersonate_combo = ttk.Combobox(
             network_tab,
@@ -346,22 +359,22 @@ class OptionsPanel(ttk.LabelFrame):
             state="normal",
             width=10,
         )
-        self._impersonate_combo.grid(row=1, column=3, sticky="w", padx=(0, 14), pady=(6, 0))
+        self._impersonate_combo.grid(row=1, column=5, sticky="w", pady=(6, 0))
 
         ttk.Label(network_tab, text="Proxy URL:").grid(
-            row=1, column=4, sticky="w", padx=(0, 4), pady=(6, 0)
-        )
-        proxy_entry = ttk.Entry(network_tab, textvariable=self._vars.proxy_var)
-        proxy_entry.grid(row=1, column=5, sticky="ew", pady=(6, 0))
-
-        ttk.Label(network_tab, text="Post-exec:").grid(
             row=2, column=0, sticky="w", padx=(0, 4), pady=(6, 0)
         )
+        proxy_entry = ttk.Entry(network_tab, textvariable=self._vars.proxy_var)
+        proxy_entry.grid(row=2, column=1, columnspan=5, sticky="ew", pady=(6, 0))
+
+        ttk.Label(network_tab, text="Post-exec:").grid(
+            row=3, column=0, sticky="w", padx=(0, 4), pady=(6, 0)
+        )
         post_exec_entry = ttk.Entry(network_tab, textvariable=self._vars.post_exec_var)
-        post_exec_entry.grid(row=2, column=1, columnspan=5, sticky="ew", pady=(6, 0))
+        post_exec_entry.grid(row=3, column=1, columnspan=5, sticky="ew", pady=(6, 0))
 
         ttk.Label(network_tab, text="Decryption key:").grid(
-            row=3, column=0, sticky="w", padx=(0, 4), pady=(6, 0)
+            row=4, column=0, sticky="w", padx=(0, 4), pady=(6, 0)
         )
         self._show_decryption_key_var = tk.BooleanVar(value=False)
         decryption_key_entry = ttk.Entry(
@@ -369,20 +382,20 @@ class OptionsPanel(ttk.LabelFrame):
             textvariable=self._vars.decryption_key_var,
             show="*",
         )
-        decryption_key_entry.grid(row=3, column=1, columnspan=4, sticky="ew", padx=(0, 8), pady=(6, 0))
+        decryption_key_entry.grid(row=4, column=1, columnspan=4, sticky="ew", padx=(0, 8), pady=(6, 0))
         show_key_cb = ttk.Checkbutton(
             network_tab,
             text="Show key",
             variable=self._show_decryption_key_var,
             command=self._toggle_decryption_key_visibility,
         )
-        show_key_cb.grid(row=3, column=5, sticky="w", pady=(6, 0))
+        show_key_cb.grid(row=4, column=5, sticky="w", pady=(6, 0))
 
         ttk.Label(
             network_tab,
-            text="Defaults: 6 workers, unlimited bandwidth (e.g. 2M), TLS impersonate via curl_cffi (e.g. chrome)",
+            text="Defaults: 6 workers, 4 retries (exponential backoff), unlimited bandwidth (e.g. 2M), TLS impersonate via curl_cffi (e.g. chrome)",
             style="Muted.TLabel",
-        ).grid(row=4, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        ).grid(row=5, column=0, columnspan=6, sticky="w", pady=(4, 0))
         self._validation_var = tk.StringVar(value="")
         self._validation_label = ttk.Label(
             self,
@@ -407,6 +420,7 @@ class OptionsPanel(ttk.LabelFrame):
         self._cb_loudnorm = cb_loudnorm
         self._cb_mono = cb_mono
         self._max_cover_entry = max_cover_entry
+        self._max_retries_spin = max_retries_spin
         self._limit_rate_entry = limit_rate_entry
         self._decryption_key_entry = decryption_key_entry
 
@@ -446,6 +460,7 @@ class OptionsPanel(ttk.LabelFrame):
             (max_workers_spin, _option_help("max_workers")),
             (book_delay_spin, _option_help("book_delay")),
             (timeout_spin, _option_help("timeout")),
+            (max_retries_spin, _option_help("max_retries")),
             (limit_rate_entry, _option_help("limit_rate")),
             (self._impersonate_combo, _option_help("impersonate")),
             (proxy_entry, _option_help("proxy")),
@@ -485,6 +500,7 @@ class OptionsPanel(ttk.LabelFrame):
             max_workers_spin,
             book_delay_spin,
             timeout_spin,
+            max_retries_spin,
             limit_rate_entry,
             self._impersonate_combo,
             proxy_entry,
@@ -516,6 +532,7 @@ class OptionsPanel(ttk.LabelFrame):
         for entry in (
             self._chapter_offset_entry,
             self._max_cover_entry,
+            self._max_retries_spin,
             self._limit_rate_entry,
             self._decryption_key_entry,
         ):
@@ -560,6 +577,13 @@ class OptionsPanel(ttk.LabelFrame):
                     errors.append("Max cover must be >= 1")
             except ValueError:
                 errors.append("Max cover must be a positive integer")
+        raw_retries = self._vars.max_retries_var.get().strip()
+        if raw_retries:
+            try:
+                if int(raw_retries) < 0:
+                    errors.append("Max retries must be >= 0")
+            except ValueError:
+                errors.append("Max retries must be a whole integer >= 0")
         raw_rate = self._vars.limit_rate_var.get().strip()
         if raw_rate:
             try:

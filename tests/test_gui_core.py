@@ -1666,7 +1666,8 @@ def test_gui_controls_build_options_and_config_loading(tmp_path, monkeypatch):
         'max_workers = 4\n'
         'book_delay = 2.5\n'
         'proxy = "http://127.0.0.1:8888"\n'
-        'timeout = 45\n',
+        'timeout = 45\n'
+        'max_retries = 6\n',
         encoding="utf-8",
     )
 
@@ -1677,9 +1678,10 @@ def test_gui_controls_build_options_and_config_loading(tmp_path, monkeypatch):
         assert app.book_delay_var.get() == "2.5"
         assert app.proxy_var.get() == "http://127.0.0.1:8888"
         assert app.timeout_var.get() == "45"
+        assert app.max_retries_var.get() == "6"
         assert app.download_archive_var.get() is False
 
-        # Set all 12 option controls and verify DownloadOptions output
+        # Set all option controls and verify DownloadOptions output
         app.split_chapters_var.set(True)
         app.write_opf_var.set(True)
         app.write_cue_var.set(True)
@@ -1689,6 +1691,7 @@ def test_gui_controls_build_options_and_config_loading(tmp_path, monkeypatch):
         app.book_delay_var.set("1.25")
         app.proxy_var.set("http://127.0.0.1:9090")
         app.timeout_var.set("60")
+        app.max_retries_var.set("2")
         app.overwrite_var.set("Overwrite")
         app.remove_chars_var.set(":?")
         app.cover_only_var.set(True)
@@ -1704,6 +1707,7 @@ def test_gui_controls_build_options_and_config_loading(tmp_path, monkeypatch):
         assert opts.book_delay == pytest.approx(1.25)
         assert opts.proxy == "http://127.0.0.1:9090"
         assert opts.timeout == pytest.approx(60.0)
+        assert opts.max_retries == 2
         assert opts.overwrite is True
         assert opts.remove_chars == ":?"
         assert opts.cover is True
@@ -1797,6 +1801,7 @@ def test_gui_persists_all_toggles_on_close_and_run_start(tmp_path):
     app.book_delay_var.set("2.5")
     app.proxy_var.set("http://127.0.0.1:8123")
     app.timeout_var.set("30")
+    app.max_retries_var.set("2")
     app.download_archive_var.set(False)
 
     # Closing the window without starting a download persists all toggles
@@ -1836,6 +1841,7 @@ def test_gui_persists_all_toggles_on_close_and_run_start(tmp_path):
         assert app2.book_delay_var.get() == "2.5"
         assert app2.proxy_var.get() == "http://127.0.0.1:8123"
         assert app2.timeout_var.get() == "30"
+        assert app2.max_retries_var.get() == "2"
         assert app2.download_archive_var.get() is False
 
         # Flip toggles and persist via _save_run_preferences (run-start path)
@@ -2523,6 +2529,10 @@ def test_gui_controller_thread_local_sessions_and_dialog_main_thread_bridge(tmp_
     for fname in (
         "pages/settings_page.py",
         "pages/library_page.py",
+        "pages/archive_tab.py",
+        "pages/catalog_tab.py",
+        "pages/catalog_covers.py",
+        "pages/sync_tab.py",
         "pages/pack_page.py",
         "pages/accounts_page.py",
         "cookie_dialog.py",
@@ -3728,7 +3738,8 @@ def test_gui_m3_chapter_editor_preview_diff_and_pack_extended_overrides(tmp_path
 @pytest.mark.gui
 def test_gui_m3_queue_inspector_reorder_filter_sync_accounts_and_archive(tmp_path, monkeypatch):
     from audiobookdl.gui.pages.accounts_page import AccountsPage
-    from audiobookdl.gui.pages.library_page import ArchiveTab, SyncTab
+    from audiobookdl.gui.pages.archive_tab import ArchiveTab
+    from audiobookdl.gui.pages.sync_tab import SyncTab
     from audiobookdl.gui.queue_panel import JobInspectorDialog
     from audiobookdl.utils.archive import DownloadArchive
 
@@ -4197,7 +4208,7 @@ def test_gui_catalog_displays_covers_and_ebook_formats(tmp_path):
     import io
     import time
     from PIL import Image
-    from audiobookdl.gui.pages.library_page import CatalogTab
+    from audiobookdl.gui.pages.catalog_tab import CatalogTab
     from audiobookdl.sources import ServiceInfo
     from audiobookdl.sources.source import CatalogBook
 
@@ -4261,13 +4272,13 @@ def test_gui_catalog_displays_covers_and_ebook_formats(tmp_path):
             deadline = time.monotonic() + 3.0
             while time.monotonic() < deadline:
                 root.update()
-                if "https://covers.example.com/cover-1.jpg" in tab._url_photos:
+                if "https://covers.example.com/cover-1.jpg" in tab._covers.url_photos:
                     break
                 time.sleep(0.04)
 
             assert "https://covers.example.com/cover-1.jpg" in fetched_urls
-            assert "https://covers.example.com/cover-1.jpg" in tab._url_photos
-            expected_photo_name = str(tab._url_photos["https://covers.example.com/cover-1.jpg"])
+            assert "https://covers.example.com/cover-1.jpg" in tab._covers.url_photos
+            expected_photo_name = str(tab._covers.url_photos["https://covers.example.com/cover-1.jpg"])
             row_images = tab._tree.item("book-0", "image")
             if isinstance(row_images, (tuple, list)):
                 assert expected_photo_name in row_images
@@ -4684,7 +4695,7 @@ def test_gui_06_persists_sync_schedule_clipboard_monitor_and_check_updates(tmp_p
 
 @pytest.mark.gui
 def test_gui_07_archive_tab_async_selection_and_verify_missing(tmp_path):
-    from audiobookdl.gui.pages.library_page import ArchiveTab
+    from audiobookdl.gui.pages.archive_tab import ArchiveTab
     from audiobookdl.utils.archive import DownloadArchive
 
     try:
@@ -5152,7 +5163,8 @@ def test_gui_16_queue_profile_column_live_row_progress_and_job_options_edit(tmp_
 
 @pytest.mark.gui
 def test_gui_17_archive_tab_pagination_and_edit_metadata(tmp_path, monkeypatch):
-    from audiobookdl.gui.pages.library_page import ArchiveTab, _ArchiveMetadataDialog
+    from audiobookdl.gui.pages.archive_metadata_dialog import _ArchiveMetadataDialog
+    from audiobookdl.gui.pages.archive_tab import ArchiveTab
     from audiobookdl.utils.archive import DownloadArchive
 
     try:
@@ -5208,7 +5220,7 @@ def test_gui_17_archive_tab_pagination_and_edit_metadata(tmp_path, monkeypatch):
                 }
 
         monkeypatch.setattr(
-            "audiobookdl.gui.pages.library_page._ArchiveMetadataDialog",
+            "audiobookdl.gui.pages.archive_tab._ArchiveMetadataDialog",
             _FakeMetaDlg,
         )
         monkeypatch.setattr(tab, "wait_window", lambda _dlg: None)
@@ -5392,7 +5404,7 @@ def test_gui_22_catalog_cover_width_series_order_filter_and_details():
     import time
     from tkinter import ttk
     from PIL import Image
-    from audiobookdl.gui.pages.library_page import CatalogTab
+    from audiobookdl.gui.pages.catalog_tab import CatalogTab
     from audiobookdl.gui.theme import apply_theme, scale_px
     from audiobookdl.sources import ServiceInfo
     from audiobookdl.sources.source import CatalogBook
@@ -5433,7 +5445,7 @@ def test_gui_22_catalog_cover_width_series_order_filter_and_details():
         tab.pack(fill=tk.BOTH, expand=True)
         root.update_idletasks()
         try:
-            assert tab._MAX_COVER_CACHE >= 2000
+            assert tab._covers.MAX_COVER_CACHE >= 2000
             assert tab._tree.column("#0", "width") >= scale_px(tab, 102)
             assert tab._tree.column("#0", "minwidth") >= scale_px(tab, 84)
 
@@ -5496,14 +5508,14 @@ def test_gui_22_catalog_cover_width_series_order_filter_and_details():
             deadline = time.monotonic() + 3.0
             while time.monotonic() < deadline:
                 root.update()
-                if "https://covers.example.com/cover-1.jpg" in tab._detail_cover_png_cache:
+                if "https://covers.example.com/cover-1.jpg" in tab._covers.detail_cover_png_cache:
                     break
                 time.sleep(0.03)
             assert tab._detail_title_var.get() == "O conto de Zoe"
             assert "John Scalzi" in tab._detail_meta_var.get()
             assert "Guerra do Velho #4" in tab._detail_meta_var.get()
             assert "Audiobook + Ebook" in tab._detail_meta_var.get()
-            assert "https://covers.example.com/cover-1.jpg" in tab._detail_cover_png_cache
+            assert "https://covers.example.com/cover-1.jpg" in tab._covers.detail_cover_png_cache
             assert "1 selected" in tab._status_var.get()
 
             # Group selection summarizes the series in Book Details
@@ -5796,7 +5808,7 @@ def test_audit_regressions_queue_reset_pack_keys_sync_mode_filter_and_abs_chapte
 
 @pytest.mark.gui
 def test_gui_event_driven_idle_poll_wakes_on_bg_task_and_debounces_archive_selection(tmp_path):
-    from audiobookdl.gui.pages.library_page import ArchiveTab
+    from audiobookdl.gui.pages.archive_tab import ArchiveTab
     from audiobookdl.utils.archive import DownloadArchive
 
     try:

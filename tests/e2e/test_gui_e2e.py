@@ -240,7 +240,7 @@ def test_gui_library_catalog_archive_and_export_end_to_end(
         ]
     )
     gui_harness.pump_until(
-        lambda: "http://librivox.org/assets/cat-cover.jpg" in cat._url_photos,
+        lambda: "http://librivox.org/assets/cat-cover.jpg" in cat._covers.url_photos,
         description="CatalogTab cover thumbnail fetch",
     )
 

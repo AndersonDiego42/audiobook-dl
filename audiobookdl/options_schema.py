@@ -8,6 +8,7 @@ from typing import Any
 from collections.abc import Callable, Mapping
 
 from audiobookdl.utils import normalize_audio_bitrate
+from audiobookdl.utils.http import DEFAULT_MAX_RETRIES
 
 
 MEDIA_TYPE_CHOICES: tuple[str, ...] = ("auto", "audiobook", "ebook", "video", "both")
@@ -120,6 +121,12 @@ def _validate_positive_int(key: str, raw: Any) -> tuple[int | None, str | None]:
     return None, f"Warning: invalid '{key}' in config (expected integer >= 1); ignoring"
 
 
+def _validate_non_negative_int(key: str, raw: Any) -> tuple[int | None, str | None]:
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+        return raw, None
+    return None, f"Warning: invalid '{key}' in config (expected integer >= 0); ignoring"
+
+
 def _validate_non_negative_float(key: str, raw: Any) -> tuple[float | None, str | None]:
     if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw >= 0:
         return float(raw), None
@@ -218,6 +225,7 @@ _CONFIG_VALIDATORS: Mapping[str, Callable[[str, Any], tuple[Any, str | None]]] =
     "bool": _validate_bool,
     "int": _validate_int,
     "positive_int": _validate_positive_int,
+    "non_negative_int": _validate_non_negative_int,
     "non_negative_float": _validate_non_negative_float,
     "positive_float": _validate_positive_float,
     "silence_noise_db": _validate_silence_noise_db,
@@ -289,6 +297,12 @@ def _serialize_int(val: Any) -> tuple[bool, Any]:
 
 def _serialize_positive_int(val: Any) -> tuple[bool, Any]:
     if val is None:
+        return False, None
+    return True, int(val)
+
+
+def _serialize_non_negative_int(val: Any) -> tuple[bool, Any]:
+    if val is None or int(val) < 0:
         return False, None
     return True, int(val)
 
@@ -527,6 +541,23 @@ def _gui_read_timeout(raw: Any) -> float | None:
         raise ValueError(f"Timeout must be a number > 0, got '{cleaned}'") from exc
     if not math.isfinite(parsed) or parsed <= 0:
         raise ValueError("Timeout must be > 0")
+    return parsed
+
+
+def _gui_init_max_retries(cfg_val: Any) -> str:
+    return str(DEFAULT_MAX_RETRIES) if cfg_val is None else str(int(cfg_val))
+
+
+def _gui_read_max_retries(raw: Any) -> int:
+    cleaned = str(raw).strip()
+    if not cleaned:
+        return DEFAULT_MAX_RETRIES
+    try:
+        parsed = int(cleaned)
+    except ValueError as exc:
+        raise ValueError(f"Max retries must be a whole number >= 0, got '{cleaned}'") from exc
+    if parsed < 0:
+        raise ValueError("Max retries must be >= 0")
     return parsed
 
 
@@ -1256,6 +1287,25 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         ),
     ),
     OptionSpec(
+        name="max_retries",
+        default=DEFAULT_MAX_RETRIES,
+        help="Maximum automatic retry attempts with exponential backoff for failed requests (0 disables retries)",
+        config_key="max_retries",
+        config_kind="non_negative_int",
+        toml_serializer=_serialize_non_negative_int,
+        merge_from_config=True,
+        merge_only_if_default=True,
+        merge_cast=int,
+        gui=GuiBinding(
+            var_attr="max_retries_var",
+            var_type="str",
+            gui_default=str(DEFAULT_MAX_RETRIES),
+            from_config=_gui_init_max_retries,
+            to_option=_gui_read_max_retries,
+            persisted_in_output_prefs=True,
+        ),
+    ),
+    OptionSpec(
         name="impersonate",
         default=None,
         help="TLS/HTTP2 browser fingerprint to impersonate via optional curl_cffi (e.g. chrome, edge, safari)",
@@ -1453,6 +1503,7 @@ class DownloadOptions:
     max_cover_size: int | None = None
     proxy: str | None = None
     timeout: float | None = None
+    max_retries: int = DEFAULT_MAX_RETRIES
     impersonate: str | None = None
     decryption_key: str | None = None
     locale: str | None = None

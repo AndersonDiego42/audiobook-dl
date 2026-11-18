@@ -55,6 +55,7 @@ All runtime keys below map directly from `audiobookdl/options_schema.py` and may
 | `max_cover_size` | `positive_int` | unset (`None`) | Downscale oversized covers so width and height do not exceed `N` pixels |
 | `proxy` | `str` | unset (`None`) | HTTP/HTTPS proxy URL passed to source and enrichment requests |
 | `timeout` | `positive_float` | unset (`None`) | HTTP request/read timeout in seconds |
+| `max_retries` | `non_negative_int` | `4` | Maximum automatic retry attempts with exponential backoff for failed requests (`0` disables retries) |
 | `impersonate` | `str` | unset (`None`) | Browser TLS/HTTP2 fingerprint for optional `curl_cffi` (`chrome`, `edge`, `safari`) |
 | `locale` | `str` | unset (`None`) | Regional locale override for localized catalogs such as Nextory (e.g. `sv_SE`, `en_GB`) |
 | `enrich_metadata` | `bool` | `false` | Fill missing metadata, cover art, and chapters from enrichment providers |

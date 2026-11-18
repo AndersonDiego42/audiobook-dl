@@ -77,6 +77,7 @@ class AudiobookDLApp:
     limit_rate_var: tk.StringVar
     proxy_var: tk.StringVar
     timeout_var: tk.StringVar
+    max_retries_var: tk.StringVar
     impersonate_var: tk.StringVar
     decryption_key_var: tk.StringVar
     enrich_metadata_var: tk.BooleanVar

@@ -1,5 +1,9 @@
+from collections.abc import Callable
+from datetime import datetime, timezone
+import email.utils
 from http.cookiejar import Cookie, CookieJar
 import importlib
+import random
 import re
 import threading
 import time
@@ -14,6 +18,9 @@ from audiobookdl.exceptions import DownloadCancelled, GenericAudiobookDLExceptio
 
 DEFAULT_HTTP_TIMEOUT: tuple[int, int] = (15, 60)
 DEFAULT_USER_AGENT: str = "audiobook-dl"
+DEFAULT_MAX_RETRIES: int = 4
+DEFAULT_RETRY_BACKOFF_BASE: float = 1.0
+MAX_RETRY_DELAY: float = 60.0
 
 _RATE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kmg]?)(?:i?b)?(?:/s)?\s*$", re.IGNORECASE)
 _RATE_UNITS = {
@@ -101,6 +108,76 @@ def resolve_http_timeout(
     if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
         return float(raw)
     return default
+
+
+def resolve_max_retries(
+    config_or_options: Any = None,
+    *,
+    default: int = DEFAULT_MAX_RETRIES,
+) -> int:
+    """Return a validated non-negative retry count from `config_or_options`, or `default`."""
+    raw = getattr(config_or_options, "max_retries", None) if config_or_options is not None else None
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+        return raw
+    return default
+
+
+def parse_retry_after(
+    value: Any | None,
+    *,
+    max_delay: float = MAX_RETRY_DELAY,
+) -> float | None:
+    """Parse an HTTP `Retry-After` header (delta seconds or HTTP-date) clamped to `max_delay`."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        seconds = float(text)
+    except ValueError:
+        try:
+            dt = email.utils.parsedate_to_datetime(text)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        seconds = (dt - datetime.now(timezone.utc)).total_seconds()
+    return max(0.0, min(max_delay, seconds))
+
+
+def compute_retry_delay(
+    attempt: int,
+    retry_after: Any | None = None,
+    *,
+    base_delay: float = DEFAULT_RETRY_BACKOFF_BASE,
+    max_delay: float = MAX_RETRY_DELAY,
+    jitter_max: float = 0.5,
+) -> float:
+    """Compute bounded exponential backoff (with jitter) or honor `Retry-After`."""
+    header_delay = parse_retry_after(retry_after, max_delay=max_delay)
+    if header_delay is not None:
+        return header_delay
+    jitter = random.uniform(0.0, jitter_max) if jitter_max > 0 else 0.0
+    return min(max_delay, float(base_delay) * (2 ** max(0, attempt)) + jitter)
+
+
+def sleep_or_cancel(
+    delay: float,
+    cancel_event: threading.Event | None = None,
+    *,
+    sleep_fn: Callable[[float], Any] = time.sleep,
+) -> None:
+    """Sleep for `delay` seconds while respecting `cancel_event`."""
+    if delay <= 0:
+        if cancel_event is not None and cancel_event.is_set():
+            raise DownloadCancelled
+        return
+    if cancel_event is not None:
+        if cancel_event.wait(delay):
+            raise DownloadCancelled
+    else:
+        sleep_fn(delay)
 
 
 def create_configured_http_session(

@@ -2190,5 +2190,132 @@ def test_download_audiobook_override_chapters_with_silence_detection(tmp_path, m
     assert recorded == [[(0, "Audible Prologue"), (10000, "Audible Ch 1")]]
 
 
+def test_download_file_configurable_retry_count_and_exponential_backoff(tmp_path, monkeypatch):
+    from audiobookdl.exceptions import DownloadError
+
+    # 1. max_retries=0 performs a single attempt with zero sleeps
+    delays_zero: list[float] = []
+    monkeypatch.setattr("audiobookdl.output.download.time.sleep", delays_zero.append)
+    monkeypatch.setattr("audiobookdl.utils.http.random.uniform", lambda _a, _b: 0.0)
+
+    session_zero = MagicMock()
+    resp_503 = _mock_response(status_code=503, headers={}, chunks=[])
+    resp_503.content = b"unavailable"
+    session_zero.get.return_value = resp_503
+    book_zero = _make_audiobook(session_zero)
+
+    with pytest.raises(DownloadError):
+        download_file((book_zero, str(tmp_path / "zero"), 0, lambda _: None, None), max_retries=0)
+    assert session_zero.get.call_count == 1
+    assert delays_zero == []
+
+    # 2. max_retries=3 attempts up to 4 times with strictly increasing exponential backoff (1s, 2s, 4s)
+    delays_exp: list[float] = []
+    monkeypatch.setattr("audiobookdl.output.download.time.sleep", delays_exp.append)
+    session_exp = MagicMock()
+    session_exp.get.side_effect = [
+        requests.exceptions.Timeout("t1"),
+        requests.exceptions.Timeout("t2"),
+        requests.exceptions.Timeout("t3"),
+        _mock_response(headers={"Content-Length": "4"}, chunks=[b"done"]),
+    ]
+    out_path = download_file(
+        (_make_audiobook(session_exp), str(tmp_path / "exp"), 0, lambda _: None, None),
+        max_retries=3,
+    )
+    assert Path(out_path).read_bytes() == b"done"
+    assert session_exp.get.call_count == 4
+    assert delays_exp == [1.0, 2.0, 4.0]
+
+
+def test_download_audiobook_forwards_max_retries_option(tmp_path, monkeypatch):
+    monkeypatch.setattr("audiobookdl.output.download.time.sleep", lambda _: None)
+    monkeypatch.setattr(
+        "audiobookdl.output.output.verify_audio_integrity",
+        lambda *_a, **_kw: None,
+    )
+    monkeypatch.setattr(
+        "audiobookdl.output.download.add_metadata_to_file",
+        lambda *_a, **_kw: None,
+    )
+    session = MagicMock()
+    session.get.side_effect = [
+        requests.exceptions.ConnectionError("drop-1"),
+        requests.exceptions.ConnectionError("drop-2"),
+        _mock_response(headers={"Content-Length": "4"}, chunks=[b"data"]),
+    ]
+    book = _make_audiobook(session)
+    opts = DownloadOptions(
+        max_retries=1,
+        skip_downloaded=False,
+        write_json_metadata=False,
+    )
+    with pytest.raises(requests.exceptions.ConnectionError):
+        download_audiobook(book, str(tmp_path / "book_fail"), opts)
+    assert session.get.call_count == 2  # 1 initial + 1 retry
+
+    session.get.reset_mock()
+    session.get.side_effect = [
+        requests.exceptions.ConnectionError("drop-1"),
+        requests.exceptions.ConnectionError("drop-2"),
+        _mock_response(headers={"Content-Length": "4"}, chunks=[b"data"]),
+    ]
+    opts_ok = DownloadOptions(
+        max_retries=2,
+        skip_downloaded=False,
+        write_json_metadata=False,
+    )
+    download_audiobook(book, str(tmp_path / "book_ok"), opts_ok)
+    assert session.get.call_count == 3  # 1 initial + 2 retries
+    assert (tmp_path / "book_ok.mp3").read_bytes() == b"data"
+
+
+def test_download_file_retries_curl_cffi_transient_and_refreshes_url_resolver(tmp_path, monkeypatch):
+    monkeypatch.setattr("audiobookdl.output.download.time.sleep", lambda _: None)
+
+    class _CurlTimeoutError(Exception):
+        __module__ = "curl_cffi.requests.exceptions"
+
+    urls = iter([
+        "https://cdn.example.com/signed-v1.mp3",
+        "https://cdn.example.com/signed-v2.mp3",
+        "https://cdn.example.com/signed-v3.mp3",
+    ])
+    requested_urls: list[str] = []
+    session = MagicMock()
+
+    def fake_get(url, **_kwargs):
+        requested_urls.append(url)
+        if len(requested_urls) == 1:
+            raise _CurlTimeoutError("curl timeout")
+        if len(requested_urls) == 2:
+            resp = _mock_response(status_code=403, headers={}, chunks=[])
+            resp.content = b"expired"
+            return resp
+        return _mock_response(headers={"Content-Length": "5"}, chunks=[b"fresh"])
+
+    session.get.side_effect = fake_get
+    book = Audiobook(
+        session=session,
+        metadata=AudiobookMetadata(title="Resolver Retry"),
+        files=[
+            AudiobookFile(
+                url="https://cdn.example.com/placeholder.mp3",
+                ext="mp3",
+                expected_status_code=200,
+                url_resolver=lambda: next(urls),
+            )
+        ],
+    )
+    out_path = download_file((book, str(tmp_path / "resolver"), 0, lambda _: None, None), max_retries=2)
+    assert Path(out_path).read_bytes() == b"fresh"
+    assert requested_urls == [
+        "https://cdn.example.com/signed-v1.mp3",
+        "https://cdn.example.com/signed-v2.mp3",
+        "https://cdn.example.com/signed-v3.mp3",
+    ]
+
+
+
 
 
