@@ -14,9 +14,22 @@ from audiobookdl.utils.audiobook import Audiobook, is_ebook
 
 
 VALID_LIBRARY_STATUSES: tuple[str, ...] = ("pending", "downloaded", "trashed")
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _TAG_CLEAN_RE = re.compile(r"[^a-z0-9_-]+")
 _UNSET: Any = object()
+
+
+def _normalize_output_path_key(output_path: str | None) -> str | None:
+    """Return canonical case-folded absolute path for O(1) `output_path_norm` lookups."""
+    cleaned = str(output_path or "").strip()
+    if not cleaned:
+        return None
+    return os.path.normcase(os.path.abspath(cleaned))
+
+
+def _fts5_phrase(value: str) -> str:
+    """Quote an arbitrary search string as a literal FTS5 phrase token."""
+    return '"' + value.replace('"', '""') + '"'
 
 
 @dataclass(frozen=True)
@@ -281,6 +294,7 @@ class DownloadArchive:
         self._persistent = persistent
         self._lock = threading.RLock()
         self._conn: sqlite3.Connection | None = None
+        self._fts5_trigram = False
         parent = os.path.dirname(self.db_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -289,7 +303,8 @@ class DownloadArchive:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
@@ -338,6 +353,14 @@ class DownloadArchive:
 
     def _init_schema(self) -> None:
         with self._connection() as conn:
+            version_row = conn.execute("PRAGMA user_version").fetchone()
+            if version_row is not None and int(version_row[0]) == _SCHEMA_VERSION:
+                fts_row = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'downloads_fts' LIMIT 1"
+                ).fetchone()
+                self._fts5_trigram = fts_row is not None
+                return
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS downloads (
@@ -348,6 +371,7 @@ class DownloadArchive:
                     title TEXT NOT NULL,
                     author TEXT NOT NULL DEFAULT '',
                     output_path TEXT,
+                    output_path_norm TEXT,
                     format TEXT,
                     downloaded_at TEXT NOT NULL,
                     profile TEXT NOT NULL DEFAULT 'default',
@@ -367,6 +391,7 @@ class DownloadArchive:
                 row["name"] for row in conn.execute("PRAGMA table_info(downloads)").fetchall()
             }
             migrations = (
+                ("output_path_norm", "TEXT"),
                 ("profile", "TEXT NOT NULL DEFAULT 'default'"),
                 ("status", "TEXT NOT NULL DEFAULT 'downloaded'"),
                 ("series", "TEXT"),
@@ -412,11 +437,68 @@ class DownloadArchive:
                 "CREATE INDEX IF NOT EXISTS idx_downloads_output_path ON downloads(output_path)"
             )
             conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_downloads_output_path_norm ON downloads(output_path_norm)"
+            )
+            conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_downloads_title_nocase ON downloads(title COLLATE NOCASE)"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_item_tags_tag ON item_tags(tag)"
             )
+            missing_norm_rows = conn.execute(
+                "SELECT id, output_path FROM downloads "
+                "WHERE output_path IS NOT NULL AND output_path != '' "
+                "AND (output_path_norm IS NULL OR output_path_norm = '')"
+            ).fetchall()
+            for r in missing_norm_rows:
+                norm_val = _normalize_output_path_key(r["output_path"])
+                if norm_val:
+                    conn.execute(
+                        "UPDATE downloads SET output_path_norm = ? WHERE id = ?",
+                        (norm_val, int(r["id"])),
+                    )
+            try:
+                conn.execute(
+                    """
+                    CREATE VIRTUAL TABLE IF NOT EXISTS downloads_fts USING fts5(
+                        title, author, narrator, series, source, profile, url, isbn, asin,
+                        content='downloads',
+                        content_rowid='id',
+                        tokenize='trigram'
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TRIGGER IF NOT EXISTS downloads_ai AFTER INSERT ON downloads BEGIN
+                        INSERT INTO downloads_fts(rowid, title, author, narrator, series, source, profile, url, isbn, asin)
+                        VALUES (new.id, new.title, new.author, new.narrator, COALESCE(new.series, ''), new.source, new.profile, COALESCE(new.url, ''), COALESCE(new.isbn, ''), COALESCE(new.asin, ''));
+                    END
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TRIGGER IF NOT EXISTS downloads_ad AFTER DELETE ON downloads BEGIN
+                        INSERT INTO downloads_fts(downloads_fts, rowid, title, author, narrator, series, source, profile, url, isbn, asin)
+                        VALUES ('delete', old.id, old.title, old.author, old.narrator, COALESCE(old.series, ''), old.source, old.profile, COALESCE(old.url, ''), COALESCE(old.isbn, ''), COALESCE(old.asin, ''));
+                    END
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TRIGGER IF NOT EXISTS downloads_au AFTER UPDATE OF title, author, narrator, series, source, profile, url, isbn, asin ON downloads BEGIN
+                        INSERT INTO downloads_fts(downloads_fts, rowid, title, author, narrator, series, source, profile, url, isbn, asin)
+                        VALUES ('delete', old.id, old.title, old.author, old.narrator, COALESCE(old.series, ''), old.source, old.profile, COALESCE(old.url, ''), COALESCE(old.isbn, ''), COALESCE(old.asin, ''));
+                        INSERT INTO downloads_fts(rowid, title, author, narrator, series, source, profile, url, isbn, asin)
+                        VALUES (new.id, new.title, new.author, new.narrator, COALESCE(new.series, ''), new.source, new.profile, COALESCE(new.url, ''), COALESCE(new.isbn, ''), COALESCE(new.asin, ''));
+                    END
+                    """
+                )
+                conn.execute("INSERT INTO downloads_fts(downloads_fts) VALUES('rebuild')")
+                self._fts5_trigram = True
+            except sqlite3.OperationalError:
+                conn.execute("DROP TABLE IF EXISTS downloads_fts")
+                self._fts5_trigram = False
             conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
     def contains(self, source: str, book_key: str) -> bool:
@@ -461,19 +543,21 @@ class DownloadArchive:
             raise ValueError(f"Invalid library status: {status!r}")
         timestamp = _utc_now()
         norm_profile = (profile or "default").strip().lower() or "default"
+        output_path_norm = _normalize_output_path_key(output_path)
         with self._connection() as conn:
             conn.execute(
                 """
                 INSERT INTO downloads (
-                    source, book_key, url, title, author, output_path, format, downloaded_at,
+                    source, book_key, url, title, author, output_path, output_path_norm, format, downloaded_at,
                     profile, status, series, series_order, narrator, duration_seconds, isbn, asin, last_seen_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source, book_key) DO UPDATE SET
                     url = COALESCE(excluded.url, downloads.url),
                     title = excluded.title,
                     author = CASE WHEN excluded.author != '' THEN excluded.author ELSE downloads.author END,
                     output_path = COALESCE(excluded.output_path, downloads.output_path),
+                    output_path_norm = COALESCE(excluded.output_path_norm, downloads.output_path_norm),
                     format = COALESCE(excluded.format, downloads.format),
                     downloaded_at = excluded.downloaded_at,
                     profile = excluded.profile,
@@ -493,6 +577,7 @@ class DownloadArchive:
                     title,
                     author,
                     output_path,
+                    output_path_norm,
                     audio_format,
                     timestamp,
                     norm_profile,
@@ -842,8 +927,8 @@ class DownloadArchive:
             matched = val in haystack
         return (not matched) if term.negated else matched
 
-    @staticmethod
     def _build_filter_plan(
+        self,
         *,
         query: str = "",
         include_trashed: bool = False,
@@ -882,11 +967,47 @@ class DownloadArchive:
             "asin": "asin",
         }
         needs_python_filter = False
+        use_fts5 = bool(getattr(self, "_fts5_trigram", False))
         for term in terms:
             val = term.value
-            # SQLite `LIKE` is ASCII case-insensitive only; push ASCII predicates to SQL
-            # and keep Python `_matches_term()` for full Unicode & negated edge cases.
-            if not term.negated and val.isascii():
+            can_fts5 = use_fts5 and len(val) >= 3
+            if term.field in _FIELD_COL_MAP and can_fts5:
+                col = _FIELD_COL_MAP[term.field]
+                op = "NOT IN" if term.negated else "IN"
+                clauses.append(
+                    f"downloads.id {op} (SELECT rowid FROM downloads_fts WHERE {col} MATCH ?)"
+                )
+                params.append(_fts5_phrase(val))
+            elif term.field is None and can_fts5 and val.isascii():
+                phrase = _fts5_phrase(val)
+                pattern = f"%{_sql_like_escape(val)}%"
+                if term.negated:
+                    clauses.append(
+                        "("
+                        "downloads.id NOT IN (SELECT rowid FROM downloads_fts WHERE downloads_fts MATCH ?) "
+                        "AND NOT EXISTS (SELECT 1 FROM item_tags t WHERE t.item_id = downloads.id AND t.tag LIKE ? ESCAPE '\\')"
+                        ")"
+                    )
+                else:
+                    clauses.append(
+                        "("
+                        "downloads.id IN (SELECT rowid FROM downloads_fts WHERE downloads_fts MATCH ?) "
+                        "OR EXISTS (SELECT 1 FROM item_tags t WHERE t.item_id = downloads.id AND t.tag LIKE ? ESCAPE '\\')"
+                        ")"
+                    )
+                params.extend([phrase, pattern])
+            elif term.field is None and can_fts5 and not val.isascii():
+                phrase = _fts5_phrase(val)
+                if term.negated:
+                    clauses.append(
+                        "downloads.id NOT IN (SELECT rowid FROM downloads_fts WHERE downloads_fts MATCH ?)"
+                    )
+                else:
+                    clauses.append(
+                        "downloads.id IN (SELECT rowid FROM downloads_fts WHERE downloads_fts MATCH ?)"
+                    )
+                params.append(phrase)
+            elif not term.negated and val.isascii():
                 pattern = f"%{_sql_like_escape(val)}%"
                 if term.field in _FIELD_COL_MAP:
                     col = _FIELD_COL_MAP[term.field]
@@ -921,6 +1042,12 @@ class DownloadArchive:
                         ")"
                     )
                     params.extend([pattern] * 10)
+            elif term.negated and val.isascii() and term.field == "tag":
+                pattern = f"%{_sql_like_escape(val)}%"
+                clauses.append(
+                    "NOT EXISTS (SELECT 1 FROM item_tags t WHERE t.item_id = downloads.id AND t.tag LIKE ? ESCAPE '\\')"
+                )
+                params.append(pattern)
             else:
                 needs_python_filter = True
 
@@ -1074,6 +1201,8 @@ class DownloadArchive:
             clean_out = str(output_path or "").strip() or None
             assignments.append("output_path = ?")
             params.append(clean_out)
+            assignments.append("output_path_norm = ?")
+            params.append(_normalize_output_path_key(clean_out))
         if status is not _UNSET:
             clean_status = str(status or "").strip().lower()
             if clean_status not in VALID_LIBRARY_STATUSES:
@@ -1138,6 +1267,47 @@ class DownloadArchive:
             tags = self._fetch_tags_for_ids(conn, [entry_id]).get(entry_id, ())
             return self._build_entry(row, tags)
 
+    def get_entries_by_keys(
+        self,
+        keys: Iterable[tuple[str, str]],
+    ) -> dict[tuple[str, str], ArchiveEntry]:
+        """Batch-fetch `ArchiveEntry` rows for `(source, book_key)` pairs."""
+        by_source: dict[str, list[str]] = {}
+        for source, book_key in keys:
+            if not book_key:
+                continue
+            src_list = by_source.setdefault(source, [])
+            if book_key not in src_list:
+                src_list.append(book_key)
+        if not by_source:
+            return {}
+        matched_rows: list[sqlite3.Row] = []
+        with self._connection() as conn:
+            for source, key_list in by_source.items():
+                for start in range(0, len(key_list), 500):
+                    batch = key_list[start : start + 500]
+                    placeholders = ",".join("?" for _ in batch)
+                    rows = conn.execute(
+                        f"""
+                        SELECT id, source, book_key, url, title, author, output_path, format, downloaded_at,
+                               profile, status, series, series_order, narrator, duration_seconds, isbn, asin, last_seen_at
+                        FROM downloads
+                        WHERE source = ? AND book_key IN ({placeholders})
+                        """,
+                        (source, *batch),
+                    ).fetchall()
+                    matched_rows.extend(rows)
+            if not matched_rows:
+                return {}
+            tags_by_id = self._fetch_tags_for_ids(
+                conn, [int(row["id"]) for row in matched_rows]
+            )
+        result: dict[tuple[str, str], ArchiveEntry] = {}
+        for row in matched_rows:
+            entry = self._build_entry(row, tags_by_id.get(int(row["id"]), ()))
+            result[(entry.source, entry.book_key)] = entry
+        return result
+
     def find_matching_entry_id(
         self,
         *,
@@ -1184,13 +1354,20 @@ class DownloadArchive:
 
             if norm_path:
                 row = conn.execute(
+                    "SELECT id FROM downloads WHERE output_path_norm = ? LIMIT 1",
+                    (norm_path,),
+                ).fetchone()
+                if row is not None:
+                    return int(row["id"])
+                row = conn.execute(
                     "SELECT id FROM downloads WHERE output_path = ? OR output_path = ? LIMIT 1",
                     (output_path, abs_path),
                 ).fetchone()
                 if row is not None:
                     return int(row["id"])
                 path_rows = conn.execute(
-                    "SELECT id, output_path FROM downloads WHERE output_path IS NOT NULL AND output_path != ''"
+                    "SELECT id, output_path FROM downloads "
+                    "WHERE output_path_norm IS NULL AND output_path IS NOT NULL AND output_path != ''"
                 ).fetchall()
                 for r in path_rows:
                     rp = str(r["output_path"] or "").strip()
@@ -1225,6 +1402,83 @@ class DownloadArchive:
                     not norm_author or not str(title_matches[0]["author"] or "").strip()
                 ):
                     return int(title_matches[0]["id"])
+        return None
+
+    def find_cross_source_duplicate(
+        self,
+        source: str,
+        book_key: str = "",
+        *,
+        title: str = "",
+        author: str = "",
+        isbn: str | None = None,
+        asin: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return an active non-trashed ledger row from another entry matching ASIN, ISBN, or title/author."""
+        norm_asin = (asin or "").strip().lower()
+        norm_isbn = (isbn or "").strip().replace("-", "").lower()
+        norm_title = " ".join((title or "").casefold().split())
+        norm_author = " ".join((author or "").casefold().split())
+        src_clean = (source or "").strip()
+        key_clean = (book_key or "").strip()
+
+        def _row_dict(row: sqlite3.Row) -> dict[str, Any]:
+            return {
+                "id": int(row["id"]),
+                "source": str(row["source"] or ""),
+                "book_key": str(row["book_key"] or ""),
+                "title": str(row["title"] or ""),
+                "author": str(row["author"] or ""),
+                "output_path": str(row["output_path"] or ""),
+                "status": str(row["status"] or ""),
+            }
+
+        with self._connection() as conn:
+            excl_sql = (
+                "status IN ('downloaded', 'queued', 'sync') "
+                "AND NOT (source = ? AND book_key = ?)"
+            )
+            cols = "id, source, book_key, title, author, output_path, status"
+            if norm_asin:
+                row = conn.execute(
+                    f"SELECT {cols} FROM downloads WHERE {excl_sql} AND TRIM(LOWER(asin)) = ? LIMIT 1",
+                    (src_clean, key_clean, norm_asin),
+                ).fetchone()
+                if row is not None:
+                    return _row_dict(row)
+            if norm_isbn:
+                row = conn.execute(
+                    f"SELECT {cols} FROM downloads WHERE {excl_sql} AND REPLACE(LOWER(TRIM(isbn)), '-', '') = ? LIMIT 1",
+                    (src_clean, key_clean, norm_isbn),
+                ).fetchone()
+                if row is not None:
+                    return _row_dict(row)
+            if norm_title:
+                title_rows = conn.execute(
+                    f"SELECT {cols} FROM downloads WHERE {excl_sql} AND title = ? COLLATE NOCASE",
+                    (src_clean, key_clean, norm_title),
+                ).fetchall()
+                if not title_rows and title:
+                    title_rows = conn.execute(
+                        f"SELECT {cols} FROM downloads WHERE {excl_sql} AND title = ? COLLATE NOCASE",
+                        (src_clean, key_clean, title.strip()),
+                    ).fetchall()
+                exact_title_rows = [
+                    r
+                    for r in title_rows
+                    if " ".join(str(r["title"] or "").casefold().split()) == norm_title
+                ]
+                if norm_author:
+                    for r in exact_title_rows:
+                        row_author = " ".join(str(r["author"] or "").casefold().split())
+                        if row_author and (
+                            row_author == norm_author
+                            or norm_author in row_author
+                            or row_author in norm_author
+                        ):
+                            return _row_dict(r)
+                elif len(exact_title_rows) == 1 and not str(exact_title_rows[0]["author"] or "").strip():
+                    return _row_dict(exact_title_rows[0])
         return None
 
     def build_match_index(self) -> "ArchiveMatchIndex":

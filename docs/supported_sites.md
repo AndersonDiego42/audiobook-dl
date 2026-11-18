@@ -35,11 +35,13 @@ When configuring `[sources.<name>]` in `audiobook-dl.toml` or selecting a servic
 - `cloudlibrary` -> `yourcloudlibrary`
 - `ytmusic` / `youtube-music` -> `youtubemusic`
 
-## Third-Party Source Plugins
+## Third-Party Plugins
 
-External Python packages can register custom `Source` subclasses via standard `importlib.metadata` entry points under the `audiobookdl.sources` group in `pyproject.toml`:
+External Python packages can extend both source adapters (`audiobookdl.sources`) and metadata enrichment (`audiobookdl.enrichment`) via `importlib.metadata` entry points:
 
 ```toml
 [project.entry-points."audiobookdl.sources"]
 my_service = "my_package.source:MyServiceSource"
 ```
+
+See the [Plugin SDK Guide](./plugins.md) for the complete `Source` template, `PLUGIN_API_VERSION = 1` validation rules, `CatalogBook` / `Result` return contracts, and `audiobookdl.enrichment` provider interface.

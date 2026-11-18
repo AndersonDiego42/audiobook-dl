@@ -655,3 +655,41 @@ def test_search_enrichment_candidates_runs_concurrently_when_session_is_none(mon
     results = search_enrichment_candidates(meta, providers=("itunes", "google", "openlibrary"))
     assert peak_active >= 2
     assert [c.provider for c in results] == ["itunes", "google", "openlibrary"]
+
+
+def test_enrichment_plugin_entry_point_discovery_and_query(monkeypatch):
+    from types import SimpleNamespace
+    from audiobookdl.utils import enrichment as enr_mod
+
+    class _FakePlugin:
+        capabilities = frozenset({"publisher", "description"})
+
+        def query(self, metadata, **_kw):
+            return [
+                {
+                    "title": metadata.title,
+                    "authors": list(metadata.authors),
+                    "publisher": "Plugin Press",
+                    "description": "Fetched from entry-point plugin",
+                }
+            ]
+
+    fake_ep = SimpleNamespace(name="localwiki", load=lambda: _FakePlugin())
+    monkeypatch.setattr(
+        enr_mod.importlib.metadata,
+        "entry_points",
+        lambda *, group="": [fake_ep] if group == enr_mod.ENRICHMENT_ENTRY_POINT_GROUP else [],
+    )
+    enr_mod.reset_plugin_enrichment_providers_cache()
+    try:
+        resolved = enr_mod.resolve_provider_list()
+        assert "plugin:localwiki" in resolved
+        assert enr_mod.parse_provider_list("localwiki") == ("plugin:localwiki",)
+        meta = AudiobookMetadata(title="Plugin Book", authors=["Plugin Author"])
+        candidates = search_enrichment_candidates(meta, providers=("plugin:localwiki",))
+        assert len(candidates) == 1
+        assert candidates[0].publisher == "Plugin Press"
+        assert candidates[0].description == "Fetched from entry-point plugin"
+    finally:
+        enr_mod.reset_plugin_enrichment_providers_cache()
+

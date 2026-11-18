@@ -260,8 +260,11 @@ def download_audiobook(
         )
         chapters_embedded = False
         cover_embedded = False
+        already_embedded_staged = False
         chapter_offset_ms = int(getattr(options, "chapter_offset_ms", 0) or 0)
         intro_chapter_mode = str(getattr(options, "intro_chapter_mode", "auto") or "auto")
+        silence_noise_db = float(getattr(options, "silence_noise_db", -35.0))
+        silence_min_seconds = float(getattr(options, "silence_min_seconds", 1.8))
         if not ebook:
             if audiobook.cover is not None and (
                 getattr(options, "square_cover", False)
@@ -279,6 +282,8 @@ def download_audiobook(
             if may_silence_chapters and len(filepaths) == 1:
                 detected = output.detect_silence_chapters(
                     filepaths[0],
+                    noise_db=silence_noise_db,
+                    min_silence_sec=silence_min_seconds,
                     cancel_event=cancel_event,
                     probe_cache=probe_cache,
                 )
@@ -370,6 +375,8 @@ def download_audiobook(
                     if not audiobook.chapters and may_silence_chapters:
                         detected = output.detect_silence_chapters(
                             master_path,
+                            noise_db=silence_noise_db,
+                            min_silence_sec=silence_min_seconds,
                             cancel_event=cancel_event,
                             probe_cache=probe_cache,
                         )
@@ -436,6 +443,7 @@ def download_audiobook(
             # Defer MP4 cover embedding when post-combine silence chapter remux will run
             defer_cover_for_silence = may_silence_chapters and cover_for_ffmpeg is not None
             combine_cover = None if defer_cover_for_silence else cover_for_ffmpeg
+            consumed_parts = list(filepaths)
             try:
                 chapters_embedded = output.combine_audiofiles(
                     filepaths,
@@ -452,18 +460,11 @@ def download_audiobook(
                     max_workers=max_workers,
                     **audio_filter_kwargs,
                 )
-                staged_key = staged_combined_path
-                os.replace(staged_combined_path, output_path)
-                staged_combined_path = None
-                output.move_cached_probe(probe_cache, staged_key, output_path)
-                if not use_staging_dir and os.path.isdir(work_output_dir):
-                    shutil.rmtree(work_output_dir, ignore_errors=True)
-                cover_embedded = combine_cover is not None
-                current_format = output_format
-                filepaths = [output_path]
                 if may_silence_chapters and not audiobook.chapters:
                     detected = output.detect_silence_chapters(
-                        output_path,
+                        staged_combined_path,
+                        noise_db=silence_noise_db,
+                        min_silence_sec=silence_min_seconds,
                         cancel_event=cancel_event,
                         probe_cache=probe_cache,
                     )
@@ -473,8 +474,41 @@ def download_audiobook(
                         audiobook.chapters = apply_intro_chapter_titles(
                             detected, intro_mode=intro_chapter_mode
                         )
+                if cancel_event is not None and cancel_event.is_set():
+                    raise DownloadCancelled
+                cover_embedded = combine_cover is not None
+                add_metadata_to_file(
+                    audiobook,
+                    staged_combined_path,
+                    options,
+                    cancel_event=cancel_event,
+                    chapters_embedded=chapters_embedded,
+                    cover_embedded=cover_embedded,
+                    write_sidecars=False,
+                )
+                staged_key = staged_combined_path
+                os.replace(staged_combined_path, output_path)
+                staged_combined_path = None
+                output.move_cached_probe(probe_cache, staged_key, output_path)
+                if not use_staging_dir:
+                    for part_path in consumed_parts:
+                        for candidate in (part_path, f"{part_path}.tmp"):
+                            if os.path.isfile(candidate):
+                                try:
+                                    os.remove(candidate)
+                                except OSError:
+                                    pass
+                    if os.path.isdir(work_output_dir):
+                        try:
+                            if not os.listdir(work_output_dir):
+                                os.rmdir(work_output_dir)
+                        except OSError:
+                            pass
+                already_embedded_staged = True
+                current_format = output_format
+                filepaths = [output_path]
             except DownloadCancelled:
-                if os.path.isdir(work_output_dir) and (use_staging_dir or not options.resume):
+                if use_staging_dir and os.path.isdir(work_output_dir):
                     shutil.rmtree(work_output_dir, ignore_errors=True)
                 raise
         elif not options.combine and not ebook and segment_groups is not None:
@@ -514,7 +548,12 @@ def download_audiobook(
         if cancel_event is not None and cancel_event.is_set():
             raise DownloadCancelled
         needs_audio_reencode = use_loudnorm or use_mono
-        if (current_format != output_format or needs_audio_reencode) and not splitting and not ebook:
+        if (
+            (current_format != output_format or needs_audio_reencode)
+            and not splitting
+            and not ebook
+            and not already_embedded_staged
+        ):
             logging.book_update("Converting files")
             if len(filepaths) == 1:
                 converted_path, chapters_embedded = output.convert_single_file(
@@ -556,15 +595,23 @@ def download_audiobook(
             is_single_file = True
         # Add metadata & commit staged directory atomically
         if len(filepaths) == 1 and not splitting:
-            add_metadata_to_file(
-                audiobook,
-                filepaths[0],
-                options,
-                cancel_event=cancel_event,
-                chapters_embedded=chapters_embedded,
-                cover_embedded=cover_embedded,
-                probe_cache=probe_cache,
-            )
+            if already_embedded_staged:
+                write_file_sidecars(
+                    audiobook,
+                    filepaths[0],
+                    options,
+                    probe_cache=probe_cache,
+                )
+            else:
+                add_metadata_to_file(
+                    audiobook,
+                    filepaths[0],
+                    options,
+                    cancel_event=cancel_event,
+                    chapters_embedded=chapters_embedded,
+                    cover_embedded=cover_embedded,
+                    probe_cache=probe_cache,
+                )
         else:
             add_metadata_to_dir(
                 audiobook,
@@ -671,22 +718,16 @@ def _resolve_abs_sidecar_path(filepath: str, metadata_obj: AudiobookMetadata) ->
     return default_path
 
 
-def add_metadata_to_file(
+def embed_metadata_to_file(
     audiobook: Audiobook,
     filepath: str,
     options: DownloadOptions,
+    *,
     cancel_event: threading.Event | None = None,
     chapters_embedded: bool = False,
     cover_embedded: bool = False,
-    probe_cache: dict[str, Any] | None = None,
-):
-    """
-    Embed metadata into a single file
-
-    :param audiobook: Audiobook object. Stores metadata
-    :param filepath: Filepath of output file
-    :param options: Runtime download options
-    """
+) -> None:
+    """Embed chapters, tags, and cover art directly into a media file (safe on staged files)."""
     ebook_file = is_ebook_extension(os.path.splitext(filepath)[1])
     needs_chapters = (
         not ebook_file
@@ -725,6 +766,21 @@ def add_metadata_to_file(
                 cover=cover_for_meta,
                 **extra_meta_kwargs,
             )
+    # Fallback cover write if container/mock did not embed it alongside metadata or chapters
+    if needs_cover and not cover_written_with_other and audiobook.cover is not None:
+        logging.book_update("Embedding cover")
+        metadata.embed_cover(filepath, audiobook.cover)
+
+
+def write_file_sidecars(
+    audiobook: Audiobook,
+    filepath: str,
+    options: DownloadOptions,
+    *,
+    probe_cache: dict[str, Any] | None = None,
+) -> None:
+    """Write cover, JSON, Audiobookshelf, OPF, and CUE sidecars beside the committed `filepath`."""
+    ebook_file = is_ebook_extension(os.path.splitext(filepath)[1])
     stem = os.path.splitext(filepath)[0]
     cover_sidecar_name: str | None = None
     if audiobook.cover and options.write_cover:
@@ -760,10 +816,43 @@ def add_metadata_to_file(
             audiobook.chapters,
             f"{stem}.cue",
         )
-    # Fallback cover write if container/mock did not embed it alongside metadata or chapters
-    if needs_cover and not cover_written_with_other and audiobook.cover is not None:
-        logging.book_update("Embedding cover")
-        metadata.embed_cover(filepath, audiobook.cover)
+
+
+def add_metadata_to_file(
+    audiobook: Audiobook,
+    filepath: str,
+    options: DownloadOptions,
+    cancel_event: threading.Event | None = None,
+    chapters_embedded: bool = False,
+    cover_embedded: bool = False,
+    probe_cache: dict[str, Any] | None = None,
+    *,
+    embed_tags: bool = True,
+    write_sidecars: bool = True,
+):
+    """
+    Embed metadata into a single file and optionally write metadata sidecars.
+
+    :param audiobook: Audiobook object. Stores metadata
+    :param filepath: Filepath of output file
+    :param options: Runtime download options
+    """
+    if embed_tags:
+        embed_metadata_to_file(
+            audiobook,
+            filepath,
+            options,
+            cancel_event=cancel_event,
+            chapters_embedded=chapters_embedded,
+            cover_embedded=cover_embedded,
+        )
+    if write_sidecars:
+        write_file_sidecars(
+            audiobook,
+            filepath,
+            options,
+            probe_cache=probe_cache,
+        )
 
 
 def _resolve_dir_track_context(
@@ -950,8 +1039,20 @@ def download_files_with_cli_output(
                 _, filepath_tmp = create_filepath(audiobook, output_dir, 0)
                 if os.path.exists(filepath_tmp):
                     os.remove(filepath_tmp)
-            elif os.path.exists(output_dir):
-                shutil.rmtree(output_dir, ignore_errors=True)
+            elif os.path.isdir(output_dir):
+                for idx in range(len(audiobook.files)):
+                    part_path, part_tmp = create_filepath(audiobook, output_dir, idx)
+                    for candidate in (part_tmp, part_path):
+                        if os.path.isfile(candidate):
+                            try:
+                                os.remove(candidate)
+                            except OSError:
+                                pass
+                try:
+                    if not os.listdir(output_dir):
+                        os.rmdir(output_dir)
+                except OSError:
+                    pass
         raise
 
 
@@ -985,6 +1086,14 @@ def _get_header_ci(headers: Any, name: str) -> Any | None:
         if str(key).lower() == target:
             return val
     return None
+
+
+def _normalize_content_type(value: Any) -> str | None:
+    """Return the normalized lowercase MIME type (`type/subtype`), stripping parameters."""
+    if not isinstance(value, str):
+        return None
+    media_type = value.split(";", 1)[0].strip().lower()
+    return media_type or None
 
 
 def _parse_retry_after(value: Any | None) -> float | None:
@@ -1171,12 +1280,17 @@ def download_file(
                     continue
 
             content_type: str | None = _get_header_ci(request.headers, "Content-Type")
+            actual_ct = _normalize_content_type(content_type)
 
             expected = file.expected_content_type
-            if isinstance(expected, (list, tuple, set)):
-                invalid_content_type = content_type not in expected
+            if isinstance(expected, (list, tuple, set, frozenset)):
+                normalized_expected = {
+                    norm for item in expected if (norm := _normalize_content_type(item)) is not None
+                }
+                invalid_content_type = bool(normalized_expected) and actual_ct not in normalized_expected
             else:
-                invalid_content_type = expected and expected != content_type
+                expected_ct = _normalize_content_type(expected)
+                invalid_content_type = bool(expected_ct) and expected_ct != actual_ct
             if (sent_range or has_custom_range) and file.expected_status_code == 200:
                 invalid_status_code = request.status_code not in (200, 206)
             else:
@@ -1201,14 +1315,13 @@ def download_file(
                 attempt += 1
                 continue
             if invalid_content_type or invalid_status_code:
-                # Failed-download bodies can be raw audio bytes: truncate + escape before rich print
-                from rich.markup import escape as _escape
+                # Failed-download bodies can be raw audio bytes: truncate + escape before logging
                 raw_body = request.content[:512]
                 try:
                     body_text = raw_body.decode("utf-8")
                 except UnicodeDecodeError:
                     body_text = repr(raw_body)
-                safe_body = _escape(body_text)
+                safe_body = logging.escape_markup(body_text)
                 raise DownloadError(
                     status_code=request.status_code,
                     content_type=content_type,
@@ -1307,15 +1420,15 @@ def download_file(
                         logging.wait_if_paused(cancel_event=cancel_event)
                         if not chunk:
                             continue
+                        chunk_len = len(chunk)
+                        if rate_limiter is not None:
+                            rate_limiter.acquire(chunk_len, cancel_event=cancel_event)
                         if stream_decryptor is not None:
                             out_chunk = stream_decryptor.decrypt_chunk(chunk)
                             if out_chunk:
                                 f.write(out_chunk)
                         else:
                             f.write(chunk)
-                        chunk_len = len(chunk)
-                        if rate_limiter is not None:
-                            rate_limiter.acquire(chunk_len, cancel_event=cancel_event)
                         bytes_written += chunk_len
                         pending_bytes += chunk_len
                         if (

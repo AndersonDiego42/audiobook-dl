@@ -14,6 +14,15 @@ def _cue_timestamp(ms: int) -> str:
     return f"{minutes:02d}:{seconds:02d}:{frames:02d}"
 
 
+_OPF_COVER_MIME_TYPES: dict[str, str] = {
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+    "webp": "image/webp",
+    "gif": "image/gif",
+}
+
+
 def build_opf_xml(
     metadata: AudiobookMetadata,
     cover_filename: str | None = None,
@@ -58,7 +67,7 @@ def build_opf_xml(
     lines.append("  </metadata>")
     if cover_filename:
         ext = os.path.splitext(cover_filename)[1].lower().lstrip(".")
-        media_type = "image/png" if ext == "png" else "image/jpeg"
+        media_type = _OPF_COVER_MIME_TYPES.get(ext, "image/jpeg")
         lines.extend([
             "  <manifest>",
             f'    <item id="cover-image" href={quoteattr(cover_filename)} media-type={quoteattr(media_type)} />',

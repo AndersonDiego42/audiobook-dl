@@ -374,3 +374,79 @@ def test_collect_upload_files_shared_directory_uses_stem_sidecars_only(tmp_path)
     solo_collected = client._collect_upload_files(str(solo))
     solo_names = {p.split("\\")[-1].split("/")[-1] for p in solo_collected}
     assert solo_names == {"Solo Book.m4b", "metadata.json", "cover.jpg"}
+
+
+def test_audiobookshelf_warns_only_on_non_loopback_http(monkeypatch):
+    from audiobookdl import logging
+    from audiobookdl.integrations.audiobookshelf import AudiobookshelfClient
+
+    logged: list[str] = []
+    monkeypatch.setattr(logging, "log", logged.append)
+
+    AudiobookshelfClient("http://localhost:13378", "tok")
+    AudiobookshelfClient("http://127.0.0.1:13378", "tok")
+    AudiobookshelfClient("https://abs.example.com", "tok")
+    assert logged == []
+
+    AudiobookshelfClient("http://abs.lan.example:13378", "tok")
+    assert len(logged) == 1
+    assert "unencrypted http://" in logged[0]
+
+
+def test_abs_upload_retries_transient_503_tracks_progress_skips_duplicate_and_webp_opf(
+    tmp_path, monkeypatch
+):
+    from audiobookdl.integrations import audiobookshelf as abs_mod
+    from audiobookdl.output.metadata.sidecars import build_opf_xml
+
+    monkeypatch.setattr(abs_mod.time, "sleep", lambda _s: None)
+    book_file = tmp_path / "RetryBook.m4b"
+    book_file.write_bytes(b"M4B-DATA-" * 100)
+
+    class _FlakySession:
+        def __init__(self) -> None:
+            self.upload_attempts = 0
+            self.search_called = False
+
+        def request(self, method, url, headers=None, json=None, data=None, files=None, timeout=None):
+            if url.endswith("/api/libraries/lib-1"):
+                return _MockResponse(200, {"library": {"id": "lib-1", "folders": [{"id": "fol-1"}]}})
+            if "/search?" in url:
+                self.search_called = True
+                return _MockResponse(
+                    200,
+                    {"book": [{"libraryItem": {"media": {"metadata": {"asin": "B0DUP999"}}}}]},
+                )
+            if url.endswith("/api/upload"):
+                body = data.read() if data is not None else b""
+                assert len(body) > len(b"M4B-DATA-") * 90
+                self.upload_attempts += 1
+                if self.upload_attempts == 1:
+                    return _MockResponse(503, text="busy")
+                return _MockResponse(200, {"ok": True})
+            return _MockResponse(404, text="missing")
+
+    sess = _FlakySession()
+    client = AudiobookshelfClient("https://abs.example.com", "tok", session=cast(requests.Session, sess))
+    progress_events: list[tuple[int, int]] = []
+    meta = AudiobookMetadata(title="Retry Book", authors=["Author"], asin="B0NEW123")
+    ok = client.upload_book(
+        str(book_file),
+        library_id="lib-1",
+        metadata=meta,
+        on_progress=lambda sent, total: progress_events.append((sent, total)),
+    )
+    assert ok is True
+    assert sess.upload_attempts == 2
+    assert progress_events[-1][0] == progress_events[-1][1] > 0
+
+    # Duplicate check skips POST /api/upload when ASIN already exists in library
+    dup_meta = AudiobookMetadata(title="Existing", asin="B0DUP999")
+    assert client.upload_book(str(book_file), library_id="lib-1", metadata=dup_meta, skip_if_exists=True) is False
+    assert sess.search_called is True
+    assert sess.upload_attempts == 2
+
+    opf = build_opf_xml(meta, "cover.webp")
+    assert 'media-type="image/webp"' in opf
+
+

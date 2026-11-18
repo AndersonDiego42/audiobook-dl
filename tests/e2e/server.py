@@ -251,7 +251,7 @@ class LocalAudiobookServer:
 
     def _dispatch(self, handler: BaseHTTPRequestHandler, method: str) -> None:
         parsed = urlsplit(handler.path)
-        req_headers = {k: v for k, v in handler.headers.items()}
+        req_headers = dict(handler.headers.items())
         host_header = req_headers.get("Host", "")
         host = (parsed.hostname or host_header.split(":", 1)[0] or self.host).lower()
         path = parsed.path or "/"

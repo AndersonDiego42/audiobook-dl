@@ -3,10 +3,8 @@ from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Co
 from audiobookdl.exceptions import BookHasNoAudiobook, BookHasNoEbook, MissingBookAccess, RequestError, UserNotAuthorized
 from audiobookdl.options_schema import DownloadOptions
 from audiobookdl.utils.audiobook import parse_language, parse_release_date
-from audiobookdl.utils.fs import atomic_write_text
 
 import base64
-import os
 import re
 from typing import Any
 from collections.abc import MutableMapping
@@ -58,29 +56,13 @@ class BookBeatSource(Source):
             + base64.b64encode(b"Personal Computer").decode()
         )
 
-    def _get_or_create_device_id(self) -> str:
-        """Load the persisted device id for this database dir, creating one if absent."""
-        device_file = os.path.join(self.database_directory, "bookbeat_device_id.txt")
-        if os.path.isfile(device_file):
-            try:
-                with open(device_file, encoding="utf-8") as fh:
-                    existing = fh.read().strip()
-                if existing:
-                    return existing
-            except OSError:
-                pass
-        generated = self.create_device_id()
-        try:
-            atomic_write_text(device_file, generated + "\n", encoding="utf-8", private=True)
-        except OSError:
-            pass
-        return generated
-
     def _login(self, url: str, username: str, password: str):
         headers: MutableMapping[str, str | bytes] = {
             "accept": "application/hal+json",
             "bb-client": "BookBeatApp",
-            "bb-device": self._get_or_create_device_id(),
+            "bb-device": self.get_or_create_device_id(
+                "bookbeat_device_id.txt", self.create_device_id
+            ),
         }
         self._session.headers.update(headers)
         login_json = {"username": username, "password": password}

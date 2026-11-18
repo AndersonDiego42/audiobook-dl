@@ -36,6 +36,7 @@ from .exceptions import (
     DownloadCancelled,
     GenericAudiobookDLException,
     NoSourceFound,
+    UserNotAuthorized,
 )
 from .output.download import download
 from .sources import find_compatible_source, find_source_by_name
@@ -92,23 +93,46 @@ DEFAULT_POST_EXEC_TIMEOUT = 300.0
 
 
 def run_post_exec_hook(
-    command: str | None,
+    command: str | Sequence[str] | None,
     *,
     output_path: str,
     metadata: Any,
     audio_format: str | None,
     timeout: float | None = DEFAULT_POST_EXEC_TIMEOUT,
+    allow_shell: bool = True,
 ) -> int | None:
     """
     Execute user-configured `post_exec` command with `AUDIOBOOK_DL_*` environment variables.
 
-    Uses a bounded timeout (`DEFAULT_POST_EXEC_TIMEOUT` = 300s), suppresses Windows console
-    windows, captures stdout/stderr into the application log, and logs failures without
-    failing an already-completed audiobook download.
+    Supports both argv sequences (`shell=False`) and shell command strings (`shell=True`
+    when `allow_shell=True`). Uses a bounded timeout (`DEFAULT_POST_EXEC_TIMEOUT` = 300s),
+    suppresses Windows console windows, captures stdout/stderr into the application log,
+    and logs failures without failing an already-completed audiobook download.
     """
-    if not command or not str(command).strip():
+    use_shell = False
+    subproc_cmd: str | list[str]
+    display_cmd: str
+    if command is None:
         return None
-    cmd = str(command).strip()
+    if isinstance(command, str):
+        stripped = command.strip()
+        if not stripped:
+            return None
+        if not allow_shell:
+            logging.log(
+                f"[yellow]Warning:[/yellow] Skipping shell post_exec command without shell opt-in: {stripped}"
+            )
+            return None
+        use_shell = True
+        subproc_cmd = stripped
+        display_cmd = stripped
+    else:
+        argv = [str(part) for part in command if str(part)]
+        if not argv:
+            return None
+        subproc_cmd = argv
+        display_cmd = " ".join(argv)
+
     env = os.environ.copy()
     env.update(
         {
@@ -121,8 +145,8 @@ def run_post_exec_hook(
     )
     try:
         completed = subprocess.run(
-            cmd,
-            shell=True,
+            subproc_cmd,
+            shell=use_shell,
             env=env,
             check=False,
             capture_output=True,
@@ -132,9 +156,9 @@ def run_post_exec_hook(
         )
     except subprocess.TimeoutExpired as exc:
         logging.error(
-            f"post_exec hook timed out after {timeout}s ({cmd})"
+            f"post_exec hook timed out after {timeout}s ({display_cmd})"
             if timeout is not None
-            else f"post_exec hook timed out ({cmd})"
+            else f"post_exec hook timed out ({display_cmd})"
         )
         stderr_raw = getattr(exc, "stderr", None)
         if stderr_raw:
@@ -147,7 +171,7 @@ def run_post_exec_hook(
                 logging.debug(f"post_exec stderr before timeout: {stderr_txt}")
         return None
     except OSError as exc:
-        logging.error(f"post_exec hook failed to start ({cmd}): {exc}")
+        logging.error(f"post_exec hook failed to start ({display_cmd}): {exc}")
         return None
 
     stdout_txt = (getattr(completed, "stdout", None) or "").strip()
@@ -156,7 +180,7 @@ def run_post_exec_hook(
         logging.log(f"post_exec stdout: {stdout_txt}")
     if completed.returncode != 0:
         detail = f" — {stderr_txt}" if stderr_txt else ""
-        logging.error(f"post_exec hook exited with code {completed.returncode}: {cmd}{detail}")
+        logging.error(f"post_exec hook exited with code {completed.returncode}: {display_cmd}{detail}")
     elif stderr_txt:
         logging.debug(f"post_exec stderr: {stderr_txt}")
     return completed.returncode
@@ -248,6 +272,9 @@ def apply_runtime_options(
             spec.name,
             spec.merge_cast(cfg_value) if spec.merge_cast is not None else cfg_value,
         )
+
+    if not getattr(options, "output_template", None):
+        options.output_template = "{title}"
 
     ffmpeg_dir = config.ffmpeg_dir.strip() or None if config.ffmpeg_dir else None
     ffmpeg_out = options.ffmpeg_output or options.debug
@@ -613,7 +640,49 @@ def prepare_source_result(
         if cancel_event is not None and cancel_event.is_set():
             raise DownloadCancelled
         logging.debug(f"Downloading result of [underline]{url}")
-        result = source.download(url)
+        try:
+            result = source.download(url)
+        except UserNotAuthorized:
+            if not (
+                getattr(source, "_loaded_cached_cookies", False)
+                and getattr(source, "supports_login", False)
+            ):
+                raise
+            logging.debug(
+                f"Cached session cookies for {source.name} were rejected; clearing stale jar and re-authenticating"
+            )
+            cached_path_fn = getattr(source, "cached_cookie_path", None)
+            if callable(cached_path_fn):
+                try:
+                    os.remove(cached_path_fn())
+                except OSError:
+                    pass
+            reset_fn = getattr(source, "reset_authentication", None)
+            if callable(reset_fn):
+                reset_fn(clear_cookies=True)
+            else:
+                source._loaded_cached_cookies = False
+            authenticate(
+                url,
+                source,
+                options,
+                config,
+                interaction=handler,
+                use_cached_cookies=False,
+            )
+            if (
+                active_pool is not None
+                and pool_key is not None
+                and hasattr(source, "_session")
+                and (not source.requires_authentication or source.authenticated)
+            ):
+                active_pool[pool_key] = source._session
+                release_fn = getattr(source, "release_session_ownership", None)
+                if callable(release_fn):
+                    release_fn()
+            if cancel_event is not None and cancel_event.is_set():
+                raise DownloadCancelled from None
+            result = source.download(url)
         return source, result
     except BaseException:
         _close_source(source)
@@ -881,6 +950,8 @@ def authenticate(
     options: DownloadOptions,
     config: Config,
     interaction: logging.InteractionHandler | None = None,
+    *,
+    use_cached_cookies: bool = True,
 ) -> None:
     """Authenticate `source` using cookie file and/or login credentials."""
     explicit_inline_creds = bool(
@@ -918,17 +989,21 @@ def authenticate(
         logging.log(
             f"Warning: profile '{req_profile}' not found in config for {source.name}"
         )
+    source._loaded_cached_cookies = False
     cookie_path = get_cookie_path(options, source_config)
     if cookie_path is not None:
         source.load_cookie_file(cookie_path)
     elif (
-        getattr(source, "supports_cookies", False)
+        use_cached_cookies
+        and getattr(source, "supports_cookies", False)
         and hasattr(source, "cached_cookie_path")
         and os.path.exists(source.cached_cookie_path())
     ):
         source.load_cookie_file(source.cached_cookie_path())
+        source._loaded_cached_cookies = bool(source.authenticated)
     if getattr(source, "supports_login", False) and not source.authenticated:
         login(url, source, options, source_config, interaction=interaction)
+        source._loaded_cached_cookies = False
         if (
             getattr(source, "supports_cookies", False)
             and hasattr(source, "save_cookie_file")
@@ -1189,57 +1264,80 @@ def process_audiobook(
     )
     archive: DownloadArchive | None = None
     check_archive = bool(use_archive and (explicit_archive or (options.skip_downloaded and ledger_path)))
-    if check_archive and ledger_path:
-        archive = DownloadArchive(ledger_path)
-        if archive.contains(source_name, book_key):
-            logging.log(
-                f"Skipping [blue]{audiobook.title}[/], already recorded in download archive."
+    try:
+        if check_archive and ledger_path:
+            archive = DownloadArchive(ledger_path, persistent=True)
+            if archive.contains(source_name, book_key):
+                logging.log(
+                    f"Skipping [blue]{audiobook.title}[/], already recorded in download archive."
+                )
+                return False
+            dup = archive.find_cross_source_duplicate(
+                source_name,
+                book_key,
+                title=audiobook.title,
+                author=audiobook.metadata.author,
+                isbn=audiobook.metadata.isbn,
+                asin=audiobook.metadata.asin,
             )
-            return False
+            if dup is not None:
+                dup_label = dup.get("output_path") or dup.get("title") or dup.get("source")
+                if options.skip_downloaded:
+                    logging.log(
+                        f"Skipping [blue]{audiobook.title}[/], already archived from {dup['source']} ({dup_label})."
+                    )
+                    return False
+                logging.log(
+                    f"[yellow]Warning:[/yellow] [blue]{audiobook.title}[/] matches existing archive entry from {dup['source']} ({dup_label})."
+                )
 
-    if getattr(options, "enrich_metadata", False):
-        enrich_audiobook_with_options(
-            audiobook,
-            options,
-            source=source,
-            interaction=interaction,
-            config=config,
+        if getattr(options, "enrich_metadata", False):
+            enrich_audiobook_with_options(
+                audiobook,
+                options,
+                source=source,
+                interaction=interaction,
+                config=config,
+            )
+
+        logging.wait_if_paused(cancel_event=cancel_event)
+        _apply_user_decryption_key(audiobook, options)
+        download(audiobook, options, interaction=interaction, cancel_event=cancel_event)
+        if source is not None:
+            source.on_download_complete(audiobook)
+
+        location = output.gen_output_location(
+            options.output_template,
+            audiobook.metadata,
+            options.remove_chars,
         )
+        fmt = resolve_audiobook_output_format(audiobook, options.output_format)
+        candidate_file = f"{location}.{fmt}" if fmt else ""
+        resolved_output = candidate_file if (candidate_file and os.path.isfile(candidate_file)) else location
 
-    logging.wait_if_paused(cancel_event=cancel_event)
-    _apply_user_decryption_key(audiobook, options)
-    download(audiobook, options, interaction=interaction, cancel_event=cancel_event)
-    if source is not None:
-        source.on_download_complete(audiobook)
-
-    location = output.gen_output_location(
-        options.output_template,
-        audiobook.metadata,
-        options.remove_chars,
-    )
-    fmt = resolve_audiobook_output_format(audiobook, options.output_format)
-    candidate_file = f"{location}.{fmt}" if fmt else ""
-    resolved_output = candidate_file if (candidate_file and os.path.isfile(candidate_file)) else location
-
-    if ledger_path:
-        target_archive = archive if archive is not None else DownloadArchive(ledger_path)
-        active_profile = normalize_profile_name(getattr(options, "profile", None))
-        target_archive.record(
-            source_name,
-            book_key,
-            title=audiobook.title,
-            author=audiobook.metadata.author,
-            url=audiobook.metadata.scrape_url,
-            output_path=resolved_output,
-            audio_format=fmt,
-            profile=active_profile,
-            status="downloaded",
-            series=audiobook.metadata.series,
-            series_order=audiobook.metadata.series_order,
-            narrator=audiobook.metadata.narrator,
-            isbn=audiobook.metadata.isbn,
-            asin=audiobook.metadata.asin,
-        )
+        if ledger_path:
+            if archive is None:
+                archive = DownloadArchive(ledger_path, persistent=True)
+            active_profile = normalize_profile_name(getattr(options, "profile", None))
+            archive.record(
+                source_name,
+                book_key,
+                title=audiobook.title,
+                author=audiobook.metadata.author,
+                url=audiobook.metadata.scrape_url,
+                output_path=resolved_output,
+                audio_format=fmt,
+                profile=active_profile,
+                status="downloaded",
+                series=audiobook.metadata.series,
+                series_order=audiobook.metadata.series_order,
+                narrator=audiobook.metadata.narrator,
+                isbn=audiobook.metadata.isbn,
+                asin=audiobook.metadata.asin,
+            )
+    finally:
+        if archive is not None:
+            archive.close()
 
     force_abs = bool(getattr(options, "upload_to_abs", False))
     abs_cfg = config.audiobookshelf if config is not None else None

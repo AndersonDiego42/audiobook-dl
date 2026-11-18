@@ -10,11 +10,9 @@ from audiobookdl.exceptions import (
     UserNotAuthorized,
 )
 from audiobookdl.utils.concurrency import run_cancellable_pool
-from audiobookdl.utils.fs import atomic_write_text
 
 import calendar
 from datetime import date, datetime
-import os
 import pycountry
 import re
 from typing import Any
@@ -69,24 +67,6 @@ class NextorySource(Source):
         """Generate a random per-user UUIDv4 device identifier."""
         return str(uuid.uuid4())
 
-    def _get_or_create_device_id(self) -> str:
-        """Return a persisted random device_id for this installation."""
-        device_file = os.path.join(self.database_directory, "nextory_device_id.txt")
-        if os.path.isfile(device_file):
-            try:
-                with open(device_file, encoding="utf-8") as fh:
-                    existing = fh.read().strip()
-                if existing:
-                    return existing
-            except OSError:
-                pass
-        generated = self.create_device_id()
-        try:
-            atomic_write_text(device_file, generated + "\n", encoding="utf-8", private=True)
-        except OSError:
-            pass
-        return generated
-
     def _resolve_locale(self, url: str = "") -> str:
         configured = getattr(self._options, "locale", None) or getattr(
             self, "_configured_locale", None
@@ -130,7 +110,9 @@ class NextorySource(Source):
         return profiles[0]
 
     def _login(self, url: str, username: str, password: str):
-        device_id = self._get_or_create_device_id()
+        device_id = self.get_or_create_device_id(
+            "nextory_device_id.txt", self.create_device_id
+        )
         locale = self._resolve_locale(url)
         logging.debug(f"{device_id=} {locale=}")
         self._session.headers.update(

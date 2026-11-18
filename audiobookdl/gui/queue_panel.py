@@ -247,7 +247,7 @@ class _JobOptionsDialog(ModalDialog):
         fmt = None if fmt_raw in ("", "Original") else fmt_raw
         media = (self._media_var.get() or "Auto").strip().lower()
         bitrate = (self._bitrate_var.get() or "").strip() or None
-        skip_dl = {"On": True, "Off": False}.get(self._skip_dl_var.get(), None)
+        skip_dl = {"On": True, "Off": False}.get(self._skip_dl_var.get())
         intro_binding = OPTIONS_BY_NAME["intro_chapter_mode"].gui
         assert intro_binding is not None
         intro_mode = intro_binding.read_option(self._intro_mode_var.get())
@@ -435,6 +435,8 @@ class ActivityQueuePanel(ttk.LabelFrame):
         on_progress_mode_changed: Callable[[str], None] | None = None,
         progress_var: tk.DoubleVar | None = None,
         active_job_var: tk.StringVar | None = None,
+        concurrency_var: tk.IntVar | None = None,
+        on_concurrency_changed: Callable[[int], None] | None = None,
         palette: ThemePalette | None = None,
     ) -> None:
         super().__init__(master, text="Activity", padding=(10, 6))
@@ -447,6 +449,8 @@ class ActivityQueuePanel(ttk.LabelFrame):
         self.metrics_var = metrics_var
         self.progress_var = progress_var or tk.DoubleVar(value=0.0)
         self.active_job_var = active_job_var or tk.StringVar(value="Idle")
+        self.concurrency_var = concurrency_var or tk.IntVar(value=controller.queue_concurrency)
+        self._on_concurrency_changed = on_concurrency_changed
         self._on_start_download = on_start_download
         self._on_cancel_download = on_cancel_download
         self._on_preview_metadata = on_preview_metadata
@@ -621,6 +625,22 @@ class ActivityQueuePanel(ttk.LabelFrame):
             queue_toolbar, text="Clear Completed", command=self.clear_completed_history
         )
         self.queue_clear_btn.pack(side=tk.RIGHT)
+        conc_frame = ttk.Frame(queue_toolbar)
+        conc_frame.pack(side=tk.RIGHT, padx=(0, 8))
+        ttk.Label(conc_frame, text="Parallel jobs:").pack(side=tk.LEFT, padx=(0, 4))
+        self.queue_concurrency_spin = ttk.Spinbox(
+            conc_frame,
+            from_=1,
+            to=4,
+            width=3,
+            textvariable=self.concurrency_var,
+            state="readonly",
+            command=self._handle_concurrency_change,
+        )
+        self.queue_concurrency_spin.pack(side=tk.LEFT)
+        self.queue_concurrency_spin.bind(
+            "<FocusOut>", lambda _e: self._handle_concurrency_change(), add="+"
+        )
 
         queue_filter_bar = ttk.Frame(queue_tab)
         queue_filter_bar.grid(row=1, column=0, sticky="ew", pady=(0, 4))
@@ -741,6 +761,19 @@ class ActivityQueuePanel(ttk.LabelFrame):
             messagebox.showinfo("Empty File", "No queue items found in the selected file.", parent=self._window)
             return
         self._on_import_queue(items)
+
+    def _handle_concurrency_change(self) -> None:
+        try:
+            raw = int(self.concurrency_var.get())
+        except (tk.TclError, TypeError, ValueError):
+            raw = self._controller.queue_concurrency
+        clamped = max(1, min(4, raw))
+        if self.concurrency_var.get() != clamped:
+            self.concurrency_var.set(clamped)
+        if self._on_concurrency_changed is not None:
+            self._on_concurrency_changed(clamped)
+        else:
+            self._controller.set_queue_concurrency(clamped)
 
     def apply_theme_palette(self, palette: ThemePalette) -> None:
         """Apply semantic log and queue status tag colors from `palette`."""

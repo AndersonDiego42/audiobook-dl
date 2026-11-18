@@ -66,7 +66,7 @@ def tag_templates(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path] |
         "m4b": (cache / "tpl.m4b", ["-c:a", "aac", "-f", "mp4"]),
         "ogg": (cache / "tpl.ogg", ["-c:a", "libvorbis"]),
     }
-    for _ext, (target, codec_args) in specs.items():
+    for target, codec_args in specs.values():
         subprocess.run(
             [
                 ffmpeg_bin,

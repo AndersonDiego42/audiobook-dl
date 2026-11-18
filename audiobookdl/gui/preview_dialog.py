@@ -276,6 +276,7 @@ class PreviewDialog(ModalDialog):
         on_apply_enrichment: Callable[[Audiobook, EnrichmentCandidate], tuple[list[str], bool, bool]] | None = None,
         manage_source_lifecycle: bool = True,
         confirm_button_text: str | None = None,
+        duplicate_warning: str | None = None,
     ) -> None:
         super().__init__(
             parent,
@@ -295,6 +296,7 @@ class PreviewDialog(ModalDialog):
         self._on_apply_enrichment = on_apply_enrichment
         self._manage_source_lifecycle = manage_source_lifecycle
         self._confirm_button_text = confirm_button_text
+        self._duplicate_warning = duplicate_warning
         self._source_transferred = False
         self._source_closed = False
         self._cb_queue = MainThreadCallbackQueue(self)
@@ -594,6 +596,14 @@ class PreviewDialog(ModalDialog):
 
         btn_bar = ttk.Frame(body)
         btn_bar.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        if self._duplicate_warning:
+            ttk.Label(
+                body,
+                text=self._duplicate_warning,
+                foreground=self._palette.warning,
+                wraplength=scale_px(self, 740),
+            ).grid(row=1, column=0, sticky="w", pady=(8, 0))
+            btn_bar.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         self._enrich_btn = ttk.Button(
             btn_bar,
             text="Enrich Metadata...",

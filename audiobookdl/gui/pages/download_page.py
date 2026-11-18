@@ -75,6 +75,8 @@ class DownloadPage(ttk.Frame):
         on_progress_mode_changed: Callable[[str], None],
         progress_var: tk.DoubleVar,
         active_job_var: tk.StringVar,
+        concurrency_var: tk.IntVar | None = None,
+        on_concurrency_changed: Callable[[int], None] | None = None,
         on_retry_selected: Callable[[Sequence[str]], None] | None = None,
     ) -> None:
         super().__init__(parent, padding=(scale_px(parent, 12), scale_px(parent, 8)))
@@ -306,6 +308,8 @@ class DownloadPage(ttk.Frame):
             on_progress_mode_changed=on_progress_mode_changed,
             progress_var=progress_var,
             active_job_var=active_job_var,
+            concurrency_var=concurrency_var,
+            on_concurrency_changed=on_concurrency_changed,
             palette=palette_provider(),
         )
 

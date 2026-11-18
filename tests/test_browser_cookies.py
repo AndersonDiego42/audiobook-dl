@@ -193,3 +193,59 @@ def test_chromium_cookie_decryption_v24_hash_and_errors(tmp_path, monkeypatch):
     )
     with pytest.raises(BrowserCookieError, match="locked by the running browser"):
         read_chromium_cookies(db_path, None, ["overdrive.com"], master_key=key)
+
+
+def test_chromium_sql_domain_filtering_skips_unrelated_cookie_decryption(tmp_path, monkeypatch):
+    from audiobookdl.utils import browser_cookies as bc_mod
+
+    db_path = tmp_path / "Cookies"
+    key = b"\x02" * 32
+    enc_ok = _encrypt_chromium_v10(key, ".storytel.com", "st_tok", include_host_hash=True)
+    chrome_exp = 13500000000000000
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("CREATE TABLE meta (key LONGVARCHAR PRIMARY KEY, value LONGVARCHAR)")
+        conn.execute("INSERT INTO meta (key, value) VALUES ('version', '24')")
+        conn.execute(
+            """
+            CREATE TABLE cookies (
+                host_key TEXT,
+                name TEXT,
+                value TEXT,
+                encrypted_value BLOB,
+                path TEXT,
+                expires_utc INTEGER,
+                is_secure INTEGER,
+                is_httponly INTEGER
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO cookies VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (".storytel.com", "session", "", enc_ok, "/", chrome_exp, 1, 1),
+                (".google.com", "NID", "", b"v20" + b"\x00" * 30, "/", chrome_exp, 1, 1),
+                (".github.com", "user_session", "", b"v20" + b"\x00" * 30, "/", chrome_exp, 1, 1),
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    decrypted_hosts: list[str] = []
+    orig_decrypt = bc_mod._decrypt_chromium_value
+
+    def spy_decrypt(host_key, *args, **kwargs):
+        decrypted_hosts.append(host_key)
+        return orig_decrypt(host_key, *args, **kwargs)
+
+    monkeypatch.setattr(bc_mod, "_decrypt_chromium_value", spy_decrypt)
+    cookies, total_scanned, warnings = read_chromium_cookies(
+        db_path, None, ["storytel.com"], master_key=key
+    )
+    assert total_scanned == 3
+    assert warnings == []
+    assert [c.value for c in cookies] == ["st_tok"]
+    assert decrypted_hosts == [".storytel.com"]
+

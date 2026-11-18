@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 import math
 import os
+import shlex
 from typing import Any
 from collections.abc import Callable, Mapping
 
@@ -39,6 +40,8 @@ GUI_CONFIG_KEYS: frozenset[str] = frozenset(
         "auto_sync_minutes",
         "auto_sync_mode",
         "auto_sync_targets",
+        "queue_concurrency",
+        "minimize_to_tray",
     }
 )
 SOURCE_CONFIG_KEYS: frozenset[str] = frozenset({"username", "password", "library", "cookie_file", "locale"})
@@ -129,6 +132,12 @@ def _validate_positive_float(key: str, raw: Any) -> tuple[float | None, str | No
     return None, f"Warning: invalid '{key}' in config (expected number > 0); ignoring"
 
 
+def _validate_silence_noise_db(key: str, raw: Any) -> tuple[float | None, str | None]:
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and -120.0 <= float(raw) <= 0.0:
+        return float(raw), None
+    return None, f"Warning: invalid '{key}' in config (expected dB between -120 and 0); ignoring"
+
+
 def _validate_audio_bitrate(key: str, raw: Any) -> tuple[str | None, str | None]:
     val, warning = _validate_str(key, raw)
     if warning is not None or val is None:
@@ -194,6 +203,16 @@ def _validate_limit_rate(key: str, raw: Any) -> tuple[str | None, str | None]:
     return cleaned, None
 
 
+def _validate_post_exec(key: str, raw: Any) -> tuple[str | list[str] | None, str | None]:
+    if isinstance(raw, str):
+        return raw, None
+    if isinstance(raw, list) and raw and all(isinstance(part, str) and "\0" not in part for part in raw):
+        cleaned = [part for part in raw if part]
+        if cleaned:
+            return cleaned, None
+    return None, f"Warning: invalid '{key}' in config (expected command string or non-empty list of strings); ignoring"
+
+
 _CONFIG_VALIDATORS: Mapping[str, Callable[[str, Any], tuple[Any, str | None]]] = {
     "str": _validate_str,
     "bool": _validate_bool,
@@ -201,11 +220,13 @@ _CONFIG_VALIDATORS: Mapping[str, Callable[[str, Any], tuple[Any, str | None]]] =
     "positive_int": _validate_positive_int,
     "non_negative_float": _validate_non_negative_float,
     "positive_float": _validate_positive_float,
+    "silence_noise_db": _validate_silence_noise_db,
     "audio_bitrate": _validate_audio_bitrate,
     "media_type": _validate_media_type,
     "intro_chapter_mode": _validate_intro_chapter_mode,
     "enrich_providers": _validate_enrich_providers,
     "limit_rate": _validate_limit_rate,
+    "post_exec": _validate_post_exec,
 }
 
 
@@ -278,6 +299,19 @@ def _serialize_positive_float(val: Any) -> tuple[bool, Any]:
     return True, float(val)
 
 
+def _serialize_float(val: Any) -> tuple[bool, Any]:
+    if val is None:
+        return False, None
+    return True, float(val)
+
+
+def _serialize_post_exec(val: Any) -> tuple[bool, Any]:
+    if isinstance(val, list):
+        cleaned = [str(part) for part in val if str(part)]
+        return (True, cleaned) if cleaned else (False, None)
+    return (True, str(val)) if val else (False, None)
+
+
 def _gui_init_output_format(cfg_val: Any) -> str:
     val = cfg_val or "Original"
     return val if val in GUI_OUTPUT_FORMATS else "Original"
@@ -343,6 +377,12 @@ def _gui_init_bool_from_truthy(cfg_val: Any) -> bool:
 
 
 def _gui_init_optional_str(cfg_val: Any) -> str:
+    return "" if cfg_val is None else str(cfg_val)
+
+
+def _gui_init_post_exec(cfg_val: Any) -> str:
+    if isinstance(cfg_val, list):
+        return shlex.join(str(part) for part in cfg_val if str(part))
     return "" if cfg_val is None else str(cfg_val)
 
 
@@ -1002,12 +1042,12 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         name="post_exec",
         default=None,
         help=(
-            "Shell command to execute after each completed audiobook (300s timeout; "
+            "Command (string or argv list) to execute after each completed audiobook (300s timeout; "
             "read AUDIOBOOK_DL_PATH/TITLE/AUTHOR/SOURCE/FORMAT env vars rather than interpolating titles)"
         ),
         config_key="post_exec",
-        config_kind="str",
-        toml_serializer=_serialize_non_empty_str,
+        config_kind="post_exec",
+        toml_serializer=_serialize_post_exec,
         merge_from_config=True,
         merge_only_if_default=True,
         merge_require_truthy=True,
@@ -1015,7 +1055,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
             var_attr="post_exec_var",
             var_type="str",
             gui_default="",
-            from_config=_gui_init_optional_str,
+            from_config=_gui_init_post_exec,
             to_option=_gui_read_optional_str,
             persisted_in_output_prefs=True,
         ),
@@ -1067,6 +1107,28 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
             gui_default=False,
             persisted_in_output_prefs=True,
         ),
+    ),
+    OptionSpec(
+        name="silence_noise_db",
+        default=-35.0,
+        help="Noise floor threshold in dB for FFmpeg silencedetect (e.g. -35.0)",
+        config_key="silence_noise_db",
+        config_kind="silence_noise_db",
+        toml_serializer=_serialize_float,
+        merge_from_config=True,
+        merge_only_if_default=True,
+        merge_cast=float,
+    ),
+    OptionSpec(
+        name="silence_min_seconds",
+        default=1.8,
+        help="Minimum silence duration in seconds for FFmpeg silencedetect",
+        config_key="silence_min_seconds",
+        config_kind="positive_float",
+        toml_serializer=_serialize_positive_float,
+        merge_from_config=True,
+        merge_only_if_default=True,
+        merge_cast=float,
     ),
     OptionSpec(
         name="chapter_offset_ms",
@@ -1362,10 +1424,12 @@ class DownloadOptions:
     max_workers: int | None = None
     book_delay: float = 0.0
     limit_rate: str | None = None
-    post_exec: str | None = None
+    post_exec: str | list[str] | None = None
     loudnorm: bool = False
     mono: bool = False
     chapters_from_silence: bool = False
+    silence_noise_db: float = -35.0
+    silence_min_seconds: float = 1.8
     chapter_offset_ms: int = 0
     intro_chapter_mode: str = "auto"
     square_cover: bool = False

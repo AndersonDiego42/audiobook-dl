@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import contextmanager
+import ctypes
+from ctypes import wintypes
+import functools
 import os
 import shutil
 import subprocess
@@ -8,7 +12,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Iterator
+from typing import Any
 import weakref
 
 _PATH_LOCKS_GUARD = threading.Lock()
@@ -126,10 +130,158 @@ def _release_os_lock(fh) -> None:
             pass
 
 
+_TOKEN_QUERY = 0x0008
+_TOKEN_USER = 1
+_SDDL_REVISION_1 = 1
+_SE_FILE_OBJECT = 1
+_DACL_SECURITY_INFORMATION = 0x00000004
+_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+
+
+@functools.lru_cache(maxsize=1)
+def _current_user_private_sddl() -> str | None:
+    """Return a protected SDDL string granting File All Access solely to the current Windows user."""
+    if os.name != "nt":
+        return None
+    windll: Any = getattr(ctypes, "windll", None)
+    if windll is None:
+        return None
+    kernel32 = windll.kernel32
+    advapi32 = windll.advapi32
+
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+    kernel32.LocalFree.restype = wintypes.HLOCAL
+
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.ConvertSidToStringSidW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.LPWSTR),
+    ]
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+
+    h_token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(
+        kernel32.GetCurrentProcess(), _TOKEN_QUERY, ctypes.byref(h_token)
+    ):
+        return None
+    try:
+        needed = wintypes.DWORD(0)
+        advapi32.GetTokenInformation(h_token, _TOKEN_USER, None, 0, ctypes.byref(needed))
+        if not needed.value:
+            return None
+        buf = (ctypes.c_ubyte * needed.value)()
+        if not advapi32.GetTokenInformation(
+            h_token, _TOKEN_USER, buf, needed.value, ctypes.byref(needed)
+        ):
+            return None
+        sid_ptr = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
+        sid_str_ptr = wintypes.LPWSTR()
+        if not advapi32.ConvertSidToStringSidW(sid_ptr, ctypes.byref(sid_str_ptr)):
+            return None
+        try:
+            sid_str = sid_str_ptr.value
+            return f"D:P(A;;FA;;;{sid_str})" if sid_str else None
+        finally:
+            if sid_str_ptr:
+                kernel32.LocalFree(sid_str_ptr)
+    finally:
+        kernel32.CloseHandle(h_token)
+
+
+def _apply_windows_private_dacl(path: str) -> bool:
+    """Restrict NTFS permissions on `path` in-process via Win32 `advapi32`; return True on success."""
+    sddl = _current_user_private_sddl()
+    if not sddl:
+        return False
+    windll: Any = getattr(ctypes, "windll", None)
+    if windll is None:
+        return False
+    kernel32 = windll.kernel32
+    advapi32 = windll.advapi32
+
+    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+    kernel32.LocalFree.restype = wintypes.HLOCAL
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.ULONG),
+    ]
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    advapi32.GetSecurityDescriptorDacl.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.BOOL),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    advapi32.GetSecurityDescriptorDacl.restype = wintypes.BOOL
+    advapi32.SetNamedSecurityInfoW.argtypes = [
+        wintypes.LPWSTR,
+        ctypes.c_int,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    advapi32.SetNamedSecurityInfoW.restype = wintypes.DWORD
+
+    sd_ptr = ctypes.c_void_p()
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl, _SDDL_REVISION_1, ctypes.byref(sd_ptr), None
+    ):
+        return False
+    try:
+        dacl_present = wintypes.BOOL()
+        dacl_defaulted = wintypes.BOOL()
+        dacl_ptr = ctypes.c_void_p()
+        if not advapi32.GetSecurityDescriptorDacl(
+            sd_ptr,
+            ctypes.byref(dacl_present),
+            ctypes.byref(dacl_ptr),
+            ctypes.byref(dacl_defaulted),
+        ) or not dacl_present.value:
+            return False
+        status = advapi32.SetNamedSecurityInfoW(
+            path,
+            _SE_FILE_OBJECT,
+            _DACL_SECURITY_INFORMATION | _PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            dacl_ptr,
+            None,
+        )
+        return status == 0
+    finally:
+        if sd_ptr:
+            kernel32.LocalFree(sd_ptr)
+
+
 def _restrict_windows_private_file(path: str) -> None:
     """Restrict NTFS permissions on `path` to the current user (best effort)."""
     if os.name != "nt":
         return
+    try:
+        if _apply_windows_private_dacl(path):
+            return
+    except (OSError, AttributeError, ctypes.ArgumentError):
+        pass
     username = (os.environ.get("USERNAME") or "").strip()
     if not username or not shutil.which("icacls"):
         return

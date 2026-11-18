@@ -150,7 +150,7 @@ def add_id3_metadata(
                 _set_easy_id3_tag(id3_tags, "tracknumber", str(value))
         elif key in ID3_CONVERT:
             _set_easy_id3_tag(id3_tags, ID3_CONVERT[key], value)
-        elif key in EasyID3.valid_keys.keys():
+        elif key in EasyID3.valid_keys:
             _set_easy_id3_tag(id3_tags, key, value)
     if track_context is not None:
         _set_easy_id3_tag(id3_tags, "title", track_context.title)

@@ -88,6 +88,7 @@ class PackBookSpec:
     output_path: str
     total_duration_seconds: float = 0.0
     chapters_source: str = "tracks"
+    track_durations_ms: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -564,6 +565,10 @@ def inspect_local_book(
         chapters=chapters,
         cover=cover,
     )
+    track_durations_ms = [
+        max(0, round(cache[p].duration * 1000)) if p in cache else 0
+        for p in sorted_tracks
+    ]
     return PackBookSpec(
         source_root=source_root,
         track_paths=sorted_tracks,
@@ -572,6 +577,7 @@ def inspect_local_book(
         output_path=output_path,
         total_duration_seconds=total_seconds,
         chapters_source=chapters_source,
+        track_durations_ms=track_durations_ms,
     )
 
 
@@ -765,15 +771,22 @@ def pack_book(
                 f"Repackaging failed to produce output file '{output_path}'"
             )
 
-        os.replace(staged_path, output_path)
-        output.move_cached_probe(cache, staged_path, output_path)
         output_download.add_metadata_to_file(
             spec.audiobook,
-            output_path,
+            staged_path,
             options,
             cancel_event=cancel_event,
             chapters_embedded=chapters_embedded,
             cover_embedded=cover_embedded,
+            probe_cache=cache,
+            write_sidecars=False,
+        )
+        os.replace(staged_path, output_path)
+        output.move_cached_probe(cache, staged_path, output_path)
+        output_download.write_file_sidecars(
+            spec.audiobook,
+            output_path,
+            options,
             probe_cache=cache,
         )
     except Exception:

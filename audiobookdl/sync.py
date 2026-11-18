@@ -144,14 +144,17 @@ def _build_sync_download_options(
     archive_path: str,
     profile: str,
 ) -> DownloadOptions:
-    base_opts = build_default_options(
-        config_location=sync_opts.config_location,
-        download_archive=archive_path,
-        skip_downloaded=True,
-        profile=None if profile == DEFAULT_PROFILE else profile,
-        output_template=sync_opts.output_template,
-        output_format=sync_opts.output_format,
-    )
+    overrides: dict[str, Any] = {
+        "config_location": sync_opts.config_location,
+        "download_archive": archive_path,
+        "skip_downloaded": True,
+        "profile": None if profile == DEFAULT_PROFILE else profile,
+    }
+    if sync_opts.output_template is not None:
+        overrides["output_template"] = sync_opts.output_template
+    if sync_opts.output_format is not None:
+        overrides["output_format"] = sync_opts.output_format
+    base_opts = build_default_options(**overrides)
     apply_runtime_options(base_opts, config)
     return base_opts
 
@@ -194,56 +197,64 @@ def discover_pending_sync_books(
             if str(svc).strip()
         ]
 
-    archive = DownloadArchive(archive_path)
     pending_groups: list[tuple[str, str, list[str]]] = []
     profile_jobs: list[tuple[str, str, DownloadOptions, list[str], ProfileSyncStats]] = []
 
-    for svc, prof in resolved_targets:
-        if cancel_event is not None and cancel_event.is_set():
-            cycle.cancelled = True
-            break
-        cycle.profiles_checked += 1
-        stats = ProfileSyncStats(service=svc, profile=prof)
-        try:
-            dl_opts = _build_sync_download_options(sync_opts, resolved_config, archive_path, prof)
-            if interaction is not None:
-                books = list_service_library(svc, dl_opts, resolved_config, interaction=interaction)
-            else:
-                books = list_service_library(svc, dl_opts, resolved_config)
-            stats.discovered = len(books)
-            cycle.books_discovered += len(books)
+    with DownloadArchive(archive_path, persistent=True) as archive:
+        for svc, prof in resolved_targets:
+            if cancel_event is not None and cancel_event.is_set():
+                cycle.cancelled = True
+                break
+            cycle.profiles_checked += 1
+            stats = ProfileSyncStats(service=svc, profile=prof)
+            try:
+                dl_opts = _build_sync_download_options(sync_opts, resolved_config, archive_path, prof)
+                if interaction is not None:
+                    books = list_service_library(svc, dl_opts, resolved_config, interaction=interaction)
+                else:
+                    books = list_service_library(svc, dl_opts, resolved_config)
+                stats.discovered = len(books)
+                cycle.books_discovered += len(books)
 
-            if not sync_opts.dry_run and books:
-                inserted, _updated = archive.upsert_catalog_items(svc, books, profile=prof)
-                stats.newly_added = inserted
-                cycle.newly_added += inserted
+                if not sync_opts.dry_run and books:
+                    inserted, _updated = archive.upsert_catalog_items(svc, books, profile=prof)
+                    stats.newly_added = inserted
+                    cycle.newly_added += inserted
 
-            pending_urls: list[str] = []
-            for book in books:
-                if not book.url:
-                    continue
-                item_source = (book.source or svc).strip().lower() or svc
-                book_key = make_catalog_book_key(item_source, book)
-                entry = archive.get_entry_by_key(item_source, book_key)
-                if entry is not None and (entry.status in ("downloaded", "trashed") or entry.is_hidden):
-                    stats.skipped += 1
-                    cycle.skipped += 1
-                    continue
-                if book.url not in pending_urls:
-                    pending_urls.append(book.url)
+                keyed_books: list[tuple[Any, str, str]] = []
+                for book in books:
+                    if not book.url:
+                        continue
+                    item_source = (book.source or svc).strip().lower() or svc
+                    book_key = make_catalog_book_key(item_source, book)
+                    keyed_books.append((book, item_source, book_key))
 
-            stats.pending_count = len(pending_urls)
-            cycle.pending_count += len(pending_urls)
-            if pending_urls:
-                pending_groups.append((svc, "" if prof == DEFAULT_PROFILE else prof, pending_urls))
-            profile_jobs.append((svc, prof, dl_opts, pending_urls, stats))
-        except Exception as exc:
-            msg = f"{svc} ({prof}): {exc}"
-            stats.error = str(exc)
-            stats.failed += 1
-            cycle.failed += 1
-            cycle.errors.append(msg)
-        cycle.details.append(stats)
+                existing_entries = archive.get_entries_by_keys(
+                    (item_source, book_key) for _, item_source, book_key in keyed_books
+                )
+
+                pending_urls: list[str] = []
+                for book, item_source, book_key in keyed_books:
+                    entry = existing_entries.get((item_source, book_key))
+                    if entry is not None and (entry.status in ("downloaded", "trashed") or entry.is_hidden):
+                        stats.skipped += 1
+                        cycle.skipped += 1
+                        continue
+                    if book.url not in pending_urls:
+                        pending_urls.append(book.url)
+
+                stats.pending_count = len(pending_urls)
+                cycle.pending_count += len(pending_urls)
+                if pending_urls:
+                    pending_groups.append((svc, "" if prof == DEFAULT_PROFILE else prof, pending_urls))
+                profile_jobs.append((svc, prof, dl_opts, pending_urls, stats))
+            except Exception as exc:
+                msg = f"{svc} ({prof}): {exc}"
+                stats.error = str(exc)
+                stats.failed += 1
+                cycle.failed += 1
+                cycle.errors.append(msg)
+            cycle.details.append(stats)
 
     return SyncDiscoveryResult(
         config=resolved_config,

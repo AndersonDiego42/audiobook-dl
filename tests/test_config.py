@@ -673,5 +673,38 @@ def test_custom_metadata_providers_toml_migration_save_and_delete(tmp_path):
     assert store.data == {}
 
 
+def test_tomlkit_preserves_multiline_strings_arrays_inline_tables_and_aot(tmp_path):
+    from audiobookdl.config import read_config, save_output_preferences
 
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    cfg_path.write_text(
+        "# Header note\n"
+        'output_template = "{title}" # keep inline\n'
+        "\n"
+        "[custom_tools]\n"
+        'banner = """line1\n'
+        'line2"""\n'
+        "layout = { mode = \"compact\", columns = 2 }\n"
+        "targets = [\n"
+        '  "storytel:us",\n'
+        '  "audible:uk",\n'
+        "]\n"
+        "\n"
+        "[[custom_tools.hooks]]\n"
+        'name = "first"\n',
+        encoding="utf-8",
+    )
+
+    save_output_preferences("m4b", True, config_location=str(cfg_path))
+    updated = cfg_path.read_text(encoding="utf-8")
+    assert "# Header note" in updated
+    assert "# keep inline" in updated
+    assert 'output_format = "m4b"' in updated
+    assert "combine = true" in updated
+    assert "[[custom_tools.hooks]]" in updated
+    parsed = read_config(str(cfg_path))
+    assert parsed["custom_tools"]["banner"] == "line1\nline2"
+    assert parsed["custom_tools"]["layout"] == {"mode": "compact", "columns": 2}
+    assert parsed["custom_tools"]["targets"] == ["storytel:us", "audible:uk"]
+    assert parsed["custom_tools"]["hooks"] == [{"name": "first"}]
 

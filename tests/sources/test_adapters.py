@@ -926,7 +926,11 @@ def test_section7_adapters_metadata_catalog_search_and_library(tmp_path):
     bb_book = bb.download("https://www.bookbeat.com/book/catalog-9?ref=share")
     assert isinstance(bb_book, Audiobook)
     assert bb_book.metadata.title == "Catalog Book"
-    assert bb._get_or_create_device_id() == bb._get_or_create_device_id()
+    assert bb.get_or_create_device_id(
+        "bookbeat_device_id.txt", bb.create_device_id
+    ) == bb.get_or_create_device_id(
+        "bookbeat_device_id.txt", bb.create_device_id
+    )
     bb._session.get = MagicMock(return_value=_json_resp({"_embedded": {"books": [{"bookid": 5, "title": "Found", "author": "BB Auth"}]}}))
     assert bb.search("found")[0].title == "Found"
 

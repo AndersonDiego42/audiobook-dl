@@ -1904,7 +1904,6 @@ def test_download_audiobook_split_intro_chapter_mode_updates_filenames_tags_and_
     import json
     import os
     from types import SimpleNamespace
-    from audiobookdl import Chapter
     from audiobookdl.output import download as dl_mod
     from audiobookdl.output import output as out_mod
     from audiobookdl.utils import AudioProbeInfo
@@ -1978,6 +1977,157 @@ def test_download_audiobook_split_intro_chapter_mode_updates_filenames_tags_and_
         "Chapter 2",
     ]
 
+
+def test_resume_combine_preserves_preexisting_files_in_output_dir(tmp_path, monkeypatch):
+    from audiobookdl.output import download as dl_mod
+    from audiobookdl.output import output as out_mod
+
+    book_dir = tmp_path / "Shared Book"
+    book_dir.mkdir()
+    sibling_file = book_dir / "notes.txt"
+    sibling_file.write_bytes(b"keep-me")
+
+    session = MagicMock()
+    session.get.side_effect = [
+        _mock_response({"Content-Length": "5"}, [b"part0"]),
+        _mock_response({"Content-Length": "5"}, [b"part1"]),
+    ]
+    book = Audiobook(
+        session=session,
+        metadata=AudiobookMetadata(title="Shared Book"),
+        files=[
+            AudiobookFile(url="https://example.com/0.mp3", ext="mp3"),
+            AudiobookFile(url="https://example.com/1.mp3", ext="mp3"),
+        ],
+    )
+
+    def fake_combine(filepaths, _in_dir, out_path, **_kwargs):
+        assert len(filepaths) == 2
+        Path(out_path).write_bytes(b"combined-m4b")
+        return True
+
+    monkeypatch.setattr(out_mod, "combine_audiofiles", fake_combine)
+    monkeypatch.setattr(dl_mod.metadata, "add_metadata", lambda *_a, **_kw: True)
+
+    opts = DownloadOptions(
+        resume=True,
+        combine=True,
+        output_format="m4b",
+        skip_downloaded=False,
+        write_json_metadata=False,
+        no_chapters=True,
+    )
+    download_audiobook(book, str(book_dir), opts)
+
+    assert (tmp_path / "Shared Book.m4b").read_bytes() == b"combined-m4b"
+    assert sibling_file.read_bytes() == b"keep-me"
+    assert not (book_dir / "Part 0.mp3").exists()
+    assert not (book_dir / "Part 1.mp3").exists()
+
+
+def test_download_file_normalizes_content_type_parameters_and_case(tmp_path):
+    from audiobookdl.exceptions import DownloadError
+    from audiobookdl.output.download import download_file
+
+    session_ok = MagicMock()
+    session_ok.get.return_value = _mock_response(
+        {"Content-Type": "Audio/MPEG; charset=utf-8", "Content-Length": "4"},
+        [b"mp3!"],
+    )
+    book_ok = Audiobook(
+        session=session_ok,
+        metadata=AudiobookMetadata(title="CT OK"),
+        files=[
+            AudiobookFile(
+                url="https://example.com/ok.mp3",
+                ext="mp3",
+                expected_content_type="audio/mpeg",
+            )
+        ],
+    )
+    out_path = download_file((book_ok, str(tmp_path / "ct_ok"), 0, lambda _d: None, None))
+    assert Path(out_path).read_bytes() == b"mp3!"
+
+    session_bad = MagicMock()
+    bad_resp = _mock_response(
+        {"Content-Type": "text/html; charset=utf-8", "Content-Length": "4"},
+        [b"html"],
+    )
+    bad_resp.content = b"html"
+    session_bad.get.return_value = bad_resp
+    book_bad = Audiobook(
+        session=session_bad,
+        metadata=AudiobookMetadata(title="CT Bad"),
+        files=[
+            AudiobookFile(
+                url="https://example.com/bad.mp3",
+                ext="mp3",
+                expected_content_type="audio/mpeg",
+            )
+        ],
+    )
+    with pytest.raises(DownloadError):
+        download_file((book_bad, str(tmp_path / "ct_bad"), 0, lambda _d: None, None))
+
+
+def test_combine_tags_staged_file_before_os_replace_and_passes_silence_thresholds(
+    tmp_path, monkeypatch
+):
+    from audiobookdl.output import download as dl_mod
+    from audiobookdl.output import output as out_mod
+
+    seen_tagged_paths: list[tuple[str, bool]] = []
+    silence_calls: list[tuple[float, float]] = []
+    final_path = tmp_path / "Atomic Book.m4b"
+
+    session = MagicMock()
+    session.get.side_effect = [
+        _mock_response({"Content-Length": "4"}, [b"pt0!"]),
+        _mock_response({"Content-Length": "4"}, [b"pt1!"]),
+    ]
+    book = Audiobook(
+        session=session,
+        metadata=AudiobookMetadata(title="Atomic Book"),
+        files=[
+            AudiobookFile(url="https://example.com/0.mp3", ext="mp3"),
+            AudiobookFile(url="https://example.com/1.mp3", ext="mp3"),
+        ],
+    )
+
+    def fake_combine(_parts, _dir, staged_out, **_kw):
+        Path(staged_out).write_bytes(b"combined-staged")
+        return False
+
+    def fake_detect(_path, *, noise_db=-35.0, min_silence_sec=1.8, **_kw):
+        silence_calls.append((noise_db, min_silence_sec))
+        return []
+
+    def fake_add_metadata(filepath, _meta, **_kw):
+        seen_tagged_paths.append((filepath, final_path.exists()))
+        raise RuntimeError("mutagen disk full")
+
+    monkeypatch.setattr(out_mod, "combine_audiofiles", fake_combine)
+    monkeypatch.setattr(out_mod, "detect_silence_chapters", fake_detect)
+    monkeypatch.setattr(dl_mod.metadata, "add_metadata", fake_add_metadata)
+
+    opts = DownloadOptions(
+        combine=True,
+        output_format="m4b",
+        chapters_from_silence=True,
+        silence_noise_db=-42.5,
+        silence_min_seconds=2.5,
+        skip_downloaded=False,
+        write_json_metadata=False,
+    )
+    with pytest.raises(RuntimeError, match="mutagen disk full"):
+        download_audiobook(book, str(tmp_path / "Atomic Book"), opts)
+
+    assert len(seen_tagged_paths) == 1
+    assert ".tmp." in seen_tagged_paths[0][0]
+    assert seen_tagged_paths[0][1] is False
+    assert not final_path.exists()
+    assert silence_calls == [(-42.5, 2.5)]
+    assert list(tmp_path.glob("*.tmp.*")) == []
 
 
 

@@ -96,7 +96,12 @@ def test_login_completes_session_and_profile_handshake(tmp_path):
     device_uuid = uuid.UUID(src._session.headers["X-Device-Id"])
     assert device_uuid.version == 4
     # Device ID is persisted per database_directory across source instances
-    assert _make_source(tmp_path)._get_or_create_device_id() == src._session.headers["X-Device-Id"]
+    assert (
+        _make_source(tmp_path).get_or_create_device_id(
+            "nextory_device_id.txt", NextorySource.create_device_id
+        )
+        == src._session.headers["X-Device-Id"]
+    )
     assert src._session.headers["token"] == "tok-123"
     assert src._session.headers["X-Login-Token"] == "tok-123"
     assert src._session.headers["X-Country-Code"] == "SE"

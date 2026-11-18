@@ -195,10 +195,33 @@ def _decode_key_data_uri(uri: str) -> bytes | None:
     return unquote_to_bytes(payload)
 
 
+def _decode_playlist_text(raw: bytes) -> str:
+    """Decode an HLS playlist payload tolerating UTF-8 BOMs and invalid byte sequences."""
+    return raw.decode("utf-8-sig", errors="replace")
+
+
+def _language_match_rank(candidate_lang: object, preferred_locale: str | None) -> int:
+    """Rank how closely an HLS rendition `LANGUAGE` tag matches `preferred_locale` (lower is better)."""
+    if not preferred_locale:
+        return 0
+    pref_norm = preferred_locale.strip().replace("_", "-").lower()
+    if not pref_norm:
+        return 0
+    cand_norm = str(candidate_lang or "").strip().replace("_", "-").lower()
+    if not cand_norm:
+        return 2
+    if cand_norm == pref_norm:
+        return 0
+    if cand_norm.split("-", 1)[0] == pref_norm.split("-", 1)[0]:
+        return 1
+    return 3
+
+
 def _select_variant_playlist_uri(
     playlist: m3u8.M3U8,
     *,
     prefer_video: bool = False,
+    locale: str | None = None,
 ) -> str | None:
     """Select the preferred audio rendition URI (unless `prefer_video`) else highest-bandwidth variant."""
     best = max(
@@ -221,6 +244,7 @@ def _select_variant_playlist_uri(
         if audio_candidates:
             audio_candidates.sort(
                 key=lambda m: (
+                    _language_match_rank(getattr(m, "language", None), locale),
                     0 if str(getattr(m, "default", "") or "").upper() == "YES" else 1,
                     0 if str(getattr(m, "autoselect", "") or "").upper() == "YES" else 1,
                 )
@@ -298,17 +322,22 @@ def get_stream_files(
         user_default_key, user_key_map = parse_decryption_key_spec(raw_dec_key)
     has_user_key = user_default_key is not None or bool(user_key_map)
 
-    content = self.get(url, headers=base_headers).decode("utf-8")
+    preferred_locale = getattr(getattr(self, "_options", None), "locale", None)
+    content = _decode_playlist_text(self.get(url, headers=base_headers))
     playlist = m3u8.loads(content, uri=url)
 
     # Resolve master/variant playlists to the preferred audio or highest-bandwidth video stream.
     seen_urls = {url}
     while playlist.is_variant and playlist.playlists:
-        next_url = _select_variant_playlist_uri(playlist, prefer_video=prefer_video)
+        next_url = _select_variant_playlist_uri(
+            playlist,
+            prefer_video=prefer_video,
+            locale=preferred_locale,
+        )
         if not next_url or next_url in seen_urls:
             break
         seen_urls.add(next_url)
-        content = self.get(next_url, headers=base_headers).decode("utf-8")
+        content = _decode_playlist_text(self.get(next_url, headers=base_headers))
         playlist = m3u8.loads(content, uri=next_url)
 
     media_sequence = playlist.media_sequence or 0
@@ -331,10 +360,12 @@ def get_stream_files(
         )
     )
     if len(unique_key_uris) > 1:
+        ctx = logging.get_job_context()
         fetched_keys = run_cancellable_pool(
             lambda uri: self._get_page(uri, headers=base_headers),
             unique_key_uris,
             max_workers=min(8, len(unique_key_uris)),
+            cancel_event=ctx.cancel_event if ctx is not None else None,
         )
         key_cache.update(zip(unique_key_uris, fetched_keys, strict=True))
 

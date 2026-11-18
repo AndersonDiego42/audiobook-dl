@@ -91,3 +91,44 @@ def test_sync_once_scan_only_updates_db_without_downloading(tmp_path):
     assert cycle.newly_added == 1
     assert cycle.pending_count == 1
     assert cycle.downloaded == 0
+
+
+def test_sync_once_preserves_config_output_template_and_format_when_sync_opts_unset(tmp_path):
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    db_path = tmp_path / "downloads.db"
+    cfg_path.write_text(
+        'output_template = "custom/{author}/{title}"\n'
+        'output_format = "m4b"\n\n'
+        '[sources.storytel]\n'
+        'username = "demo"\n',
+        encoding="utf-8",
+    )
+
+    captured_options = []
+
+    class _CapturingDownloader:
+        def __init__(self, config, options, cancel_event=None):
+            captured_options.append(options)
+
+        def download(self, urls):
+            from audiobookdl.pipeline import DownloadSummary
+
+            s = DownloadSummary()
+            s.books_completed = len(urls)
+            return s
+
+    books = [CatalogBook(title="Sync Item", url="https://storytel.com/s1", author="Author")]
+    sync_opts = SyncOptions(
+        config_location=str(cfg_path),
+        archive_path=str(db_path),
+    )
+    with patch("audiobookdl.sync.list_service_library", return_value=books), patch(
+        "audiobookdl.sync.Downloader", _CapturingDownloader
+    ):
+        cycle = run_sync_once(sync_opts)
+
+    assert cycle.downloaded == 1
+    assert len(captured_options) == 1
+    assert captured_options[0].output_template == "custom/{author}/{title}"
+    assert captured_options[0].output_format == "m4b"
+

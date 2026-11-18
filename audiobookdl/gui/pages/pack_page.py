@@ -451,7 +451,7 @@ class PackPage(ttk.Frame):
             self._edited_chapters_by_key.clear()
             self._book_overrides_by_key.clear()
             self._prune_edits_on_scan = False
-        self._chapter_editor.set_chapters([])
+        self._chapter_editor.set_chapters([], audition_tracks=[])
         for iid in self._tree.get_children():
             self._tree.delete(iid)
         self._scrolled_tree.set_empty_state(
@@ -480,10 +480,18 @@ class PackPage(ttk.Frame):
         key = self._spec_key(spec)
         dur_ms = round(spec.total_duration_seconds * 1000) if spec.total_duration_seconds > 0 else None
         chapters = self._edited_chapters_by_key.get(key, spec.audiobook.chapters)
+        audition_tracks = [
+            (
+                path,
+                spec.track_durations_ms[i] if i < len(spec.track_durations_ms) else 0,
+            )
+            for i, path in enumerate(spec.track_paths)
+        ]
         self._chapter_editor.set_chapters(
             chapters,
             total_duration_ms=dur_ms,
             source_label=spec.chapters_source,
+            audition_tracks=audition_tracks,
         )
 
     def _on_chapters_edited(self, chapters: list[Chapter]) -> None:
@@ -774,7 +782,7 @@ class PackPage(ttk.Frame):
                 )
             count = len(self._preview_specs)
             if count == 0:
-                self._chapter_editor.set_chapters([])
+                self._chapter_editor.set_chapters([], audition_tracks=[])
                 self._scrolled_tree.set_empty_state(True, "No audiobooks found in selected paths.")
                 self.status_var.set("No audiobooks found in selected paths.")
             else:

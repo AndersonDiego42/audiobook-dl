@@ -20,7 +20,6 @@ from typing import Any
 from collections.abc import Sequence
 
 import os
-import re
 import sys
 
 try:
@@ -29,6 +28,8 @@ except ModuleNotFoundError:  # Python < 3.11
     import tomli as tomllib  # type: ignore[no-redef]
 
 import platformdirs
+import tomlkit
+from tomlkit.exceptions import TOMLKitError
 
 
 @define
@@ -60,6 +61,8 @@ class GuiConfig:
     auto_sync_minutes: int | None = None
     auto_sync_mode: str | None = None
     auto_sync_targets: list[str] | None = None
+    queue_concurrency: int | None = None
+    minimize_to_tray: bool | None = None
 
 
 @define
@@ -102,10 +105,12 @@ class Config:
     timeout: float | None = None
     impersonate: str | None = None
     locale: str | None = None
-    post_exec: str | None = None
+    post_exec: str | list[str] | None = None
     loudnorm: bool | None = None
     mono: bool | None = None
     chapters_from_silence: bool | None = None
+    silence_noise_db: float | None = None
+    silence_min_seconds: float | None = None
     chapter_offset_ms: int | None = None
     intro_chapter_mode: str | None = None
     square_cover: bool | None = None
@@ -163,6 +168,8 @@ class Config:
                 if self.gui.auto_sync_targets is not None
                 else None
             ),
+            queue_concurrency=self.gui.queue_concurrency,
+            minimize_to_tray=self.gui.minimize_to_tray,
         )
         abs_copy = AudiobookshelfConfig(
             url=self.audiobookshelf.url,
@@ -188,7 +195,8 @@ class Config:
         }
         for spec in CONFIG_OPTION_SPECS:
             if spec.config_key is not None:
-                kwargs[spec.config_key] = getattr(self, spec.config_key)
+                val = getattr(self, spec.config_key)
+                kwargs[spec.config_key] = list(val) if isinstance(val, list) else val
         return Config(**kwargs)
 
 
@@ -772,6 +780,12 @@ def structure_config(
             auto_sync_minutes=_read_gui_positive_int(gui_section, "auto_sync_minutes"),
             auto_sync_mode=_read_gui_sync_mode(gui_section),
             auto_sync_targets=_read_gui_sync_targets(gui_section),
+            queue_concurrency=(
+                max(1, min(4, qc))
+                if (qc := _read_gui_positive_int(gui_section, "queue_concurrency")) is not None
+                else None
+            ),
+            minimize_to_tray=_read_gui_bool(gui_section, "minimize_to_tray"),
         )
 
     abs_section = config_dict.get("audiobookshelf")
@@ -906,228 +920,75 @@ def structure_config(
     )
 
 
-def _format_toml_key(key: str) -> str:
-    if re.fullmatch(r"[A-Za-z0-9_-]+", key):
-        return key
-    return _format_toml_value(key)
+def _has_nonempty_toml_entries(mapping: dict[str, Any]) -> bool:
+    """Return True if `mapping` contains at least one non-empty leaf value."""
+    for val in mapping.values():
+        if isinstance(val, dict):
+            if _has_nonempty_toml_entries(val):
+                return True
+        elif val is not None and val != "":
+            return True
+    return False
 
 
-def _format_toml_value(value: Any) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (int, float)):
-        return str(value)
-    if isinstance(value, (list, tuple)):
-        return "[" + ", ".join(_format_toml_value(item) for item in value) + "]"
-    text = str(value)
-    escaped = []
-    for ch in text:
-        if ch == "\\":
-            escaped.append("\\\\")
-        elif ch == '"':
-            escaped.append('\\"')
-        elif ch == "\b":
-            escaped.append("\\b")
-        elif ch == "\f":
-            escaped.append("\\f")
-        elif ch == "\n":
-            escaped.append("\\n")
-        elif ch == "\r":
-            escaped.append("\\r")
-        elif ch == "\t":
-            escaped.append("\\t")
-        elif ord(ch) < 0x20:
-            escaped.append(f"\\u{ord(ch):04x}")
-        else:
-            escaped.append(ch)
-    return f'"{"".join(escaped)}"'
+def _sync_toml_mapping(container: Any, target: dict[str, Any]) -> None:
+    """Reconcile a `tomlkit` document/table in-place against `target`, preserving comments."""
+    for existing_key in list(container.keys()):
+        if existing_key not in target:
+            del container[existing_key]
 
-
-def _split_toml_section_header(header: str) -> tuple[str, ...] | None:
-    """Parse a dotted TOML `[section.sub]` header into key segments."""
-    text = header.strip()
-    if not text:
-        return None
-    parts: list[str] = []
-    idx = 0
-    while idx < len(text):
-        while idx < len(text) and text[idx].isspace():
-            idx += 1
-        if idx >= len(text):
-            break
-        if text[idx] in ('"', "'"):
-            quote_ch = text[idx]
-            idx += 1
-            buf = []
-            while idx < len(text) and text[idx] != quote_ch:
-                if text[idx] == "\\" and quote_ch == '"' and idx + 1 < len(text):
-                    idx += 1
-                buf.append(text[idx])
-                idx += 1
-            if idx >= len(text):
-                return None
-            idx += 1
-            parts.append("".join(buf))
-            while idx < len(text) and text[idx].isspace():
-                idx += 1
-            if idx < len(text):
-                if text[idx] != ".":
-                    return None
-                idx += 1
-        else:
-            start = idx
-            while idx < len(text) and text[idx] != ".":
-                idx += 1
-            seg = text[start:idx].strip()
-            if not seg:
-                return None
-            parts.append(seg)
-            if idx < len(text) and text[idx] == ".":
-                idx += 1
-    return tuple(parts) if parts else None
-
-
-def _strip_toml_assignment_key(line: str) -> tuple[str, str] | None:
-    """Return `(key_name, trailing_comment)` if `line` is a single-line TOML assignment."""
-    stripped = line.lstrip()
-    if not stripped or stripped.startswith("#") or stripped.startswith("["):
-        return None
-    eq_idx = stripped.find("=")
-    if eq_idx <= 0:
-        return None
-    raw_key = stripped[:eq_idx].strip()
-    if len(raw_key) >= 2 and raw_key[0] in ('"', "'") and raw_key[-1] == raw_key[0]:
-        key_name = raw_key[1:-1]
-    elif re.fullmatch(r"[A-Za-z0-9_-]+", raw_key):
-        key_name = raw_key
-    else:
-        return None
-    rhs = stripped[eq_idx + 1 :]
-    in_quote: str | None = None
-    escaped = False
-    trailing = ""
-    for pos, ch in enumerate(rhs):
-        if escaped:
-            escaped = False
+    for key, val in target.items():
+        if val is None or val == "":
+            if key in container:
+                del container[key]
             continue
-        if in_quote == '"' and ch == "\\":
-            escaped = True
+        if isinstance(val, dict):
+            if not _has_nonempty_toml_entries(val):
+                if key in container:
+                    del container[key]
+                continue
+            existing = container.get(key)
+            if isinstance(existing, dict):
+                _sync_toml_mapping(existing, val)
+            else:
+                sub_table = tomlkit.table()
+                _sync_toml_mapping(sub_table, val)
+                container[key] = sub_table
             continue
-        if ch in ('"', "'"):
-            if in_quote == ch:
-                in_quote = None
-            elif in_quote is None:
-                in_quote = ch
-        elif ch == "#" and in_quote is None:
-            trailing = "  " + rhs[pos:].rstrip()
-            break
-    if in_quote is not None:
-        return None
-    return key_name, trailing
 
-
-def _iter_toml_sections(data: dict[str, Any], prefix: tuple[str, ...] = ()) -> list[tuple[tuple[str, ...], list[tuple[str, Any]]]]:
-    """Collect `(section_path, scalar_items)` pairs in deterministic order for all nested dicts."""
-    scalars: list[tuple[str, Any]] = []
-    sub_sections: list[tuple[tuple[str, ...], list[tuple[str, Any]]]] = []
-    for k, v in data.items():
-        if isinstance(v, dict):
-            sub_sections.extend(_iter_toml_sections(v, prefix + (str(k),)))
-        elif v is not None and v != "":
-            scalars.append((str(k), v))
-    sections: list[tuple[tuple[str, ...], list[tuple[str, Any]]]] = []
-    if prefix:
-        if scalars:
-            sections.append((prefix, scalars))
-    elif scalars:
-        sections.append(((), scalars))
-    sections.extend(sub_sections)
-    return sections
+        normalized = list(val) if isinstance(val, tuple) else val
+        if key in container:
+            existing_val = container[key]
+            unwrapped = existing_val.unwrap() if hasattr(existing_val, "unwrap") else existing_val
+            if type(unwrapped) is type(normalized) and unwrapped == normalized:
+                continue
+        container[key] = normalized
 
 
 def _merge_toml_preserving_comments(existing_text: str, data: dict[str, Any]) -> str:
     """
-    Update TOML `existing_text` with `data` while preserving `#` comments, blank lines,
-    key order, inline comments, and unknown user sections.
+    Update TOML `existing_text` with `data` using `tomlkit`, preserving `#` comments,
+    blank lines, key order, inline comments, multiline structures, and custom sections.
     """
-    target_sections = dict(_iter_toml_sections(data))
-    emitted_keys: dict[tuple[str, ...], set[str]] = {sec: set() for sec in target_sections}
-    out_lines: list[str] = []
-    current_section: tuple[str, ...] = ()
-
-    def _flush_missing_for_section(sec: tuple[str, ...]) -> None:
-        if sec not in target_sections:
-            return
-        seen = emitted_keys.setdefault(sec, set())
-        missing = [(k, v) for k, v in target_sections[sec] if k not in seen]
-        if not missing:
-            return
-        # Insert new keys before any trailing blank lines at the end of the section.
-        trailing_blanks: list[str] = []
-        while out_lines and out_lines[-1].strip() == "":
-            trailing_blanks.append(out_lines.pop())
-        for k, v in missing:
-            out_lines.append(f"{_format_toml_key(k)} = {_format_toml_value(v)}")
-            seen.add(k)
-        out_lines.extend(reversed(trailing_blanks))
-
-    for raw_line in existing_text.splitlines():
-        sec_match = re.match(r"^\s*\[([^\[\]]+)\]\s*(?:#.*)?$", raw_line)
-        if sec_match:
-            _flush_missing_for_section(current_section)
-            parsed_sec = _split_toml_section_header(sec_match.group(1))
-            if parsed_sec is not None:
-                current_section = parsed_sec
-            out_lines.append(raw_line)
-            continue
-
-        parsed_assign = _strip_toml_assignment_key(raw_line)
-        if parsed_assign is not None:
-            key_name, trailing_comment = parsed_assign
-            sec_entries = dict(target_sections.get(current_section, []))
-            if key_name in sec_entries:
-                val = sec_entries[key_name]
-                indent = raw_line[: len(raw_line) - len(raw_line.lstrip())]
-                out_lines.append(
-                    f"{indent}{_format_toml_key(key_name)} = {_format_toml_value(val)}{trailing_comment}"
-                )
-                emitted_keys.setdefault(current_section, set()).add(key_name)
-            # Keys removed from target_sections are intentionally dropped cleanly.
-            continue
-
-        out_lines.append(raw_line)
-
-    _flush_missing_for_section(current_section)
-
-    for sec, entries in _iter_toml_sections(data):
-        if sec == ():
-            continue
-        seen = emitted_keys.get(sec, set())
-        remaining = [(k, v) for k, v in entries if k not in seen]
-        if not remaining:
-            continue
-        if out_lines and out_lines[-1].strip() != "":
-            out_lines.append("")
-        out_lines.append(f"[{'.'.join(_format_toml_key(part) for part in sec)}]")
-        for k, v in remaining:
-            out_lines.append(f"{_format_toml_key(k)} = {_format_toml_value(v)}")
-
-    return "\n".join(out_lines) + ("\n" if out_lines else "")
+    try:
+        doc = tomlkit.parse(existing_text)
+    except TOMLKitError:
+        return _dump_toml(data)
+    _sync_toml_mapping(doc, data)
+    rendered = tomlkit.dumps(doc)
+    if rendered and not rendered.endswith("\n"):
+        rendered += "\n"
+    return rendered
 
 
 def _dump_toml(data: dict[str, Any]) -> str:
     """Serialize config dictionary (top-level scalars + all nested tables) to TOML."""
-    lines: list[str] = []
-    for sec, entries in _iter_toml_sections(data):
-        if not entries:
-            continue
-        if sec:
-            if lines:
-                lines.append("")
-            lines.append(f"[{'.'.join(_format_toml_key(part) for part in sec)}]")
-        for k, v in entries:
-            lines.append(f"{_format_toml_key(k)} = {_format_toml_value(v)}")
-    return "\n".join(lines) + ("\n" if lines else "")
+    doc = tomlkit.document()
+    _sync_toml_mapping(doc, data)
+    rendered = tomlkit.dumps(doc)
+    if rendered and not rendered.endswith("\n"):
+        rendered += "\n"
+    return rendered
 
 
 def _has_plaintext_password(config_dict: dict[str, Any]) -> bool:
@@ -1324,6 +1185,8 @@ def save_gui_preferences(
     auto_sync_minutes: int | None = None,
     auto_sync_mode: str | None = None,
     auto_sync_targets: Sequence[str] | None = None,
+    queue_concurrency: int | None = None,
+    minimize_to_tray: bool | None = None,
 ) -> str:
     """Persist GUI window state, output prefs, archive toggle, theme, notifications, clipboard, and sync schedule."""
     config_location = overwrite or get_config_location(None)
@@ -1353,12 +1216,15 @@ def save_gui_preferences(
             "notify_on_complete": notify_on_complete,
             "clipboard_monitor": clipboard_monitor,
             "auto_sync_enabled": auto_sync_enabled,
+            "minimize_to_tray": minimize_to_tray,
         }
         for bkey, bval in bool_updates.items():
             if bval is not None:
                 gui_dict[bkey] = bool(bval)
         if auto_sync_minutes is not None and int(auto_sync_minutes) >= 1:
             gui_dict["auto_sync_minutes"] = int(auto_sync_minutes)
+        if queue_concurrency is not None:
+            gui_dict["queue_concurrency"] = max(1, min(4, int(queue_concurrency)))
         if auto_sync_mode is not None:
             norm_mode = auto_sync_mode.strip().lower()
             if norm_mode not in VALID_AUTO_SYNC_MODES:

@@ -10,6 +10,7 @@ from collections.abc import Iterator, Mapping
 
 
 DEFAULT_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
+_CACHE_SCHEMA_VERSION = 1
 
 
 def default_enrichment_cache_path(database_directory: str) -> str:
@@ -59,7 +60,8 @@ class EnrichmentCache:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
     @contextmanager
@@ -93,6 +95,10 @@ class EnrichmentCache:
 
     def _init_schema(self) -> None:
         with self._connection() as conn:
+            version_row = conn.execute("PRAGMA user_version").fetchone()
+            if version_row is not None and int(version_row[0]) == _CACHE_SCHEMA_VERSION:
+                return
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS enrichment_cache (
@@ -106,6 +112,7 @@ class EnrichmentCache:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_enrichment_cache_fetched ON enrichment_cache(fetched_at)"
             )
+            conn.execute(f"PRAGMA user_version = {_CACHE_SCHEMA_VERSION}")
 
     def get(
         self,

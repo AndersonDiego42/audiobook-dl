@@ -491,3 +491,144 @@ def test_archive_count_offset_pagination_and_update_entry(tmp_path):
         archive.close()
 
 
+def test_archive_get_entries_by_keys_and_skips_redundant_wal_ddl(tmp_path):
+    from unittest.mock import patch
+
+    db_path = tmp_path / "downloads.db"
+    with DownloadArchive(str(db_path), persistent=True) as archive:
+        id1 = archive.record("storytel", "k1", title="Book 1", status="downloaded")
+        archive.add_tags(id1, ["fav"])
+        archive.record("audible", "k2", title="Book 2", status="trashed")
+
+        found = archive.get_entries_by_keys([
+            ("storytel", "k1"),
+            ("audible", "k2"),
+            ("storytel", "missing"),
+        ])
+        assert set(found.keys()) == {("storytel", "k1"), ("audible", "k2")}
+        assert found[("storytel", "k1")].tags == ("fav",)
+        assert found[("audible", "k2")].status == "trashed"
+
+    executed_sql: list[str] = []
+    orig_connect = sqlite3.connect
+
+    class _TracingConnection:
+        def __init__(self, inner):
+            object.__setattr__(self, "_inner", inner)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def __setattr__(self, name, value):
+            setattr(self._inner, name, value)
+
+        def __enter__(self):
+            self._inner.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._inner.__exit__(*args)
+
+        def execute(self, sql, *args, **kwargs):
+            executed_sql.append(str(sql))
+            return self._inner.execute(sql, *args, **kwargs)
+
+    with patch(
+        "audiobookdl.utils.archive.sqlite3.connect",
+        side_effect=lambda *a, **kw: _TracingConnection(orig_connect(*a, **kw)),
+    ):
+        with DownloadArchive(str(db_path)) as reopened:
+            assert reopened.contains("storytel", "k1") is True
+            assert ("storytel", "k1") in reopened.get_entries_by_keys([("storytel", "k1")])
+
+    assert not any("PRAGMA journal_mode=WAL" in stmt for stmt in executed_sql)
+    assert not any("CREATE TABLE IF NOT EXISTS" in stmt for stmt in executed_sql)
+
+
+def test_archive_fts5_unicode_substring_and_output_path_norm(tmp_path):
+    db_path = tmp_path / "library.db"
+    out_file = tmp_path / "Books" / "Hobbit.m4b"
+    out_file.parent.mkdir()
+    out_file.write_bytes(b"m4b")
+
+    with DownloadArchive(str(db_path), persistent=True) as archive:
+        id1 = archive.record(
+            "storytel",
+            "k1",
+            title="Kærlighed & Ångström",
+            author="Søren Kierkegaard",
+        )
+        id2 = archive.record(
+            "audible",
+            "k2",
+            title="The Hobbit",
+            author="J.R.R. Tolkien",
+            output_path=str(out_file),
+        )
+        assert id1 > 0 and id2 > 0
+        assert archive._fts5_trigram is True
+
+        # Unicode case-insensitive & mid-word substring both resolve purely in SQL FTS5
+        for q in ("søren", "ångstr", "bbit", "-author:kierk"):
+            _t, _eh, _w, _p, needs_py = archive._build_filter_plan(query=q)
+            assert needs_py is False, f"expected SQL FTS5 plan for {q!r}"
+
+        assert [e.id for e in archive.list_entries(query="søren")] == [id1]
+        assert archive.count_entries(query="ångstr") == 1
+        assert [e.id for e in archive.list_entries(query="bbit")] == [id2]
+        assert [e.id for e in archive.list_entries(query="-author:kierk")] == [id2]
+
+        # Normalized output_path index lookup matches regardless of case differences on Windows
+        assert archive.find_matching_entry_id(output_path=str(out_file).upper() if str(out_file).isascii() else str(out_file)) == id2
+        archive.update_entry(id1, title="Updated Søren", output_path=str(tmp_path / "Soren.m4b"))
+        assert [e.id for e in archive.list_entries(query="updated søren")] == [id1]
+        assert archive.find_matching_entry_id(output_path=str(tmp_path / "Soren.m4b")) == id1
+
+
+def test_find_cross_source_duplicate_matches_identifiers_and_ignores_trashed(tmp_path):
+    db_path = tmp_path / "dups.db"
+    with DownloadArchive(str(db_path), persistent=True) as archive:
+        archive.record(
+            "storytel",
+            "st-1",
+            title="Dune",
+            author="Frank Herbert",
+            asin="B000R3434M",
+            isbn="978-0-441-17271-9",
+            output_path=str(tmp_path / "Dune.m4b"),
+            status="downloaded",
+        )
+        archive.record(
+            "audible",
+            "au-trash",
+            title="Trashed Title",
+            author="Someone",
+            asin="B00TRASH99",
+            status="trashed",
+        )
+
+        # Matches via ASIN from another source
+        by_asin = archive.find_cross_source_duplicate("libro.fm", "lf-9", asin="b000r3434m")
+        assert by_asin is not None and by_asin["source"] == "storytel"
+
+        # Matches via ISBN (ignoring hyphens) from another source
+        by_isbn = archive.find_cross_source_duplicate("bookbeat", "bb-7", isbn="9780441172719")
+        assert by_isbn is not None and by_isbn["source"] == "storytel"
+
+        # Matches via normalized title + author from another source
+        by_title = archive.find_cross_source_duplicate(
+            "nextory", "nx-2", title="  dune ", author="frank herbert"
+        )
+        assert by_title is not None and by_title["source"] == "storytel"
+
+        # Excludes same (source, book_key) and trashed rows
+        assert (
+            archive.find_cross_source_duplicate("storytel", "st-1", title="Dune", author="Frank Herbert", asin="B000R3434M")
+            is None
+        )
+        assert archive.find_cross_source_duplicate("bookbeat", "bb-8", asin="B00TRASH99") is None
+
+
+
+
+

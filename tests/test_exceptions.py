@@ -91,7 +91,7 @@ def test_error_template_inventory_covers_all_18_assets():
     assert subclass_templates | extra_templates == actual_templates
 
 
-@pytest.mark.parametrize("exc_cls,kwargs", _SUBCLASS_CASES, ids=lambda v: v.__name__ if isinstance(v, type) else "kwargs")
+@pytest.mark.parametrize(("exc_cls", "kwargs"), _SUBCLASS_CASES, ids=lambda v: v.__name__ if isinstance(v, type) else "kwargs")
 def test_audiobook_dl_exception_print_renders_cleanly(exc_cls, kwargs):
     sink = _RecordingSink()
     exc = exc_cls(**kwargs)
@@ -120,7 +120,7 @@ def test_non_subclass_error_templates_render_cleanly():
     assert "m4b" in sink.messages[1][1]
 
 
-@pytest.mark.parametrize("exc_cls,kwargs", _SUBCLASS_CASES, ids=lambda v: v.__name__ if isinstance(v, type) else "kwargs")
+@pytest.mark.parametrize(("exc_cls", "kwargs"), _SUBCLASS_CASES, ids=lambda v: v.__name__ if isinstance(v, type) else "kwargs")
 def test_audiobook_dl_exception_str_is_non_empty_plain_text(exc_cls, kwargs):
     exc = exc_cls(**kwargs)
     text = str(exc).strip()

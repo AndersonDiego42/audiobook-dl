@@ -77,13 +77,6 @@ class _SafeFormatDict(dict):
 # Number of parallel ffmpeg remux processes when preparing files for combining
 COMBINE_REMUX_THREADS = 16
 
-def gen_output_filename(booktitle: str, file: Mapping[str, str], template: str) -> str:
-    """Generates an output filename based on different attributes of the
-    file"""
-    arguments = {**file, **{"booktitle": booktitle}}
-    filename = template.format(**arguments)
-    return _fix_output(filename)
-
 
 def _require_executable(name: str) -> str:
     """Resolve an external executable path or raise `MissingDependency`."""
@@ -589,9 +582,14 @@ def detect_silence_chapters(
     min_silence_sec: float = 1.8,
     cancel_event: threading.Event | None = None,
     probe_cache: dict[str, AudioProbeInfo] | None = None,
+    show_progress: bool = True,
 ) -> list[Chapter]:
     """Run FFmpeg `silencedetect` on `filepath` and synthesize chapter markers at pauses."""
     ffmpeg = _require_executable("ffmpeg")
+    info = _get_cached_probe(filepath, probe_cache)
+    expected = info.duration if info.duration > 0 else 0.0
+    duration_ms = round(expected * 1000) if expected > 0 else None
+    capture = not logging.is_ffmpeg_output()
     command = [
         ffmpeg,
         "-hide_banner",
@@ -601,14 +599,33 @@ def detect_silence_chapters(
         f"silencedetect=noise={noise_db}dB:d={min_silence_sec}",
         "-f",
         "null",
-        "-",
     ]
-    result = run_cancellable_subprocess(command, capture_output=True, cancel_event=cancel_event)
+    if show_progress and capture and expected > 0:
+        command += ["-progress", "pipe:1", "-nostats"]
+    command.append("-")
+
+    if show_progress and capture and expected > 0:
+        with logging.progress([]) as prog:
+            task_id = prog.add_task("Detecting silence chapters", total=expected)
+            reported = 0.0
+
+            def _on_silence_progress(seconds: float) -> None:
+                nonlocal reported
+                target = min(expected, max(0.0, seconds))
+                delta = target - reported
+                if delta > 0:
+                    reported = target
+                    prog.advance(task_id, delta)
+
+            with ffmpeg_progress_callback(_on_silence_progress):
+                result = run_cancellable_subprocess(command, capture_output=True, cancel_event=cancel_event)
+            if reported < expected:
+                prog.advance(task_id, expected - reported)
+    else:
+        result = run_cancellable_subprocess(command, capture_output=True, cancel_event=cancel_event)
     if result.returncode != 0:
         return []
     stderr_text = (result.stderr or b"").decode("utf-8", errors="replace")
-    info = _get_cached_probe(filepath, probe_cache)
-    duration_ms = round(info.duration * 1000) if info.duration > 0 else None
 
     starts = [0]
     for match in _SILENCE_END_RE.finditer(stderr_text):
@@ -727,7 +744,6 @@ def combine_audiofiles(
     output_extension = get_extension(output_path)
     work_dir = f"{os.path.normpath(tmp_dir)}.work"
     ts_dir = os.path.join(work_dir, "ts_parts")
-    combined_ts = os.path.join(work_dir, "combined.ts")
     chapter_file = os.path.join(work_dir, "ffmetadata.txt")
     cover_base_path = os.path.join(work_dir, "cover")
     cover_tmp_path: str | None = None
@@ -882,8 +898,10 @@ def combine_audiofiles(
                         raise FailedCombining
                     ts_paths.append(ts_path)
 
+            sample_info = _get_cached_probe(ts_paths[0], cache)
             if len(ts_paths) == 1:
                 ffmpeg_input = ts_paths[0]
+                expected = sample_info.duration
             else:
                 concat_candidate = "concat:" + "|".join(ts_paths)
                 if (
@@ -893,31 +911,18 @@ def combine_audiofiles(
                 ):
                     ffmpeg_input = concat_candidate
                 else:
-                    with open(combined_ts, "wb") as out:
-                        for ts_path in ts_paths:
-                            if cancel_event is not None and cancel_event.is_set():
-                                raise DownloadCancelled
-                            with open(ts_path, "rb") as part:
-                                shutil.copyfileobj(part, out)
-                    ffmpeg_input = combined_ts
-
-            sample_info = _get_cached_probe(ts_paths[0], cache)
-            if len(ts_paths) == 1:
-                expected = sample_info.duration
-                chapter_duration = expected
-            else:
-                part_total = 0.0
-                if ffmpeg_input != combined_ts or chapters:
-                    part_infos = _probe_uncached_audio_info(ts_paths, cache, cancel_event=cancel_event)
-                    part_total = sum(info.duration for info in part_infos)
-                if ffmpeg_input == combined_ts:
-                    expected = _get_cached_probe(combined_ts, cache).duration
-                    # Binary-concatenated multi-part MPEG-TS can reset PTS at junctions so ffprobe on
-                    # `combined_ts` under-reports duration; sum part durations when bounding chapters.
-                    chapter_duration = max(expected, part_total) if chapters else expected
-                else:
-                    expected = part_total
-                    chapter_duration = part_total
+                    concat_list_path = os.path.join(work_dir, "concat_list.txt")
+                    _write_concat_list_file(concat_list_path, ts_paths)
+                    ffmpeg_input_flags = ["-f", "concat", "-safe", "0"]
+                    ffmpeg_input = concat_list_path
+                part_infos = _probe_uncached_audio_info(
+                    ts_paths,
+                    cache,
+                    cancel_event=cancel_event,
+                    max_workers=max_workers,
+                )
+                expected = sum(info.duration for info in part_infos)
+            chapter_duration = expected
             if output_extension in MP4_CONTAINERS:
                 mux_source_ext = "ts"
         else:

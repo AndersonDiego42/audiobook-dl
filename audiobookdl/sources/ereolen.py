@@ -4,6 +4,7 @@ from audiobookdl.exceptions import BookHasNoAudiobook, DataNotPresent, RequestEr
 from audiobookdl.utils.audiobook import parse_duration_ms, parse_language
 
 import re
+import threading
 from typing import Any
 from urllib.parse import urlparse
 import requests
@@ -17,6 +18,7 @@ class EreolenSource(Source):
     names = ["eReolen"]
     login_data = ["username", "password"]
     supports_library = True
+    _refresh_lock = threading.Lock()
     library_domains = [
         line.strip()
         for line in utils.read_asset_file("assets/sources/ereolen/libraries.txt").splitlines()
@@ -45,32 +47,33 @@ class EreolenSource(Source):
 
         Falls back to existing static domains if the registry page cannot be reached.
         """
-        http_client = session or requests
-        try:
-            resp = http_client.get("https://ereolen.dk/libraries", timeout=timeout)
-        except requests.RequestException:
+        with cls._refresh_lock:
+            http_client = session or requests
+            try:
+                resp = http_client.get("https://ereolen.dk/libraries", timeout=timeout)
+            except requests.RequestException:
+                return list(cls.library_domains)
+            if getattr(resp, "status_code", 0) != 200:
+                return list(cls.library_domains)
+            html = getattr(resp, "text", None) or (
+                resp.content.decode("utf-8", errors="replace") if getattr(resp, "content", None) else ""
+            )
+            discovered = re.findall(
+                r"https?://(?:www\.)?([a-z0-9.-]+\.(?:dk|fo|gl))(?:/|\"|')",
+                html,
+                flags=re.IGNORECASE,
+            )
+            cleaned: list[str] = []
+            seen = set(cls.library_domains)
+            cleaned.extend(cls.library_domains)
+            for domain in discovered:
+                host = domain.lower().removeprefix("www.")
+                if host and host not in seen and "ereolen.dk" not in host and "dbc.dk" not in host:
+                    seen.add(host)
+                    cleaned.append(host)
+            cls.library_domains = cleaned
+            cls.match = cls._build_match_patterns(cls.library_domains)
             return list(cls.library_domains)
-        if getattr(resp, "status_code", 0) != 200:
-            return list(cls.library_domains)
-        html = getattr(resp, "text", None) or (
-            resp.content.decode("utf-8", errors="replace") if getattr(resp, "content", None) else ""
-        )
-        discovered = re.findall(
-            r"https?://(?:www\.)?([a-z0-9.-]+\.(?:dk|fo|gl))(?:/|\"|')",
-            html,
-            flags=re.IGNORECASE,
-        )
-        cleaned: list[str] = []
-        seen = set(cls.library_domains)
-        cleaned.extend(cls.library_domains)
-        for domain in discovered:
-            host = domain.lower().removeprefix("www.")
-            if host and host not in seen and "ereolen.dk" not in host and "dbc.dk" not in host:
-                seen.add(host)
-                cleaned.append(host)
-        cls.library_domains = cleaned
-        cls.match = cls._build_match_patterns(cls.library_domains)
-        return list(cls.library_domains)
 
     def _login(self, url: str, username: str, password: str):
         hostname = urlparse(url).hostname or "ereolen.dk"

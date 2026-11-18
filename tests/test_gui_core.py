@@ -5787,6 +5787,353 @@ def test_audit_regressions_queue_reset_pack_keys_sync_mode_filter_and_abs_chapte
             pass
 
 
+@pytest.mark.gui
+def test_gui_event_driven_idle_poll_wakes_on_bg_task_and_debounces_archive_selection(tmp_path):
+    from audiobookdl.gui.pages.library_page import ArchiveTab
+    from audiobookdl.utils.archive import DownloadArchive
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+
+    try:
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+        try:
+            # 1. Idle poll stops scheduling 250ms timers once queues and tasks are empty.
+            app._poll_queue()
+            assert app._poll_after_id is None
+
+            # 2. Submitting a bounded pool task wakes polling cleanly and sleeps again once complete.
+            gate = threading.Event()
+            done_flag = threading.Event()
+
+            def _bg_job() -> None:
+                gate.wait(timeout=2.0)
+                app.controller.event_queue.put(LogEvent(level="INFO", message="bg-woke"))
+                done_flag.set()
+
+            app.controller._submit_bg_task(_bg_job)
+            assert app.controller.has_active_background_tasks() is True
+            assert app._poll_after_id is not None
+
+            gate.set()
+            assert done_flag.wait(timeout=2.0)
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and (
+                app._poll_after_id is not None or not app.controller.event_queue.empty()
+            ):
+                root.update()
+                time.sleep(0.01)
+            assert app.controller.has_active_background_tasks() is False
+            assert app._poll_after_id is None
+        finally:
+            app._on_close(force=True)
+    finally:
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
+    # 3. ArchiveTab._on_entry_selected debounces rapid selection switches and skips intermediate walk.
+    root2 = tk.Tk()
+    root2.withdraw()
+    try:
+        archive_path = tmp_path / "downloads.db"
+        dir_a = tmp_path / "BookA"
+        dir_b = tmp_path / "BookB"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        (dir_a / "a.mp3").write_bytes(b"a" * 1024)
+        (dir_b / "b.mp3").write_bytes(b"b" * 3072)
+
+        with DownloadArchive(str(archive_path), persistent=True) as arch:
+            id_a = arch.record("librivox", "https://example.com/a", title="A", output_path=str(dir_a))
+            id_b = arch.record("librivox", "https://example.com/b", title="B", output_path=str(dir_b))
+
+        tab = ArchiveTab(root2, str(archive_path))
+        seen_paths: list[str] = []
+        orig_format_size = tab._format_size
+
+        def spy_format_size(path: str, *, is_cancelled=None) -> str:
+            seen_paths.append(path)
+            return orig_format_size(path, is_cancelled=is_cancelled)
+
+        tab._format_size = spy_format_size  # type: ignore[method-assign]
+        try:
+            tab._tree.selection_set(str(id_a))
+            tab._on_entry_selected()
+            tab._tree.selection_set(str(id_b))
+            tab._on_entry_selected()
+
+            deadline = time.monotonic() + 2.0
+            while "Calculating..." in tab._detail_meta_var.get() and time.monotonic() < deadline:
+                root2.update()
+                time.sleep(0.01)
+            assert seen_paths == [str(dir_b)]
+            assert "3.0 KB" in tab._detail_meta_var.get()
+        finally:
+            tab.destroy()
+    finally:
+        try:
+            if root2.winfo_exists():
+                root2.destroy()
+        except tk.TclError:
+            pass
+
+
+@pytest.mark.gui
+def test_gui_p2_3_horizontal_scroll_live_system_theme_and_queue_concurrency(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from audiobookdl.config import load_config
+    from audiobookdl.gui.controller import GuiController, QueuedJob, GuiInteractionHandler
+    from audiobookdl.gui.widgets import ScrolledTreeview, TreeColumnSpec
+    from audiobookdl.options_schema import build_default_options
+    from audiobookdl.pipeline import DownloadSummary
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+
+    system_theme = ["light"]
+    monkeypatch.setattr("audiobookdl.gui.app.detect_system_theme", lambda: system_theme[0])
+    monkeypatch.setattr("audiobookdl.gui.theme.detect_system_theme", lambda: system_theme[0])
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    try:
+        app = AudiobookDLApp(root, config_location=str(cfg_path))
+        try:
+            # 1. ScrolledTreeview horizontal scrollbar auto-hides & Shift-wheel scrolls
+            st = ScrolledTreeview(
+                root,
+                (
+                    TreeColumnSpec("col_a", "Column A", width=300, stretch=False),
+                    TreeColumnSpec("col_b", "Column B", width=300, stretch=False),
+                ),
+            )
+            st._on_xscroll("0.0", "0.5")
+            assert bool(st.hscrollbar.winfo_manager()) is True
+            st._on_xscroll("0.0", "1.0")
+            assert st.hscrollbar.winfo_manager() == ""
+            assert st._on_shift_mousewheel(SimpleNamespace(delta=-120)) == "break"
+
+            # 2. Live OS theme change tracking when mode == "system"
+            app.set_theme("system")
+            assert app._palette.mode == "light"
+            assert app._theme_watch_after_id is not None
+            system_theme[0] = "dark"
+            app._check_system_theme()
+            assert app._palette.mode == "dark"
+            app.set_theme("light")
+            assert app._theme_watch_after_id is None
+
+            # 3. Queue concurrency UI spinbox persists to config
+            dl_page = app.download_page
+            app.queue_concurrency_var.set(2)
+            dl_page.queue_panel._handle_concurrency_change()
+            assert app.controller.queue_concurrency == 2
+            assert load_config(str(cfg_path)).gui.queue_concurrency == 2
+        finally:
+            app._on_close(force=True)
+    finally:
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
+    # 4. GuiController runs queued jobs concurrently when queue_concurrency == 2
+    ctrl = GuiController(config_location=str(cfg_path))
+    assert ctrl.queue_concurrency == 2
+    barrier = threading.Barrier(2, timeout=2.0)
+    seen_urls: list[str] = []
+    seen_lock = threading.Lock()
+
+    def _concurrent_run(urls, _opts, _cfg, **_kwargs):
+        barrier.wait()
+        with seen_lock:
+            seen_urls.extend(urls)
+        return DownloadSummary(completed=1, books_completed=1)
+
+    monkeypatch.setattr("audiobookdl.gui.controller.run_downloads", _concurrent_run)
+    try:
+        ev = threading.Event()
+        inter = GuiInteractionHandler(ctrl.event_queue, ev)
+        opts = build_default_options(output_template=str(tmp_path / "{title}"))
+        with ctrl.queue_cond:
+            ctrl.worker_has_active_run = True
+            ctrl.batch_total = 2
+            ctrl.pending_jobs.append(
+                QueuedJob(
+                    job_id="j1",
+                    run_id=1,
+                    url="https://example.com/1",
+                    options=opts,
+                    interaction=inter,
+                )
+            )
+            ctrl.pending_jobs.append(
+                QueuedJob(
+                    job_id="j2",
+                    run_id=1,
+                    url="https://example.com/2",
+                    options=opts,
+                    interaction=inter,
+                )
+            )
+            ctrl.ensure_worker_started()
+            ctrl.queue_cond.notify_all()
+
+        done_events = []
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and not done_events:
+            ctrl.drain_events(
+                lambda e: done_events.append(e) if isinstance(e, RunDoneEvent) else None
+            )
+            time.sleep(0.02)
+        assert len(done_events) == 1
+        assert done_events[0].summary.books_completed == 2
+        assert set(seen_urls) == {"https://example.com/1", "https://example.com/2"}
+    finally:
+        ctrl.shutdown(is_running=False, is_previewing=False)
+
+
+@pytest.mark.gui
+def test_p3_2_audition_tray_daemon_and_duplicate_preview(tmp_path, monkeypatch):
+    from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter
+    from audiobookdl.config import load_config
+    from audiobookdl.gui.app import AudiobookDLApp
+    from audiobookdl.gui.chapter_editor import ChapterEditorFrame, resolve_audition_target
+    from audiobookdl.gui.tray import TrayIconController
+    from audiobookdl.utils.archive import DownloadArchive, default_archive_path
+
+    # 1. resolve_audition_target pinpoints single-file and multi-track chapter offsets
+    t1 = tmp_path / "01.mp3"
+    t2 = tmp_path / "02.mp3"
+    t1.write_bytes(b"a")
+    t2.write_bytes(b"b")
+    assert resolve_audition_target(12500, [(str(t1), 60000)]) == (str(t1), 12.5)
+    assert resolve_audition_target(75000, [(str(t1), 60000), (str(t2), 60000)]) == (str(t2), 15.0)
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        # 2. ChapterEditorFrame Audition 5s starts and cleanly terminates ffplay subprocess
+        terminated = []
+
+        class _FakeProc:
+            def __init__(self):
+                self._rc = None
+
+            def poll(self):
+                return self._rc
+
+            def terminate(self):
+                self._rc = 0
+                terminated.append("term")
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                self._rc = -9
+
+        spawned_cmds = []
+        with monkeypatch.context() as mp:
+            mp.setattr(
+                "audiobookdl.gui.chapter_editor.find_executable",
+                lambda name: "C:/bin/ffplay.exe" if name == "ffplay" else None,
+            )
+            mp.setattr(
+                "audiobookdl.gui.chapter_editor.subprocess.Popen",
+                lambda cmd, **_kw: (spawned_cmds.append(list(cmd)), _FakeProc())[1],
+            )
+
+            editor = ChapterEditorFrame(root)
+            editor.set_chapters(
+                [Chapter(start=0, title="Intro"), Chapter(start=75000, title="Part 2")],
+                audition_tracks=[(str(t1), 60000), (str(t2), 60000)],
+            )
+            assert str(editor._audition_btn.cget("state")) == "normal"
+            editor.tree.selection_set("1")
+            assert editor.toggle_audition() is True
+            assert spawned_cmds and "-ss" in spawned_cmds[0] and "15.000" in spawned_cmds[0]
+            assert str(t2) in spawned_cmds[0]
+            assert editor._audition_btn.cget("text") == "Stop Audition"
+            assert editor.toggle_audition() is False
+            assert terminated == ["term"]
+            editor.destroy()
+
+        # 3. Minimize-to-tray config + App._on_close() + cross-source duplicate preview warning
+        cfg_path = tmp_path / "tray_cfg.toml"
+        db_dir = tmp_path / "db"
+        cfg_path.write_text(
+            f'database_directory = "{str(db_dir).replace(chr(92), "/")}"\n\n'
+            "[gui]\nuse_download_archive = true\n",
+            encoding="utf-8",
+        )
+        with DownloadArchive(default_archive_path(str(db_dir)), persistent=True) as archive:
+            archive.record(
+                "storytel",
+                "st-dune",
+                title="Dune",
+                author="Frank Herbert",
+                asin="B000R3434M",
+                output_path=str(tmp_path / "Dune.m4b"),
+                status="downloaded",
+            )
+
+        app = AudiobookDLApp(root, config_location=str(cfg_path))
+        try:
+            tray_starts = []
+            tray_stops = []
+            monkeypatch.setattr(TrayIconController, "is_available", staticmethod(lambda: True))
+            monkeypatch.setattr(app._tray_controller, "start", lambda: (tray_starts.append(True), True)[1])
+            monkeypatch.setattr(app._tray_controller, "stop", lambda: tray_stops.append(True))
+
+            app.minimize_to_tray_var.set(True)
+            app._toggle_minimize_to_tray()
+            assert load_config(str(cfg_path)).gui.minimize_to_tray is True
+
+            # Normal close minimizes instead of destroying root
+            app._on_close()
+            assert len(tray_starts) == 1
+            assert root.winfo_exists()
+
+            # Cross-source duplicate banner shown in PreviewDialog
+            src = type("_DummySrc", (), {"name": "libro.fm", "close": lambda self: None})()
+            ab = Audiobook(
+                session=MagicMock(),
+                metadata=AudiobookMetadata(title="Dune", authors=["Frank Herbert"], asin="B000R3434M"),
+                files=[AudiobookFile(url="https://libro.fm/1.mp3", ext="mp3")],
+            )
+            dlg = app._show_preview_dialog("https://libro.fm/book/dune", src, ab)  # type: ignore[arg-type]
+            assert dlg._duplicate_warning is not None
+            assert "storytel" in dlg._duplicate_warning
+            dlg.destroy()
+
+            # Forced close stops tray cleanly
+            app._on_close(force=True)
+            assert len(tray_stops) >= 1
+        except Exception:
+            if root.winfo_exists():
+                app._on_close(force=True)
+            raise
+    finally:
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
+
+
+
+
 
 
 

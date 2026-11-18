@@ -2,7 +2,7 @@ from collections import deque
 from contextlib import contextmanager
 import contextvars
 from dataclasses import dataclass
-from rich.text import Text
+import re
 from typing import Any, Protocol
 from collections.abc import Generator, Sequence
 from audiobookdl.utils import read_asset_file
@@ -148,12 +148,22 @@ def get_ui_sink() -> LogSink | None:
     return ctx.sink if ctx is not None else None
 
 
-def strip_markup(msg: str) -> str:
-    """Convert Rich markup text into plain text for non-terminal UIs."""
-    try:
-        return Text.from_markup(msg).plain
-    except Exception:
+_MARKUP_STRIP_RE = re.compile(r"\\(\[)|\[(?:/[^\n\[\]]*|[a-z#@][^\n\[\]]*)\]")
+_MARKUP_ESCAPE_RE = re.compile(r"(\\*)(\[)")
+
+
+def escape_markup(msg: str) -> str:
+    """Escape square-bracket markup tokens in `msg` before logging."""
+    if "[" not in msg:
         return msg
+    return _MARKUP_ESCAPE_RE.sub(lambda m: f"{m.group(1) * 2}\\[", msg)
+
+
+def strip_markup(msg: str) -> str:
+    """Strip inline style markup tags into plain text for GUI and plain logs."""
+    if "[" not in msg:
+        return msg
+    return _MARKUP_STRIP_RE.sub(lambda m: m.group(1) or "", msg)
 
 
 _PROGRESS_EMIT_INTERVAL = 0.05  # 20 Hz max UI progress emission rate

@@ -172,10 +172,8 @@ class DpapiCredentialStore(CredentialStore):
         return {}
 
     def _write_entries(self, entries: dict[str, dict[str, Any]]) -> None:
-        if not entries:
-            if os.path.exists(self.vault_path):
-                os.remove(self.vault_path)
-            return
+        # Write an explicit empty vault atomically rather than unlinking so concurrent
+        # readers inspecting/locking `self.vault_path` do not observe transient ENOENT.
         payload = {"version": 1, "entries": entries}
         atomic_write_text(
             self.vault_path,
@@ -339,11 +337,54 @@ class PlaintextFallbackCredentialStore(CredentialStore):
 
     is_secure = False
 
-    def __init__(self, allow_plaintext: bool = False) -> None:
+    def __init__(
+        self,
+        allow_plaintext: bool = False,
+        vault_path: str | None = None,
+    ) -> None:
         self.allow_plaintext = allow_plaintext
+        self.vault_path = vault_path
+        self._entries: dict[str, dict[str, str | None]] = {}
+
+    def _read_vault(self) -> dict[str, dict[str, str | None]]:
+        if not self.vault_path or not os.path.exists(self.vault_path):
+            return dict(self._entries)
+        try:
+            with open(self.vault_path, encoding="utf-8") as f:
+                data = json.load(f)
+            entries = data.get("entries")
+            if isinstance(entries, dict):
+                return entries
+        except (OSError, ValueError, TypeError) as exc:
+            logging.debug(f"Failed to read plaintext fallback vault '{self.vault_path}': {exc}")
+        return {}
+
+    def _write_vault(self, entries: dict[str, dict[str, str | None]]) -> None:
+        self._entries = dict(entries)
+        if not self.vault_path:
+            return
+        payload = {"version": 1, "entries": entries}
+        atomic_write_text(
+            self.vault_path,
+            json.dumps(payload, indent=2),
+            private=True,
+        )
 
     def get_password(self, service_key: str, username: str | None) -> str | None:
-        return None
+        if not self.allow_plaintext:
+            return None
+        if self.vault_path:
+            with file_lock(self.vault_path):
+                entries = self._read_vault()
+        else:
+            entries = self._entries
+        entry = entries.get(service_key)
+        if not isinstance(entry, dict):
+            return None
+        if entry.get("username") != username:
+            return None
+        password = entry.get("password")
+        return password if isinstance(password, str) else None
 
     def set_password(
         self, service_key: str, username: str | None, password: str
@@ -353,6 +394,14 @@ class PlaintextFallbackCredentialStore(CredentialStore):
                 f"Warning: No OS keyring backend available; saving password for "
                 f"'{service_key}' in plaintext."
             )
+            record = {"username": username, "password": password}
+            if self.vault_path:
+                with file_lock(self.vault_path):
+                    entries = self._read_vault()
+                    entries[service_key] = record
+                    self._write_vault(entries)
+            else:
+                self._entries[service_key] = record
         else:
             logging.log(
                 f"Warning: No OS keyring backend available; password for '{service_key}' "
@@ -360,7 +409,35 @@ class PlaintextFallbackCredentialStore(CredentialStore):
             )
 
     def delete_password(self, service_key: str, username: str | None) -> None:
-        return None
+        if self.vault_path:
+            with file_lock(self.vault_path):
+                entries = self._read_vault()
+                entry = entries.get(service_key)
+                if isinstance(entry, dict) and (
+                    username is None or entry.get("username") == username
+                ):
+                    entries.pop(service_key, None)
+                    self._write_vault(entries)
+        else:
+            entry = self._entries.get(service_key)
+            if isinstance(entry, dict) and (
+                username is None or entry.get("username") == username
+            ):
+                self._entries.pop(service_key, None)
+
+    def stored_services(self) -> dict[str, str | None]:
+        if not self.allow_plaintext:
+            return {}
+        if self.vault_path:
+            with file_lock(self.vault_path):
+                entries = self._read_vault()
+        else:
+            entries = self._entries
+        return {
+            service_key: entry.get("username")
+            for service_key, entry in entries.items()
+            if isinstance(entry, dict)
+        }
 
 
 def _is_usable_keyring_backend(keyring_module: Any) -> bool:

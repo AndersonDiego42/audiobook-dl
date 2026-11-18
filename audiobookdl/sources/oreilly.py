@@ -658,9 +658,7 @@ class OReillySource(Source[str]):
 
     def _build_ebook_audiobook(self, urn: str, info: dict[str, Any], *, url: str) -> Audiobook:
         epubs_api_url = f"{_BASE_URL}/api/v2/epubs/{urn}/"
-        file_headers: MutableMapping[str, str | bytes] = {
-            k: v for k, v in self._api_headers().items()
-        }
+        file_headers: MutableMapping[str, str | bytes] = dict(self._api_headers())
         def _write_epub(dest_path: str, u: str = urn, i: dict[str, Any] = info) -> None:
             self._write_epub_archive(u, i, dest_path)
 

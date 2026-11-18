@@ -158,6 +158,9 @@ class SettingsPage(ttk.Frame):
         notify_on_complete_var: tk.BooleanVar,
         clipboard_monitor_var: tk.BooleanVar,
         check_updates_var: tk.BooleanVar | None = None,
+        minimize_to_tray_var: tk.BooleanVar | None = None,
+        tray_available: bool = False,
+        on_toggle_minimize_to_tray: Callable[[], None] | None = None,
         on_theme_changed: Callable[[str], object],
         on_toggle_clipboard_monitor: Callable[[], None],
         on_toggle_check_updates: Callable[[], None] | None = None,
@@ -248,6 +251,23 @@ class SettingsPage(ttk.Frame):
             variable=clipboard_monitor_var,
             command=on_toggle_clipboard_monitor,
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=2)
+
+        tray_var = minimize_to_tray_var if minimize_to_tray_var is not None else tk.BooleanVar(value=False)
+        tray_label = (
+            "Minimize to system tray when closing window (keeps scheduled sync active)"
+            if tray_available
+            else "Minimize to system tray when closing window (install 'pystray' to enable)"
+        )
+        tray_kwargs: dict[str, object] = {
+            "text": tray_label,
+            "variable": tray_var,
+            "state": "normal" if tray_available else "disabled",
+        }
+        if on_toggle_minimize_to_tray is not None:
+            tray_kwargs["command"] = on_toggle_minimize_to_tray
+        ttk.Checkbutton(app_frame, **tray_kwargs).grid(  # type: ignore[arg-type]
+            row=3, column=0, columnspan=2, sticky="w", pady=2
+        )
 
         # 2. FFmpeg & Media Tools
         ffmpeg_frame = ttk.LabelFrame(body, text="FFmpeg & FFprobe", padding=scale_px(self, 10))

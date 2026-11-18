@@ -11,8 +11,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-        python-version: ["3.11", "3.13"]
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.10", "3.11", "3.13"]
+        exclude:
+          - os: windows-latest
+            python-version: "3.11"
+          - os: macos-latest
+            python-version: "3.10"
+          - os: macos-latest
+            python-version: "3.11"
 
     runs-on: ${{ matrix.os }}
 
@@ -25,14 +32,14 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install package and dev dependencies (Python 3.11 core + dev)
-        if: matrix.python-version == '3.11'
+      - name: Install package and core dev dependencies (Python 3.10)
+        if: matrix.python-version == '3.10'
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
 
-      - name: Install package and full extras (Python 3.13)
-        if: matrix.python-version != '3.11'
+      - name: Install package and full extras (Python 3.11 / 3.13)
+        if: matrix.python-version != '3.10'
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev,export,impersonate,dnd]"
@@ -40,6 +47,10 @@ jobs:
       - name: Install FFmpeg on Linux
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install FFmpeg on macOS
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
 
       - name: Install FFmpeg on Windows
         if: runner.os == 'Windows'
@@ -49,16 +60,34 @@ jobs:
         run: ruff check audiobookdl tests scripts
 
       - name: Run mypy
-        run: mypy audiobookdl
+        run: mypy audiobookdl scripts
+
+      - name: Run unit and integration tests with coverage (Linux Python 3.13)
+        if: runner.os == 'Linux' && matrix.python-version == '3.13'
+        run: xvfb-run -a python -m pytest -m "not e2e" --cov=audiobookdl --cov-report=xml --cov-report=term-missing:skip-covered -q
+        continue-on-error: false
 
       - name: Run unit and integration tests (Linux headless)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.python-version != '3.13'
         run: xvfb-run -a python -m pytest -m "not e2e" -q
+        continue-on-error: false
+
+      - name: Run unit and integration tests (macOS headless)
+        if: runner.os == 'macOS'
+        run: python -m pytest -m "not e2e and not gui" -q
         continue-on-error: false
 
       - name: Run unit and integration tests (Windows)
         if: runner.os == 'Windows'
         run: python -m pytest -m "not e2e" -q
+
+      - name: Upload coverage report
+        if: runner.os == 'Linux' && matrix.python-version == '3.13'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: warn
 
       - name: Run end-to-end tests (Linux headless)
         if: runner.os == 'Linux'

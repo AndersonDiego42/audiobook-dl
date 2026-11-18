@@ -13,7 +13,6 @@ from audiobookdl import (
 from audiobookdl.exceptions import DataNotPresent, GenericAudiobookDLException, NoSourceFound, RequestError, UserNotAuthorized
 from audiobookdl.utils.audiobook import parse_duration_ms
 from audiobookdl.utils.http import DEFAULT_USER_AGENT, extract_session_cookies
-from rich.markup import escape
 
 import json
 import lxml.html
@@ -411,7 +410,9 @@ class AudiobooksdotcomSource(Source):
                 page_text,
             )
             if audio_match is None:
-                logging.debug(f"Could not find audio URL. Page content from {part_url} was:\n{escape(page_text)}")
+                logging.debug(
+                    f"Could not find audio URL. Page content from {part_url} was:\n{logging.escape_markup(page_text)}"
+                )
                 raise DataNotPresent
             audio_url = audio_match.group()
             files.append(

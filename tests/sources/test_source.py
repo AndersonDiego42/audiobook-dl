@@ -428,7 +428,7 @@ def test_download_file_invokes_lazy_encryption_resolver(tmp_path):
     from Crypto.Util.Padding import pad
     from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata
     from audiobookdl.output.download import download_file
-    from audiobookdl.utils.audiobook import AESEncryption
+    from audiobookdl.utils.audiobook import AESCBCEncryption
 
     key = b"0123456789abcdef"
     iv = b"abcdef9876543210"
@@ -447,7 +447,7 @@ def test_download_file_invokes_lazy_encryption_resolver(tmp_path):
     def _resolve_enc():
         nonlocal resolved_calls
         resolved_calls += 1
-        return AESEncryption(key=key, iv=iv)
+        return AESCBCEncryption(key=key, iv=iv)
 
     ab = Audiobook(
         session=session,
@@ -492,6 +492,158 @@ def test_get_stream_files_prefer_video_selects_highest_bandwidth_variant(tmp_pat
     assert len(files) == 1
     assert files[0].ext == "ts"
     assert files[0].url == "https://cdn.example.com/video/1080p.m3u8".replace("1080p.m3u8", "seg0.ts")
+
+
+def test_get_stream_files_handles_utf8_bom_and_locale_audio_rendition(tmp_path):
+    from types import SimpleNamespace
+
+    master_m3u8 = (
+        "\ufeff#EXTM3U\n"
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",LANGUAGE="en",DEFAULT=YES,URI="audio/en.m3u8"\n'
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Swedish",LANGUAGE="sv",DEFAULT=NO,URI="audio/sv.m3u8"\n'
+        '#EXT-X-STREAM-INF:BANDWIDTH=1200000,AUDIO="aud"\n'
+        "video/main.m3u8\n"
+    ).encode("utf-8")
+    sv_m3u8 = (
+        "\ufeff#EXTM3U\n"
+        "#EXTINF:5.0,\n"
+        "sv_seg0.ts\n"
+        "#EXT-X-ENDLIST\n"
+    ).encode("utf-8")
+    source = _make_source(tmp_path)
+    source._options = SimpleNamespace(locale="sv-SE")
+    source._session.get = MagicMock(
+        side_effect=[
+            MagicMock(status_code=200, content=master_m3u8),
+            MagicMock(status_code=200, content=sv_m3u8),
+        ]
+    )
+
+    files = source.get_stream_files("https://cdn.example.com/master.m3u8")
+    assert len(files) == 1
+    assert files[0].url == "https://cdn.example.com/audio/sv_seg0.ts"
+
+
+def test_source_get_or_create_device_id_persists_and_recovers_empty(tmp_path):
+    calls = 0
+
+    def _factory() -> str:
+        nonlocal calls
+        calls += 1
+        return f"dev-{calls}"
+
+    src = _make_source(tmp_path)
+    first = src.get_or_create_device_id("device.txt", _factory)
+    second = src.get_or_create_device_id("device.txt", _factory)
+    assert first == "dev-1"
+    assert second == "dev-1"
+    assert calls == 1
+
+    # Blank file regenerates instead of returning empty device id
+    device_file = tmp_path / "dummy" / "device.txt"
+    device_file.write_text("   \n", encoding="utf-8")
+    regenerated = src.get_or_create_device_id("device.txt", _factory)
+    assert regenerated == "dev-2"
+    assert calls == 2
+
+
+def test_plugin_source_validation_rejects_api_mismatch_and_name_collisions(monkeypatch):
+    from audiobookdl.sources import (
+        Source,
+        PLUGIN_API_VERSION,
+        get_source_classes,
+        reset_plugin_sources_cache,
+    )
+
+    class _ValidPlugin(Source):
+        names = ["BrandNewPlugin"]
+        match = [r"https?://brandnew\.example\.com/.+"]
+        plugin_api_version = PLUGIN_API_VERSION
+
+    class _WrongVersionPlugin(Source):
+        names = ["FuturePlugin"]
+        match = [r"https?://future\.example\.com/.+"]
+        plugin_api_version = PLUGIN_API_VERSION + 1
+
+    class _BuiltinCollisionPlugin(Source):
+        names = ["storytel"]
+        match = [r"https?://evil\.example\.com/.+"]
+
+    class _DuplicatePlugin(Source):
+        names = ["brandnewplugin"]
+        match = [r"https?://dup\.example\.com/.+"]
+
+    class _EP:
+        def __init__(self, name, cls):
+            self.name = name
+            self._cls = cls
+
+        def load(self):
+            return self._cls
+
+    reset_plugin_sources_cache()
+    monkeypatch.setattr(
+        "audiobookdl.sources.importlib.metadata.entry_points",
+        lambda group="": [
+            _EP("valid", _ValidPlugin),
+            _EP("wrong_ver", _WrongVersionPlugin),
+            _EP("collide_builtin", _BuiltinCollisionPlugin),
+            _EP("collide_plugin", _DuplicatePlugin),
+        ]
+        if group == "audiobookdl.sources"
+        else [],
+    )
+    try:
+        classes = get_source_classes()
+        assert _ValidPlugin in classes
+        assert _WrongVersionPlugin not in classes
+        assert _BuiltinCollisionPlugin not in classes
+        assert _DuplicatePlugin not in classes
+    finally:
+        reset_plugin_sources_cache()
+
+
+def test_ereolen_refresh_library_domains_is_thread_safe():
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    from audiobookdl.sources.ereolen import EreolenSource
+
+    orig_domains = list(EreolenSource.library_domains)
+    orig_match = list(EreolenSource.match)
+    in_flight = 0
+    max_concurrent = 0
+    probe_lock = threading.Lock()
+
+    class _FakeSession:
+        def get(self, _url, timeout=10.0):
+            nonlocal in_flight, max_concurrent
+            import time
+
+            with probe_lock:
+                in_flight += 1
+                max_concurrent = max(max_concurrent, in_flight)
+            time.sleep(0.02)
+            with probe_lock:
+                in_flight -= 1
+            return MagicMock(
+                status_code=200,
+                text='<a href="https://odensebib.dk/">Odense</a>',
+            )
+
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(
+                pool.map(lambda _i: EreolenSource.refresh_library_domains(session=_FakeSession()), range(4))
+            )
+        assert max_concurrent == 1
+        assert all("odensebib.dk" in r for r in results)
+        assert "odensebib.dk" in EreolenSource.library_domains
+        assert any("odensebib" in pat for pat in EreolenSource.match)
+    finally:
+        EreolenSource.library_domains = orig_domains
+        EreolenSource.match = orig_match
+
+
 
 
 

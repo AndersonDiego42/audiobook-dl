@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from collections.abc import Callable, Sequence
@@ -12,6 +13,7 @@ from collections.abc import Callable, Sequence
 from audiobookdl.gui.formatting import format_duration, format_timestamp_ms, parse_timestamp_ms
 from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, scale_px
 from audiobookdl.gui.widgets import ModalDialog, ScrolledTreeview, TreeColumnSpec
+from audiobookdl.utils import find_executable, subprocess_kwargs
 from audiobookdl.utils.audiobook import Chapter
 
 _CUE_TRACK_RE = re.compile(r"^\s*TRACK\s+\d+\s+", re.IGNORECASE)
@@ -283,6 +285,27 @@ class _ChapterShiftDialog(ModalDialog):
         self.destroy()
 
 
+def resolve_audition_target(
+    chapter_start_ms: int,
+    tracks: Sequence[tuple[str, int]],
+) -> tuple[str, float] | None:
+    """Resolve `(audio_file_path, seek_seconds)` for `chapter_start_ms` within local `tracks`."""
+    cleaned = [(str(path), max(0, int(dur_ms))) for path, dur_ms in tracks if str(path).strip()]
+    if not cleaned:
+        return None
+    target_ms = max(0, int(chapter_start_ms))
+    if len(cleaned) == 1:
+        return cleaned[0][0], target_ms / 1000.0
+    cursor_ms = 0
+    for path, dur_ms in cleaned:
+        if dur_ms > 0 and target_ms < cursor_ms + dur_ms:
+            return path, max(0, target_ms - cursor_ms) / 1000.0
+        cursor_ms += dur_ms
+    last_path, last_dur = cleaned[-1]
+    last_start_ms = max(0, cursor_ms - last_dur)
+    return last_path, max(0, target_ms - last_start_ms) / 1000.0
+
+
 class ChapterEditorFrame(ttk.Frame):
     """Interactive chapter table allowing add, rename, timestamp edit/shift, delete, merge, and import/export."""
 
@@ -306,6 +329,9 @@ class ChapterEditorFrame(ttk.Frame):
         self._on_change = on_change
         self._chapters: list[Chapter] = []
         self._chapter_sources: list[str] = []
+        self._audition_tracks: list[tuple[str, int]] = []
+        self._audition_proc: subprocess.Popen[bytes] | None = None
+        self._audition_poll_id: str | None = None
         self._total_duration_ms: int | None = None
         self._source_label = ""
         self._info_var = tk.StringVar(value="No chapters")
@@ -328,8 +354,15 @@ class ChapterEditorFrame(ttk.Frame):
             side=tk.LEFT, padx=(0, 4)
         )
         ttk.Button(toolbar, text="Export...", command=self.export_to_file).pack(
-            side=tk.LEFT
+            side=tk.LEFT, padx=(0, 4)
         )
+        self._audition_btn = ttk.Button(
+            toolbar,
+            text="Audition 5s",
+            command=self.toggle_audition,
+            state="disabled",
+        )
+        self._audition_btn.pack(side=tk.LEFT)
         ttk.Label(toolbar, textvariable=self._info_var, style="Muted.TLabel").pack(side=tk.RIGHT)
 
         self._scrolled = ScrolledTreeview(
@@ -342,6 +375,7 @@ class ChapterEditorFrame(ttk.Frame):
         self._scrolled.grid(row=1, column=0, sticky="nsew")
         self.tree = self._scrolled.tree
         self.tree.bind("<Double-1>", lambda _e: self.edit_selected())
+        self.bind("<Destroy>", self._on_destroy, add="+")
 
     def apply_theme(self, palette: ThemePalette) -> None:
         """Update the stored palette used when opening chapter edit dialogs."""
@@ -353,7 +387,9 @@ class ChapterEditorFrame(ttk.Frame):
         *,
         total_duration_ms: int | None = None,
         source_label: str = "",
+        audition_tracks: Sequence[tuple[str, int]] | None = None,
     ) -> None:
+        self.stop_audition()
         src = source_label or "Embedded"
         paired = sorted(
             [(Chapter(start=int(c.start), title=str(c.title)), src) for c in chapters],
@@ -361,9 +397,138 @@ class ChapterEditorFrame(ttk.Frame):
         )
         self._chapters = [item[0] for item in paired]
         self._chapter_sources = [item[1] for item in paired]
+        if audition_tracks is not None:
+            self._audition_tracks = [
+                (str(path), max(0, int(dur_ms)))
+                for path, dur_ms in audition_tracks
+                if str(path).strip()
+            ]
         self._total_duration_ms = total_duration_ms
         self._source_label = source_label
         self._render()
+
+    def set_audition_sources(self, tracks: Sequence[tuple[str, int]] | None) -> None:
+        """Bind local `(path, duration_ms)` tracks used for 5-second boundary auditioning."""
+        self.stop_audition()
+        self._audition_tracks = (
+            [(str(path), max(0, int(dur_ms))) for path, dur_ms in tracks if str(path).strip()]
+            if tracks
+            else []
+        )
+        self._update_audition_button_state()
+
+    def _update_audition_button_state(self) -> None:
+        if self._audition_proc is not None and self._audition_proc.poll() is None:
+            self._audition_btn.configure(text="Stop Audition", state="normal")
+            return
+        can_play = bool(
+            self._chapters
+            and self._audition_tracks
+            and find_executable("ffplay") is not None
+        )
+        self._audition_btn.configure(
+            text="Audition 5s",
+            state="normal" if can_play else "disabled",
+        )
+
+    def stop_audition(self) -> None:
+        """Terminate any active `ffplay` audition subprocess."""
+        if self._audition_poll_id is not None:
+            try:
+                self.after_cancel(self._audition_poll_id)
+            except tk.TclError:
+                pass
+            self._audition_poll_id = None
+        proc = self._audition_proc
+        self._audition_proc = None
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=1.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        try:
+            if self.winfo_exists():
+                self._update_audition_button_state()
+        except tk.TclError:
+            pass
+
+    def toggle_audition(self) -> bool:
+        """Play a 5-second preview around the selected chapter boundary via `ffplay`, or stop if active."""
+        if self._audition_proc is not None and self._audition_proc.poll() is None:
+            self.stop_audition()
+            return False
+        if not self._chapters or not self._audition_tracks:
+            return False
+        sel = self.tree.selection()
+        idx = int(sel[0]) if sel else 0
+        if not (0 <= idx < len(self._chapters)):
+            return False
+        target = resolve_audition_target(self._chapters[idx].start, self._audition_tracks)
+        if target is None or not os.path.isfile(target[0]):
+            messagebox.showwarning(
+                "Audition Unavailable",
+                "Local audio file for the selected chapter could not be found.",
+                parent=self,
+            )
+            return False
+        ffplay_bin = find_executable("ffplay")
+        if ffplay_bin is None:
+            messagebox.showwarning(
+                "ffplay Not Found",
+                "Audio auditioning requires 'ffplay' (included with full FFmpeg builds).",
+                parent=self,
+            )
+            self._update_audition_button_state()
+            return False
+        audio_path, offset_sec = target
+        cmd = [
+            ffplay_bin,
+            "-nodisp",
+            "-autoexit",
+            "-loglevel",
+            "quiet",
+            "-ss",
+            f"{offset_sec:.3f}",
+            "-t",
+            "5",
+            audio_path,
+        ]
+        try:
+            self._audition_proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                **subprocess_kwargs(),
+            )
+        except OSError as exc:
+            messagebox.showerror("Audition Failed", f"Could not launch ffplay: {exc}", parent=self)
+            self._audition_proc = None
+            self._update_audition_button_state()
+            return False
+        self._update_audition_button_state()
+        self._audition_poll_id = self.after(200, self._poll_audition)
+        return True
+
+    def _poll_audition(self) -> None:
+        self._audition_poll_id = None
+        proc = self._audition_proc
+        if proc is None:
+            self._update_audition_button_state()
+            return
+        if proc.poll() is not None:
+            self._audition_proc = None
+            self._update_audition_button_state()
+            return
+        self._audition_poll_id = self.after(200, self._poll_audition)
+
+    def _on_destroy(self, event: tk.Event) -> None:
+        if event.widget is self:
+            self.stop_audition()
 
     def get_chapters(self) -> list[Chapter]:
         return [Chapter(start=c.start, title=c.title) for c in self._chapters]
@@ -409,6 +574,7 @@ class ChapterEditorFrame(ttk.Frame):
             total == 0,
             "No chapters detected. Import a .cue or .json file to add chapters.",
         )
+        self._update_audition_button_state()
 
     def add_chapter(self) -> None:
         default_start = self._chapters[-1].start if self._chapters else 0

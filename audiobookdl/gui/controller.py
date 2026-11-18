@@ -2,6 +2,7 @@
 
 from collections import deque
 from collections.abc import Callable, Generator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 import json
@@ -24,7 +25,12 @@ from audiobookdl.config import (
     save_output_preferences,
     save_source_credentials,
 )
-from audiobookdl.utils.archive import resolve_database_directory
+from audiobookdl.utils.archive import (
+    DownloadArchive,
+    default_archive_path,
+    make_book_key,
+    resolve_database_directory,
+)
 from audiobookdl.utils.fs import atomic_write_text
 from audiobookdl.exceptions import DownloadCancelled
 from audiobookdl.gui.events import (
@@ -235,18 +241,28 @@ class GuiLogSink:
     def __init__(self, event_queue: "queue.Queue[ControllerEvent]") -> None:
         self._queue = event_queue
         self._active_run_id = 0
-        self._active_job_id: str | None = None
-        self._active_series_title: str = ""
-        self._last_emitted_title: str = ""
+        self._job_local = threading.local()
+
+    def _job_state(self) -> Any:
+        state = getattr(self._job_local, "state", None)
+        if state is None:
+            state = {"job_id": None, "series_title": "", "last_title": ""}
+            self._job_local.state = state
+        return state
+
+    @property
+    def _active_job_id(self) -> str | None:
+        return self._job_state()["job_id"]
 
     def set_active_run_id(self, run_id: int) -> None:
         self._active_run_id = run_id
 
     def set_active_job_id(self, job_id: str | None) -> None:
-        """Bind `job_id` so `item_progress` updates also resolve the active queue row title."""
-        self._active_job_id = job_id
-        self._active_series_title = ""
-        self._last_emitted_title = ""
+        """Bind `job_id` for the current worker thread so `item_progress` resolves queue titles."""
+        state = self._job_state()
+        state["job_id"] = job_id
+        state["series_title"] = ""
+        state["last_title"] = ""
 
     def on_log(self, level: str, message: str) -> None:
         self._queue.put(LogEvent(level=level, message=message))
@@ -287,21 +303,24 @@ class GuiLogSink:
             )
         )
         cleaned = (title or "").strip()
-        if not self._active_job_id or not cleaned:
+        state = self._job_state()
+        active_job_id = state["job_id"]
+        if not active_job_id or not cleaned:
             return
+        series_title = state["series_title"]
         if total > 1 and current == 0:
-            self._active_series_title = cleaned
+            state["series_title"] = cleaned
             display_title = cleaned
         elif total > 1 and current > 0:
-            if self._active_series_title and self._active_series_title != cleaned:
-                display_title = f"{self._active_series_title} ({current}/{total})"
+            if series_title and series_title != cleaned:
+                display_title = f"{series_title} ({current}/{total})"
             else:
                 display_title = f"{cleaned} ({current}/{total})"
         else:
             display_title = cleaned
-        if display_title != self._last_emitted_title:
-            self._last_emitted_title = display_title
-            self._queue.put(JobMetaEvent(job_id=self._active_job_id, title=display_title))
+        if display_title != state["last_title"]:
+            state["last_title"] = display_title
+            self._queue.put(JobMetaEvent(job_id=active_job_id, title=display_title))
 
     def on_progress_finish(self) -> None:
         self._queue.put(ProgressFinishEvent())
@@ -424,13 +443,65 @@ class GuiController:
         self.catalog_request_id = 0
         self.preview_request_id = 0
         self.active_job_id: str | None = None
+        self.active_job_ids: set[str] = set()
         self.active_job_running = False
+        self.queue_concurrency: int = max(
+            1, min(4, int(self.config.gui.queue_concurrency or 1))
+        )
         self.cancelled_job_ids: set[str] = set()
         self._save_defer_depth = 0
         self._save_deferred = False
         self._thread_local = threading.local()
         self._sessions_lock = threading.Lock()
         self._thread_sessions: list[Any] = []
+        self._bg_lock = threading.Lock()
+        self._active_bg_tasks = 0
+        self._bg_executor: ThreadPoolExecutor | None = None
+        self._activity_callback: Callable[[], None] | None = None
+
+    def set_activity_callback(self, callback: Callable[[], None] | None) -> None:
+        """Register a main-thread wakeup callback invoked when background tasks start."""
+        self._activity_callback = callback
+
+    def _notify_activity(self) -> None:
+        cb = self._activity_callback
+        if cb is not None:
+            try:
+                cb()
+            except Exception:
+                pass
+
+    def has_active_background_tasks(self) -> bool:
+        """Return True while queue worker jobs or bounded pool tasks are active."""
+        with self._bg_lock:
+            aux_active = self._active_bg_tasks > 0
+        return bool(self.worker_has_active_run or self.active_job_running or aux_active)
+
+    def _submit_bg_task(self, fn: Callable[[], None]) -> None:
+        """Execute `fn` on the shared bounded GUI background executor."""
+        with self._bg_lock:
+            if self._bg_executor is None:
+                self._bg_executor = ThreadPoolExecutor(
+                    max_workers=6,
+                    thread_name_prefix="abdl-gui-bg",
+                )
+            self._active_bg_tasks += 1
+            executor = self._bg_executor
+
+        def _wrapped() -> None:
+            try:
+                fn()
+            finally:
+                with self._bg_lock:
+                    self._active_bg_tasks = max(0, self._active_bg_tasks - 1)
+
+        try:
+            executor.submit(_wrapped)
+        except Exception:
+            with self._bg_lock:
+                self._active_bg_tasks = max(0, self._active_bg_tasks - 1)
+            raise
+        self._notify_activity()
 
     @staticmethod
     def make_job_id() -> str:
@@ -457,6 +528,13 @@ class GuiController:
         """Return a thread-safe isolated copy of the current cached configuration."""
         with self.queue_lock:
             return self.config.clone()
+
+    def set_queue_concurrency(self, value: int) -> int:
+        """Set maximum parallel queued jobs (`1..4`) and return the clamped value."""
+        clamped = max(1, min(4, int(value)))
+        with self.queue_cond:
+            self.queue_concurrency = clamped
+        return clamped
 
     def save_ffmpeg_dir(self, resolved_dir: str | None) -> Config:
         save_ffmpeg_dir(resolved_dir, overwrite=self.config_location)
@@ -543,6 +621,8 @@ class GuiController:
         auto_sync_minutes: int | None = None,
         auto_sync_mode: str | None = None,
         auto_sync_targets: Sequence[str] | None = None,
+        queue_concurrency: int | None = None,
+        minimize_to_tray: bool | None = None,
         output_prefs: Mapping[str, Any] | None = None,
     ) -> None:
         if output_prefs:
@@ -565,6 +645,8 @@ class GuiController:
             auto_sync_minutes=auto_sync_minutes,
             auto_sync_mode=auto_sync_mode,
             auto_sync_targets=auto_sync_targets,
+            queue_concurrency=queue_concurrency,
+            minimize_to_tray=minimize_to_tray,
         )
 
     def save_gui_preferences(
@@ -575,6 +657,8 @@ class GuiController:
         auto_sync_minutes: int | None = None,
         auto_sync_mode: str | None = None,
         auto_sync_targets: Sequence[str] | None = None,
+        queue_concurrency: int | None = None,
+        minimize_to_tray: bool | None = None,
     ) -> Config:
         """Persist incremental `[gui]` preferences and reload `self.config`."""
         save_gui_preferences(
@@ -584,8 +668,41 @@ class GuiController:
             auto_sync_minutes=auto_sync_minutes,
             auto_sync_mode=auto_sync_mode,
             auto_sync_targets=auto_sync_targets,
+            queue_concurrency=queue_concurrency,
+            minimize_to_tray=minimize_to_tray,
         )
         return self.reload_config()
+
+    def find_cross_source_duplicate(
+        self,
+        metadata: Any,
+        *,
+        source_name: str = "",
+        archive_path: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return an active archive row from another service matching `metadata`, if any."""
+        cfg = self.config_snapshot()
+        db_dir = resolve_database_directory(cfg)
+        ledger = archive_path or default_archive_path(db_dir)
+        if not ledger or not os.path.exists(ledger):
+            return None
+        book_key = (
+            getattr(metadata, "scrape_url", None)
+            or getattr(metadata, "title", None)
+            or make_book_key(source_name, type("_B", (), {"metadata": metadata, "title": getattr(metadata, "title", "")})())
+        )
+        try:
+            with DownloadArchive(ledger, persistent=True) as archive:
+                return archive.find_cross_source_duplicate(
+                    source_name,
+                    str(book_key or ""),
+                    title=str(getattr(metadata, "title", "") or ""),
+                    author=str(getattr(metadata, "author", "") or ""),
+                    isbn=getattr(metadata, "isbn", None),
+                    asin=getattr(metadata, "asin", None),
+                )
+        except Exception:
+            return None
 
     def set_check_updates(self, enabled: bool) -> Config:
         """Persist `check_updates` in `audiobook-dl.toml` and reload `self.config`."""
@@ -1429,6 +1546,7 @@ class GuiController:
                 daemon=True,
             )
             self.worker.start()
+        self._notify_activity()
 
     def _drain_pending_jobs(self, cancel_status: str = "Cancelled") -> bool:
         """Remove queued jobs after cancellation/error; return True if close sentinel seen."""
@@ -1469,6 +1587,271 @@ class GuiController:
             if not any(j is not None and j.url == url for j in self.pending_jobs):
                 self.run_seen_urls.discard(url)
 
+    def _execute_single_queued_job(
+        self,
+        active_job: QueuedJob,
+        *,
+        run_id: int,
+        item_index: int,
+        item_total: int,
+        batch_summary: DownloadSummary,
+        summary_lock: threading.Lock,
+    ) -> bool:
+        """Run one claimed `QueuedJob`, emit status events, and return True if batch was cancelled."""
+        self.event_queue.put(
+            BatchItemEvent(
+                run_id=run_id,
+                item_index=item_index,
+                item_total=item_total,
+                target_url=active_job.url,
+            )
+        )
+        self.event_queue.put(
+            JobStatusEvent(job_id=active_job.job_id, status="Running", detail="")
+        )
+        self.sink.set_active_job_id(active_job.job_id)
+
+        should_break = False
+        try:
+            config = self.config_snapshot()
+            resolved_title = ""
+            resolved_output_path = ""
+            if active_job.pack_request is not None:
+                req = active_job.pack_request
+                pack_summary = run_pack(
+                    req.paths,
+                    active_job.options,
+                    config,
+                    output_dir=req.output_dir,
+                    recursive=req.recursive,
+                    delete_source=req.delete_source,
+                    overrides=req.overrides,
+                    interaction=active_job.interaction,
+                    cancel_event=self.cancel_event,
+                    pause_event=self.pause_event,
+                    sink=self.sink,
+                )
+                summary = DownloadSummary(
+                    completed=1 if pack_summary.books_completed and pack_summary.books_failed == 0 else 0,
+                    failed=1 if pack_summary.books_failed > 0 else 0,
+                    cancelled=pack_summary.cancelled,
+                    books_completed=pack_summary.books_completed,
+                    books_skipped=pack_summary.books_skipped,
+                    books_failed=pack_summary.books_failed,
+                    book_errors=list(pack_summary.book_errors),
+                )
+                if pack_summary.output_paths:
+                    if len(pack_summary.output_paths) == 1:
+                        resolved_output_path = pack_summary.output_paths[0]
+                    else:
+                        first_out = pack_summary.output_paths[0]
+                        resolved_output_path = os.path.dirname(first_out) or first_out
+                        base_label = req.label or os.path.basename(resolved_output_path) or "Local Pack"
+                        resolved_title = f"{base_label} ({len(pack_summary.output_paths)} books)"
+            else:
+                run_kwargs: dict[str, Any] = {
+                    "interaction": active_job.interaction,
+                    "cancel_event": self.cancel_event,
+                    "pause_event": self.pause_event,
+                    "sink": self.sink,
+                }
+                if active_job.selected_indices is not None:
+                    run_kwargs["selected_indices"] = active_job.selected_indices
+                if active_job.prefetched is not None:
+                    run_kwargs["prefetched"] = active_job.prefetched
+                summary = run_downloads(
+                    [active_job.url],
+                    active_job.options,
+                    config,
+                    **run_kwargs,
+                )
+                if summary.outputs:
+                    if len(summary.outputs) == 1:
+                        resolved_title = str(summary.outputs[0].get("title") or "").strip()
+                        resolved_output_path = str(summary.outputs[0].get("output_path") or "").strip()
+                    else:
+                        first_out = str(summary.outputs[0].get("output_path") or "").strip()
+                        resolved_output_path = os.path.dirname(first_out) or first_out
+            if resolved_title or resolved_output_path:
+                self.event_queue.put(
+                    JobMetaEvent(
+                        job_id=active_job.job_id,
+                        title=resolved_title,
+                        output_path=resolved_output_path,
+                    )
+                )
+            with summary_lock:
+                batch_summary.completed += summary.completed
+                batch_summary.failed += summary.failed
+                batch_summary.books_completed += summary.books_completed
+                batch_summary.books_skipped += summary.books_skipped
+                batch_summary.books_failed += summary.books_failed
+                batch_summary.book_errors.extend(summary.book_errors)
+            if summary.cancelled:
+                with summary_lock:
+                    batch_summary.cancelled = True
+                self._discard_seen_url_if_unpending(active_job.url)
+                self.event_queue.put(
+                    JobStatusEvent(job_id=active_job.job_id, status="Cancelled", detail="")
+                )
+                should_break = True
+            elif summary.failed > 0 or summary.books_failed > 0:
+                detail = format_failed_job_detail(summary.book_errors)
+                self._discard_seen_url_if_unpending(active_job.url)
+                self.event_queue.put(
+                    JobStatusEvent(job_id=active_job.job_id, status="Failed", detail=detail)
+                )
+            else:
+                if summary.books_completed:
+                    out_name = os.path.basename(resolved_output_path) if resolved_output_path else ""
+                    detail = (
+                        f"{summary.books_completed} ok \u2014 {out_name}"
+                        if out_name
+                        else f"{summary.books_completed} ok"
+                    )
+                else:
+                    detail = "Skipped" if summary.books_skipped else "Done"
+                self.event_queue.put(
+                    JobStatusEvent(job_id=active_job.job_id, status="Completed", detail=detail)
+                )
+        except DownloadCancelled:
+            with summary_lock:
+                batch_summary.cancelled = True
+            self._discard_seen_url_if_unpending(active_job.url)
+            self.event_queue.put(
+                JobStatusEvent(job_id=active_job.job_id, status="Cancelled", detail="")
+            )
+            should_break = True
+        except Exception as exc:
+            if self.cancel_event.is_set():
+                with summary_lock:
+                    batch_summary.cancelled = True
+                self._discard_seen_url_if_unpending(active_job.url)
+                self.event_queue.put(
+                    JobStatusEvent(job_id=active_job.job_id, status="Cancelled", detail="")
+                )
+                should_break = True
+            else:
+                err_text = str(exc).strip() or type(exc).__name__
+                with summary_lock:
+                    batch_summary.failed += 1
+                    batch_summary.books_failed += 1
+                    batch_summary.book_errors.append((active_job.url, err_text))
+                self._discard_seen_url_if_unpending(active_job.url)
+                self.event_queue.put(
+                    LogEvent(level="ERROR", message=f"{active_job.url}: {err_text}")
+                )
+                self.event_queue.put(
+                    JobStatusEvent(
+                        job_id=active_job.job_id,
+                        status="Failed",
+                        detail=err_text[:120],
+                    )
+                )
+        finally:
+            self.sink.set_active_job_id(None)
+            self._close_job_prefetched(active_job)
+            with self.queue_cond:
+                self.cancelled_job_ids.discard(active_job.job_id)
+                self.active_job_ids.discard(active_job.job_id)
+                if self.active_job_id == active_job.job_id:
+                    self.active_job_id = next(iter(self.active_job_ids), None)
+                self.active_job_running = bool(self.active_job_ids)
+        return should_break
+
+    def _run_batch_worker(
+        self,
+        *,
+        run_id: int,
+        initial_job: list[QueuedJob | None],
+        batch_summary: DownloadSummary,
+        summary_lock: threading.Lock,
+        item_counter: list[int],
+    ) -> bool:
+        """Process queued jobs in a thread-isolated session pool; return True if sentinel seen."""
+        saw_sentinel = False
+        worker_session_pool: SessionPool = {}
+        with session_pool_scope(worker_session_pool):
+            try:
+                while True:
+                    with self.queue_cond:
+                        if initial_job and initial_job[0] is not None:
+                            current_job: QueuedJob | None = initial_job[0]
+                            initial_job[0] = None
+                        else:
+                            current_job, popped_sentinel = self._pop_next_job_locked()
+                            if popped_sentinel:
+                                saw_sentinel = True
+                        if current_job is None:
+                            break
+                        self.active_job_ids.add(current_job.job_id)
+
+                    if self.is_paused() and not self.cancel_event.is_set():
+                        self.event_queue.put(
+                            JobStatusEvent(job_id=current_job.job_id, status="Paused", detail="Queue paused")
+                        )
+                        while not self.pause_event.wait(0.2):
+                            if self.cancel_event.is_set():
+                                break
+                            with self.queue_cond:
+                                if current_job.job_id in self.cancelled_job_ids:
+                                    break
+                    if self.cancel_event.is_set():
+                        with summary_lock:
+                            batch_summary.cancelled = True
+                        self._close_job_prefetched(current_job)
+                        with self.queue_cond:
+                            self.cancelled_job_ids.discard(current_job.job_id)
+                            self.active_job_ids.discard(current_job.job_id)
+                            if self.active_job_id == current_job.job_id:
+                                self.active_job_id = next(iter(self.active_job_ids), None)
+                            self.active_job_running = bool(self.active_job_ids)
+                        self.event_queue.put(
+                            JobStatusEvent(job_id=current_job.job_id, status="Cancelled", detail="")
+                        )
+                        if self._drain_pending_jobs("Cancelled"):
+                            saw_sentinel = True
+                        break
+
+                    with self.queue_cond:
+                        if current_job.job_id in self.cancelled_job_ids:
+                            self.cancelled_job_ids.discard(current_job.job_id)
+                            self.active_job_ids.discard(current_job.job_id)
+                            if self.active_job_id == current_job.job_id:
+                                self.active_job_id = next(iter(self.active_job_ids), None)
+                            self.active_job_running = bool(self.active_job_ids)
+                            skipped_job: QueuedJob | None = current_job
+                            active_job: QueuedJob | None = None
+                        else:
+                            self.active_job_running = True
+                            item_total = self.batch_total
+                            skipped_job = None
+                            active_job = current_job
+
+                    if active_job is None:
+                        self._close_job_prefetched(skipped_job)
+                        continue
+
+                    with summary_lock:
+                        item_counter[0] += 1
+                        item_idx = item_counter[0]
+
+                    should_break = self._execute_single_queued_job(
+                        active_job,
+                        run_id=run_id,
+                        item_index=item_idx,
+                        item_total=item_total,
+                        batch_summary=batch_summary,
+                        summary_lock=summary_lock,
+                    )
+                    if should_break:
+                        if self._drain_pending_jobs("Cancelled"):
+                            saw_sentinel = True
+                        break
+            finally:
+                close_session_pool(worker_session_pool)
+        return saw_sentinel
+
     def _worker_loop(self) -> None:
         while True:
             with self.queue_cond:
@@ -1477,228 +1860,51 @@ class GuiController:
                 first_job = self.pending_jobs.popleft()
                 if first_job is not None:
                     self.active_job_id = first_job.job_id
+                    self.active_job_ids = {first_job.job_id}
                     self.active_job_running = False
+                concurrency = max(1, min(4, int(self.queue_concurrency)))
             if first_job is None:
                 break
 
             run_id = first_job.run_id
             batch_summary = DownloadSummary()
+            summary_lock = threading.Lock()
+            item_counter = [0]
             fatal_exc: Exception | None = None
-            item_index = 0
             saw_sentinel = False
-            current_job: QueuedJob | None = first_job
-            run_session_pool: SessionPool = {}
-            try:
-                with session_pool_scope(run_session_pool):
-                    while current_job is not None:
-                        if self.is_paused() and not self.cancel_event.is_set():
-                            self.event_queue.put(
-                                JobStatusEvent(job_id=current_job.job_id, status="Paused", detail="Queue paused")
-                            )
-                            while not self.pause_event.wait(0.2):
-                                if self.cancel_event.is_set():
-                                    break
-                                with self.queue_cond:
-                                    if current_job.job_id in self.cancelled_job_ids:
-                                        break
-                        if self.cancel_event.is_set():
-                            batch_summary.cancelled = True
-                            self._close_job_prefetched(current_job)
-                            with self.queue_cond:
-                                self.cancelled_job_ids.discard(current_job.job_id)
-                                self.active_job_id = None
-                                self.active_job_running = False
-                            self.event_queue.put(
-                                JobStatusEvent(job_id=current_job.job_id, status="Cancelled", detail="")
-                            )
-                            saw_sentinel = self._drain_pending_jobs("Cancelled")
-                            break
-
-                        active_job: QueuedJob | None = current_job
-                        next_job: QueuedJob | None = None
-                        skipped_job: QueuedJob | None = None
-                        item_total = 0
-                        with self.queue_cond:
-                            if current_job.job_id in self.cancelled_job_ids:
-                                self.cancelled_job_ids.discard(current_job.job_id)
-                                self.active_job_id = None
-                                self.active_job_running = False
-                                skipped_job = current_job
-                                next_job, saw_sentinel = self._pop_next_job_locked()
-                                active_job = None
-                            else:
-                                self.active_job_running = True
-                                item_total = self.batch_total
-
-                        if active_job is None:
-                            self._close_job_prefetched(skipped_job)
-                            current_job = next_job
-                            continue
-
-                        item_index += 1
-                        self.event_queue.put(
-                            BatchItemEvent(
-                                run_id=run_id,
-                                item_index=item_index,
-                                item_total=item_total,
-                                target_url=active_job.url,
-                            )
+            initial_holder: list[QueuedJob | None] = [first_job]
+            if concurrency <= 1:
+                saw_sentinel = self._run_batch_worker(
+                    run_id=run_id,
+                    initial_job=initial_holder,
+                    batch_summary=batch_summary,
+                    summary_lock=summary_lock,
+                    item_counter=item_counter,
+                )
+            else:
+                with ThreadPoolExecutor(
+                    max_workers=concurrency,
+                    thread_name_prefix="abdl-dl-job",
+                ) as job_pool:
+                    futures = [
+                        job_pool.submit(
+                            self._run_batch_worker,
+                            run_id=run_id,
+                            initial_job=initial_holder if idx == 0 else [],
+                            batch_summary=batch_summary,
+                            summary_lock=summary_lock,
+                            item_counter=item_counter,
                         )
-                        self.event_queue.put(
-                            JobStatusEvent(job_id=active_job.job_id, status="Running", detail="")
-                        )
-                        self.sink.set_active_job_id(active_job.job_id)
-
-                        should_break = False
-                        try:
-                            config = self.config_snapshot()
-                            resolved_title = ""
-                            resolved_output_path = ""
-                            if active_job.pack_request is not None:
-                                req = active_job.pack_request
-                                pack_summary = run_pack(
-                                    req.paths,
-                                    active_job.options,
-                                    config,
-                                    output_dir=req.output_dir,
-                                    recursive=req.recursive,
-                                    delete_source=req.delete_source,
-                                    overrides=req.overrides,
-                                    interaction=active_job.interaction,
-                                    cancel_event=self.cancel_event,
-                                    pause_event=self.pause_event,
-                                    sink=self.sink,
-                                )
-                                summary = DownloadSummary(
-                                    completed=1 if pack_summary.books_completed and pack_summary.books_failed == 0 else 0,
-                                    failed=1 if pack_summary.books_failed > 0 else 0,
-                                    cancelled=pack_summary.cancelled,
-                                    books_completed=pack_summary.books_completed,
-                                    books_skipped=pack_summary.books_skipped,
-                                    books_failed=pack_summary.books_failed,
-                                    book_errors=list(pack_summary.book_errors),
-                                )
-                                if pack_summary.output_paths:
-                                    if len(pack_summary.output_paths) == 1:
-                                        resolved_output_path = pack_summary.output_paths[0]
-                                    else:
-                                        first_out = pack_summary.output_paths[0]
-                                        resolved_output_path = os.path.dirname(first_out) or first_out
-                                        base_label = req.label or os.path.basename(resolved_output_path) or "Local Pack"
-                                        resolved_title = f"{base_label} ({len(pack_summary.output_paths)} books)"
-                            else:
-                                run_kwargs: dict[str, Any] = {
-                                    "interaction": active_job.interaction,
-                                    "cancel_event": self.cancel_event,
-                                    "pause_event": self.pause_event,
-                                    "sink": self.sink,
-                                }
-                                if active_job.selected_indices is not None:
-                                    run_kwargs["selected_indices"] = active_job.selected_indices
-                                if active_job.prefetched is not None:
-                                    run_kwargs["prefetched"] = active_job.prefetched
-                                summary = run_downloads(
-                                    [active_job.url],
-                                    active_job.options,
-                                    config,
-                                    **run_kwargs,
-                                )
-                                if summary.outputs:
-                                    if len(summary.outputs) == 1:
-                                        resolved_title = str(summary.outputs[0].get("title") or "").strip()
-                                        resolved_output_path = str(summary.outputs[0].get("output_path") or "").strip()
-                                    else:
-                                        first_out = str(summary.outputs[0].get("output_path") or "").strip()
-                                        resolved_output_path = os.path.dirname(first_out) or first_out
-                            if resolved_title or resolved_output_path:
-                                self.event_queue.put(
-                                    JobMetaEvent(
-                                        job_id=active_job.job_id,
-                                        title=resolved_title,
-                                        output_path=resolved_output_path,
-                                    )
-                                )
-                            batch_summary.completed += summary.completed
-                            batch_summary.failed += summary.failed
-                            batch_summary.books_completed += summary.books_completed
-                            batch_summary.books_skipped += summary.books_skipped
-                            batch_summary.books_failed += summary.books_failed
-                            batch_summary.book_errors.extend(summary.book_errors)
-                            if summary.cancelled:
-                                batch_summary.cancelled = True
-                                self._discard_seen_url_if_unpending(active_job.url)
-                                self.event_queue.put(
-                                    JobStatusEvent(job_id=active_job.job_id, status="Cancelled", detail="")
-                                )
-                                saw_sentinel = self._drain_pending_jobs("Cancelled")
-                                should_break = True
-                            elif summary.failed > 0 or summary.books_failed > 0:
-                                detail = format_failed_job_detail(summary.book_errors)
-                                self._discard_seen_url_if_unpending(active_job.url)
-                                self.event_queue.put(
-                                    JobStatusEvent(job_id=active_job.job_id, status="Failed", detail=detail)
-                                )
-                            else:
-                                if summary.books_completed:
-                                    out_name = os.path.basename(resolved_output_path) if resolved_output_path else ""
-                                    detail = (
-                                        f"{summary.books_completed} ok \u2014 {out_name}"
-                                        if out_name
-                                        else f"{summary.books_completed} ok"
-                                    )
-                                else:
-                                    detail = "Skipped" if summary.books_skipped else "Done"
-                                self.event_queue.put(
-                                    JobStatusEvent(job_id=active_job.job_id, status="Completed", detail=detail)
-                                )
-                        except DownloadCancelled:
-                            batch_summary.cancelled = True
-                            self._discard_seen_url_if_unpending(active_job.url)
-                            self.event_queue.put(
-                                JobStatusEvent(job_id=active_job.job_id, status="Cancelled", detail="")
-                            )
-                            saw_sentinel = self._drain_pending_jobs("Cancelled")
-                            should_break = True
-                        except Exception as exc:
-                            if self.cancel_event.is_set():
-                                batch_summary.cancelled = True
-                                self._discard_seen_url_if_unpending(active_job.url)
-                                self.event_queue.put(
-                                    JobStatusEvent(job_id=active_job.job_id, status="Cancelled", detail="")
-                                )
-                                saw_sentinel = self._drain_pending_jobs("Cancelled")
-                                should_break = True
-                            else:
-                                err_text = str(exc).strip() or type(exc).__name__
-                                batch_summary.failed += 1
-                                batch_summary.books_failed += 1
-                                batch_summary.book_errors.append((active_job.url, err_text))
-                                self._discard_seen_url_if_unpending(active_job.url)
-                                self.event_queue.put(
-                                    LogEvent(level="ERROR", message=f"{active_job.url}: {err_text}")
-                                )
-                                self.event_queue.put(
-                                    JobStatusEvent(
-                                        job_id=active_job.job_id,
-                                        status="Failed",
-                                        detail=err_text[:120],
-                                    )
-                                )
-                        finally:
-                            self.sink.set_active_job_id(None)
-                            self._close_job_prefetched(active_job)
-                            with self.queue_cond:
-                                self.cancelled_job_ids.discard(active_job.job_id)
-                                self.active_job_id = None
-                                self.active_job_running = False
-
-                        if should_break:
-                            break
-
-                        with self.queue_cond:
-                            current_job, saw_sentinel = self._pop_next_job_locked()
-            finally:
-                close_session_pool(run_session_pool)
+                        for idx in range(concurrency)
+                    ]
+                    for fut in futures:
+                        if fut.result():
+                            saw_sentinel = True
+                with self.queue_cond:
+                    self.worker_has_active_run = False
+                    self.active_job_ids.clear()
+                    self.active_job_id = None
+                    self.active_job_running = False
 
             self.event_queue.put(
                 RunDoneEvent(run_id=run_id, summary=batch_summary, error=fatal_exc)
@@ -1754,7 +1960,7 @@ class GuiController:
                 if request_id == self.preview_request_id:
                     self.event_queue.put(PreviewDoneEvent(url=url, prepared=None, error=exc))
 
-        threading.Thread(target=_worker, daemon=True).start()
+        self._submit_bg_task(_worker)
         return request_id
 
     def _register_aux_interaction(self, interaction: GuiInteractionHandler) -> None:
@@ -1812,7 +2018,7 @@ class GuiController:
                 interaction.release_all()
                 self._unregister_aux_interaction(interaction)
 
-        threading.Thread(target=_worker, daemon=True).start()
+        self._submit_bg_task(_worker)
 
     def cancel_catalog_fetch(self) -> bool:
         """Cancel the currently in-flight catalog search/list request, if any."""
@@ -1903,7 +2109,7 @@ class GuiController:
                 if self.catalog_interaction is interaction:
                     self.catalog_interaction = None
 
-        threading.Thread(target=_worker, daemon=True).start()
+        self._submit_bg_task(_worker)
         return request_id
 
     def cancel_library_sync(self) -> None:
@@ -1950,7 +2156,7 @@ class GuiController:
                     self.sync_interaction = None
                 interaction.release_all()
 
-        threading.Thread(target=_worker, daemon=True).start()
+        self._submit_bg_task(_worker)
 
     def start_sync_enqueue_discovery(
         self,
@@ -1998,7 +2204,7 @@ class GuiController:
                     self.sync_interaction = None
                 interaction.release_all()
 
-        threading.Thread(target=_worker, daemon=True).start()
+        self._submit_bg_task(_worker)
 
     def start_abs_upload(
         self,
@@ -2038,14 +2244,41 @@ class GuiController:
                     authors=[a for a in authors if a],
                     series=series,
                 )
-                client.upload_book(local_path, library_id=abs_cfg.library_id, metadata=meta)
+                started_progress = False
+
+                def _on_upload_progress(sent: int, total: int) -> None:
+                    nonlocal started_progress
+                    if total <= 0:
+                        return
+                    if not started_progress:
+                        started_progress = True
+                        self.event_queue.put(
+                            ProgressStartEvent(
+                                description=f"Uploading {title}",
+                                total=float(total),
+                            )
+                        )
+                    self.event_queue.put(
+                        ProgressAdvanceEvent(completed=float(sent), total=float(total))
+                    )
+
+                try:
+                    client.upload_book(
+                        local_path,
+                        library_id=abs_cfg.library_id,
+                        metadata=meta,
+                        on_progress=_on_upload_progress,
+                    )
+                finally:
+                    if started_progress:
+                        self.event_queue.put(ProgressFinishEvent())
                 if abs_cfg.auto_scan:
                     client.scan_library(abs_cfg.library_id)
                 self.event_queue.put(AbsUploadDoneEvent(title=title, ok=True, error_message=None))
             except Exception as exc:
                 self.event_queue.put(AbsUploadDoneEvent(title=title, ok=False, error_message=str(exc)))
 
-        threading.Thread(target=_worker, daemon=True).start()
+        self._submit_bg_task(_worker)
 
     def start_update_check(self, *, interactive: bool, respect_opt_out: bool) -> None:
         cfg = self.config_snapshot()
@@ -2065,14 +2298,14 @@ class GuiController:
             if interactive or (info is not None and info.has_update):
                 self.event_queue.put(UpdateCheckedEvent(info=info, interactive=interactive))
 
-        threading.Thread(target=_worker, daemon=True).start()
+        self._submit_bg_task(_worker)
 
     def start_winget_ffmpeg_install(self) -> None:
         def _worker() -> None:
             ok, detail = install_ffmpeg_via_winget()
             self.event_queue.put(FfmpegInstallDoneEvent(ok=ok, detail=detail))
 
-        threading.Thread(target=_worker, daemon=True).start()
+        self._submit_bg_task(_worker)
 
     def search_enrichment_for_audiobook(
         self,
@@ -2225,6 +2458,12 @@ class GuiController:
                         close_fn()
                     except Exception:
                         pass
+        with self._bg_lock:
+            bg_exec = self._bg_executor
+            self._bg_executor = None
+        self._activity_callback = None
+        if bg_exec is not None:
+            bg_exec.shutdown(wait=False, cancel_futures=True)
         with self._sessions_lock:
             sessions = list(self._thread_sessions)
             self._thread_sessions.clear()

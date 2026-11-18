@@ -223,6 +223,8 @@ def test_schema_driven_merge_and_preset_precedence(tmp_path):
             "enrich_metadata": True,
             "enrich_providers": "itunes,google",
             "enrich_interactive": True,
+            "silence_noise_db": -38.0,
+            "silence_min_seconds": 2.2,
         },
         credential_store=None,
     )
@@ -330,3 +332,7 @@ def test_persisted_gui_roundtrip_silence_offset_and_abs(tmp_path):
     assert intro_binding.read_option("Auto (detect intro)") == "auto"
     assert intro_binding.read_option("Always (first is 00)") == "always"
     assert intro_binding.read_option("Off (start at 01)") == "off"
+    assert validate_config_value("silence_noise_db", "silence_noise_db", -42.5) == (-42.5, None)
+    assert validate_config_value("silence_noise_db", "silence_noise_db", 5.0)[0] is None
+    assert validate_config_value("silence_min_seconds", "positive_float", 2.5) == (2.5, None)
+    assert validate_config_value("silence_min_seconds", "positive_float", 0.0)[0] is None

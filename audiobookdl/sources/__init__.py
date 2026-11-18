@@ -147,6 +147,14 @@ _BUILTIN_SOURCES: tuple[type[Source], ...] = (
 )
 
 
+PLUGIN_API_VERSION = 1
+
+
+def reset_plugin_sources_cache() -> None:
+    """Clear cached third-party entry-point source discovery results."""
+    _discover_plugin_sources.cache_clear()
+
+
 @functools.lru_cache(maxsize=1)
 def _discover_plugin_sources() -> list[type[Source]]:
     """Discover third-party `Source` subclasses via the `audiobookdl.sources` entry point group."""
@@ -159,22 +167,45 @@ def _discover_plugin_sources() -> list[type[Source]]:
         logging.debug(f"Failed querying source entry points: {exc}")
         return discovered
 
+    known_names = {
+        str(name).lower()
+        for builtin_cls in _BUILTIN_SOURCES
+        for name in getattr(builtin_cls, "names", ())
+    }
     for ep in eps:
+        ep_name = getattr(ep, "name", ep)
         try:
             cls = ep.load()
         except Exception as exc:
-            logging.debug(f"Failed loading source plugin '{getattr(ep, 'name', ep)}': {exc}")
+            logging.debug(f"Failed loading source plugin '{ep_name}': {exc}")
             continue
-        if (
+        if not (
             isinstance(cls, type)
             and issubclass(cls, Source)
             and cls is not Source
             and getattr(cls, "names", None)
             and getattr(cls, "match", None)
         ):
-            discovered.append(cls)
-        else:
-            logging.debug(f"Ignoring invalid source plugin entry point '{getattr(ep, 'name', ep)}': {cls!r}")
+            logging.debug(f"Ignoring invalid source plugin entry point '{ep_name}': {cls!r}")
+            continue
+        api_version = getattr(cls, "plugin_api_version", PLUGIN_API_VERSION)
+        if api_version != PLUGIN_API_VERSION:
+            logging.debug(
+                f"Ignoring source plugin '{ep_name}' with incompatible plugin_api_version={api_version!r} (expected {PLUGIN_API_VERSION})"
+            )
+            continue
+        plugin_names = [str(name).strip().lower() for name in cls.names if str(name).strip()]
+        if not plugin_names:
+            logging.debug(f"Ignoring source plugin '{ep_name}' with empty service names")
+            continue
+        collisions = [name for name in plugin_names if name in known_names]
+        if collisions:
+            logging.debug(
+                f"Ignoring source plugin '{ep_name}' due to service name collision: {collisions}"
+            )
+            continue
+        known_names.update(plugin_names)
+        discovered.append(cls)
     return discovered
 
 

@@ -4,10 +4,11 @@ import re
 import threading
 import time
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 import requests
 from requests.adapters import HTTPAdapter
 
+from audiobookdl import logging
 from audiobookdl.exceptions import DownloadCancelled, GenericAudiobookDLException
 
 
@@ -245,3 +246,21 @@ def redirect_of(
         if target_pattern and re.search(target_pattern, url):
             return url
     return url
+
+
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def warn_if_insecure_token_url(url: str, service_label: str) -> bool:
+    """Warn if an authenticated HTTP request targets a non-loopback `http://` URL; return True if warned."""
+    parsed = urlparse(url)
+    if parsed.scheme.lower() != "http":
+        return False
+    host = (parsed.hostname or "").strip().lower()
+    if host in _LOOPBACK_HOSTS:
+        return False
+    logging.log(
+        f"[yellow]Warning:[/yellow] Sending {service_label} credentials over unencrypted "
+        f"http:// to '{host or parsed.netloc}'. Prefer https:// outside trusted local networks."
+    )
+    return True

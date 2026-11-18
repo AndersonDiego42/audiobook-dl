@@ -127,6 +127,8 @@ audiobook-dl can be configured via `audiobook-dl.toml` at:
 
 In portable Windows `.exe` mode, placing a `.portable` marker file or `audiobook-dl.toml` beside `audiobook-dl.exe` keeps `audiobook-dl.toml` and `db/` in that same folder instead of `%LOCALAPPDATA%`. Updates written by audiobook-dl preserve `#` comments and unknown TOML sections.
 
+See [docs/configuration.md](./docs/configuration.md) for the complete reference covering all global TOML keys, `[gui]` preferences, `[sources.<service>]` profiles, `[audiobookshelf]`, and `[enrichment.custom.<name>]`.
+
 ### Global Options
 ```toml
 output_template = "{author}/{title}"
@@ -210,10 +212,13 @@ Useful build flags:
 ## Documentation
 All additional technical and developer documentation lives in [`docs/`](./docs/README.md):
 - [Documentation Index](./docs/README.md)
-- [Supported Sites, Aliases & Plugins](./docs/supported_sites.md)
+- [Configuration Reference](./docs/configuration.md)
+- [Supported Sites & Aliases](./docs/supported_sites.md)
+- [Plugin SDK Guide](./docs/plugins.md)
 - [System Architecture](./docs/architecture.md)
 - [Runtime & Release Workflows](./docs/workflows.md)
 - [Testing & E2E Harness Guide](./docs/testing.md)
+- [Contributing Guide](./CONTRIBUTING.md) · [Security Policy](./SECURITY.md) · [Changelog](./CHANGELOG.md)
 
 ## Contributions
-Issues, bug-reports, pull requests, or ideas for features and improvements are **very welcome**.
+Issues, bug-reports, pull requests, or ideas for features and improvements are **very welcome**. Please read [CONTRIBUTING.md](./CONTRIBUTING.md) before opening a PR.

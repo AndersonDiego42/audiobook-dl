@@ -206,3 +206,18 @@ def test_series_download_pauses_between_books(tmp_path):
         t.join(timeout=2.0)
         assert not t.is_alive()
         assert processed == ["T1", "T2"]
+
+
+def test_strip_and_escape_markup():
+    assert logging.strip_markup("[red]Error[/red]") == "Error"
+    assert logging.strip_markup("[underline]https://example.com[/]") == "https://example.com"
+    assert logging.strip_markup("[yellow]Warning:[/yellow] [Book 1] (2024)") == "Warning: [Book 1] (2024)"
+    assert logging.strip_markup(r"\[red]literal\[/red]") == "[red]literal[/red]"
+    assert logging.strip_markup("[bold cyan]Step 1[/bold cyan]") == "Step 1"
+    assert logging.strip_markup("plain text") == "plain text"
+
+    escaped = logging.escape_markup("[red]Forbidden[/red]")
+    assert escaped == r"\[red]Forbidden\[/red]"
+    assert logging.strip_markup(escaped) == "[red]Forbidden[/red]"
+    assert logging.escape_markup("no brackets") == "no brackets"
+

@@ -260,14 +260,44 @@ class ScrolledTreeview(ttk.Frame):
             )
 
         self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=self.scrollbar.set)
+        self.hscrollbar = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(
+            yscrollcommand=self.scrollbar.set,
+            xscrollcommand=self._on_xscroll,
+        )
         self.tree.grid(row=0, column=0, sticky="nsew")
         self.scrollbar.grid(row=0, column=1, sticky="ns")
+        self.tree.bind("<Shift-MouseWheel>", self._on_shift_mousewheel, add="+")
+        self.tree.bind("<Shift-Button-4>", lambda _e: self._xscroll_units(-2), add="+")
+        self.tree.bind("<Shift-Button-5>", lambda _e: self._xscroll_units(2), add="+")
 
         self._empty_overlay: ttk.Frame | None = None
         self._empty_label: ttk.Label | None = None
         self._empty_btn: ttk.Button | None = None
         self._empty_cmd: Callable[[], None] | None = None
+
+    def _on_xscroll(self, first: float | str, last: float | str) -> None:
+        self.hscrollbar.set(first, last)
+        try:
+            f_val = float(first)
+            l_val = float(last)
+        except (TypeError, ValueError):
+            f_val, l_val = 0.0, 1.0
+        if f_val <= 0.0 and l_val >= 1.0:
+            self.hscrollbar.grid_remove()
+        else:
+            self.hscrollbar.grid(row=1, column=0, sticky="ew")
+
+    def _xscroll_units(self, units: int) -> str:
+        self.tree.xview_scroll(units, "units")
+        return "break"
+
+    def _on_shift_mousewheel(self, event: tk.Event) -> str | None:
+        delta = getattr(event, "delta", 0)
+        if not delta:
+            return None
+        step = -1 if delta > 0 else 1
+        return self._xscroll_units(step * 2)
 
     def set_tree_column_width(self, width: int, *, minwidth: int | None = None) -> None:
         """Update the `#0` tree column width (and optional `minwidth`) in logical pixels."""
@@ -699,13 +729,14 @@ def attach_url_context_menu(
 class MainThreadCallbackQueue:
     """Thread-safe queue delivering background worker callbacks onto the Tk main thread."""
 
-    def __init__(self, widget: tk.Misc, interval_ms: int = 25) -> None:
+    def __init__(self, widget: tk.Misc, interval_ms: int = 30) -> None:
         self._widget = widget
-        self._interval_ms = interval_ms
+        self._interval_ms = max(10, interval_ms)
         self._queue: queue.Queue[Callable[[], None]] = queue.Queue()
         self._after_id: str | None = None
         self._destroyed = False
         self._active_workers = 0
+        self._idle_polls = 0
         self._lock = threading.Lock()
         widget.bind("<Destroy>", self._on_destroy, add="+")
 
@@ -715,6 +746,7 @@ class MainThreadCallbackQueue:
             if self._destroyed:
                 return
             self._active_workers += 1
+            self._idle_polls = 0
         self._ensure_polling()
 
     def post(self, callback: Callable[[], None]) -> None:
@@ -726,12 +758,13 @@ class MainThreadCallbackQueue:
         with self._lock:
             self._active_workers = max(0, self._active_workers - 1)
 
-    def _ensure_polling(self) -> None:
+    def _ensure_polling(self, delay_ms: int | None = None) -> None:
         if self._destroyed or self._after_id is not None:
             return
+        delay = self._interval_ms if delay_ms is None else delay_ms
         try:
             if self._widget.winfo_exists():
-                self._after_id = self._widget.after(self._interval_ms, self._poll)
+                self._after_id = self._widget.after(delay, self._poll)
         except tk.TclError:
             self._after_id = None
 
@@ -747,11 +780,13 @@ class MainThreadCallbackQueue:
             self._destroyed = True
             return
 
+        drained_any = False
         while not self._destroyed:
             try:
                 cb = self._queue.get_nowait()
             except queue.Empty:
                 break
+            drained_any = True
             try:
                 if not self._widget.winfo_exists():
                     self._destroyed = True
@@ -766,7 +801,13 @@ class MainThreadCallbackQueue:
         with self._lock:
             keep_polling = self._active_workers > 0 or not self._queue.empty()
         if keep_polling:
-            self._ensure_polling()
+            if drained_any:
+                self._idle_polls = 0
+                next_delay = self._interval_ms
+            else:
+                self._idle_polls = min(self._idle_polls + 1, 4)
+                next_delay = min(120, self._interval_ms + self._idle_polls * self._interval_ms)
+            self._ensure_polling(next_delay)
 
     def _on_destroy(self, event: tk.Event) -> None:
         if getattr(event, "widget", None) is not self._widget:

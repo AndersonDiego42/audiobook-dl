@@ -1243,4 +1243,180 @@ def test_downloader_session_pool_isolates_profiles_and_closes(tmp_path):
     assert dl._owned_session_pool == {}
 
 
+def test_post_exec_hook_supports_argv_list_without_shell_and_blocks_disallowed_shell(tmp_path):
+    from unittest.mock import patch
+    from audiobookdl.pipeline import run_post_exec_hook
+
+    seen: list[tuple[object, bool]] = []
+
+    def fake_run(cmd, shell=False, **_kw):
+        seen.append((cmd, shell))
+        return type("_R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    with patch("audiobookdl.pipeline.subprocess.run", side_effect=fake_run):
+        rc = run_post_exec_hook(
+            ["notify-send", "Done"],
+            output_path=str(tmp_path / "Book.m4b"),
+            metadata=AudiobookMetadata(title="Hook Book"),
+            audio_format="m4b",
+            allow_shell=False,
+        )
+    assert rc == 0
+    assert seen == [(["notify-send", "Done"], False)]
+
+    seen.clear()
+    warnings: list[str] = []
+    with (
+        patch("audiobookdl.pipeline.subprocess.run", side_effect=fake_run),
+        patch("audiobookdl.pipeline.logging.log", side_effect=warnings.append),
+    ):
+        rc_blocked = run_post_exec_hook(
+            "echo unsafe",
+            output_path=str(tmp_path / "Book.m4b"),
+            metadata=AudiobookMetadata(title="Hook Book"),
+            audio_format="m4b",
+            allow_shell=False,
+        )
+    assert rc_blocked is None
+    assert seen == []
+    assert any("Skipping shell post_exec" in msg for msg in warnings)
+
+
+def test_prepare_source_result_reauthenticates_once_on_expired_cached_cookies(tmp_path, monkeypatch):
+    import os
+    from audiobookdl import AudiobookFile
+    from audiobookdl.config import SourceConfig
+    from audiobookdl.exceptions import UserNotAuthorized
+    from audiobookdl.pipeline import prepare_source_result
+    from audiobookdl.sources.source import Source
+    from audiobookdl.utils.http import extract_session_cookies
+
+    class _RetryAuthSource(Source):
+        names = ["retrytest"]
+        match = [r"https?://retry\.example\.com/book/.+"]
+        _authentication_methods = ["cookies", "login"]
+        login_data = ["username", "password"]
+        calls: list[str] = []
+
+        def _login(self, url: str, username: str, password: str) -> None:
+            self.calls.append(f"login:{username}:{password}")
+            self._session.cookies.set("session", "fresh-token", domain="retry.example.com")
+
+        def download(self, url: str) -> Audiobook:
+            cookie_val = self._session.cookies.get("session")
+            self.calls.append(f"download:{cookie_val}")
+            if cookie_val != "fresh-token":
+                raise UserNotAuthorized(detail="stale cookie")
+            return Audiobook(
+                session=self._session,
+                metadata=AudiobookMetadata(title="Refreshed Book", scrape_url=url),
+                files=[AudiobookFile(url="https://retry.example.com/a.mp3", ext="mp3")],
+            )
+
+    _RetryAuthSource.calls = []
+    opts = build_default_options(database_directory=str(tmp_path), skip_downloaded=False)
+    seed_source = _RetryAuthSource(opts)
+    seed_source._session.cookies.set("session", "expired-token", domain="retry.example.com")
+    cookie_path = seed_source.save_cookie_file()
+    seed_source.close()
+    assert os.path.isfile(cookie_path)
+
+    cfg = Config(
+        sources={
+            "retrytest": SourceConfig(
+                username="alice",
+                password="secret",
+                cookie_file=None,
+                library=None,
+                locale=None,
+            )
+        },
+        output_template=None,
+        database_directory=str(tmp_path),
+        skip_downloaded=False,
+    )
+    monkeypatch.setattr(
+        "audiobookdl.pipeline.find_compatible_source",
+        lambda _url: _RetryAuthSource,
+    )
+
+    source, result = prepare_source_result(
+        "https://retry.example.com/book/1",
+        opts,
+        cfg,
+    )
+    try:
+        assert isinstance(result, Audiobook)
+        assert result.metadata.title == "Refreshed Book"
+        assert _RetryAuthSource.calls == [
+            "download:expired-token",
+            "login:alice:secret",
+            "download:fresh-token",
+        ]
+        # Refreshed cookies are persisted to the cache jar
+        saved = extract_session_cookies(source._session)
+        assert any(c.name == "session" and c.value == "fresh-token" for c in saved)
+        assert os.path.isfile(cookie_path)
+    finally:
+        source.close()
+
+    # If re-login download still raises UserNotAuthorized, propagate cleanly after 1 retry
+    _RetryAuthSource.calls = []
+
+    def _always_unauthorized(_self, _url: str) -> Audiobook:
+        _RetryAuthSource.calls.append("download:fail")
+        raise UserNotAuthorized(detail="still invalid")
+
+    monkeypatch.setattr(_RetryAuthSource, "download", _always_unauthorized)
+    with pytest.raises(UserNotAuthorized):
+        prepare_source_result("https://retry.example.com/book/1", opts, cfg)
+    assert _RetryAuthSource.calls == ["download:fail", "login:alice:secret", "download:fail"]
+
+
+def test_process_audiobook_skips_cross_source_duplicate_when_skip_downloaded(tmp_path, monkeypatch):
+    from audiobookdl import AudiobookFile
+    from audiobookdl.pipeline import process_audiobook
+    from audiobookdl.utils.archive import DownloadArchive, default_archive_path
+
+    db_dir = tmp_path / "db"
+    archive_path = default_archive_path(str(db_dir))
+    with DownloadArchive(archive_path, persistent=True) as archive:
+        archive.record(
+            "storytel",
+            "https://storytel.example.com/1",
+            title="Foundation",
+            author="Isaac Asimov",
+            isbn="9780553293357",
+            output_path=str(tmp_path / "Foundation.m4b"),
+            status="downloaded",
+        )
+
+    download_called = []
+    monkeypatch.setattr("audiobookdl.pipeline.download", lambda *a, **kw: download_called.append(True))
+
+    book = Audiobook(
+        session=requests.Session(),
+        metadata=AudiobookMetadata(
+            title="Foundation",
+            authors=["Isaac Asimov"],
+            isbn="978-0-553-29335-7",
+            scrape_url="https://bookbeat.example.com/book/42",
+        ),
+        files=[AudiobookFile(url="https://bookbeat.example.com/track.mp3", ext="mp3")],
+    )
+    opts = build_default_options(
+        database_directory=str(db_dir),
+        output_template=str(tmp_path / "{title}"),
+        skip_downloaded=True,
+    )
+    processed = process_audiobook(
+        type("_Src", (), {"name": "bookbeat", "on_download_complete": lambda *_a: None})(),
+        book,
+        opts,
+    )
+    assert processed is False
+    assert download_called == []
+
+
+
 

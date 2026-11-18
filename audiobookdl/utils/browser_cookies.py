@@ -361,17 +361,45 @@ def detect_available_browsers() -> dict[str, bool]:
     return available
 
 
+def _sql_like_escape_domain(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _build_domain_sql_where(
+    column_name: str,
+    target_domains: Sequence[str],
+) -> tuple[str, list[str]]:
+    """Build parameterized SQLite `WHERE` clause matching exact or subdomain entries."""
+    normalized: list[str] = []
+    for raw in target_domains:
+        dom = raw.strip().lstrip(".").lower()
+        if dom and dom not in normalized:
+            normalized.append(dom)
+    if not normalized:
+        return "1 = 0", []
+    clauses: list[str] = []
+    params: list[str] = []
+    for dom in normalized:
+        clauses.append(f"(LOWER(LTRIM({column_name}, '.')) = ? OR LOWER({column_name}) LIKE ? ESCAPE '\\')")
+        params.extend([dom, f"%.{_sql_like_escape_domain(dom)}"])
+    return " OR ".join(clauses), params
+
+
 def read_firefox_cookies(
     db_path: Path,
     target_domains: Sequence[str],
 ) -> tuple[list[http.cookiejar.Cookie], int]:
     """Read and filter cookies from a Firefox `cookies.sqlite` file."""
+    where_sql, params = _build_domain_sql_where("host", target_domains)
     with tempfile.TemporaryDirectory(prefix="abdl-ff-") as tmp:
         copied = _copy_sqlite_to_temp(db_path, Path(tmp))
         conn = sqlite3.connect(str(copied))
         try:
+            count_row = conn.execute("SELECT COUNT(*) FROM moz_cookies").fetchone()
+            total_scanned = int(count_row[0]) if count_row is not None else 0
             rows = conn.execute(
-                "SELECT host, name, value, path, expiry, isSecure, isHttpOnly FROM moz_cookies"
+                f"SELECT host, name, value, path, expiry, isSecure, isHttpOnly FROM moz_cookies WHERE {where_sql}",
+                tuple(params),
             ).fetchall()
         finally:
             conn.close()
@@ -393,7 +421,7 @@ def read_firefox_cookies(
                 http_only=bool(is_httponly),
             )
         )
-    return matched, len(rows)
+    return matched, total_scanned
 
 
 def _dpapi_unprotect(encrypted_bytes: bytes) -> bytes:
@@ -526,6 +554,7 @@ def read_chromium_cookies(
     master_key: bytes | None = None,
 ) -> tuple[list[http.cookiejar.Cookie], int, list[str]]:
     """Read and filter cookies from a Chromium `Cookies` SQLite database."""
+    where_sql, params = _build_domain_sql_where("host_key", target_domains)
     try:
         with tempfile.TemporaryDirectory(prefix="abdl-cr-") as tmp:
             copied = _copy_sqlite_to_temp(db_path, Path(tmp))
@@ -540,8 +569,11 @@ def read_chromium_cookies(
                         db_version = int(ver_row[0])
                 except sqlite3.Error:
                     db_version = 0
+                count_row = conn.execute("SELECT COUNT(*) FROM cookies").fetchone()
+                total_scanned = int(count_row[0]) if count_row is not None else 0
                 rows = conn.execute(
-                    "SELECT host_key, name, value, encrypted_value, path, expires_utc, is_secure, is_httponly FROM cookies"
+                    f"SELECT host_key, name, value, encrypted_value, path, expires_utc, is_secure, is_httponly FROM cookies WHERE {where_sql}",
+                    tuple(params),
                 ).fetchall()
             finally:
                 conn.close()
@@ -593,7 +625,7 @@ def read_chromium_cookies(
             raise app_bound_error
         warnings.append(str(app_bound_error))
 
-    return matched, len(rows), warnings
+    return matched, total_scanned, warnings
 
 
 def _try_browser_cookie3(browser: str, target_domains: Sequence[str]) -> list[http.cookiejar.Cookie] | None:

@@ -983,7 +983,8 @@ def test_combine_audiofiles_parallel_aac_transcode_concat_and_fallback(tmp_path)
             probe_cache={str(p0): cache[str(p0)], str(p1): cache[str(p1)]},
         )
     mux_cmd_2 = [c for c in cmds if c[-1] == str(out_m4b_2)][0]
-    assert mux_cmd_2[mux_cmd_2.index("-i") + 1].endswith("combined.ts")
+    assert "-f" in mux_cmd_2 and "concat" in mux_cmd_2
+    assert mux_cmd_2[mux_cmd_2.index("-i") + 1].endswith("concat_list.txt")
     assert "+faststart" in mux_cmd_2
 
 
@@ -1253,17 +1254,21 @@ def test_combine_audiofiles_mixed_non_mp4_normalizes_parts(tmp_path, monkeypatch
     assert any("norm_parts" in part or "concat_list.txt" in part for part in final_cmd)
 
 
-def test_combine_audiofiles_exceeding_max_concat_files_uses_binary_ts(tmp_path, monkeypatch):
+def test_combine_audiofiles_exceeding_max_concat_files_uses_concat_demuxer(tmp_path, monkeypatch):
     monkeypatch.setattr(output, "_require_executable", lambda name: "ffmpeg")
     monkeypatch.setattr(
         output,
         "_remux_to_mpegts",
         lambda src, dst, cancel_event=None, *, preserve_video=False: open(dst, "wb").write(b"ts") > 0,
     )
+    total_parts = output._MAX_CONCAT_PROTOCOL_FILES + 1
     monkeypatch.setattr(
         output,
         "_probe_audio_info",
-        lambda path: AudioProbeInfo(duration=1.0, codec_name="mp3"),
+        lambda path: AudioProbeInfo(
+            duration=float(total_parts) if path.endswith("many.mp3") else 1.0,
+            codec_name="mp3",
+        ),
     )
 
     seen_cmds = []
@@ -1283,13 +1288,17 @@ def test_combine_audiofiles_exceeding_max_concat_files_uses_binary_ts(tmp_path, 
         files.append(str(p))
 
     out_mp3 = tmp_path / "many.mp3"
-    combine_audiofiles(files, str(tmp_path / "tmp"), str(out_mp3))
+    work_tmp = tmp_path / "tmp"
+    combine_audiofiles(files, str(work_tmp), str(out_mp3))
 
     assert out_mp3.exists()
     assert len(seen_cmds) == 1
-    cmd_str = " ".join(seen_cmds[0])
+    cmd = seen_cmds[0]
+    cmd_str = " ".join(cmd)
     assert "concat:" not in cmd_str
-    assert "combined.ts" in cmd_str
+    assert "-f" in cmd and "concat" in cmd
+    assert "concat_list.txt" in cmd_str
+    assert not (tmp_path / "tmp.work" / "combined.ts").exists()
 
 
 def test_add_chapters_ffmpeg_applies_faststart_only_to_mp4(tmp_path, monkeypatch):

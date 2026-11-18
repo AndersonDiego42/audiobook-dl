@@ -5,6 +5,7 @@ from collections import Counter, deque
 import dataclasses
 import importlib.resources
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -86,6 +87,7 @@ from audiobookdl.gui.pages import (
 from audiobookdl.gui.preview_dialog import ChoiceDialog, PreviewDialog
 from audiobookdl.gui.queue_panel import ActivityQueuePanel
 from audiobookdl.gui.shell import NAV_ITEMS, SidebarShell
+from audiobookdl.gui.tray import TrayIconController
 from audiobookdl.gui.theme import (
     THEME_LABELS,
     THEME_MODES,
@@ -93,6 +95,7 @@ from audiobookdl.gui.theme import (
     apply_theme,
     apply_theme_to_widget_tree,
     apply_theme_to_window,
+    detect_system_theme,
     enable_high_dpi_awareness,
     make_bold_font,
     normalize_theme_mode,
@@ -226,7 +229,10 @@ class AudiobookDLApp:
         self._style = ttk.Style()
         self._theme_mode = normalize_theme_mode(self._controller.config.gui.theme)
         self._theme_var = tk.StringVar(value=self._theme_mode)
+        self._last_system_theme = detect_system_theme()
+        self._theme_watch_after_id: str | None = None
         self._palette: ThemePalette = apply_theme(self.root, self._style, self._theme_mode)
+        self.queue_concurrency_var = tk.IntVar(value=self._controller.queue_concurrency)
 
         cfg_gui = self._controller.config.gui
         self._services: list[ServiceInfo] = get_available_services()
@@ -270,6 +276,12 @@ class AudiobookDLApp:
             [split_source_profile_key(t) for t in cfg_gui.auto_sync_targets]
             if cfg_gui.auto_sync_targets is not None
             else []
+        )
+        self._tray_controller = TrayIconController(
+            dispatch=lambda cb: self.root.after(0, cb),
+            on_restore=self._restore_from_tray,
+            on_sync_now=self._sync_from_tray,
+            on_exit=lambda: self._on_close(force=True),
         )
 
         self._auth = ServiceAuthCoordinator(
@@ -322,9 +334,11 @@ class AudiobookDLApp:
         self._url_debounce_after_id: str | None = None
         self._modal_prompt_active = False
         self._deferred_modal_events: deque[ControllerEvent] = deque()
+        self._controller.set_activity_callback(self._schedule_poll_soon)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<Destroy>", self._on_root_destroy, add="+")
         self._poll_after_id = self.root.after(50, self._poll_queue)
+        self._sync_system_theme_watch()
         if self.clipboard_monitor_var.get():
             self._automation.apply_clipboard_monitor(quiet=True, persist=False)
         if self._automation.auto_sync_enabled:
@@ -431,13 +445,60 @@ class AudiobookDLApp:
         """Switch between `'system'`, `'light'`, and `'dark'` themes live."""
         self._theme_mode = normalize_theme_mode(mode)
         self._theme_var.set(self._theme_mode)
+        if self._theme_mode == "system":
+            self._last_system_theme = detect_system_theme()
         self._palette = apply_theme(self.root, self._style, self._theme_mode)
         self.shell.apply_theme(self._palette)
         for child in self.root.winfo_children():
             if isinstance(child, tk.Toplevel):
                 apply_theme_to_window(child, self._palette)
         self._ffmpeg_assistant.update_status()
+        self._sync_system_theme_watch()
         return self._palette
+
+    def _cancel_theme_watch(self) -> None:
+        after_id = getattr(self, "_theme_watch_after_id", None)
+        self._theme_watch_after_id = None
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except tk.TclError:
+                pass
+
+    def _sync_system_theme_watch(self) -> None:
+        self._cancel_theme_watch()
+        if self._theme_mode != "system":
+            return
+        try:
+            if self.root.winfo_exists():
+                self._theme_watch_after_id = self.root.after(2500, self._check_system_theme)
+        except tk.TclError:
+            self._theme_watch_after_id = None
+
+    def _check_system_theme(self) -> None:
+        self._theme_watch_after_id = None
+        if self._theme_mode != "system":
+            return
+        try:
+            if not self.root.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        current = detect_system_theme()
+        if current != self._last_system_theme:
+            self._last_system_theme = current
+            self.set_theme("system")
+            return
+        self._sync_system_theme_watch()
+
+    def _on_queue_concurrency_changed(self, value: int) -> None:
+        clamped = self._controller.set_queue_concurrency(value)
+        if self.queue_concurrency_var.get() != clamped:
+            self.queue_concurrency_var.set(clamped)
+        try:
+            self._controller.save_gui_preferences(queue_concurrency=clamped)
+        except OSError as exc:
+            self.status_var.set(f"Failed to save concurrency preference: {exc}")
 
     @property
     def controller(self) -> GuiController:
@@ -543,6 +604,7 @@ class AudiobookDLApp:
         self.notify_on_complete_var = tk.BooleanVar(value=notify_default)
 
         self.clipboard_monitor_var = tk.BooleanVar(value=bool(cfg.gui.clipboard_monitor))
+        self.minimize_to_tray_var = tk.BooleanVar(value=bool(cfg.gui.minimize_to_tray))
         self.check_updates_var = tk.BooleanVar(value=(cfg.check_updates is not False))
         self.status_var = tk.StringVar(value="Ready")
         self.active_job_var = tk.StringVar(value="Idle")
@@ -671,6 +733,8 @@ class AudiobookDLApp:
             on_progress_mode_changed=self.shell.set_footer_progress_mode,
             progress_var=self.progress_var,
             active_job_var=self.active_job_var,
+            concurrency_var=self.queue_concurrency_var,
+            on_concurrency_changed=self._on_queue_concurrency_changed,
         )
         page.preset_combo.bind("<<ComboboxSelected>>", self._on_preset_selected)
         self._bind_drop_target(page.urls_text, stop_prop=True)
@@ -861,6 +925,9 @@ class AudiobookDLApp:
             notify_on_complete_var=self.notify_on_complete_var,
             clipboard_monitor_var=self.clipboard_monitor_var,
             check_updates_var=self.check_updates_var,
+            minimize_to_tray_var=self.minimize_to_tray_var,
+            tray_available=self._tray_controller.is_available(),
+            on_toggle_minimize_to_tray=self._toggle_minimize_to_tray,
             on_theme_changed=self.set_theme,
             on_toggle_clipboard_monitor=self._toggle_clipboard_monitor,
             on_toggle_check_updates=self._toggle_check_updates,
@@ -1008,7 +1075,11 @@ class AudiobookDLApp:
         file_menu.add_command(label="Open Output Folder", command=self._open_output_folder)
         file_menu.add_command(label="Reload Config", command=self._reload_config)
         file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self._on_close, accelerator="Ctrl+Q")
+        file_menu.add_command(
+            label="Exit",
+            command=lambda: self._on_close(force=True),
+            accelerator="Ctrl+Q",
+        )
         menubar.add_cascade(label="File", menu=file_menu)
 
         view_menu = tk.Menu(menubar, tearoff=0)
@@ -1045,7 +1116,7 @@ class AudiobookDLApp:
 
         self.root.configure(menu=menubar)
         self.root.bind("<Control-o>", lambda _e: self._browse_url_file())
-        self.root.bind("<Control-q>", lambda _e: self._on_close())
+        self.root.bind("<Control-q>", lambda _e: self._on_close(force=True))
         self.root.bind("<Control-p>", lambda _e: self.preview_metadata())
         self.root.bind("<F5>", lambda _e: self.start_download())
         for idx, spec in enumerate(NAV_ITEMS, start=1):
@@ -1227,7 +1298,12 @@ class AudiobookDLApp:
                     continue
                 cfg_val = getattr(cfg, spec.config_key, None)
                 getattr(self, binding.var_attr).set(binding.init_value(cfg_val))
-            new_post_exec = (cfg.post_exec or "").strip()
+            raw_post_exec = cfg.post_exec
+            new_post_exec = (
+                shlex.join(raw_post_exec)
+                if isinstance(raw_post_exec, list)
+                else (raw_post_exec or "").strip()
+            )
             if new_post_exec and new_post_exec != previous_post_exec:
                 approved = messagebox.askyesno(
                     "Confirm Post-Exec Command",
@@ -1247,6 +1323,8 @@ class AudiobookDLApp:
             if cfg.gui.clipboard_monitor is not None:
                 self.clipboard_monitor_var.set(cfg.gui.clipboard_monitor)
                 self._automation.apply_clipboard_monitor(quiet=True, persist=False)
+            if cfg.gui.minimize_to_tray is not None:
+                self.minimize_to_tray_var.set(cfg.gui.minimize_to_tray)
             self.check_updates_var.set(cfg.check_updates is not False)
             if cfg.gui.auto_sync_enabled is not None:
                 self._automation.auto_sync_enabled = cfg.gui.auto_sync_enabled
@@ -2280,6 +2358,19 @@ class AudiobookDLApp:
                         if e.status == "downloaded" and e.title and e.title.strip()
                     }
         series_title = result.title if isinstance(result, Series) else None
+        duplicate_warning: str | None = None
+        if isinstance(result, Audiobook) and self.download_archive_var.get():
+            dup = self._controller.find_cross_source_duplicate(
+                result.metadata,
+                source_name=source.name,
+                archive_path=self._archive_ledger_path(),
+            )
+            if dup is not None:
+                dup_where = dup.get("output_path") or dup.get("title") or ""
+                duplicate_warning = (
+                    f"Duplicate Alert: Already in library from {dup['source']}"
+                    + (f" ({dup_where})" if dup_where else "")
+                )
         dialog = PreviewDialog(
             self.root,
             url,
@@ -2302,6 +2393,7 @@ class AudiobookDLApp:
             palette=self._palette,
             on_search_enrichment=_search_enrichment,
             on_apply_enrichment=_apply_enrichment,
+            duplicate_warning=duplicate_warning,
         )
         self._preview_dialog = dialog
         return dialog
@@ -2375,11 +2467,6 @@ class AudiobookDLApp:
                 return
         except tk.TclError:
             return
-        try:
-            self._poll_after_id = self.root.after(50, self._poll_queue)
-        except tk.TclError:
-            self._poll_after_id = None
-            return
         processed = self._controller.drain_events(
             self._handle_event,
             max_batch=self._controller.MAX_QUEUE_BATCH,
@@ -2393,13 +2480,14 @@ class AudiobookDLApp:
         if processed >= self._controller.MAX_QUEUE_BATCH:
             self._schedule_poll_soon(10)
         elif (
-            processed == 0
-            and not self._is_running
-            and not self._is_previewing
-            and not self._is_syncing
-            and not self._deferred_modal_events
+            self._is_running
+            or self._is_previewing
+            or self._is_syncing
+            or self._controller.has_active_background_tasks()
+            or bool(self._deferred_modal_events)
+            or not self._controller.event_queue.empty()
         ):
-            self._schedule_poll_soon(250)
+            self._schedule_poll_soon(50)
 
     def _cancel_poll_timer(self) -> None:
         after_id = getattr(self, "_poll_after_id", None)
@@ -2413,6 +2501,7 @@ class AudiobookDLApp:
     def _on_root_destroy(self, event: tk.Event) -> None:
         if getattr(event, "widget", None) is self.root:
             self._cancel_poll_timer()
+            self._cancel_theme_watch()
         self._automation.cancel_auto_sync()
         self._automation.cancel_clipboard()
 
@@ -2616,7 +2705,56 @@ class AudiobookDLApp:
         if lib_page is not None:
             lib_page.archive_tab.refresh()
 
+    def _toggle_minimize_to_tray(self) -> None:
+        enabled = bool(self.minimize_to_tray_var.get())
+        try:
+            self._controller.save_gui_preferences(minimize_to_tray=enabled)
+        except OSError:
+            pass
+        if not enabled:
+            self._tray_controller.stop()
+            self.status_var.set("Minimize to tray disabled")
+        else:
+            self.status_var.set("Minimize to tray enabled")
+
+    def _restore_from_tray(self) -> None:
+        self._tray_controller.stop()
+        try:
+            if self.root.winfo_exists():
+                self.root.deiconify()
+                self.root.lift()
+                self.root.focus_force()
+        except tk.TclError:
+            pass
+
+    def _sync_from_tray(self) -> None:
+        if self._automation.auto_sync_targets:
+            self._execute_sync_targets(
+                self._automation.auto_sync_targets,
+                self._automation.auto_sync_mode,
+            )
+        else:
+            self._sync_libraries()
+
+    def _minimize_to_tray(self) -> bool:
+        if not self._tray_controller.start():
+            return False
+        try:
+            self.root.withdraw()
+        except tk.TclError:
+            self._tray_controller.stop()
+            return False
+        self.status_var.set("Minimized to system tray (scheduled sync active)")
+        return True
+
     def _on_close(self, *, force: bool = False) -> None:
+        if (
+            not force
+            and self.minimize_to_tray_var.get()
+            and self._tray_controller.is_available()
+            and self._minimize_to_tray()
+        ):
+            return
         if not force and (self._is_running or self._is_syncing):
             if not messagebox.askyesno(
                 "Operation in Progress",
@@ -2656,11 +2794,15 @@ class AudiobookDLApp:
                 theme=self._theme_mode,
                 notify_on_complete=self.notify_on_complete_var.get(),
                 clipboard_monitor=self.clipboard_monitor_var.get(),
+                queue_concurrency=self._controller.queue_concurrency,
+                minimize_to_tray=self.minimize_to_tray_var.get(),
                 output_prefs=self._read_persisted_gui_preferences(),
             )
         except OSError:
             pass
         self._cancel_poll_timer()
+        self._cancel_theme_watch()
+        self._tray_controller.stop()
         self._automation.cancel_auto_sync()
         self._automation.cancel_clipboard()
         self._controller.shutdown(

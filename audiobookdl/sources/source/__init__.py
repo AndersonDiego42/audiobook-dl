@@ -6,6 +6,7 @@ from audiobookdl import logging, Result, Audiobook, Cover
 from audiobookdl.exceptions import DataNotPresent, GenericAudiobookDLException
 from audiobookdl.utils import CustomSSLContextHTTPAdapter
 from audiobookdl.utils.audiobook import detect_image_extension
+from audiobookdl.utils.fs import atomic_write_text
 from audiobookdl.utils.http import (
     create_impersonated_session,
     extract_session_cookies,
@@ -14,7 +15,7 @@ from audiobookdl.utils.http import (
 
 # External imports
 from collections import OrderedDict
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 import requests
@@ -130,6 +131,7 @@ class Source(Generic[T]):
 
     def __init__(self, options: DownloadOptions):
         self.__authenticated: bool = False
+        self._loaded_cached_cookies: bool = False
         self.__pages: OrderedDict[str, bytes] = OrderedDict()
         self.__pages_bytes: int = 0
         self._options: DownloadOptions = options
@@ -193,6 +195,31 @@ class Source(Generic[T]):
     def authenticated(self):
         """Returns `True` if the source has been authenticated"""
         return self.__authenticated
+
+    def reset_authentication(self, *, clear_cookies: bool = True) -> None:
+        """Reset authentication state (and optionally session cookies) before re-login."""
+        self.__authenticated = False
+        self._loaded_cached_cookies = False
+        if clear_cookies and hasattr(self, "_session"):
+            self._session.cookies.clear()
+
+    def get_or_create_device_id(self, filename: str, factory: Callable[[], str]) -> str:
+        """Return a persisted device identifier in `database_directory`, creating one if absent."""
+        device_file = os.path.join(self.database_directory, filename)
+        if os.path.isfile(device_file):
+            try:
+                with open(device_file, encoding="utf-8") as fh:
+                    existing = fh.read().strip()
+                if existing:
+                    return existing
+            except OSError:
+                pass
+        generated = factory()
+        try:
+            atomic_write_text(device_file, generated + "\n", encoding="utf-8", private=True)
+        except OSError:
+            pass
+        return generated
 
 
     @property

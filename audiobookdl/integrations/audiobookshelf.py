@@ -1,16 +1,19 @@
 """Audiobookshelf REST client for library inspection, book upload, and library scans."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 import io
 import mimetypes
 import os
+import time
 from typing import Any, IO
+from urllib.parse import quote as url_quote
 import uuid
 import requests
 
+from audiobookdl import logging
 from audiobookdl.exceptions import AudiobookDLException
 from audiobookdl.utils.audiobook import AudiobookMetadata
-from audiobookdl.utils.http import DEFAULT_HTTP_TIMEOUT
+from audiobookdl.utils.http import DEFAULT_HTTP_TIMEOUT, warn_if_insecure_token_url
 
 ABS_CREDENTIAL_KEY = "integration:audiobookshelf"
 _AUDIO_MEDIA_EXTENSIONS = frozenset({
@@ -67,6 +70,7 @@ class _MultipartUploadStream(io.RawIOBase):
         file_entries: Sequence[tuple[str, str]],
         *,
         boundary: str | None = None,
+        on_bytes: Callable[[int], None] | None = None,
     ) -> None:
         self.boundary = boundary or f"----audiobookdl-{uuid.uuid4().hex}"
         self._segments: list[bytes | str] = []
@@ -111,6 +115,13 @@ class _MultipartUploadStream(io.RawIOBase):
         self._seg_index = 0
         self._seg_offset = 0
         self._open_file: IO[bytes] | None = None
+        self._on_bytes = on_bytes
+
+    def reset(self) -> None:
+        """Rewind stream position cleanly for HTTP request retries."""
+        self._close_active_file()
+        self._seg_index = 0
+        self._seg_offset = 0
 
     def __len__(self) -> int:
         return self._total_len
@@ -164,7 +175,10 @@ class _MultipartUploadStream(io.RawIOBase):
                     self._close_active_file()
                     self._seg_index += 1
                     self._seg_offset = 0
-        return b"".join(chunks)
+        payload = b"".join(chunks)
+        if payload and self._on_bytes is not None:
+            self._on_bytes(len(payload))
+        return payload
 
 
 class AudiobookshelfClient:
@@ -184,6 +198,7 @@ class AudiobookshelfClient:
         self.api_token = api_token.strip()
         if not self.api_token:
             raise AudiobookshelfError("Audiobookshelf API token is empty")
+        warn_if_insecure_token_url(self.base_url, "Audiobookshelf")
         self._owns_session = session is None
         self.session = session if session is not None else requests.Session()
         self.timeout = timeout
@@ -195,6 +210,8 @@ class AudiobookshelfClient:
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.api_token}"}
 
+    _RETRIABLE_STATUS_CODES = frozenset({429, 502, 503, 504})
+
     def _request(
         self,
         method: str,
@@ -204,29 +221,99 @@ class AudiobookshelfClient:
         data: Any = None,
         files: list[tuple[str, tuple[str, Any]]] | None = None,
         headers: Mapping[str, str] | None = None,
+        max_retries: int = 2,
     ) -> requests.Response:
         url = f"{self.base_url}{path}"
         req_headers = self._headers()
         if headers:
             req_headers.update(headers)
-        try:
-            resp = self.session.request(
-                method,
-                url,
-                headers=req_headers,
-                json=json_body,
-                data=data,
-                files=files,
-                timeout=self.timeout,
+        can_retry = data is None or isinstance(data, (bytes, bytearray, str)) or hasattr(data, "reset")
+        attempts = max(1, (max_retries + 1) if can_retry else 1)
+        last_exc: requests.RequestException | None = None
+        resp: requests.Response | None = None
+
+        for attempt in range(attempts):
+            if attempt > 0 and hasattr(data, "reset"):
+                data.reset()
+            try:
+                resp = self.session.request(
+                    method,
+                    url,
+                    headers=req_headers,
+                    json=json_body,
+                    data=data,
+                    files=files,
+                    timeout=self.timeout,
+                )
+            except requests.RequestException as exc:
+                last_exc = exc
+                if attempt + 1 < attempts:
+                    time.sleep(min(4.0, 0.5 * (2 ** attempt)))
+                    continue
+                raise AudiobookshelfError(
+                    f"Audiobookshelf request failed ({method} {path}): {exc}"
+                ) from exc
+            if resp.status_code in self._RETRIABLE_STATUS_CODES and attempt + 1 < attempts:
+                time.sleep(min(4.0, 0.5 * (2 ** attempt)))
+                continue
+            break
+
+        if resp is None:
+            raise AudiobookshelfError(
+                f"Audiobookshelf request failed ({method} {path}): {last_exc}"
             )
-        except requests.RequestException as exc:
-            raise AudiobookshelfError(f"Audiobookshelf request failed ({method} {path}): {exc}") from exc
         if resp.status_code >= 400:
             detail = (resp.text or "").strip()[:300]
             raise AudiobookshelfError(
                 f"Audiobookshelf API returned HTTP {resp.status_code} for {method} {path}: {detail}"
             )
         return resp
+
+    def book_exists_in_library(
+        self,
+        library_id: str,
+        metadata: AudiobookMetadata | None,
+    ) -> bool:
+        """Return True if a matching ASIN, ISBN, or title+author already exists in `library_id`."""
+        if not library_id.strip() or metadata is None:
+            return False
+        query = (metadata.asin or metadata.isbn or metadata.title or "").strip()
+        if not query:
+            return False
+        try:
+            resp = self._request(
+                "GET",
+                f"/api/libraries/{library_id}/search?q={url_quote(query)}",
+            )
+            payload = resp.json()
+        except (AudiobookshelfError, ValueError):
+            return False
+        items = payload.get("book") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            return False
+
+        target_asin = (metadata.asin or "").strip().lower()
+        target_isbn = (metadata.isbn or "").strip().replace("-", "").lower()
+        target_title = " ".join((metadata.title or "").casefold().split())
+        target_author = " ".join((metadata.author or "").casefold().split())
+        for entry in items:
+            lib_item = entry.get("libraryItem") if isinstance(entry, dict) else None
+            media = lib_item.get("media") if isinstance(lib_item, dict) else None
+            meta = media.get("metadata") if isinstance(media, dict) else None
+            if not isinstance(meta, dict):
+                continue
+            item_asin = str(meta.get("asin") or "").strip().lower()
+            item_isbn = str(meta.get("isbn") or "").strip().replace("-", "").lower()
+            if target_asin and item_asin and item_asin == target_asin:
+                return True
+            if target_isbn and item_isbn and item_isbn == target_isbn:
+                return True
+            item_title = " ".join(str(meta.get("title") or "").casefold().split())
+            if target_title and item_title == target_title:
+                item_author = " ".join(str(meta.get("authorName") or "").casefold().split())
+                if not target_author or not item_author or target_author == item_author:
+                    return True
+        return False
 
     def ping(self) -> str:
         """Verify credentials via `/api/authorize` and return authenticated username."""
@@ -339,10 +426,17 @@ class AudiobookshelfClient:
         library_id: str,
         metadata: AudiobookMetadata | None = None,
         folder_id: str | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
+        skip_if_exists: bool = False,
     ) -> bool:
         """Upload local audiobook files and sidecars via `POST /api/upload`."""
         if not library_id.strip():
             raise AudiobookshelfError("Audiobookshelf library ID is required to upload")
+        if skip_if_exists and self.book_exists_in_library(library_id, metadata):
+            logging.log(
+                f"Skipping Audiobookshelf upload for '{getattr(metadata, 'title', local_path)}': already in library"
+            )
+            return False
         resolved_folder = folder_id or self.get_library_folder_id(library_id)
         filepaths = self._collect_upload_files(local_path)
         form_data: dict[str, Any] = {
@@ -357,7 +451,23 @@ class AudiobookshelfClient:
                 form_data["series"] = metadata.series
 
         file_entries = [(str(idx), fpath) for idx, fpath in enumerate(filepaths)]
-        stream = _MultipartUploadStream(form_data, file_entries)
+        uploaded_bytes = 0
+        total_len = 0
+
+        def _track_bytes(delta: int) -> None:
+            nonlocal uploaded_bytes
+            uploaded_bytes += delta
+            if on_progress is not None and total_len > 0:
+                on_progress(min(uploaded_bytes, total_len), total_len)
+
+        stream = _MultipartUploadStream(
+            form_data,
+            file_entries,
+            on_bytes=_track_bytes if on_progress is not None else None,
+        )
+        total_len = len(stream)
+        if on_progress is not None and total_len > 0:
+            on_progress(0, total_len)
         try:
             self._request(
                 "POST",
@@ -365,7 +475,7 @@ class AudiobookshelfClient:
                 data=stream,
                 headers={
                     "Content-Type": f"multipart/form-data; boundary={stream.boundary}",
-                    "Content-Length": str(len(stream)),
+                    "Content-Length": str(total_len),
                 },
             )
         finally:
@@ -380,6 +490,7 @@ def sync_book_to_audiobookshelf(
     *,
     force_upload: bool = False,
     session: requests.Session | None = None,
+    skip_if_exists: bool = False,
 ) -> bool:
     """Upload and/or trigger a library scan on Audiobookshelf when configured.
 
@@ -405,7 +516,29 @@ def sync_book_to_audiobookshelf(
     client = AudiobookshelfClient(url, token, session=session)
     try:
         if want_upload:
-            client.upload_book(local_path, library_id=library_id, metadata=metadata)
+            logging.book_update("Uploading to Audiobookshelf")
+            with logging.progress([]) as prog:
+                task_id: int | None = None
+                reported = 0
+
+                def _on_upload_progress(sent: int, total: int) -> None:
+                    nonlocal task_id, reported
+                    if total <= 0:
+                        return
+                    if task_id is None:
+                        task_id = prog.add_task("Uploading to Audiobookshelf", total=float(total))
+                    delta = sent - reported
+                    if delta > 0:
+                        reported = sent
+                        prog.advance(task_id, float(delta))
+
+                client.upload_book(
+                    local_path,
+                    library_id=library_id,
+                    metadata=metadata,
+                    on_progress=_on_upload_progress,
+                    skip_if_exists=skip_if_exists,
+                )
         if auto_scan:
             client.scan_library(library_id)
         return True

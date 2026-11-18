@@ -3,6 +3,8 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import date
 from difflib import SequenceMatcher
+import functools
+import importlib.metadata
 from io import BytesIO
 import re
 from typing import Any
@@ -29,11 +31,13 @@ from audiobookdl.utils.enrichment_cache import (
     default_enrichment_cache_path,
     make_cache_key,
 )
-from audiobookdl.utils.http import DEFAULT_USER_AGENT
+from audiobookdl.utils.http import DEFAULT_USER_AGENT, warn_if_insecure_token_url
 
 
 DEFAULT_PROVIDERS: tuple[str, ...] = ("audnexus", "itunes", "google", "openlibrary")
 CUSTOM_PROVIDER_PREFIX = "custom:"
+PLUGIN_PROVIDER_PREFIX = "plugin:"
+ENRICHMENT_ENTRY_POINT_GROUP = "audiobookdl.enrichment"
 PROVIDER_ALIASES: dict[str, str] = {
     "audnexus": "audnexus",
     "audible": "audnexus",
@@ -142,6 +146,34 @@ def _lookup_custom_provider(
     return None
 
 
+@functools.lru_cache(maxsize=1)
+def _discover_plugin_enrichment_providers() -> dict[str, Any]:
+    """Discover third-party enrichment plugins from the `audiobookdl.enrichment` entry-point group."""
+    plugins: dict[str, Any] = {}
+    try:
+        eps = importlib.metadata.entry_points(group=ENRICHMENT_ENTRY_POINT_GROUP)
+    except Exception as exc:
+        logging.debug(f"Failed querying enrichment entry points: {exc}")
+        return plugins
+    for ep in eps:
+        raw_name = str(getattr(ep, "name", "") or "").strip().lower()
+        if not raw_name or raw_name in PROVIDER_ALIASES:
+            continue
+        try:
+            loaded = ep.load()
+        except Exception as exc:
+            logging.debug(f"Failed loading enrichment plugin '{raw_name}': {exc}")
+            continue
+        if callable(loaded) or hasattr(loaded, "query"):
+            plugins[raw_name] = loaded
+    return plugins
+
+
+def reset_plugin_enrichment_providers_cache() -> None:
+    """Clear the cached `audiobookdl.enrichment` entry-point lookup (for tests/reloads)."""
+    _discover_plugin_enrichment_providers.cache_clear()
+
+
 def parse_provider_list(
     raw: str | None,
     *,
@@ -150,6 +182,7 @@ def parse_provider_list(
     """Parse a comma-separated provider list into canonical deduplicated provider identifiers."""
     if raw is None or not raw.strip():
         return DEFAULT_PROVIDERS
+    plugin_providers = _discover_plugin_enrichment_providers()
     resolved: list[str] = []
     seen = set()
     for token in raw.split(","):
@@ -166,14 +199,24 @@ def parse_provider_list(
                         f"Configured custom providers: {', '.join(custom_providers.keys()) or 'none'}"
                     )
                 canonical = f"{CUSTOM_PROVIDER_PREFIX}{slug}"
-            elif custom_providers is not None:
-                slug = cleaned
-                if _lookup_custom_provider(slug, custom_providers) is not None:
-                    canonical = f"{CUSTOM_PROVIDER_PREFIX}{slug}"
+            elif cleaned.startswith(PLUGIN_PROVIDER_PREFIX):
+                pslug = cleaned[len(PLUGIN_PROVIDER_PREFIX) :].strip()
+                if pslug not in plugin_providers:
+                    raise ValueError(
+                        f"Unknown enrichment plugin '{token.strip()}'. "
+                        f"Discovered plugins: {', '.join(sorted(plugin_providers)) or 'none'}"
+                    )
+                canonical = f"{PLUGIN_PROVIDER_PREFIX}{pslug}"
+            elif custom_providers is not None and _lookup_custom_provider(cleaned, custom_providers) is not None:
+                canonical = f"{CUSTOM_PROVIDER_PREFIX}{cleaned}"
+            elif cleaned in plugin_providers:
+                canonical = f"{PLUGIN_PROVIDER_PREFIX}{cleaned}"
         if canonical is None:
-            valid = list(DEFAULT_PROVIDERS) + [
-                f"{CUSTOM_PROVIDER_PREFIX}{k}" for k in (custom_providers or {})
-            ]
+            valid = (
+                list(DEFAULT_PROVIDERS)
+                + [f"{CUSTOM_PROVIDER_PREFIX}{k}" for k in (custom_providers or {})]
+                + [f"{PLUGIN_PROVIDER_PREFIX}{k}" for k in sorted(plugin_providers)]
+            )
             raise ValueError(
                 f"Unknown enrichment provider '{token.strip()}'. Valid providers: {', '.join(valid)}"
             )
@@ -190,21 +233,24 @@ def resolve_provider_list(
     *,
     custom_providers: Mapping[str, Any] | None = None,
 ) -> tuple[str, ...]:
-    """Return explicit `raw` providers, or `DEFAULT_PROVIDERS` plus enabled custom providers."""
+    """Return explicit `raw` providers, or `DEFAULT_PROVIDERS` plus enabled custom/plugin providers."""
     if raw is not None and raw.strip():
         return parse_provider_list(raw, custom_providers=custom_providers)
-    if not custom_providers:
-        return DEFAULT_PROVIDERS
     resolved: list[str] = list(DEFAULT_PROVIDERS)
-    for key, cfg in custom_providers.items():
-        if not getattr(cfg, "enabled", True):
-            continue
-        name = getattr(cfg, "name", None) or key
-        try:
-            slug = normalize_custom_provider_name(str(name))
-        except ValueError:
-            continue
-        token = f"{CUSTOM_PROVIDER_PREFIX}{slug}"
+    if custom_providers:
+        for key, cfg in custom_providers.items():
+            if not getattr(cfg, "enabled", True):
+                continue
+            name = getattr(cfg, "name", None) or key
+            try:
+                slug = normalize_custom_provider_name(str(name))
+            except ValueError:
+                continue
+            token = f"{CUSTOM_PROVIDER_PREFIX}{slug}"
+            if token not in resolved:
+                resolved.append(token)
+    for pslug in sorted(_discover_plugin_enrichment_providers()):
+        token = f"{PLUGIN_PROVIDER_PREFIX}{pslug}"
         if token not in resolved:
             resolved.append(token)
     return tuple(resolved)
@@ -1024,6 +1070,8 @@ def _query_abs_custom_provider(
         params["author"] = metadata.authors[0]
 
     api_key = getattr(provider_cfg, "api_key", None)
+    if api_key:
+        warn_if_insecure_token_url(base_url, f"custom metadata provider '{slug}'")
     headers = {"Authorization": str(api_key)} if api_key else None
     payload = _cached_get_json(
         session,
@@ -1070,6 +1118,7 @@ def test_custom_metadata_provider(
     proxies = {"http": proxy, "https": proxy} if proxy else None
     headers = {"User-Agent": DEFAULT_USER_AGENT}
     if api_key and api_key.strip():
+        warn_if_insecure_token_url(base_url, "custom metadata provider")
         headers["Authorization"] = api_key.strip()
     session_cm = nullcontext(session) if session is not None else requests.Session()
     with session_cm as sess:
@@ -1157,6 +1206,38 @@ def _query_provider(
             use_cache=use_cache,
             cache_ttl_seconds=cache_ttl_seconds,
         )
+    if provider.startswith(PLUGIN_PROVIDER_PREFIX):
+        pslug = provider[len(PLUGIN_PROVIDER_PREFIX) :].strip().lower()
+        plugin = _discover_plugin_enrichment_providers().get(pslug)
+        if plugin is None:
+            raise ValueError(f"Enrichment plugin '{pslug}' is not installed")
+        query_fn = getattr(plugin, "query", plugin)
+        try:
+            raw_items = query_fn(
+                metadata,
+                session=session,
+                proxy=proxy,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            logging.debug(f"Enrichment plugin '{pslug}' query failed: {exc}")
+            return []
+        candidates: list[EnrichmentCandidate] = []
+        for item in raw_items or ():
+            if isinstance(item, EnrichmentCandidate):
+                cand = item
+            elif isinstance(item, Mapping):
+                parsed = _parse_abs_custom_match(provider, item)
+                if parsed is None:
+                    continue
+                cand = parsed
+            else:
+                continue
+            if cand.score <= 0.0:
+                cand.score = score_candidate_match(metadata, cand)
+            candidates.append(cand)
+        candidates.sort(key=lambda c: c.score, reverse=True)
+        return candidates
     raise ValueError(f"Unknown enrichment provider: {provider!r}")
 
 
@@ -1261,6 +1342,11 @@ _ABS_CUSTOM_CAPABILITIES: frozenset[str] = frozenset({
 def _provider_capabilities_for(provider: str) -> frozenset[str] | None:
     if provider.startswith(CUSTOM_PROVIDER_PREFIX):
         return _ABS_CUSTOM_CAPABILITIES
+    if provider.startswith(PLUGIN_PROVIDER_PREFIX):
+        pslug = provider[len(PLUGIN_PROVIDER_PREFIX) :].strip().lower()
+        plugin = _discover_plugin_enrichment_providers().get(pslug)
+        caps = getattr(plugin, "capabilities", None) if plugin is not None else None
+        return frozenset(caps) if caps else None
     return _PROVIDER_CAPABILITIES.get(provider)
 
 

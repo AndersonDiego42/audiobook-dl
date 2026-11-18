@@ -241,6 +241,11 @@ class ArchiveTab(ttk.Frame):
         self._details_visible = True
         self._detail_cover_photo: object | None = None
         self._detail_token = 0
+        self._detail_debounce_after_id: str | None = None
+        self._detail_executor = ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="abdl-archive-detail",
+        )
         self._loading_ops = 0
         self._page_offset = 0
         self._total_matches = 0
@@ -458,16 +463,23 @@ class ArchiveTab(ttk.Frame):
         ]
 
     @staticmethod
-    def _format_size(path: str) -> str:
+    def _format_size(
+        path: str,
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> str:
         try:
             if os.path.isfile(path):
                 size = os.path.getsize(path)
             elif os.path.isdir(path):
-                size = sum(
-                    os.path.getsize(os.path.join(r, fn))
-                    for r, _d, files in os.walk(path)
-                    for fn in files
-                )
+                size = 0
+                for r, _d, files in os.walk(path):
+                    if is_cancelled is not None and is_cancelled():
+                        return "--"
+                    for fn in files:
+                        if is_cancelled is not None and is_cancelled():
+                            return "--"
+                        size += os.path.getsize(os.path.join(r, fn))
             else:
                 return "Missing on disk"
         except OSError:
@@ -506,6 +518,12 @@ class ArchiveTab(ttk.Frame):
     def _on_entry_selected(self, _event: tk.Event | None = None) -> None:
         self._detail_token += 1
         token = self._detail_token
+        if self._detail_debounce_after_id is not None:
+            try:
+                self.after_cancel(self._detail_debounce_after_id)
+            except tk.TclError:
+                pass
+            self._detail_debounce_after_id = None
         entries = self._selected_entries()
         if not entries:
             self._detail_cover_photo = None
@@ -552,13 +570,32 @@ class ArchiveTab(ttk.Frame):
         self._detail_cover_label.configure(image="", text="Loading cover...")
 
         thumb_max = scale_px(self, 140)
+
+        def _trigger_detail_worker() -> None:
+            self._start_entry_detail_worker(token, base_lines, output_path, thumb_max)
+
+        self._detail_debounce_after_id = self.after(75, _trigger_detail_worker)
+
+    def _start_entry_detail_worker(
+        self,
+        token: int,
+        base_lines: list[str],
+        output_path: str,
+        thumb_max: int,
+    ) -> None:
+        self._detail_debounce_after_id = None
+        if token != self._detail_token:
+            return
         self._cb_queue.begin_task()
 
         def _worker() -> None:
             try:
                 if token != self._detail_token:
                     return
-                size_text = self._format_size(output_path)
+                size_text = self._format_size(
+                    output_path,
+                    is_cancelled=lambda: token != self._detail_token,
+                )
                 if token != self._detail_token:
                     return
                 cover_path = self._find_nearby_cover(output_path)
@@ -577,7 +614,7 @@ class ArchiveTab(ttk.Frame):
             finally:
                 self._cb_queue.finish_worker()
 
-        threading.Thread(target=_worker, daemon=True).start()
+        self._detail_executor.submit(_worker)
 
     def _apply_entry_details(
         self,
@@ -1148,12 +1185,20 @@ class ArchiveTab(ttk.Frame):
     def _on_destroy(self, event: tk.Event) -> None:
         if event.widget is not self:
             return
+        self._detail_token += 1
+        if self._detail_debounce_after_id is not None:
+            try:
+                self.after_cancel(self._detail_debounce_after_id)
+            except tk.TclError:
+                pass
+            self._detail_debounce_after_id = None
         if self._debounce_after_id is not None:
             try:
                 self.after_cancel(self._debounce_after_id)
             except tk.TclError:
                 pass
             self._debounce_after_id = None
+        self._detail_executor.shutdown(wait=False, cancel_futures=True)
         if self._ledger is not None:
             self._ledger.close()
             self._ledger = None

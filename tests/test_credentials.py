@@ -215,3 +215,54 @@ def test_get_credential_store_accepts_plaintext_env_alias(tmp_path, monkeypatch)
         store = get_credential_store(str(cfg_path))
     assert isinstance(store, PlaintextFallbackCredentialStore)
     assert store.allow_plaintext is True
+
+
+def test_plaintext_fallback_store_crud_and_vault_round_trip(tmp_path):
+    mem_store = PlaintextFallbackCredentialStore(allow_plaintext=True)
+    mem_store.set_password("storytel", "reader@example.com", "pw1")
+    assert mem_store.get_password("storytel", "reader@example.com") == "pw1"
+    assert mem_store.stored_services() == {"storytel": "reader@example.com"}
+    mem_store.delete_password("storytel", "reader@example.com")
+    assert mem_store.get_password("storytel", "reader@example.com") is None
+    assert mem_store.stored_services() == {}
+
+    vault_path = str(tmp_path / "plaintext-vault.json")
+    persisting = PlaintextFallbackCredentialStore(allow_plaintext=True, vault_path=vault_path)
+    persisting.set_password("audible", "alice@example.com", "secret-pw")
+
+    reloaded = PlaintextFallbackCredentialStore(allow_plaintext=True, vault_path=vault_path)
+    assert reloaded.get_password("audible", "alice@example.com") == "secret-pw"
+    assert reloaded.stored_services() == {"audible": "alice@example.com"}
+    reloaded.delete_password("audible", "alice@example.com")
+    assert reloaded.get_password("audible", "alice@example.com") is None
+
+    disabled = PlaintextFallbackCredentialStore(allow_plaintext=False, vault_path=vault_path)
+    disabled.set_password("bookbeat", "bob@example.com", "ignored")
+    assert disabled.get_password("bookbeat", "bob@example.com") is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="DPAPI and Windows DACL are Windows-only")
+def test_dpapi_empty_vault_retained_and_private_write_skips_icacls(tmp_path, monkeypatch):
+    import json
+    import subprocess
+    from audiobookdl.utils.fs import atomic_write_text
+
+    vault = get_vault_path(str(tmp_path / "audiobook-dl.toml"))
+    store = DpapiCredentialStore(vault)
+    store.set_password("bookbeat", "bob@example.com", "top-secret")
+    store.delete_password("bookbeat", "bob@example.com")
+
+    assert os.path.exists(vault)
+    payload = json.loads(open(vault, encoding="utf-8").read())
+    assert payload == {"version": 1, "entries": {}}
+    assert store.get_password("bookbeat", "bob@example.com") is None
+    assert store.stored_services() == {}
+
+    def fail_subprocess(*_args, **_kwargs):
+        raise AssertionError("icacls subprocess should not run when Win32 DACL succeeds")
+
+    monkeypatch.setattr(subprocess, "run", fail_subprocess)
+    priv_file = tmp_path / "private-secret.txt"
+    atomic_write_text(str(priv_file), "hello-secret", private=True)
+    assert priv_file.read_text(encoding="utf-8") == "hello-secret"
+
