@@ -33,7 +33,7 @@ from Crypto.Util.Padding import pad
 from typing import Any
 from collections.abc import Sequence
 from urllib3.util import parse_url
-from urllib.parse import quote_plus, parse_qs
+from urllib.parse import quote_plus, parse_qs, urljoin
 from datetime import datetime, date
 import pycountry
 import json
@@ -41,6 +41,7 @@ import re
 import os
 import uuid
 from audiobookdl.utils import read_asset_file
+from audiobookdl.utils.http import get_header_ci, is_cloudflare_challenge
 
 
 def _load_metadata_corrections() -> dict[str, dict[str, Any]]:
@@ -138,10 +139,8 @@ class StorytelSource(Source):
         return cipher_text.hex()
 
     def check_cloudflare_blocked(self, response: Response) -> None:
-        if response.status_code == 403:
-            error_str = "<title>Attention Required! | Cloudflare</title>"
-            if error_str in response.text:
-                raise CloudflareBlocked
+        if is_cloudflare_challenge(response):
+            raise CloudflareBlocked
 
     def _login(self, url: str, username: str, password: str) -> None:
         self._url = url
@@ -639,18 +638,20 @@ class StorytelSource(Source):
 
     def _get_asset_url(self, consumableId: str, asset_type: str) -> str:
         """Get a final asset URL by requesting the assets API and returning the redirect location."""
+        asset_req_url = f"https://api.storytel.net/assets/v2/consumables/{consumableId}/{asset_type}"
         resp = self.request(
             "GET",
-            f"https://api.storytel.net/assets/v2/consumables/{consumableId}/{asset_type}",
+            asset_req_url,
             allow_redirects=False,
         )
         self._download_counter += 1
-        if resp.status_code != 302 or "Location" not in resp.headers:
+        location = get_header_ci(resp.headers, "Location")
+        if resp.status_code not in (301, 302, 303, 307, 308) or not isinstance(location, str) or not location:
             raise GenericAudiobookDLException(
                 f"request to {resp.url} failed, got {resp.status_code} response: {resp.text}"
             )
-        location: str = resp.headers["Location"]
-        return location
+        base_url = resp.url if isinstance(getattr(resp, "url", None), str) and resp.url else asset_req_url
+        return urljoin(base_url, location)
 
     def get_audio_url(self, consumableId: str) -> str:
         """Get the final Audio URL from Storytel's assets API."""

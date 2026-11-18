@@ -1,4 +1,3 @@
-import audiobookdl.sources as sources
 from .logging import error, print_error_file, strip_markup
 from .utils import read_asset_file
 
@@ -57,6 +56,8 @@ class NoSourceFound(AudiobookDLException):
     error_description = "no_source_found"
 
     def print(self):
+        import audiobookdl.sources as sources
+
         source_name_list = "\n".join([f" • {name}" for name in sources.get_source_names()])
         print_error_file(self.error_description, sources=source_name_list, **self.data)
 

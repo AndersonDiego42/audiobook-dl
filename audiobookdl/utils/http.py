@@ -1,8 +1,9 @@
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 import email.utils
 from http.cookiejar import Cookie, CookieJar
 import importlib
+import math
 import random
 import re
 import threading
@@ -21,6 +22,66 @@ DEFAULT_USER_AGENT: str = "audiobook-dl"
 DEFAULT_MAX_RETRIES: int = 4
 DEFAULT_RETRY_BACKOFF_BASE: float = 1.0
 MAX_RETRY_DELAY: float = 60.0
+
+# HTTP status codes indicating transient origin, gateway, rate-limit, or Cloudflare edge failures.
+RETRIABLE_CDN_STATUS_CODES: frozenset[int] = frozenset(
+    {408, 425, 429, 502, 503, 504, 520, 521, 522, 523, 524, 529}
+)
+
+_GENERIC_BINARY_MIME_TYPES: frozenset[str] = frozenset(
+    {
+        "application/octet-stream",
+        "binary/octet-stream",
+        "application/binary",
+        "application/x-binary",
+    }
+)
+_SOFT_ERROR_MIME_TYPES: frozenset[str] = frozenset(
+    {
+        "text/html",
+        "application/xhtml+xml",
+        "application/xml",
+        "text/xml",
+        "application/json",
+        "application/problem+json",
+        "text/plain",
+    }
+)
+_TEXT_DOCUMENT_EXTENSIONS: frozenset[str] = frozenset(
+    {"txt", "html", "htm", "xml", "json", "m3u8", "srt", "vtt", "cue", "opf"}
+)
+_STREAM_COMPATIBLE_APP_TYPES: frozenset[str] = frozenset(
+    {
+        "application/mp4",
+        "application/mp2t",
+        "application/ogg",
+        "application/x-mpegurl",
+        "application/vnd.apple.mpegurl",
+    }
+)
+_MEDIA_MIME_EQUIVALENCE_GROUPS: tuple[frozenset[str], ...] = (
+    frozenset({"audio/mpeg", "audio/mp3", "audio/mpeg3", "audio/x-mpeg", "audio/x-mp3", "audio/x-mpeg-3"}),
+    frozenset({"audio/mp4", "audio/x-m4a", "audio/m4a", "audio/x-mp4", "application/mp4", "video/mp4"}),
+    frozenset({"audio/aac", "audio/x-aac", "audio/aacp", "audio/adts", "audio/x-hx-aac-adts"}),
+    frozenset({"video/mp2t", "application/mp2t", "audio/mp2t"}),
+    frozenset({"audio/ogg", "application/ogg", "audio/opus", "audio/vorbis"}),
+    frozenset({"audio/flac", "audio/x-flac"}),
+    frozenset({"audio/wav", "audio/x-wav", "audio/wave"}),
+    frozenset({"application/epub+zip", "application/epub"}),
+    frozenset({"application/vnd.apple.mpegurl", "application/x-mpegurl", "audio/mpegurl", "audio/x-mpegurl"}),
+)
+_MEDIA_MIME_TO_GROUP: dict[str, frozenset[str]] = {
+    mime: group for group in _MEDIA_MIME_EQUIVALENCE_GROUPS for mime in group
+}
+
+_HEADER_BYTE_RANGE_RE = re.compile(r"^bytes\s*=\s*(\d+)\s*-\s*(\d+)$", re.IGNORECASE)
+_CLOUDFLARE_CHALLENGE_MARKERS: tuple[str, ...] = (
+    "<title>attention required! | cloudflare</title>",
+    "<title>just a moment...</title>",
+    "/cdn-cgi/challenge-platform/",
+    "cf-chl-",
+    "enable javascript and cookies to continue",
+)
 
 _RATE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kmg]?)(?:i?b)?(?:/s)?\s*$", re.IGNORECASE)
 _RATE_UNITS = {
@@ -122,13 +183,159 @@ def resolve_max_retries(
     return default
 
 
+def get_header_ci(headers: Any, name: str) -> Any | None:
+    """Return header value case-insensitively across `CaseInsensitiveDict`, `curl_cffi`, and plain dicts."""
+    if headers is None:
+        return None
+    getter = getattr(headers, "get", None)
+    if callable(getter):
+        value = getter(name)
+        if isinstance(value, (str, bytes, int, float)):
+            return value
+    items_fn = getattr(headers, "items", None)
+    if callable(items_fn):
+        target = name.lower()
+        for key, val in items_fn():
+            if str(key).lower() == target:
+                return val
+    return None
+
+
+def parse_byte_range_header(range_val: Any) -> tuple[int, int] | None:
+    """Parse an HTTP `Range: bytes=start-end` header into `(start, end)` inclusive."""
+    if not isinstance(range_val, str):
+        return None
+    match = _HEADER_BYTE_RANGE_RE.fullmatch(range_val.strip())
+    if not match:
+        return None
+    start = int(match.group(1))
+    end = int(match.group(2))
+    if end < start:
+        return None
+    return start, end
+
+
+def normalize_content_type(value: Any) -> str | None:
+    """Return the normalized lowercase MIME type (`type/subtype`), stripping parameters and quotes."""
+    if not isinstance(value, str):
+        return None
+    primary = value.split(",", 1)[0]
+    media_type = primary.split(";", 1)[0].strip().strip("\"'").lower()
+    return media_type or None
+
+
+def is_content_type_compatible(
+    actual_raw: Any,
+    expected: Any,
+    *,
+    file_ext: str | None = None,
+) -> tuple[bool, str | None]:
+    """
+    Validate CDN `Content-Type` against `expected` while allowing MIME aliases and generic binary streams.
+
+    Rejects HTML/XML/JSON/text soft-error responses on non-text media/ebook downloads even when
+    `expected` is `None`. Returns `(is_compatible, normalized_actual)`.
+    """
+    actual_ct = normalize_content_type(actual_raw)
+
+    expected_set: set[str] = set()
+    if isinstance(expected, str):
+        norm = normalize_content_type(expected)
+        if norm:
+            expected_set.add(norm)
+    elif isinstance(expected, Iterable):
+        for item in expected:
+            norm = normalize_content_type(item)
+            if norm:
+                expected_set.add(norm)
+
+    ext = (file_ext or "").lstrip(".").lower()
+    if actual_ct in _SOFT_ERROR_MIME_TYPES:
+        if actual_ct in expected_set or ext in _TEXT_DOCUMENT_EXTENSIONS:
+            return True, actual_ct
+        return False, actual_ct
+
+    if not expected_set:
+        return True, actual_ct
+
+    if actual_ct is None:
+        # Many object-storage / signed CDN URLs omit Content-Type on valid 200/206 media responses.
+        expects_text_only = all(t in _SOFT_ERROR_MIME_TYPES for t in expected_set)
+        return (not expects_text_only), None
+
+    if actual_ct in expected_set:
+        return True, actual_ct
+
+    expects_text_only = all(t in _SOFT_ERROR_MIME_TYPES for t in expected_set)
+    if actual_ct in _GENERIC_BINARY_MIME_TYPES and not expects_text_only:
+        return True, actual_ct
+
+    if (_GENERIC_BINARY_MIME_TYPES & expected_set) and (
+        actual_ct.startswith(("audio/", "video/"))
+        or actual_ct in _STREAM_COMPATIBLE_APP_TYPES
+        or actual_ct in _GENERIC_BINARY_MIME_TYPES
+    ):
+        return True, actual_ct
+
+    actual_group = _MEDIA_MIME_TO_GROUP.get(actual_ct)
+    if actual_group is not None and any(exp in actual_group for exp in expected_set):
+        return True, actual_ct
+
+    return False, actual_ct
+
+
+def is_cloudflare_challenge(response: Any, *, body: bytes | str | None = None) -> bool:
+    """Return `True` when an HTTP response represents an interactive Cloudflare/WAF challenge."""
+    if response is None and body is None:
+        return False
+    status_code = getattr(response, "status_code", None) if response is not None else None
+    if isinstance(status_code, bool) or not isinstance(status_code, int):
+        status_code = None
+    headers = getattr(response, "headers", None) if response is not None else None
+
+    cf_mitigated = get_header_ci(headers, "cf-mitigated")
+    if isinstance(cf_mitigated, str) and cf_mitigated.strip().lower() == "challenge":
+        return True
+
+    if status_code is not None and status_code not in (200, 403, 429, 503):
+        return False
+
+    server_hdr = get_header_ci(headers, "server")
+    has_cf_header = (
+        (isinstance(server_hdr, str) and "cloudflare" in server_hdr.lower())
+        or isinstance(get_header_ci(headers, "cf-ray"), str)
+    )
+
+    sample_text = ""
+    if isinstance(body, (bytes, bytearray)):
+        sample_text = bytes(body[:16384]).decode("utf-8", errors="ignore").lower()
+    elif isinstance(body, str):
+        sample_text = body[:16384].lower()
+    elif response is not None:
+        raw_content = getattr(response, "content", None)
+        if isinstance(raw_content, (bytes, bytearray)) and raw_content:
+            sample_text = bytes(raw_content[:16384]).decode("utf-8", errors="ignore").lower()
+        else:
+            raw_text = getattr(response, "text", None)
+            if isinstance(raw_text, str):
+                sample_text = raw_text[:16384].lower()
+
+    if not sample_text:
+        return False
+    if "<title>attention required! | cloudflare</title>" in sample_text:
+        return True
+    if has_cf_header and any(marker in sample_text for marker in _CLOUDFLARE_CHALLENGE_MARKERS):
+        return True
+    return False
+
+
 def parse_retry_after(
     value: Any | None,
     *,
     max_delay: float = MAX_RETRY_DELAY,
 ) -> float | None:
     """Parse an HTTP `Retry-After` header (delta seconds or HTTP-date) clamped to `max_delay`."""
-    if value is None:
+    if value is None or not isinstance(value, (str, int, float)) or isinstance(value, bool):
         return None
     text = str(value).strip()
     if not text:
@@ -143,19 +350,61 @@ def parse_retry_after(
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         seconds = (dt - datetime.now(timezone.utc)).total_seconds()
+    if not math.isfinite(seconds):
+        return None
     return max(0.0, min(max_delay, seconds))
+
+
+def parse_retry_after_headers(
+    headers: Any | None,
+    *,
+    max_delay: float = MAX_RETRY_DELAY,
+) -> float | None:
+    """Extract bounded retry delay from `Retry-After`, `X-Retry-After`, `Retry-After-Ms`, or `*RateLimit-Reset`."""
+    if headers is None:
+        return None
+    for hdr_name in ("Retry-After", "X-Retry-After"):
+        delay = parse_retry_after(get_header_ci(headers, hdr_name), max_delay=max_delay)
+        if delay is not None:
+            return delay
+
+    raw_ms = get_header_ci(headers, "Retry-After-Ms")
+    if isinstance(raw_ms, (str, int, float)) and not isinstance(raw_ms, bool):
+        try:
+            ms_val = float(str(raw_ms).strip())
+            if math.isfinite(ms_val):
+                return max(0.0, min(max_delay, ms_val / 1000.0))
+        except ValueError:
+            pass
+
+    for reset_name in ("RateLimit-Reset", "X-RateLimit-Reset", "X-Rate-Limit-Reset"):
+        raw_reset = get_header_ci(headers, reset_name)
+        if isinstance(raw_reset, (str, int, float)) and not isinstance(raw_reset, bool):
+            try:
+                reset_val = float(str(raw_reset).strip())
+            except ValueError:
+                continue
+            if not math.isfinite(reset_val):
+                continue
+            seconds = (reset_val - time.time()) if reset_val > 1_000_000_000 else reset_val
+            return max(0.0, min(max_delay, seconds))
+
+    return None
 
 
 def compute_retry_delay(
     attempt: int,
     retry_after: Any | None = None,
     *,
+    headers: Any | None = None,
     base_delay: float = DEFAULT_RETRY_BACKOFF_BASE,
     max_delay: float = MAX_RETRY_DELAY,
     jitter_max: float = 0.5,
 ) -> float:
-    """Compute bounded exponential backoff (with jitter) or honor `Retry-After`."""
+    """Compute bounded exponential backoff (with jitter) or honor CDN retry/rate-limit headers."""
     header_delay = parse_retry_after(retry_after, max_delay=max_delay)
+    if header_delay is None and headers is not None:
+        header_delay = parse_retry_after_headers(headers, max_delay=max_delay)
     if header_delay is not None:
         return header_delay
     jitter = random.uniform(0.0, jitter_max) if jitter_max > 0 else 0.0
@@ -310,12 +559,20 @@ def redirect_of(
             allow_redirects=False,
             timeout=DEFAULT_HTTP_TIMEOUT,
         )
-        if response.status_code not in (301, 302, 303, 307, 308):
-            return url if (stop_non_redirect and hops > 0) else None
-        location = response.headers.get("location") or response.headers.get("Location")
-        if not location:
-            return url if (stop_non_redirect and hops > 0) else None
-        next_url = urljoin(url, location)
+        try:
+            if response.status_code not in (301, 302, 303, 307, 308):
+                return url if (stop_non_redirect and hops > 0) else None
+            location = get_header_ci(response.headers, "location")
+            if not isinstance(location, str) or not location:
+                return url if (stop_non_redirect and hops > 0) else None
+            next_url = urljoin(url, location)
+        finally:
+            close_fn = getattr(response, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
         hops += 1
         if next_url == url:
             return next_url

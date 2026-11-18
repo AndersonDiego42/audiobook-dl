@@ -5,13 +5,23 @@ from audiobookdl.utils.audiobook import (
     CENCDecryption,
     SampleAESEncryption,
     parse_decryption_key_spec,
+    reconcile_cenc_decryption,
 )
 from audiobookdl.utils.concurrency import run_cancellable_pool
+from audiobookdl.utils.pssh import (
+    PsshBox,
+    PsshParseError,
+    extract_cenc_kids_safe,
+    parse_hls_key_data,
+    parse_pssh_boxes,
+)
 from audiobookdl.utils.http import (
     DEFAULT_HTTP_TIMEOUT,
     DEFAULT_MAX_RETRIES,
+    RETRIABLE_CDN_STATUS_CODES,
     compute_retry_delay,
     extract_session_cookies,
+    is_cloudflare_challenge,
     is_transient_network_error,
     resolve_max_retries,
     sleep_or_cancel,
@@ -23,12 +33,13 @@ import json
 import os
 import threading
 import time
+from typing import Any
 from urllib.parse import unquote_to_bytes, urlparse
 import m3u8
 import requests
 
 
-RETRIABLE_STATUS_CODES = frozenset({429, 502, 503, 504})
+RETRIABLE_STATUS_CODES = RETRIABLE_CDN_STATUS_CODES
 
 
 def request(
@@ -84,10 +95,21 @@ def request(
             sleep_or_cancel(delay, _cancel_event(), sleep_fn=time.sleep)
             continue
 
+        if is_cloudflare_challenge(resp):
+            try:
+                resp.close()
+            except Exception:
+                pass
+            raise exceptions.CloudflareBlocked(
+                detail=(
+                    f"HTTP {resp.status_code} Cloudflare challenge from {_safe_url_label(url)}. "
+                    "Try --impersonate chrome or fresh browser cookies."
+                )
+            )
+
         if resp.status_code in RETRIABLE_STATUS_CODES and attempt < effective_retries:
             raw_headers = getattr(resp, "headers", None)
-            retry_after = raw_headers.get("Retry-After") if raw_headers else None
-            delay = compute_retry_delay(attempt, retry_after)
+            delay = compute_retry_delay(attempt, headers=raw_headers)
             logging.debug(
                 f"HTTP {resp.status_code} for {upper_method} {url}; retrying in {delay:.2f}s"
             )
@@ -115,6 +137,13 @@ def _safe_url_label(url: str) -> str:
 
 
 def _raise_for_failed_response(url: str, resp: requests.Response) -> None:
+    if is_cloudflare_challenge(resp):
+        raise exceptions.CloudflareBlocked(
+            detail=(
+                f"HTTP {resp.status_code} Cloudflare challenge from {_safe_url_label(url)}. "
+                "Try --impersonate chrome or fresh browser cookies."
+            )
+        )
     logging.debug(f"Failed to download data from: {url}\nResponse:\n{resp.content!r}")
     detail = f"HTTP {resp.status_code} from {_safe_url_label(url)}"
     if resp.status_code in (401, 403):
@@ -274,10 +303,89 @@ def _parse_hls_iv(raw_iv: str | None, sequence_num: int, *, byte_length: int = 1
     return raw_bytes
 
 
+def _extract_hls_key_attribute_kid(key_obj) -> tuple[bytes, ...]:
+    raw_kid = getattr(key_obj, "keyid", None)
+    if not raw_kid:
+        extra = getattr(key_obj, "_extra_params", None)
+        if isinstance(extra, dict):
+            raw_kid = extra.get("keyid")
+    if not isinstance(raw_kid, str):
+        return ()
+    cleaned = raw_kid.strip().lower().removeprefix("0x").replace("-", "")
+    if len(cleaned) != 32:
+        return ()
+    try:
+        return (bytes.fromhex(cleaned),)
+    except ValueError:
+        return ()
+
+
+def _extract_hls_key_pssh_boxes(
+    key_obj,
+    fmt_lower: str,
+    init_bytes: bytes | None = None,
+) -> list[PsshBox]:
+    boxes: list[PsshBox] = []
+    key_uri = str(getattr(key_obj, "absolute_uri", None) or getattr(key_obj, "uri", None) or "").strip()
+    if key_uri.lower().startswith("data:"):
+        try:
+            boxes.extend(parse_hls_key_data(key_uri, key_format=fmt_lower))
+        except PsshParseError:
+            pass
+    if init_bytes:
+        try:
+            boxes.extend(parse_pssh_boxes(init_bytes))
+        except PsshParseError:
+            pass
+    return boxes
+
+
+def _extract_hls_cenc_kids(
+    key_obj,
+    fmt_lower: str,
+    init_bytes: bytes | None = None,
+) -> tuple[bytes, ...]:
+    boxes = _extract_hls_key_pssh_boxes(key_obj, fmt_lower, init_bytes)
+    kids: list[bytes] = []
+    for box in boxes:
+        kids.extend(box.key_ids)
+    kids.extend(_extract_hls_key_attribute_kid(key_obj))
+    if init_bytes:
+        kids.extend(extract_cenc_kids_safe(init_bytes))
+    return tuple(dict.fromkeys(kids))
+
+
+def _format_hls_drm_error(
+    key_obj,
+    key_format: str,
+    init_bytes: bytes | None = None,
+) -> str:
+    fmt_lower = key_format.lower()
+    boxes = _extract_hls_key_pssh_boxes(key_obj, fmt_lower, init_bytes)
+    kids = _extract_hls_cenc_kids(key_obj, fmt_lower, init_bytes)
+    if boxes:
+        systems = ", ".join(dict.fromkeys(box.system_name for box in boxes))
+        if kids:
+            kids_hex = ", ".join(kid.hex() for kid in kids)
+            return (
+                f"HLS stream is protected by {systems} (KEYFORMAT '{key_format}', KID {kids_hex}); "
+                "supply decryption_key as KID:KEY"
+            )
+        return (
+            f"HLS stream is protected by {systems} (KEYFORMAT '{key_format}'); "
+            "supply decryption_key"
+        )
+    if kids:
+        kids_hex = ", ".join(kid.hex() for kid in kids)
+        return f"Unsupported or DRM-protected HLS KEYFORMAT '{key_format}' (KID {kids_hex})"
+    return f"Unsupported or DRM-protected HLS KEYFORMAT '{key_format}'"
+
+
 def _validate_hls_key(
     key_obj,
     *,
     has_user_key: bool,
+    init_bytes: bytes | None = None,
 ) -> tuple[str, str]:
     key_method = str(getattr(key_obj, "method", "") or "").strip().upper()
     if key_method not in _SUPPORTED_HLS_KEY_METHODS:
@@ -290,9 +398,46 @@ def _validate_hls_key(
         if key_method in ("SAMPLE-AES", "SAMPLE-AES-CTR", "SAMPLE-AES-CENC") and has_user_key:
             return key_method, fmt_lower
         raise exceptions.GenericAudiobookDLException(
-            f"Unsupported or DRM-protected HLS KEYFORMAT '{key_format}'"
+            _format_hls_drm_error(key_obj, key_format, init_bytes=init_bytes)
         )
     return key_method, fmt_lower
+
+
+def _load_m3u8_playlist(
+    source_obj: Any,
+    target_url: str,
+    headers: dict[str, str],
+) -> m3u8.M3U8:
+    """Fetch an HLS playlist via `source_obj`, honoring post-redirect URLs and rejecting CDN error pages."""
+    if "get" in getattr(source_obj, "__dict__", {}) or getattr(type(source_obj), "get", None) is not get:
+        raw_bytes = source_obj.get(target_url, headers=headers)
+        resolved_url = target_url
+        resp_obj: Any = None
+    else:
+        resp_obj = source_obj.request("GET", target_url, headers=headers)
+        if resp_obj.status_code != 200:
+            _raise_for_failed_response(target_url, resp_obj)
+        raw_bytes = resp_obj.content
+        candidate_url = getattr(resp_obj, "url", None)
+        resolved_url = (
+            candidate_url
+            if isinstance(candidate_url, str) and candidate_url.startswith(("http://", "https://"))
+            else target_url
+        )
+    content = _decode_playlist_text(raw_bytes)
+    stripped = content.lstrip()
+    if stripped and not stripped.startswith("#EXT") and stripped.startswith(("<", "{")):
+        if is_cloudflare_challenge(resp_obj, body=content):
+            raise exceptions.CloudflareBlocked(
+                detail=(
+                    f"Cloudflare challenge returned instead of HLS playlist from {_safe_url_label(resolved_url)}. "
+                    "Try --impersonate chrome or fresh browser cookies."
+                )
+            )
+        raise exceptions.RequestError(
+            detail=f"Unexpected non-M3U8 playlist response from {_safe_url_label(resolved_url)}"
+        )
+    return m3u8.loads(content, uri=resolved_url)
 
 
 def get_stream_files(
@@ -314,8 +459,7 @@ def get_stream_files(
     has_user_key = user_default_key is not None or bool(user_key_map)
 
     preferred_locale = getattr(getattr(self, "_options", None), "locale", None)
-    content = _decode_playlist_text(self.get(url, headers=base_headers))
-    playlist = m3u8.loads(content, uri=url)
+    playlist = _load_m3u8_playlist(self, url, base_headers)
 
     # Resolve master/variant playlists to the preferred audio or highest-bandwidth video stream.
     seen_urls = {url}
@@ -328,8 +472,7 @@ def get_stream_files(
         if not next_url or next_url in seen_urls:
             break
         seen_urls.add(next_url)
-        content = _decode_playlist_text(self.get(next_url, headers=base_headers))
-        playlist = m3u8.loads(content, uri=next_url)
+        playlist = _load_m3u8_playlist(self, next_url, base_headers)
 
     media_sequence = playlist.media_sequence or 0
     files = []
@@ -387,7 +530,12 @@ def get_stream_files(
                     resp = self.request("GET", init_uri, headers=init_headers)
                     if resp.status_code not in (200, 206):
                         _raise_for_failed_response(init_uri, resp)
-                    init_cache[cache_key] = resp.content
+                    init_payload = resp.content
+                    expected_len = (init_end - init_start) + 1
+                    if resp.status_code == 200 and len(init_payload) > expected_len:
+                        # CDN ignored Range on #EXT-X-MAP and returned the full asset; slice the requested init range.
+                        init_payload = init_payload[init_start : init_end + 1]
+                    init_cache[cache_key] = init_payload
                 else:
                     init_cache[cache_key] = self.get(init_uri, headers=init_headers)
             init_bytes = init_cache[cache_key]
@@ -401,12 +549,20 @@ def get_stream_files(
             size=seg_size,
         )
         if seg.key is not None and getattr(seg.key, "method", None) not in (None, "NONE"):
-            key_method, fmt_lower = _validate_hls_key(seg.key, has_user_key=has_user_key)
+            key_method, fmt_lower = _validate_hls_key(
+                seg.key,
+                has_user_key=has_user_key,
+                init_bytes=init_bytes,
+            )
+            is_fmp4 = init_bytes is not None or seg_ext.lstrip(".").lower() in _FMP4_EXTENSIONS
             expected_key_len = 32 if key_method in ("AES-256", "AES-256-GCM") else 16
             resolved_key: bytes | None = None
             if user_default_key is not None and len(user_default_key) == expected_key_len:
                 resolved_key = user_default_key
-            elif key_method in ("SAMPLE-AES-CTR", "SAMPLE-AES-CENC") and user_key_map:
+            elif (
+                (key_method in ("SAMPLE-AES-CTR", "SAMPLE-AES-CENC") or (key_method == "SAMPLE-AES" and is_fmp4))
+                and user_key_map
+            ):
                 resolved_key = None
             elif fmt_lower in ("identity", _W3C_CLEARKEY_FORMAT) and getattr(seg.key, "absolute_uri", None):
                 key_uri = str(seg.key.absolute_uri)
@@ -442,22 +598,31 @@ def get_stream_files(
                 nonce_bytes = _parse_hls_iv(seg.key.iv, media_sequence + idx, byte_length=12)
                 current.encryption_method = AESGCMEncryption(key=resolved_key, nonce=nonce_bytes)
             elif key_method == "SAMPLE-AES":
-                is_fmp4 = init_bytes is not None or seg_ext.lstrip(".").lower() in _FMP4_EXTENSIONS
                 if is_fmp4:
-                    current.encryption_method = CENCDecryption(
+                    cenc_method = CENCDecryption(
                         key=resolved_key,
                         key_map=dict(user_key_map),
                     )
+                    reconcile_cenc_decryption(
+                        cenc_method,
+                        _extract_hls_cenc_kids(seg.key, fmt_lower, init_bytes),
+                    )
+                    current.encryption_method = cenc_method
                 else:
                     assert resolved_key is not None
                     iv_bytes = _parse_hls_iv(seg.key.iv, media_sequence + idx, byte_length=16)
                     current.encryption_method = SampleAESEncryption(key=resolved_key, iv=iv_bytes)
             else:
                 # SAMPLE-AES-CTR / SAMPLE-AES-CENC
-                current.encryption_method = CENCDecryption(
+                cenc_method = CENCDecryption(
                     key=resolved_key,
                     key_map=dict(user_key_map),
                 )
+                reconcile_cenc_decryption(
+                    cenc_method,
+                    _extract_hls_cenc_kids(seg.key, fmt_lower, init_bytes),
+                )
+                current.encryption_method = cenc_method
         files.append(current)
     return files
 

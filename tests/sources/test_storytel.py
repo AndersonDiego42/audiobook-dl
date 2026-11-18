@@ -918,5 +918,25 @@ def test_storytel_catalog_extracts_cover_urls_and_ebook_formats(tmp_path):
     assert found[0].has_audiobook is True
 
 
+def test_storytel_asset_redirect_accepts_307_and_lowercase_location_and_cf_mitigated(tmp_path):
+    src = _make_source(tmp_path)
+    src._session.get = MagicMock(
+        return_value=_mock_resp(
+            307,
+            headers={"location": "/signed/book.mp3?sig=1"},
+            url="https://api.storytel.net/assets/v2/consumables/123/abook",
+        )
+    )
+    assert src.get_audio_url("123") == "https://api.storytel.net/signed/book.mp3?sig=1"
+
+    cf_resp = _mock_resp(
+        403,
+        headers={"cf-mitigated": "challenge", "server": "cloudflare"},
+        text="<html><title>Just a moment...</title></html>",
+    )
+    with pytest.raises(CloudflareBlocked):
+        src.check_cloudflare_blocked(cf_resp)
+
+
 
 

@@ -1,6 +1,7 @@
 from audiobookdl import logging, Audiobook
 from audiobookdl.options_schema import DownloadOptions
 from audiobookdl.exceptions import (
+    CloudflareBlocked,
     DownloadError,
     DownloadCancelled,
     FailedCombining,
@@ -30,7 +31,11 @@ from audiobookdl.utils.http import (
     DEFAULT_MAX_RETRIES,
     TokenBucketRateLimiter,
     compute_retry_delay,
+    get_header_ci,
+    is_cloudflare_challenge,
+    is_content_type_compatible,
     is_transient_network_error,
+    parse_byte_range_header,
     parse_byte_rate,
     sleep_or_cancel,
 )
@@ -1005,23 +1010,16 @@ class DownloadSizeEstimate:
     per_file_bytes: tuple[int | None, ...]
 
 
-_HEADER_BYTE_RANGE_RE = re.compile(r"^bytes\s*=\s*(\d+)\s*-\s*(\d+)$", re.IGNORECASE)
-
-
 def _known_file_byte_size(file: Any) -> int | None:
     raw_size = getattr(file, "size", None)
     if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size > 0:
         return raw_size
     headers = getattr(file, "headers", None)
     if headers:
-        range_val = _get_header_ci(headers, "Range")
-        if isinstance(range_val, str):
-            match = _HEADER_BYTE_RANGE_RE.fullmatch(range_val.strip())
-            if match:
-                start = int(match.group(1))
-                end = int(match.group(2))
-                if end >= start:
-                    return (end - start) + 1
+        parsed_range = parse_byte_range_header(get_header_ci(headers, "Range"))
+        if parsed_range is not None:
+            start, end = parsed_range
+            return (end - start) + 1
     return None
 
 
@@ -1050,16 +1048,37 @@ def _probe_remote_file_size(
             timeout=timeout,
         )
         status = int(getattr(resp, "status_code", 0) or 0)
+        if status in (405, 501) and not any(str(k).lower() == "range" for k in req_headers):
+            get_fn = getattr(audiobook.session, "get", None)
+            if callable(get_fn):
+                close_fn = getattr(resp, "close", None)
+                if callable(close_fn):
+                    try:
+                        close_fn()
+                    except Exception:
+                        pass
+                range_headers = dict(req_headers)
+                range_headers["Range"] = "bytes=0-0"
+                resp = get_fn(
+                    file.url,
+                    headers=range_headers,
+                    allow_redirects=True,
+                    stream=True,
+                    timeout=timeout,
+                )
+                status = int(getattr(resp, "status_code", 0) or 0)
         if status not in (200, 206):
             return None
         headers = getattr(resp, "headers", None)
         if not headers:
             return None
-        _, _, range_total = _parse_content_range(_get_header_ci(headers, "Content-Range"))
+        _, _, range_total = _parse_content_range(get_header_ci(headers, "Content-Range"))
         if range_total is not None and range_total > 0:
             return range_total
-        content_len = _parse_content_length(headers)
-        return content_len if content_len > 0 else None
+        if status == 200:
+            content_len = _parse_content_length(headers)
+            return content_len if content_len > 0 else None
+        return None
     except Exception:
         return None
     finally:
@@ -1304,35 +1323,20 @@ def create_filepath(audiobook: Audiobook, output_dir: str, index: int) -> tuple[
     return path, path_tmp
 
 
-def _get_header_ci(headers: Any, name: str) -> Any | None:
-    """Return header value case-insensitively for both CaseInsensitiveDict and plain dicts."""
-    value = headers.get(name)
-    if value is not None:
-        return value
-    target = name.lower()
-    for key, val in headers.items():
-        if str(key).lower() == target:
-            return val
-    return None
-
-
-def _normalize_content_type(value: Any) -> str | None:
-    """Return the normalized lowercase MIME type (`type/subtype`), stripping parameters."""
-    if not isinstance(value, str):
-        return None
-    media_type = value.split(";", 1)[0].strip().lower()
-    return media_type or None
-
-
 def _parse_content_length(headers: Any) -> int:
-    """Parse Content-Length header safely, returning 0 when missing or invalid."""
-    raw_length = _get_header_ci(headers, "Content-Length")
-    if isinstance(raw_length, int):
+    """Parse Content-Length header safely, tolerating identical proxy duplicates."""
+    raw_length = get_header_ci(headers, "Content-Length")
+    if isinstance(raw_length, int) and not isinstance(raw_length, bool):
         return raw_length if raw_length > 0 else 0
     if isinstance(raw_length, str):
-        stripped = raw_length.strip()
-        if stripped.isdigit():
-            return int(stripped)
+        parts = [part.strip() for part in raw_length.split(",") if part.strip()]
+        if not parts:
+            return 0
+        if all(part.isdigit() for part in parts):
+            unique_vals = {int(part) for part in parts}
+            if len(unique_vals) == 1:
+                val = next(iter(unique_vals))
+                return val if val > 0 else 0
     return 0
 
 
@@ -1456,7 +1460,7 @@ def download_file(
             )
             if sent_range and request.status_code == 416:
                 _, _, total_from_range = _parse_content_range(
-                    _get_header_ci(request.headers, "Content-Range")
+                    get_header_ci(request.headers, "Content-Range")
                 )
                 if (
                     total_from_range is not None
@@ -1476,38 +1480,62 @@ def download_file(
                     reset_stale_tmp = True
                     continue
 
-            content_type: str | None = _get_header_ci(request.headers, "Content-Type")
-            actual_ct = _normalize_content_type(content_type)
-
-            expected = file.expected_content_type
-            if isinstance(expected, (list, tuple, set, frozenset)):
-                normalized_expected = {
-                    norm for item in expected if (norm := _normalize_content_type(item)) is not None
-                }
-                invalid_content_type = bool(normalized_expected) and actual_ct not in normalized_expected
-            else:
-                expected_ct = _normalize_content_type(expected)
-                invalid_content_type = bool(expected_ct) and expected_ct != actual_ct
+            content_type: str | None = get_header_ci(request.headers, "Content-Type")
+            ct_ok, _ = is_content_type_compatible(
+                content_type,
+                file.expected_content_type,
+                file_ext=file.ext,
+            )
+            invalid_content_type = not ct_ok
             if (sent_range or has_custom_range) and file.expected_status_code == 200:
                 invalid_status_code = request.status_code not in (200, 206)
             else:
                 invalid_status_code = bool(
                     file.expected_status_code and file.expected_status_code != request.status_code
                 )
-            retryable_status = (
-                invalid_status_code
-                and (
-                    request.status_code == 429
-                    or 500 <= request.status_code < 600
-                    or (file.url_resolver is not None and request.status_code in (403, 410))
+
+            if invalid_status_code or invalid_content_type:
+                # Fail fast on interactive Cloudflare/WAF challenges instead of burning retry budget.
+                cf_mitigated = get_header_ci(request.headers, "cf-mitigated")
+                server_hdr = get_header_ci(request.headers, "server")
+                has_cf_marker = (
+                    (isinstance(cf_mitigated, str) and cf_mitigated.strip().lower() == "challenge")
+                    or (isinstance(server_hdr, str) and "cloudflare" in server_hdr.lower())
+                    or isinstance(get_header_ci(request.headers, "cf-ray"), str)
                 )
-                and request.status_code != file.expected_status_code
+                if has_cf_marker and is_cloudflare_challenge(
+                    request,
+                    body=(
+                        request.content[:4096]
+                        if isinstance(getattr(request, "content", None), (bytes, bytearray))
+                        else None
+                    ),
+                ):
+                    raise CloudflareBlocked(
+                        detail=(
+                            f"HTTP {request.status_code} Cloudflare challenge from {file.url}. "
+                            "Try --impersonate chrome or fresh browser cookies."
+                        )
+                    )
+
+            retryable_status = (
+                (
+                    invalid_status_code
+                    and (
+                        request.status_code in (408, 425, 429)
+                        or 500 <= request.status_code < 600
+                        or (file.url_resolver is not None and request.status_code in (401, 403, 410))
+                    )
+                    and request.status_code != file.expected_status_code
+                )
+                or (
+                    invalid_content_type
+                    and not invalid_status_code
+                    and file.url_resolver is not None
+                )
             )
             if retryable_status and attempt + 1 < max_attempts:
-                delay = compute_retry_delay(
-                    attempt,
-                    _get_header_ci(request.headers, "Retry-After"),
-                )
+                delay = compute_retry_delay(attempt, headers=request.headers)
                 logging.log(
                     f"[yellow]Retrying[/yellow] {os.path.basename(filepath)} "
                     f"(HTTP {request.status_code}, attempt {attempt + 2}/{max_attempts}, waiting {delay:.1f}s)"
@@ -1521,7 +1549,16 @@ def download_file(
                 continue
             if invalid_content_type or invalid_status_code:
                 # Failed-download bodies can be raw audio bytes: truncate + escape before logging
-                raw_body = request.content[:512]
+                raw_content = getattr(request, "content", b"")
+                raw_slice = bytes(raw_content[:4096]) if isinstance(raw_content, (bytes, bytearray)) else b""
+                if is_cloudflare_challenge(request, body=raw_slice):
+                    raise CloudflareBlocked(
+                        detail=(
+                            f"HTTP {request.status_code} Cloudflare challenge from {file.url}. "
+                            "Try --impersonate chrome or fresh browser cookies."
+                        )
+                    )
+                raw_body = raw_slice[:512]
                 try:
                     body_text = raw_body.decode("utf-8")
                 except UnicodeDecodeError:
@@ -1538,9 +1575,29 @@ def download_file(
 
             open_mode = "wb"
             total_filesize = _parse_content_length(request.headers)
+            custom_range_bounds = (
+                parse_byte_range_header(get_header_ci(request_headers, "Range"))
+                if has_custom_range
+                else None
+            )
+            slicing_200_range = False
+            slice_start = 0
+            slice_end_excl = 0
+            if (
+                custom_range_bounds is not None
+                and request.status_code == 200
+                and _parse_content_range(get_header_ci(request.headers, "Content-Range"))
+                == (None, None, None)
+            ):
+                # CDN ignored Range on a custom byte-range request (e.g. HLS BYTERANGE); slice the stream.
+                slice_start, range_end = custom_range_bounds
+                slice_end_excl = range_end + 1
+                slicing_200_range = True
+                total_filesize = slice_end_excl - slice_start
+
             if sent_range and request.status_code == 206:
                 range_start, _, range_total = _parse_content_range(
-                    _get_header_ci(request.headers, "Content-Range")
+                    get_header_ci(request.headers, "Content-Range")
                 )
                 if range_start is not None and range_start != existing_bytes:
                     if range_start == 0:
@@ -1580,7 +1637,8 @@ def download_file(
             # Stream decryption inline into an isolated temp path when reading
             # from byte 0 so `filepath_tmp` only ever contains raw un-decrypted bytes.
             stream_decryptor: StreamDecryptor | None = None
-            accept_ranges = (_get_header_ci(request.headers, "Accept-Ranges") or "").strip().lower()
+            raw_accept_ranges = get_header_ci(request.headers, "Accept-Ranges")
+            accept_ranges = raw_accept_ranges.strip().lower() if isinstance(raw_accept_ranges, str) else ""
             can_inline_decrypt = (
                 not resume
                 or len(audiobook.files) > 1
@@ -1616,6 +1674,7 @@ def download_file(
                 last_flush = time.monotonic()
 
             try:
+                stream_offset = 0
                 with open(write_target, open_mode) as f:
                     if (
                         file.init_section
@@ -1628,6 +1687,18 @@ def download_file(
                         if not chunk:
                             continue
                         chunk_len = len(chunk)
+                        if slicing_200_range:
+                            chunk_start = stream_offset
+                            stream_offset += chunk_len
+                            take_start = max(0, slice_start - chunk_start)
+                            take_end = min(chunk_len, slice_end_excl - chunk_start)
+                            if take_end <= take_start:
+                                if stream_offset >= slice_end_excl:
+                                    break
+                                continue
+                            if take_start > 0 or take_end < chunk_len:
+                                chunk = chunk[take_start:take_end]
+                                chunk_len = len(chunk)
                         if rate_limiter is not None:
                             rate_limiter.acquire(chunk_len, cancel_event=cancel_event)
                         if stream_decryptor is not None:
@@ -1644,6 +1715,8 @@ def download_file(
                             or (time.monotonic() - last_flush) >= PROGRESS_FLUSH_INTERVAL
                         ):
                             _flush_progress()
+                        if slicing_200_range and stream_offset >= slice_end_excl:
+                            break
                     if stream_decryptor is not None:
                         tail = stream_decryptor.finalize()
                         if tail:
@@ -1651,12 +1724,21 @@ def download_file(
             finally:
                 _flush_progress()
             final_size = (existing_bytes + bytes_written) if open_mode == "ab" else bytes_written
-            content_encoding = _get_header_ci(request.headers, "Content-Encoding")
+            content_encoding = get_header_ci(request.headers, "Content-Encoding")
             is_identity = not (
                 isinstance(content_encoding, str)
                 and content_encoding.strip()
                 and content_encoding.strip().lower() != "identity"
             )
+            if (
+                request.status_code == 200
+                and open_mode == "wb"
+                and bytes_written == 0
+                and not file.init_section
+            ):
+                raise requests.exceptions.ChunkedEncodingError(
+                    f"Empty 200 OK response from {file.url}"
+                )
             if is_identity and total_filesize > 0 and final_size < total_filesize:
                 raise requests.exceptions.ChunkedEncodingError(
                     f"Incomplete download for {file.url}: "

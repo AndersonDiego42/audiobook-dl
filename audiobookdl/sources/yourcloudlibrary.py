@@ -2,6 +2,7 @@ from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, logging
 from audiobookdl.exceptions import GenericAudiobookDLException, RequestError, UserNotAuthorized
 from audiobookdl.utils.audiobook import parse_language, parse_release_date
+from audiobookdl.utils.http import get_header_ci
 
 import json
 import lxml.html
@@ -193,7 +194,8 @@ class YourCloudLibrarySource(Source):
         except (RequestError, UserNotAuthorized):
             return False
         if resp.status_code in (301, 302, 303, 307, 308):
-            location = (resp.headers.get("location") or resp.headers.get("Location") or "").lower()
+            raw_loc = get_header_ci(resp.headers, "location")
+            location = raw_loc.lower() if isinstance(raw_loc, str) else ""
             return not any(tok in location for tok in ("login", "signin", "sign-in"))
         if resp.status_code in (401, 403) or resp.status_code != 200:
             return False

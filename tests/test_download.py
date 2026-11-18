@@ -2455,6 +2455,154 @@ def test_download_audiobook_forwards_bitrate_and_sample_rate_on_original_format(
     assert kwargs["sample_rate"] == 22050
 
 
+def test_download_file_cdn_content_type_compatibility_and_soft_errors(tmp_path):
+    from audiobookdl.exceptions import CloudflareBlocked
+
+    # 1. MIME aliases, generic binary types, and omitted Content-Type succeed on media files
+    for idx, (resp_headers, expected_ct, ext) in enumerate(
+        [
+            ({"Content-Type": "audio/mp3", "Content-Length": "4"}, "audio/mpeg", "mp3"),
+            ({"Content-Type": "binary/octet-stream", "Content-Length": "4"}, "audio/mpeg", "mp3"),
+            ({"Content-Length": "4"}, "audio/mpeg", "mp3"),
+            ({"Content-Type": "video/mp2t", "Content-Length": "4"}, "application/octet-stream", "ts"),
+            ({"Content-Type": "audio/x-m4a", "Content-Length": "4"}, "audio/mp4", "m4a"),
+        ]
+    ):
+        session_ok = MagicMock()
+        session_ok.get.return_value = _mock_response(resp_headers, [b"data"])
+        book = Audiobook(
+            session=session_ok,
+            metadata=AudiobookMetadata(title=f"Compat {idx}"),
+            files=[
+                AudiobookFile(
+                    url=f"https://cdn.example.com/{idx}.{ext}",
+                    ext=ext,
+                    expected_content_type=expected_ct,
+                )
+            ],
+        )
+        out = download_file((book, str(tmp_path / f"compat_{idx}"), 0, lambda _: None, None))
+        assert Path(out).read_bytes() == b"data"
+
+    # 2. HTTP 200 soft-error HTML/XML pages are rejected even for ebooks (which skip ffprobe)
+    session_epub = MagicMock()
+    epub_err_resp = _mock_response(
+        {"Content-Type": "application/xml; charset=utf-8", "Content-Length": "38"},
+        [b"<Error><Code>AccessDenied</Code></Error>"],
+    )
+    epub_err_resp.content = b"<Error><Code>AccessDenied</Code></Error>"
+    session_epub.get.return_value = epub_err_resp
+    epub_book = Audiobook(
+        session=session_epub,
+        metadata=AudiobookMetadata(title="Soft Error Ebook"),
+        files=[AudiobookFile(url="https://cdn.example.com/book.epub", ext="epub")],
+    )
+    with pytest.raises(DownloadError):
+        download_file((epub_book, str(tmp_path / "soft_epub"), 0, lambda _: None, None))
+    assert not (tmp_path / "soft_epub.epub").exists()
+
+    # 3. Cloudflare challenge fails fast with CloudflareBlocked instead of retrying
+    session_cf = MagicMock()
+    cf_resp = _mock_response(
+        {"cf-mitigated": "challenge", "server": "cloudflare", "Content-Type": "text/html"},
+        [b"<html><title>Just a moment...</title></html>"],
+        status_code=429,
+    )
+    cf_resp.content = b"<html><title>Just a moment...</title></html>"
+    session_cf.get.return_value = cf_resp
+    cf_book = _make_audiobook(session_cf)
+    with pytest.raises(CloudflareBlocked):
+        download_file((cf_book, str(tmp_path / "cf"), 0, lambda _: None, None), max_retries=3)
+    assert session_cf.get.call_count == 1
+
+
+def test_download_file_slices_200_when_cdn_ignores_custom_range_and_handles_duplicate_cl(tmp_path, monkeypatch):
+    monkeypatch.setattr("audiobookdl.output.download.time.sleep", lambda _: None)
+
+    # 1. Custom byte-range request where CDN ignores Range and returns 200 OK full payload
+    full_payload = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    session_slice = MagicMock()
+    resp_full = _mock_response(
+        {"Content-Length": f"{len(full_payload)}, {len(full_payload)}"},
+        [full_payload[:8], full_payload[8:20], full_payload[20:]],
+        status_code=200,
+    )
+    session_slice.get.return_value = resp_full
+    progress: list[float] = []
+    book_slice = Audiobook(
+        session=session_slice,
+        metadata=AudiobookMetadata(title="Range Slice"),
+        files=[
+            AudiobookFile(
+                url="https://cdn.example.com/big.m4a",
+                ext="m4a",
+                headers={"Range": "bytes=10-19"},
+            )
+        ],
+    )
+    out_slice = download_file((book_slice, str(tmp_path / "slice"), 0, progress.append, None))
+    assert Path(out_slice).read_bytes() == b"ABCDEFGHIJ"
+    assert sum(progress) == pytest.approx(1.0)
+
+    # 2. Empty 200 OK response retries and recovers when CDN delivers non-empty body
+    session_empty = MagicMock()
+    session_empty.get.side_effect = [
+        _mock_response({"Content-Type": "audio/mpeg"}, []),
+        _mock_response({"Content-Length": "4", "Content-Type": "audio/mpeg"}, [b"mp3!"]),
+    ]
+    out_empty = download_file((_make_audiobook(session_empty), str(tmp_path / "empty_retry"), 0, lambda _: None, None))
+    assert Path(out_empty).read_bytes() == b"mp3!"
+    assert session_empty.get.call_count == 2
+
+
+def test_download_file_retries_408_rate_limit_reset_and_401_url_resolver(tmp_path, monkeypatch):
+    delays: list[float] = []
+    monkeypatch.setattr("audiobookdl.output.download.time.sleep", delays.append)
+
+    urls = iter(["https://cdn.example.com/v1.mp3", "https://cdn.example.com/v2.mp3", "https://cdn.example.com/v3.mp3"])
+    session = MagicMock()
+    session.get.side_effect = [
+        _mock_response(status_code=408, headers={"X-RateLimit-Reset": "2"}, chunks=[]),
+        _mock_response(status_code=401, headers={}, chunks=[]),
+        _mock_response(status_code=200, headers={"Content-Length": "4"}, chunks=[b"good"]),
+    ]
+    book = Audiobook(
+        session=session,
+        metadata=AudiobookMetadata(title="CDN Retries"),
+        files=[
+            AudiobookFile(
+                url="https://cdn.example.com/init.mp3",
+                ext="mp3",
+                url_resolver=lambda: next(urls),
+            )
+        ],
+    )
+    out = download_file((book, str(tmp_path / "cdn_retry"), 0, lambda _: None, None))
+    assert Path(out).read_bytes() == b"good"
+    assert delays[0] == pytest.approx(2.0)
+
+
+def test_estimate_download_size_falls_back_to_range_get_when_head_rejected():
+    from audiobookdl.output.download import estimate_download_size
+
+    session = MagicMock()
+    head_resp = MagicMock(status_code=405, headers={})
+    get_resp = MagicMock(status_code=206, headers={"Content-Range": "bytes 0-0/123456"})
+    session.head.return_value = head_resp
+    session.get.return_value = get_resp
+    book = Audiobook(
+        session=session,
+        metadata=AudiobookMetadata(title="No HEAD CDN"),
+        files=[AudiobookFile(url="https://cdn.example.com/signed.mp3", ext="mp3")],
+    )
+    est = estimate_download_size(book, probe_remote=True)
+    assert est.estimated_bytes == 123456
+    assert est.is_exact is True
+    session.get.assert_called_once()
+    head_resp.close.assert_called_once()
+    get_resp.close.assert_called_once()
+
+
 
 
 

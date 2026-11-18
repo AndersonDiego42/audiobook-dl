@@ -670,6 +670,103 @@ def test_parse_decryption_key_spec_and_schema_and_pipeline():
     assert book.files[1].encryption_method is None
 
 
+def _build_widevine_pssh_box(kid: bytes) -> bytes:
+    import struct
+    from audiobookdl.utils.pssh import WIDEVINE_SYSTEM_ID
+
+    proto = b"\x12\x10" + kid
+    body = struct.pack(">B3s", 0, b"\x00\x00\x00") + WIDEVINE_SYSTEM_ID.bytes + struct.pack(">I", len(proto)) + proto
+    return struct.pack(">I4s", 8 + len(body), b"pssh") + body
+
+
+def test_hls_drm_pssh_error_reports_system_and_kid_and_validates_key_map():
+    import base64
+    from audiobookdl.utils.pssh import WIDEVINE_SYSTEM_ID
+
+    kid = bytes.fromhex("11223344556677889900aabbccddeeff")
+    wrong_kid = bytes.fromhex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    key16 = bytes.fromhex("00112233445566778899aabbccddeeff")
+    pssh_b64 = base64.b64encode(_build_widevine_pssh_box(kid)).decode("ascii")
+
+    playlist = (
+        "#EXTM3U\n"
+        f'#EXT-X-KEY:METHOD=SAMPLE-AES-CTR,URI="data:text/plain;base64,{pssh_b64}",'
+        f'KEYFORMAT="urn:uuid:{WIDEVINE_SYSTEM_ID}"\n'
+        "#EXTINF:5.0,\n"
+        "https://example.com/seg0.m4s\n"
+    )
+
+    class _DummySource(Source):
+        names = ["dummy"]
+        match = [r"https://example\.com/.*"]
+
+    src_no_key = _DummySource(build_default_options(decryption_key=None))
+    src_no_key.get = MagicMock(return_value=playlist.encode("utf-8"))  # type: ignore[method-assign]
+    with pytest.raises(GenericAudiobookDLException) as exc_info:
+        src_no_key.get_stream_files("https://example.com/p.m3u8")
+    msg = str(exc_info.value)
+    assert "Widevine" in msg
+    assert kid.hex() in msg
+
+    # Wrong KID:KEY fails fast before segment downloads
+    src_wrong = _DummySource(build_default_options(decryption_key=f"{wrong_kid.hex()}:{key16.hex()}"))
+    src_wrong.get = MagicMock(return_value=playlist.encode("utf-8"))  # type: ignore[method-assign]
+    with pytest.raises(GenericAudiobookDLException, match=kid.hex()):
+        src_wrong.get_stream_files("https://example.com/p.m3u8")
+
+    # Bare key with single PSSH KID automatically populates kid and key_map
+    src_bare = _DummySource(build_default_options(decryption_key=key16.hex()))
+    src_bare.get = MagicMock(return_value=playlist.encode("utf-8"))  # type: ignore[method-assign]
+    files = src_bare.get_stream_files("https://example.com/p.m3u8")
+    assert isinstance(files[0].encryption_method, CENCDecryption)
+    assert files[0].encryption_method.kid == kid
+    assert files[0].encryption_method.key_map == {kid: key16}
+
+
+def test_pipeline_and_decrypt_file_cenc_pssh_reconciliation(tmp_path):
+    import struct
+
+    kid = bytes.fromhex("11223344556677889900aabbccddeeff")
+    wrong_kid = bytes.fromhex("223344556677889900aabbccddeeff11")
+    key16 = bytes.fromhex("00112233445566778899aabbccddeeff")
+    pssh_box = _build_widevine_pssh_box(kid)
+    moov_box = struct.pack(">I4s", 8 + len(pssh_box), b"moov") + pssh_box
+    init_section = struct.pack(">I4s", 16, b"ftyp") + b"isom\x00\x00\x02\x00" + moov_box
+
+    book_mismatch = Audiobook(
+        session=MagicMock(),
+        metadata=AudiobookMetadata(title="Mismatch"),
+        files=[AudiobookFile(url="https://example.com/seg.m4s", ext="m4s", init_section=init_section)],
+    )
+    with pytest.raises(GenericAudiobookDLException) as exc_info:
+        _apply_user_decryption_key(
+            book_mismatch,
+            build_default_options(decryption_key=f"{wrong_kid.hex()}:{key16.hex()}"),
+        )
+    assert kid.hex() in str(exc_info.value)
+    assert wrong_kid.hex() in str(exc_info.value)
+
+    book_bare = Audiobook(
+        session=MagicMock(),
+        metadata=AudiobookMetadata(title="BareKey"),
+        files=[AudiobookFile(url="https://example.com/seg.m4s", ext="m4s", init_section=init_section)],
+    )
+    _apply_user_decryption_key(book_bare, build_default_options(decryption_key=key16.hex()))
+    assert isinstance(book_bare.files[0].encryption_method, CENCDecryption)
+    assert book_bare.files[0].encryption_method.kid == kid
+    assert book_bare.files[0].encryption_method.key_map == {kid: key16}
+
+    # Direct MP4 file on disk without init_section also fails fast on KID mismatch before spawning ffmpeg
+    mp4_path = tmp_path / "cenc.mp4"
+    mp4_path.write_bytes(init_section + struct.pack(">I4s", 12, b"mdat") + b"\x00\x00\x00\x00")
+    with (
+        patch("audiobookdl.output.encryption.find_executable", return_value="ffmpeg"),
+        patch("audiobookdl.output.encryption.subprocess.run", side_effect=AssertionError("ffmpeg should not run")),
+    ):
+        with pytest.raises(GenericAudiobookDLException, match=kid.hex()):
+            decrypt_file(str(mp4_path), CENCDecryption(key_map={wrong_kid: key16}))
+
+
 @pytest.mark.gui
 def test_gui_options_panel_decryption_key_masking_and_validation(tmp_path):
     import tkinter as tk

@@ -12,7 +12,7 @@ from audiobookdl import (
 )
 from audiobookdl.exceptions import DataNotPresent, GenericAudiobookDLException, NoSourceFound, RequestError, UserNotAuthorized
 from audiobookdl.utils.audiobook import parse_duration_ms
-from audiobookdl.utils.http import DEFAULT_USER_AGENT, extract_session_cookies
+from audiobookdl.utils.http import DEFAULT_USER_AGENT, extract_session_cookies, get_header_ci
 
 import json
 import lxml.html
@@ -57,7 +57,8 @@ class AudiobooksdotcomSource(Source):
         except (RequestError, UserNotAuthorized):
             return False
         if resp.status_code in (301, 302, 303, 307, 308):
-            location = (resp.headers.get("location") or resp.headers.get("Location") or "").lower()
+            raw_loc = get_header_ci(resp.headers, "location")
+            location = raw_loc.lower() if isinstance(raw_loc, str) else ""
             return not any(tok in location for tok in ("login", "signin", "sign-in"))
         if resp.status_code in (401, 403) or resp.status_code != 200:
             return False

@@ -164,6 +164,38 @@ def parse_decryption_key_spec(raw: str) -> tuple[bytes | None, dict[bytes, bytes
     return default_key, key_map
 
 
+def reconcile_cenc_decryption(method: CENCDecryption, known_kids: Sequence[bytes]) -> None:
+    """
+    Validate CENC `key_map` entries against `known_kids` and bind single-KID bare keys.
+
+    Raises `GenericAudiobookDLException` when `method` relies on a KID-keyed map (with no
+    default `key`) that does not match any entry in `known_kids`. When a bare default `key`
+    is present and `known_kids` contains a single KID, binds `method.kid` and
+    `method.key_map[kid] = method.key` for precise FFmpeg `-decryption_keys` matching.
+    """
+    unique_kids = tuple(dict.fromkeys(kid for kid in known_kids if len(kid) == 16))
+    if not unique_kids:
+        return
+    supplied_kids = set(method.key_map.keys())
+    if method.kid is not None:
+        supplied_kids.add(method.kid)
+    if method.key is None and supplied_kids and not any(kid in supplied_kids for kid in unique_kids):
+        from audiobookdl.exceptions import GenericAudiobookDLException
+
+        needed_hex = ", ".join(kid.hex() for kid in unique_kids)
+        supplied_hex = ", ".join(kid.hex() for kid in sorted(supplied_kids))
+        raise GenericAudiobookDLException(
+            f"CENC decryption key mismatch: stream requires KID(s) {needed_hex}, "
+            f"but supplied decryption_key only covers KID(s) {supplied_hex}"
+        )
+    if method.key is not None and len(unique_kids) == 1:
+        only_kid = unique_kids[0]
+        if method.kid is None:
+            method.kid = only_kid
+        if only_kid not in method.key_map:
+            method.key_map[only_kid] = method.key
+
+
 @define
 class AudiobookFile:
     # Url to audio file
@@ -177,7 +209,7 @@ class AudiobookFile:
     # Encryption method
     encryption_method: AudiobookFileEncryption | None = None
     # Expected content-type of the download request
-    expected_content_type: str | None = None
+    expected_content_type: str | Sequence[str] | set[str] | frozenset[str] | None = None
     # Expected status code of the download request
     expected_status_code: int = 200
     # Optional lazy URL resolver invoked when downloading starts

@@ -142,3 +142,13 @@ enabled = true
 - `url` (`str`): Base `http://` or `https://` endpoint implementing the Audiobookshelf metadata provider `/search` contract.
 - `api_key` (`str`): Automatically migrated into the credential store when present in TOML.
 - `enabled` (`bool`): Whether `custom:<name>` is available when enabled in the GUI or `enrich_providers`.
+
+---
+
+## Session-Only CENC / HLS Decryption (`decryption_key`)
+
+`decryption_key` is a session-only runtime option (not persisted to `audiobook-dl.toml`) accepting 32/64-char hex keys or `KID:KEY` pairs for ISO BMFF Common Encryption (`cenc`/`cbcs`) and HLS streams.
+
+- `audiobook-dl` performs **parse-only** inspection of ISO BMFF `pssh` boxes (Widevine, PlayReady, ClearKey, FairPlay), `tenc` default KIDs, and HLS `data:` key URIs; it does **not** perform DRM license acquisition or run a CDM.
+- When an HLS stream uses an unsupported DRM `KEYFORMAT` with PSSH metadata and no `decryption_key` is supplied, the error reports the detected DRM system name and KID(s).
+- When `KID:KEY` pairs are supplied and stream KIDs are known from `pssh`/`tenc` metadata, mismatched keys fail immediately with a message listing the required and supplied KIDs; a bare key on a single-KID stream is automatically bound to that KID for FFmpeg.

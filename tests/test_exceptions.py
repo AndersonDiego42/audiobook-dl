@@ -8,6 +8,7 @@ import pytest
 
 from audiobookdl import exceptions, logging
 from audiobookdl.integrations.audiobookshelf import AudiobookshelfError
+from audiobookdl.utils.pssh import PsshParseError
 
 
 class _RecordingSink:
@@ -67,6 +68,7 @@ _SUBCLASS_CASES: list[tuple[type[exceptions.AudiobookDLException], dict[str, obj
     (exceptions.MissingDependency, {"dependency": "ffmpeg"}),
     (exceptions.NoFilesFound, {}),
     (exceptions.NoSourceFound, {}),
+    (PsshParseError, {"heading": "Invalid PSSH box"}),
     (exceptions.RequestError, {}),
     (exceptions.UserNotAuthorized, {}),
 ]
@@ -128,7 +130,7 @@ def test_audiobook_dl_exception_str_is_non_empty_plain_text(exc_cls, kwargs):
     assert "[red]" not in text
 
     # Subclasses using base `**kwargs` accept `detail=...` cleanly for GUI dialogs.
-    if exc_cls not in (AudiobookshelfError, exceptions.GenericAudiobookDLException):
+    if exc_cls not in (AudiobookshelfError, exceptions.GenericAudiobookDLException, PsshParseError):
         bare = exc_cls(detail="HTTP 401 from https://api.storytel.net/libraries/bookshelf")
         bare_text = str(bare).strip()
         assert bare_text != ""

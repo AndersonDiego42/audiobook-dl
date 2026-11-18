@@ -1406,7 +1406,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
         name="decryption_key",
         default=None,
-        help="Optional session-only clear decryption key (32/64-char hex or KID:KEY pairs) for CENC/HLS overrides",
+        help="Optional session-only clear decryption key (32/64-char hex or KID:KEY pairs) for CENC/HLS overrides; errors list required KIDs when PSSH/tenc metadata is present",
         gui=GuiBinding(
             var_attr="decryption_key_var",
             var_type="str",

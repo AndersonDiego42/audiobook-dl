@@ -84,8 +84,10 @@ from .utils.audiobook import (
     Result,
     Series,
     parse_decryption_key_spec,
+    reconcile_cenc_decryption,
     resolve_audiobook_output_format,
 )
+from .utils.pssh import extract_cenc_kids_safe
 from .utils.enrichment import (
     EnrichmentCandidate,
     EnrichmentResult,
@@ -1502,6 +1504,9 @@ def _apply_user_decryption_key(audiobook: Audiobook, options: DownloadOptions) -
             and file.ext.lstrip(".").lower() in _CENC_CONTAINER_EXTENSIONS
         ):
             file.encryption_method = CENCDecryption(key=default_key, key_map=dict(key_map))
+        if isinstance(file.encryption_method, CENCDecryption) and file.init_section:
+            known_kids = extract_cenc_kids_safe(file.init_section)
+            reconcile_cenc_decryption(file.encryption_method, known_kids)
 
 
 def process_audiobook(

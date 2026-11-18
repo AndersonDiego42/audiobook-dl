@@ -679,6 +679,77 @@ def test_ereolen_refresh_library_domains_is_thread_safe():
         EreolenSource.match = orig_match
 
 
+def test_source_handles_cdn_522_retries_cloudflare_challenge_and_redirected_hls(tmp_path, monkeypatch):
+    from audiobookdl.exceptions import CloudflareBlocked
+
+    monkeypatch.setattr("audiobookdl.sources.source.networking.time.sleep", lambda _: None)
+    monkeypatch.setattr("audiobookdl.utils.http.random.uniform", lambda _a, _b: 0.0)
+
+    # 1. Cloudflare 522 & 408 transient CDN errors are retried with X-Retry-After
+    source = _make_source(tmp_path)
+    delays: list[float] = []
+    monkeypatch.setattr("audiobookdl.sources.source.networking.time.sleep", delays.append)
+    source._session.get = MagicMock(
+        side_effect=[
+            MagicMock(status_code=522, headers={"x-retry-after": "2"}, content=b"origin timeout"),
+            MagicMock(status_code=408, headers={}, content=b"req timeout"),
+            MagicMock(status_code=200, headers={}, content=b"recovered"),
+        ]
+    )
+    assert source.get("https://cdn.example.com/api") == b"recovered"
+    assert delays == [2.0, 2.0]
+
+    # 2. Cloudflare interactive challenge raises CloudflareBlocked immediately without retrying
+    source._session.get = MagicMock(
+        return_value=MagicMock(
+            status_code=503,
+            headers={"cf-mitigated": "challenge", "server": "cloudflare"},
+            content=b"<html><title>Just a moment...</title></html>",
+        )
+    )
+    with pytest.raises(CloudflareBlocked):
+        source.get("https://cdn.example.com/blocked")
+    assert source._session.get.call_count == 1
+
+    # 3. Redirected HLS playlist resolves relative segment URIs against post-redirect resp.url,
+    #    and slices init_section when CDN ignores Range on EXT-X-MAP and returns 200 OK.
+    redirected_m3u8 = (
+        b"#EXTM3U\n"
+        b'#EXT-X-MAP:URI="media.mp4",BYTERANGE="4@2"\n'
+        b"#EXTINF:5.0,\n"
+        b"seg-0.m4s\n"
+        b"#EXT-X-ENDLIST\n"
+    )
+    full_mp4 = b"XXINITrest-of-mp4"
+    source._session.get = MagicMock(
+        side_effect=[
+            MagicMock(
+                status_code=200,
+                url="https://edge-eu.cdn.example.net/book42/stream.m3u8",
+                headers={},
+                content=redirected_m3u8,
+            ),
+            MagicMock(status_code=200, headers={}, content=full_mp4),
+        ]
+    )
+    files = source.get_stream_files("https://api.example.com/play/master.m3u8")
+    assert len(files) == 1
+    assert files[0].url == "https://edge-eu.cdn.example.net/book42/seg-0.m4s"
+    assert files[0].init_section == b"INIT"
+
+    # 4. Non-M3U8 HTML soft-error playlist raises RequestError
+    source._session.get = MagicMock(
+        return_value=MagicMock(
+            status_code=200,
+            url="https://cdn.example.com/bad.m3u8",
+            headers={"Content-Type": "text/html"},
+            content=b"<html><body>Not Found</body></html>",
+        )
+    )
+    with pytest.raises(RequestError, match="non-M3U8"):
+        source.get_stream_files("https://cdn.example.com/bad.m3u8")
+
+
 
 
 
