@@ -109,6 +109,7 @@ class Config:
     loudnorm: bool | None = None
     mono: bool | None = None
     chapters_from_silence: bool | None = None
+    override_chapters: bool | None = None
     silence_noise_db: float | None = None
     silence_min_seconds: float | None = None
     chapter_offset_ms: int | None = None

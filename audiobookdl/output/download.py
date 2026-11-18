@@ -66,6 +66,8 @@ def download(
     options: DownloadOptions,
     interaction: logging.InteractionHandler | None = None,
     cancel_event: threading.Event | None = None,
+    *,
+    chapters_already_overridden: bool = False,
 ):
     """
     Download contents of audiobook
@@ -74,6 +76,7 @@ def download(
     :param options: Runtime download options
     :param interaction: Optional handler for confirmation prompts
     :param cancel_event: Optional event checked to cancel download
+    :param chapters_already_overridden: Whether upstream enrichment already replaced chapters
     """
     try:
         output_dir = output.gen_output_location(
@@ -87,6 +90,7 @@ def download(
             options,
             interaction=interaction,
             cancel_event=cancel_event,
+            chapters_already_overridden=chapters_already_overridden,
         )
     except KeyboardInterrupt:
         raise DownloadCancelled from None
@@ -145,20 +149,27 @@ def download_audiobook(
     options: DownloadOptions,
     interaction: logging.InteractionHandler | None = None,
     cancel_event: threading.Event | None = None,
+    *,
+    chapters_already_overridden: bool = False,
 ):
     """Download, convert, combine, and add metadata to files from `Audiobook` object"""
     # Check if file/dir exists and should be skipped or confirmed before overwriting
     ebook = is_ebook(audiobook)
     video = is_video(audiobook)
     wants_split = (not ebook) and bool(getattr(options, "split_chapters", False))
+    override_chapters = (
+        bool(getattr(options, "override_chapters", False))
+        and not chapters_already_overridden
+    )
     may_silence_chapters = bool(
         not ebook
         and not video
         and getattr(options, "chapters_from_silence", False)
-        and not audiobook.chapters
+        and (not audiobook.chapters or override_chapters)
         and not options.no_chapters
     )
-    splitting = wants_split and len(audiobook.chapters) > 1
+    defer_chapters_for_silence = may_silence_chapters and override_chapters
+    splitting = wants_split and not defer_chapters_for_silence and len(audiobook.chapters) > 1
     expected_split_output = splitting or (wants_split and may_silence_chapters)
     is_single_file = (len(audiobook.files) == 1 or (options.combine and not ebook)) and not expected_split_output
     target_path = ""
@@ -328,7 +339,7 @@ def download_audiobook(
             audio_filter_kwargs["mono"] = True
         segment_groups = (
             _build_chapter_segment_groups(audiobook, filepaths)
-            if not ebook and not options.combine
+            if not ebook and not options.combine and not defer_chapters_for_silence
             else None
         )
 
@@ -372,7 +383,7 @@ def download_audiobook(
                         max_workers=max_workers,
                         **audio_filter_kwargs,
                     )
-                    if not audiobook.chapters and may_silence_chapters:
+                    if may_silence_chapters and (not audiobook.chapters or override_chapters):
                         detected = output.detect_silence_chapters(
                             master_path,
                             noise_db=silence_noise_db,
@@ -443,6 +454,7 @@ def download_audiobook(
             # Defer MP4 cover embedding when post-combine silence chapter remux will run
             defer_cover_for_silence = may_silence_chapters and cover_for_ffmpeg is not None
             combine_cover = None if defer_cover_for_silence else cover_for_ffmpeg
+            combine_chapters = None if may_silence_chapters else chapters_for_ffmpeg
             consumed_parts = list(filepaths)
             try:
                 chapters_embedded = output.combine_audiofiles(
@@ -450,7 +462,7 @@ def download_audiobook(
                     work_output_dir,
                     staged_combined_path,
                     cancel_event=cancel_event,
-                    chapters=chapters_for_ffmpeg,
+                    chapters=combine_chapters,
                     audio_bitrate=options.audio_bitrate,
                     metadata=audiobook.metadata,
                     cover=combine_cover,
@@ -460,7 +472,7 @@ def download_audiobook(
                     max_workers=max_workers,
                     **audio_filter_kwargs,
                 )
-                if may_silence_chapters and not audiobook.chapters:
+                if may_silence_chapters and (not audiobook.chapters or override_chapters):
                     detected = output.detect_silence_chapters(
                         staged_combined_path,
                         noise_db=silence_noise_db,
@@ -528,6 +540,7 @@ def download_audiobook(
         elif (
             not options.combine
             and not ebook
+            and not defer_chapters_for_silence
             and len(filepaths) > 1
             and output.should_smart_merge_hls(filepaths, audiobook.chapters, probe_cache=probe_cache)
         ):

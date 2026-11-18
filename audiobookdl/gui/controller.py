@@ -2324,6 +2324,7 @@ class GuiController:
         db_dir = getattr(options, "database_directory", None)
         use_cache = not bool(getattr(options, "no_enrich_cache", False))
         include_chapters = not bool(getattr(options, "no_chapters", False))
+        override_chapters = bool(getattr(options, "override_chapters", False))
         if db_dir:
             with EnrichmentCache(default_enrichment_cache_path(db_dir), persistent=True) as cache:
                 return apply_candidate_to_audiobook(
@@ -2335,6 +2336,7 @@ class GuiController:
                     cache=cache,
                     use_cache=use_cache,
                     include_chapters=include_chapters,
+                    override_chapters=override_chapters,
                 )
         return apply_candidate_to_audiobook(
             audiobook,
@@ -2344,6 +2346,7 @@ class GuiController:
             timeout=getattr(options, "timeout", None) or 10.0,
             use_cache=use_cache,
             include_chapters=include_chapters,
+            override_chapters=override_chapters,
         )
 
     def drain_events(

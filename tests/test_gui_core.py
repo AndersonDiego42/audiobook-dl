@@ -6,7 +6,7 @@ import time
 import tkinter as tk
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -2921,6 +2921,7 @@ def test_gui_options_panel_exposes_new_pipeline_options_and_roundtrips(tmp_path)
         app.loudnorm_var.set(True)
         app.mono_var.set(True)
         app.chapters_from_silence_var.set(True)
+        app.override_chapters_var.set(True)
         app.chapter_offset_ms_var.set("-250")
         app.square_cover_var.set(True)
         app.max_cover_size_var.set("1200")
@@ -2931,6 +2932,11 @@ def test_gui_options_panel_exposes_new_pipeline_options_and_roundtrips(tmp_path)
         assert opts.loudnorm is True
         assert opts.mono is True
         assert opts.chapters_from_silence is True
+        assert opts.override_chapters is True
+        app.no_chapters_var.set(True)
+        assert str(app._options_panel._cb_override_chapters.cget("state")) == "disabled"
+        app.no_chapters_var.set(False)
+        assert str(app._options_panel._cb_override_chapters.cget("state")) == "normal"
         assert opts.chapter_offset_ms == -250
         assert opts.square_cover is True
         assert opts.max_cover_size == 1200
@@ -5919,7 +5925,7 @@ def test_gui_p2_3_horizontal_scroll_live_system_theme_and_queue_concurrency(tmp_
             assert bool(st.hscrollbar.winfo_manager()) is True
             st._on_xscroll("0.0", "1.0")
             assert st.hscrollbar.winfo_manager() == ""
-            assert st._on_shift_mousewheel(SimpleNamespace(delta=-120)) == "break"
+            assert st._on_shift_mousewheel(cast(tk.Event, SimpleNamespace(delta=-120))) == "break"
 
             # 2. Live OS theme change tracking when mode == "system"
             app.set_theme("system")
@@ -6225,32 +6231,32 @@ def test_gui_activity_panel_toolbar_reflow_and_download_bars(tmp_path):
         assert qp._action_bar_mode == "compact"
         assert qp._log_toolbar_mode == "compact"
         assert qp._queue_toolbar_mode == "compact"
-        assert int(qp.download_btn.grid_info()["row"]) == 0
-        assert int(qp.pack_btn.grid_info()["row"]) == 1
-        assert int(qp._log_save_btn.grid_info()["row"]) == 1
-        assert int(qp.queue_clear_btn.grid_info()["row"]) == 1
+        assert qp.download_btn.grid_info()["row"] == 0
+        assert qp.pack_btn.grid_info()["row"] == 1
+        assert qp._log_save_btn.grid_info()["row"] == 1
+        assert qp.queue_clear_btn.grid_info()["row"] == 1
 
         qp.sync_responsive_toolbars(scale_px(qp, 760))
         assert qp._action_bar_mode == "wide"
         assert qp._log_toolbar_mode == "wide"
         assert qp._queue_toolbar_mode == "wide"
-        assert int(qp.pack_btn.grid_info()["row"]) == 0
-        assert int(qp._log_save_btn.grid_info()["row"]) == 0
-        assert int(qp.queue_clear_btn.grid_info()["row"]) == 0
+        assert qp.pack_btn.grid_info()["row"] == 0
+        assert qp._log_save_btn.grid_info()["row"] == 0
+        assert qp.queue_clear_btn.grid_info()["row"] == 0
 
         dl._on_folder_bar_configure(SimpleNamespace(width=scale_px(dl, 500)))  # type: ignore[arg-type]
         dl._on_url_footer_configure(SimpleNamespace(width=scale_px(dl, 500)))  # type: ignore[arg-type]
         assert dl._folder_bar_mode == "compact"
         assert dl._url_footer_mode == "compact"
-        assert int(dl.account_chip_btn.grid_info()["row"]) == 1
-        assert int(dl._url_btn_row.grid_info()["row"]) == 1
+        assert dl.account_chip_btn.grid_info()["row"] == 1
+        assert dl._url_btn_row.grid_info()["row"] == 1
 
         dl._on_folder_bar_configure(SimpleNamespace(width=scale_px(dl, 700)))  # type: ignore[arg-type]
         dl._on_url_footer_configure(SimpleNamespace(width=scale_px(dl, 700)))  # type: ignore[arg-type]
         assert dl._folder_bar_mode == "wide"
         assert dl._url_footer_mode == "wide"
-        assert int(dl.account_chip_btn.grid_info()["row"]) == 0
-        assert int(dl._url_btn_row.grid_info()["row"]) == 0
+        assert dl.account_chip_btn.grid_info()["row"] == 0
+        assert dl._url_btn_row.grid_info()["row"] == 0
     finally:
         app.controller.shutdown(is_running=False, is_previewing=False)
         root.destroy()
@@ -6287,7 +6293,7 @@ def test_gui_navigation_history_breadcrumbs_and_deep_links(tmp_path):
         lib._handle_notebook_tab_changed()
         assert app.shell.active_route == NavRoute("library", sub_tab="sync")
         assert "Library Sync" in app.shell.breadcrumb_var.get()
-        assert app.shell.can_go_back is True
+        assert app.shell.can_go_back
 
         # Context-preserving jump to Accounts and Pack
         app.controller.save_source_credentials("storytel", username="alice", profile="work")

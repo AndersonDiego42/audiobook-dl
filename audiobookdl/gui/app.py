@@ -209,6 +209,7 @@ class AudiobookDLApp:
     loudnorm_var: tk.BooleanVar
     mono_var: tk.BooleanVar
     chapters_from_silence_var: tk.BooleanVar
+    override_chapters_var: tk.BooleanVar
     chapter_offset_ms_var: tk.StringVar
     intro_chapter_mode_var: tk.StringVar
     square_cover_var: tk.BooleanVar

@@ -1354,6 +1354,7 @@ def _missing_enrichment_fields(
     audiobook: Audiobook,
     *,
     include_chapters: bool = True,
+    override_chapters: bool = False,
 ) -> set[str]:
     meta = audiobook.metadata
     missing: set[str] = set()
@@ -1383,7 +1384,7 @@ def _missing_enrichment_fields(
         missing.add("release_date")
     if audiobook.cover is None:
         missing.add("cover")
-    if include_chapters and not audiobook.chapters:
+    if include_chapters and (override_chapters or not audiobook.chapters):
         missing.add("chapters")
     return missing
 
@@ -1392,8 +1393,15 @@ def _has_missing_enrichment_fields(
     audiobook: Audiobook,
     *,
     include_chapters: bool = True,
+    override_chapters: bool = False,
 ) -> bool:
-    return bool(_missing_enrichment_fields(audiobook, include_chapters=include_chapters))
+    return bool(
+        _missing_enrichment_fields(
+            audiobook,
+            include_chapters=include_chapters,
+            override_chapters=override_chapters,
+        )
+    )
 
 
 def apply_candidate_to_audiobook(
@@ -1407,10 +1415,12 @@ def apply_candidate_to_audiobook(
     use_cache: bool = True,
     cache_ttl_seconds: float = DEFAULT_CACHE_TTL_SECONDS,
     include_chapters: bool = True,
+    override_chapters: bool = False,
 ) -> tuple[list[str], bool, bool]:
     """
     Apply missing metadata fields, cover, and chapters from `candidate` onto
-    `audiobook` without overwriting existing non-empty fields.
+    `audiobook` without overwriting existing non-empty fields unless
+    `override_chapters` is enabled for chapters.
     """
     meta = audiobook.metadata
     updated_fields: list[str] = []
@@ -1466,7 +1476,7 @@ def apply_candidate_to_audiobook(
     need_cover = audiobook.cover is None and bool(candidate.cover_url)
     need_chapters = (
         include_chapters
-        and not audiobook.chapters
+        and (override_chapters or not audiobook.chapters)
         and (bool(candidate.chapters) or (candidate.provider == "audnexus" and bool(candidate.asin)))
     )
     if need_cover or need_chapters:
@@ -1583,10 +1593,12 @@ def enrich_audiobook_metadata(
     interactive: bool = False,
     selector: CandidateSelector | None = None,
     include_chapters: bool = True,
+    override_chapters: bool = False,
 ) -> EnrichmentResult:
     """
     Enrich `audiobook` across `providers` in priority order, filling missing
-    metadata, cover art, and chapters without overwriting existing source data.
+    metadata, cover art, and chapters without overwriting existing source data
+    (unless `override_chapters` replaces existing chapters).
     """
     provider_list = (
         tuple(providers)
@@ -1594,7 +1606,11 @@ def enrich_audiobook_metadata(
         else resolve_provider_list(None, custom_providers=custom_providers)
     )
     result = EnrichmentResult()
-    if not _has_missing_enrichment_fields(audiobook, include_chapters=include_chapters):
+    if not _has_missing_enrichment_fields(
+        audiobook,
+        include_chapters=include_chapters,
+        override_chapters=override_chapters,
+    ):
         return result
 
     cache_cm: Any = (
@@ -1607,10 +1623,16 @@ def enrich_audiobook_metadata(
         else nullcontext(None)
     )
     session_cm = nullcontext(session) if session is not None else requests.Session()
+    chapters_overridden = False
 
     with cache_cm as cache, session_cm as sess:
         for provider in provider_list:
-            missing = _missing_enrichment_fields(audiobook, include_chapters=include_chapters)
+            effective_override = override_chapters and not chapters_overridden
+            missing = _missing_enrichment_fields(
+                audiobook,
+                include_chapters=include_chapters,
+                override_chapters=effective_override,
+            )
             if not missing:
                 break
             supported = _provider_capabilities_for(provider)
@@ -1654,6 +1676,7 @@ def enrich_audiobook_metadata(
                 use_cache=use_cache,
                 cache_ttl_seconds=cache_ttl_seconds,
                 include_chapters=include_chapters,
+                override_chapters=effective_override,
             )
             result.providers_used.append(provider)
             result.matched_candidates.append(chosen)
@@ -1662,7 +1685,13 @@ def enrich_audiobook_metadata(
                 result.fields_updated.extend(f for f in fields if f not in result.fields_updated)
                 result.cover_updated = result.cover_updated or cover_updated
                 result.chapters_updated = result.chapters_updated or chapters_updated
-            if not _has_missing_enrichment_fields(audiobook, include_chapters=include_chapters):
+            if chapters_updated:
+                chapters_overridden = True
+            if not _has_missing_enrichment_fields(
+                audiobook,
+                include_chapters=include_chapters,
+                override_chapters=override_chapters and not chapters_overridden,
+            ):
                 break
 
     return result

@@ -203,6 +203,7 @@ def test_schema_driven_merge_and_preset_precedence(tmp_path):
             "loudnorm": True,
             "mono": True,
             "chapters_from_silence": True,
+            "override_chapters": True,
             "chapter_offset_ms": -250,
             "intro_chapter_mode": "always",
             "square_cover": True,
@@ -313,12 +314,14 @@ def test_persisted_gui_roundtrip_silence_offset_and_abs(tmp_path):
     save_output_preferences(
         config_location=str(cfg_path),
         chapters_from_silence=True,
+        override_chapters=True,
         chapter_offset_ms=-350,
         intro_chapter_mode="always",
         upload_to_abs=True,
     )
     loaded = load_config(str(cfg_path))
     assert loaded.chapters_from_silence is True
+    assert loaded.override_chapters is True
     assert loaded.chapter_offset_ms == -350
     assert loaded.intro_chapter_mode == "always"
     assert loaded.upload_to_abs is True

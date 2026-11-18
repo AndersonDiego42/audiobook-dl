@@ -1179,6 +1179,7 @@ def enrich_audiobook_with_options(
         interactive=interactive,
         selector=selector,
         include_chapters=not bool(getattr(options, "no_chapters", False)),
+        override_chapters=bool(getattr(options, "override_chapters", False)),
     )
     if result.updated:
         details = list(result.fields_updated)
@@ -1275,8 +1276,9 @@ def process_audiobook(
                     f"[yellow]Warning:[/yellow] [blue]{audiobook.title}[/] matches existing archive entry from {dup['source']} ({dup_label})."
                 )
 
+        enrich_result = None
         if getattr(options, "enrich_metadata", False):
-            enrich_audiobook_with_options(
+            enrich_result = enrich_audiobook_with_options(
                 audiobook,
                 options,
                 source=source,
@@ -1286,7 +1288,16 @@ def process_audiobook(
 
         logging.wait_if_paused(cancel_event=cancel_event)
         _apply_user_decryption_key(audiobook, options)
-        download(audiobook, options, interaction=interaction, cancel_event=cancel_event)
+        if enrich_result is not None and enrich_result.chapters_updated:
+            download(
+                audiobook,
+                options,
+                interaction=interaction,
+                cancel_event=cancel_event,
+                chapters_already_overridden=True,
+            )
+        else:
+            download(audiobook, options, interaction=interaction, cancel_event=cancel_event)
         if source is not None:
             source.on_download_complete(audiobook)
 

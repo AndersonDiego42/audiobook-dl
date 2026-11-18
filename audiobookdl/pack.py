@@ -659,8 +659,9 @@ def pack_book(
     if cancel_event is not None and cancel_event.is_set():
         raise DownloadCancelled
 
+    enrich_result = None
     if getattr(options, "enrich_metadata", False):
-        enrich_audiobook_with_options(
+        enrich_result = enrich_audiobook_with_options(
             spec.audiobook,
             options,
             interaction=interaction,
@@ -706,10 +707,15 @@ def pack_book(
             spec.audiobook.chapters, chapter_offset_ms
         )
 
+    chapters_already_overridden = bool(enrich_result and enrich_result.chapters_updated)
+    override_chapters = (
+        bool(getattr(options, "override_chapters", False))
+        and not chapters_already_overridden
+    )
     may_silence_chapters = (
         not options.no_chapters
         and bool(getattr(options, "chapters_from_silence", False))
-        and not spec.audiobook.chapters
+        and (not spec.audiobook.chapters or override_chapters)
     )
     if may_silence_chapters and len(spec.track_paths) == 1:
         detected = output.detect_silence_chapters(

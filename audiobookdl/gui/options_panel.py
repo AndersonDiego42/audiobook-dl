@@ -188,28 +188,38 @@ class OptionsPanel(ttk.LabelFrame):
         sidecars_tab.columnconfigure(3, weight=1)
         self.options_notebook.add(sidecars_tab, text="Chapters & Sidecars")
 
+        chapters_top_row = ttk.Frame(sidecars_tab)
+        chapters_top_row.grid(row=0, column=0, columnspan=4, sticky="ew")
+
         cb_no_chapters = ttk.Checkbutton(
-            sidecars_tab, text="No chapters", variable=self._vars.no_chapters_var
+            chapters_top_row, text="No chapters", variable=self._vars.no_chapters_var
         )
-        cb_no_chapters.grid(row=0, column=0, sticky="w", padx=(0, 14))
+        cb_no_chapters.pack(side=tk.LEFT, padx=(0, 14))
 
         cb_split_chapters = ttk.Checkbutton(
-            sidecars_tab,
+            chapters_top_row,
             text="Split chapters",
             variable=self._vars.split_chapters_var,
             command=self._on_split_chapters_clicked,
         )
-        cb_split_chapters.grid(row=0, column=1, sticky="w", padx=(0, 14))
+        cb_split_chapters.pack(side=tk.LEFT, padx=(0, 14))
 
         cb_silence_chapters = ttk.Checkbutton(
-            sidecars_tab,
+            chapters_top_row,
             text="Silence chapters",
             variable=self._vars.chapters_from_silence_var,
         )
-        cb_silence_chapters.grid(row=0, column=2, sticky="w", padx=(0, 14))
+        cb_silence_chapters.pack(side=tk.LEFT, padx=(0, 14))
 
-        offset_box = ttk.Frame(sidecars_tab)
-        offset_box.grid(row=0, column=3, sticky="w")
+        cb_override_chapters = ttk.Checkbutton(
+            chapters_top_row,
+            text="Override chapters",
+            variable=self._vars.override_chapters_var,
+        )
+        cb_override_chapters.pack(side=tk.LEFT, padx=(0, 14))
+
+        offset_box = ttk.Frame(chapters_top_row)
+        offset_box.pack(side=tk.LEFT)
         ttk.Label(offset_box, text="Offset (ms):").pack(side=tk.LEFT, padx=(0, 4))
         chapter_offset_entry = ttk.Entry(
             offset_box, textvariable=self._vars.chapter_offset_ms_var, width=7
@@ -390,6 +400,7 @@ class OptionsPanel(ttk.LabelFrame):
         self._enrich_providers_entry = enrich_providers_entry
         self._cb_split_chapters = cb_split_chapters
         self._cb_silence_chapters = cb_silence_chapters
+        self._cb_override_chapters = cb_override_chapters
         self._chapter_offset_entry = chapter_offset_entry
         self._intro_chapter_combo = intro_chapter_combo
         self._cb_cue = cb_cue
@@ -418,6 +429,7 @@ class OptionsPanel(ttk.LabelFrame):
             (cb_no_chapters, _option_help("no_chapters")),
             (cb_split_chapters, _option_help("split_chapters")),
             (cb_silence_chapters, _option_help("chapters_from_silence")),
+            (cb_override_chapters, _option_help("override_chapters")),
             (chapter_offset_entry, _option_help("chapter_offset_ms")),
             (intro_chapter_combo, _option_help("intro_chapter_mode")),
             (cb_json, _option_help("write_json_metadata")),
@@ -456,6 +468,7 @@ class OptionsPanel(ttk.LabelFrame):
             cb_no_chapters,
             cb_split_chapters,
             cb_silence_chapters,
+            cb_override_chapters,
             chapter_offset_entry,
             intro_chapter_combo,
             cb_json,
@@ -603,6 +616,7 @@ class OptionsPanel(ttk.LabelFrame):
         _set_widget(self._cb_combine, (not cover_only) and (not split_on))
         _set_widget(self._cb_split_chapters, (not cover_only) and (not no_chapters))
         _set_widget(self._cb_silence_chapters, (not cover_only) and (not no_chapters))
+        _set_widget(self._cb_override_chapters, (not cover_only) and (not no_chapters))
         _set_widget(self._chapter_offset_entry, not no_chapters)
         _set_widget(self._intro_chapter_combo, (not cover_only) and (not no_chapters), readonly_combo=True)
         _set_widget(self._cb_cue, not no_chapters)

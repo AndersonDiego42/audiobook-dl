@@ -1438,5 +1438,51 @@ def test_process_audiobook_skips_cross_source_duplicate_when_skip_downloaded(tmp
     assert download_called == []
 
 
+def test_process_audiobook_override_chapters_passes_flags_to_enrichment_and_download(tmp_path):
+    from unittest.mock import MagicMock, patch
+    from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter
+    from audiobookdl.pipeline import process_audiobook
+    from audiobookdl.utils.enrichment import EnrichmentResult
+
+    captured: dict[str, Any] = {}
+
+    def fake_enrich(audiobook, **kwargs):
+        captured["override_chapters"] = kwargs.get("override_chapters")
+        audiobook.chapters = [Chapter(start=0, title="Audible Ch 1")]
+        return EnrichmentResult(
+            updated=True,
+            providers_used=["audnexus"],
+            chapters_updated=True,
+        )
+
+    def fake_download(audiobook, opts, **kwargs):
+        captured["download_chapters_already_overridden"] = kwargs.get("chapters_already_overridden")
+
+    src = MagicMock()
+    src.name = "storytel"
+    src._session = MagicMock()
+    book = Audiobook(
+        session=src._session,
+        metadata=AudiobookMetadata(title="Storytel Book"),
+        files=[AudiobookFile(url="https://example.com/a.mp3", ext="mp3")],
+        chapters=[Chapter(start=0, title="Bad 1"), Chapter(start=5000, title="Bad 2")],
+    )
+    opts = build_default_options(
+        output_template=str(tmp_path / "{title}"),
+        enrich_metadata=True,
+        override_chapters=True,
+    )
+    with (
+        patch("audiobookdl.pipeline.enrich_audiobook_metadata", side_effect=fake_enrich),
+        patch("audiobookdl.pipeline.download", side_effect=fake_download),
+    ):
+        process_audiobook(src, book, opts)
+
+    assert captured["override_chapters"] is True
+    assert captured["download_chapters_already_overridden"] is True
+    assert [(c.start, c.title) for c in book.chapters] == [(0, "Audible Ch 1")]
+
+
+
 
 

@@ -2130,4 +2130,65 @@ def test_combine_tags_staged_file_before_os_replace_and_passes_silence_threshold
     assert list(tmp_path.glob("*.tmp.*")) == []
 
 
+def test_download_audiobook_override_chapters_with_silence_detection(tmp_path, monkeypatch):
+    from audiobookdl import Chapter
+    from audiobookdl.output import download as dl_mod
+    from audiobookdl.output import output as out_mod
+
+    src_mp3 = tmp_path / "single.mp3"
+    src_mp3.write_bytes(b"mp3")
+    monkeypatch.setattr(dl_mod, "download_files_with_progress", lambda *a, **kw: [str(src_mp3)])
+    monkeypatch.setattr(
+        out_mod,
+        "detect_silence_chapters",
+        lambda *a, **kw: [Chapter(0, "Chapter 1"), Chapter(8000, "Chapter 2")],
+    )
+    monkeypatch.setattr(
+        out_mod,
+        "convert_single_file",
+        lambda old_path, out_fmt, **kwargs: (str(tmp_path / f"book.{out_fmt}"), True),
+    )
+    recorded: list[list[tuple[int, str]]] = []
+    monkeypatch.setattr(
+        dl_mod,
+        "add_metadata_to_file",
+        lambda ab, fp, opts, **kwargs: recorded.append([(c.start, c.title) for c in ab.chapters]),
+    )
+
+    # With override_chapters=True, existing bad Storytel chapters are replaced by silence chapters
+    book = Audiobook(
+        session=MagicMock(),
+        metadata=AudiobookMetadata(title="Storytel Book"),
+        files=[AudiobookFile(url="https://example.com/single.mp3", ext="mp3")],
+        chapters=[Chapter(0, "Track 1"), Chapter(3000, "Track 2"), Chapter(6000, "Track 3")],
+    )
+    opts = DownloadOptions(
+        output_format="m4b",
+        chapters_from_silence=True,
+        override_chapters=True,
+        skip_downloaded=False,
+        write_json_metadata=False,
+    )
+    download_audiobook(book, str(tmp_path / "Storytel Book"), opts)
+    assert recorded == [[(0, "Chapter 1"), (8000, "Chapter 2")]]
+
+    # When enrichment already replaced chapters (chapters_already_overridden=True),
+    # silence detection must NOT clobber them.
+    recorded.clear()
+    enriched_book = Audiobook(
+        session=MagicMock(),
+        metadata=AudiobookMetadata(title="Enriched Book"),
+        files=[AudiobookFile(url="https://example.com/single.mp3", ext="mp3")],
+        chapters=[Chapter(0, "Audible Prologue"), Chapter(10000, "Audible Ch 1")],
+    )
+    download_audiobook(
+        enriched_book,
+        str(tmp_path / "Enriched Book"),
+        opts,
+        chapters_already_overridden=True,
+    )
+    assert recorded == [[(0, "Audible Prologue"), (10000, "Audible Ch 1")]]
+
+
+
 

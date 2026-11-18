@@ -1109,6 +1109,22 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         ),
     ),
     OptionSpec(
+        name="override_chapters",
+        default=False,
+        help="Replace existing source chapters when using metadata enrichment or silence detection",
+        config_key="override_chapters",
+        config_kind="bool",
+        toml_serializer=_serialize_bool,
+        merge_from_config=True,
+        merge_only_if_default=True,
+        gui=GuiBinding(
+            var_attr="override_chapters_var",
+            var_type="bool",
+            gui_default=False,
+            persisted_in_output_prefs=True,
+        ),
+    ),
+    OptionSpec(
         name="silence_noise_db",
         default=-35.0,
         help="Noise floor threshold in dB for FFmpeg silencedetect (e.g. -35.0)",
@@ -1428,6 +1444,7 @@ class DownloadOptions:
     loudnorm: bool = False
     mono: bool = False
     chapters_from_silence: bool = False
+    override_chapters: bool = False
     silence_noise_db: float = -35.0
     silence_min_seconds: float = 1.8
     chapter_offset_ms: int = 0

@@ -693,3 +693,112 @@ def test_enrichment_plugin_entry_point_discovery_and_query(monkeypatch):
     finally:
         enr_mod.reset_plugin_enrichment_providers_cache()
 
+
+def test_audnexus_override_chapters_replaces_existing_source_chapters():
+    from audiobookdl import Chapter, Cover
+
+    session = _RoutingSession({
+        "api.audible.com/1.0/catalog/products": {
+            "products": [
+                {
+                    "asin": "B08G9PRS1K",
+                    "title": "Storytel Book",
+                    "authors": [{"name": "Jane Author"}],
+                }
+            ]
+        },
+        "api.audnex.us/books/B08G9PRS1K/chapters": {
+            "asin": "B08G9PRS1K",
+            "chapters": [
+                {"title": "Prologue", "startOffsetMs": 0},
+                {"title": "Chapter 1: Awakening", "startOffsetMs": 60000},
+            ],
+        },
+        "api.audnex.us/books/B08G9PRS1K": {
+            "asin": "B08G9PRS1K",
+            "title": "Storytel Book",
+            "authors": [{"name": "Jane Author"}],
+            "narrators": [{"name": "Voice Actor"}],
+        },
+    })
+
+    def _make_book() -> Audiobook:
+        return Audiobook(
+            session=requests.Session(),
+            metadata=AudiobookMetadata(
+                title="Storytel Book",
+                authors=["Jane Author"],
+                narrators=["Voice Actor"],
+                series="Existing Series",
+                series_order=1,
+                genres=["Fiction"],
+                language="en",
+                description="Already complete metadata",
+                isbn="9780000000001",
+                asin="B08G9PRS1K",
+                publisher="Pub",
+                release_date=date(2022, 1, 1),
+            ),
+            files=[],
+            cover=Cover(image=b"img", extension="jpg"),
+            chapters=[
+                Chapter(start=0, title="Track 01"),
+                Chapter(start=15000, title="Track 02"),
+            ],
+        )
+
+    # Without override_chapters: existing source chapters are preserved
+    book_keep = _make_book()
+    res_keep = enrich_audiobook_metadata(
+        book_keep,
+        providers=("audnexus",),
+        session=session,  # type: ignore[arg-type]
+        use_cache=False,
+    )
+    assert res_keep.updated is False
+    assert res_keep.chapters_updated is False
+    assert [(c.start, c.title) for c in book_keep.chapters] == [
+        (0, "Track 01"),
+        (15000, "Track 02"),
+    ]
+
+    # With override_chapters=True: Audible/Audnexus chapters replace source chapters
+    book_override = _make_book()
+    res_override = enrich_audiobook_metadata(
+        book_override,
+        providers=("audnexus",),
+        session=session,  # type: ignore[arg-type]
+        use_cache=False,
+        override_chapters=True,
+    )
+    assert res_override.updated is True
+    assert res_override.chapters_updated is True
+    assert [(c.start, c.title) for c in book_override.chapters] == [
+        (0, "Prologue"),
+        (60000, "Chapter 1: Awakening"),
+    ]
+
+    # If candidate has no chapters, existing chapters are NOT wiped out
+    empty_ch_session = _RoutingSession({
+        "api.audnex.us/books/B08G9PRS1K/chapters": {"asin": "B08G9PRS1K", "chapters": []},
+        "api.audnex.us/books/B08G9PRS1K": {
+            "asin": "B08G9PRS1K",
+            "title": "Storytel Book",
+            "authors": [{"name": "Jane Author"}],
+        },
+    })
+    book_fallback = _make_book()
+    res_empty = enrich_audiobook_metadata(
+        book_fallback,
+        providers=("audnexus",),
+        session=empty_ch_session,  # type: ignore[arg-type]
+        use_cache=False,
+        override_chapters=True,
+    )
+    assert res_empty.chapters_updated is False
+    assert [(c.start, c.title) for c in book_fallback.chapters] == [
+        (0, "Track 01"),
+        (15000, "Track 02"),
+    ]
+
+
