@@ -83,6 +83,8 @@ class DownloadPage(ttk.Frame):
         on_import_queue: Callable[[list[dict[str, Any]]], None],
         on_queue_summary_changed: Callable[[int, int], None],
         on_progress_mode_changed: Callable[[str], None],
+        on_m4b_toggled: Callable[[], None],
+        on_format_selected: Callable[[tk.Event | None], None],
         progress_var: tk.DoubleVar,
         active_job_var: tk.StringVar,
         concurrency_var: tk.IntVar | None = None,
@@ -285,8 +287,8 @@ class DownloadPage(ttk.Frame):
         self.options_panel = OptionsPanel(
             self.options_section.content,
             app,
-            on_m4b_toggled=app._on_m4b_toggled,
-            on_format_selected=app._on_format_selected,
+            on_m4b_toggled=on_m4b_toggled,
+            on_format_selected=on_format_selected,
             palette_provider=palette_provider,
         )
         self.options_panel.grid(row=0, column=0, sticky="ew")

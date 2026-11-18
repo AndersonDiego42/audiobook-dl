@@ -226,13 +226,13 @@ def test_gui_app_smoke_and_state_transitions(tmp_path):
         assert opts.output_template == os.path.join(str(tmp_path), "{title}")
 
         # Verify state transitions
-        app._set_running_state(True)
+        app._runs.set_running_state(True)
         assert app.is_running
-        app._finish_run(DownloadSummary(completed=1, failed=0, cancelled=False), None)
+        app._runs.finish_run(DownloadSummary(completed=1, failed=0, cancelled=False), None)
         assert not app.is_running
         assert app.status_var.get() == "Completed"
 
-        app._finish_run(DownloadSummary(completed=0, failed=0, cancelled=True), None)
+        app._runs.finish_run(DownloadSummary(completed=0, failed=0, cancelled=True), None)
         assert app.status_var.get() == "Cancelled"
         root.update_idletasks()
     finally:
@@ -301,7 +301,7 @@ def test_gui_service_dropdown_saves_and_restores_credentials(tmp_path):
         auth_panel.on_service_selected()
         app.username_var.set("alice@example.com")
         app.password_var.set("hunter2!")
-        app.save_current_credentials()
+        app._auth.save_current_credentials()
         assert app.saved_badge_var.get() == "Saved"
 
         # Switch to Librivox (no auth), then back via URL auto-detection
@@ -312,7 +312,7 @@ def test_gui_service_dropdown_saves_and_restores_credentials(tmp_path):
 
         app.navigate("download")
         app.urls_text.insert("1.0", "https://www.storytel.com/no/nn/books/something-12345")
-        app._on_urls_changed()
+        app._urls.on_urls_changed()
         assert app.service_label_var.get() == "Storytel / Mofibo"
         assert app.username_var.get() == "alice@example.com"
         assert app.password_var.get() == "hunter2!"
@@ -328,7 +328,7 @@ def test_gui_service_dropdown_saves_and_restores_credentials(tmp_path):
         assert app2.username_var.get() == "alice@example.com"
         assert app2.password_var.get() == "hunter2!"
 
-        app2.forget_current_credentials()
+        app2._auth.forget_current_credentials()
         assert app2.username_var.get() == ""
         assert app2.password_var.get() == ""
         assert app2.saved_badge_var.get() == ""
@@ -352,7 +352,7 @@ def test_gui_m4b_option_sync_and_persistence(tmp_path):
 
         app.combine_var.set(False)
         app.m4b_var.set(True)
-        app._on_m4b_toggled()
+        app._options.on_m4b_toggled()
         assert app.output_format_var.get() == "m4b"
         assert app.combine_var.get() is True
 
@@ -362,13 +362,13 @@ def test_gui_m4b_option_sync_and_persistence(tmp_path):
 
         # Selecting another format clears the m4b checkbox
         app.output_format_var.set("mp3")
-        app._on_format_selected()
+        app._options.on_format_selected()
         assert app.m4b_var.get() is False
 
         # Selecting m4b via dropdown checks the m4b checkbox and enables combine
         app.combine_var.set(False)
         app.output_format_var.set("m4b")
-        app._on_format_selected()
+        app._options.on_format_selected()
         assert app.m4b_var.get() is True
         assert app.combine_var.get() is True
 
@@ -401,7 +401,7 @@ def test_gui_app_end_to_end_worker_and_prompts(tmp_path, monkeypatch):
         app.urls_text.insert("1.0", "https://example.com/book1\n")
 
         monkeypatch.setattr("audiobookdl.gui.ffmpeg_assistant.find_executable", lambda name: name)
-        monkeypatch.setattr("audiobookdl.gui.app.simpledialog.askstring", lambda *a, **kw: "secret-user")
+        monkeypatch.setattr("audiobookdl.gui.event_dispatcher.simpledialog.askstring", lambda *a, **kw: "secret-user")
         monkeypatch.setattr("audiobookdl.gui.app.messagebox.askyesno", lambda *a, **kw: True)
 
         observed = {}
@@ -484,13 +484,13 @@ def test_gui_poll_queue_bounds_batch_and_coalesces_progress(tmp_path):
     try:
         app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
         handled: list[ControllerEvent] = []
-        original_handle = app._handle_event
+        original_handle = app._events.handle_event
 
         def recording_handle(item: ControllerEvent) -> None:
             handled.append(item)
             original_handle(item)
 
-        app._handle_event = recording_handle  # type: ignore[method-assign]
+        app._events.handle_event = recording_handle  # type: ignore[method-assign]
 
         # Queue 250 items: burst of progress_advance, a log in between, and more progress_advance
         for i in range(1, 151):
@@ -500,7 +500,7 @@ def test_gui_poll_queue_bounds_batch_and_coalesces_progress(tmp_path):
             app.controller.event_queue.put(ProgressAdvanceEvent(completed=float(i), total=300.0))
 
         # First tick drains up to MAX_QUEUE_BATCH (200) items and coalesces consecutive advances
-        app._poll_queue()
+        app._events.poll_queue()
         assert handled == [
             ProgressAdvanceEvent(completed=150.0, total=300.0),
             LogEvent(level="INFO", message="Midway"),
@@ -510,7 +510,7 @@ def test_gui_poll_queue_bounds_batch_and_coalesces_progress(tmp_path):
 
         # Second tick drains remaining 50 items, coalesced into one progress_advance
         handled.clear()
-        app._poll_queue()
+        app._events.poll_queue()
         assert handled == [ProgressAdvanceEvent(completed=249.0, total=300.0)]
         assert app.progressbar.cget("value") == pytest.approx(249.0 / 300.0 * 100.0)
     finally:
@@ -687,7 +687,7 @@ def test_gui_paste_urls_from_clipboard(tmp_path):
         )
         root.update()
 
-        added = app._paste_urls_from_clipboard()
+        added = app._urls.paste_urls_from_clipboard()
         assert added == [
             "https://www.storytel.com/no/nn/books/something-12345",
             "https://example.com/book2",
@@ -695,7 +695,7 @@ def test_gui_paste_urls_from_clipboard(tmp_path):
         assert app.service_label_var.get() == "Storytel / Mofibo"
 
         # Pasting same clipboard again deduplicates
-        added_again = app._paste_urls_from_clipboard()
+        added_again = app._urls.paste_urls_from_clipboard()
         assert added_again == []
     finally:
         root.destroy()
@@ -890,12 +890,12 @@ def test_gui_preview_audiobook_with_cover_and_series_checklist(tmp_path, monkeyp
         app.preview_metadata()
         for _ in range(100):
             root.update()
-            if not app.is_previewing and app._preview_dialog is not None:
+            if not app.is_previewing and app._preview.dialog is not None:
                 break
             threading.Event().wait(0.02)
 
         assert not app.is_previewing
-        dialog = app._preview_dialog
+        dialog = app._preview.dialog
         assert dialog is not None
         assert dialog.winfo_exists()
         assert "Sample Audio" in dialog.title()
@@ -929,11 +929,11 @@ def test_gui_preview_audiobook_with_cover_and_series_checklist(tmp_path, monkeyp
         app.preview_metadata()
         for _ in range(100):
             root.update()
-            if not app.is_previewing and app._preview_dialog is not None:
+            if not app.is_previewing and app._preview.dialog is not None:
                 break
             threading.Event().wait(0.02)
 
-        series_dialog = app._preview_dialog
+        series_dialog = app._preview.dialog
         assert series_dialog is not None
         check_vars = series_dialog._check_vars
         assert len(check_vars) == 3
@@ -941,7 +941,7 @@ def test_gui_preview_audiobook_with_cover_and_series_checklist(tmp_path, monkeyp
         selected = [i for i, v in enumerate(check_vars) if v.get()]
         series_dialog.destroy()
 
-        app._enqueue_from_preview("https://example.com/series", (fake_source, series), selected)  # type: ignore[arg-type]
+        app._preview.enqueue_from_preview("https://example.com/series", (fake_source, series), selected)  # type: ignore[arg-type]
         for _ in range(100):
             root.update()
             if not app.is_running:
@@ -1013,13 +1013,13 @@ def test_gui_ffmpeg_locate_persists_and_updates_status(tmp_path, monkeypatch):
     monkeypatch.setattr("audiobookdl.utils.shutil.which", lambda _name: None)
     monkeypatch.setattr("audiobookdl.utils.validate_executable", lambda _path: None)
     monkeypatch.setattr("audiobookdl.gui.ffmpeg_assistant.validate_executable", lambda _path: None)
-    monkeypatch.setattr("audiobookdl.gui.app.filedialog.askdirectory", lambda **_kw: str(ffmpeg_root))
+    monkeypatch.setattr("audiobookdl.gui.ffmpeg_assistant.filedialog.askdirectory", lambda **_kw: str(ffmpeg_root))
 
     try:
         app = AudiobookDLApp(root, config_location=str(cfg_path))
         assert "Not found" in app.ffmpeg_status_var.get()
 
-        assert app.browse_ffmpeg_dir()
+        assert app._ffmpeg_assistant.browse_dir()
         assert app.ffmpeg_status_var.get() == "FFmpeg: Ready"
         assert load_config(str(cfg_path)).ffmpeg_dir == os.path.abspath(str(bin_dir))
     finally:
@@ -1078,7 +1078,7 @@ def test_gui_start_download_validates_ffmpeg_upfront(tmp_path, monkeypatch):
             lambda *_a, **_kw: True,
         )
         monkeypatch.setattr(
-            "audiobookdl.gui.app.filedialog.askdirectory",
+            "audiobookdl.gui.ffmpeg_assistant.filedialog.askdirectory",
             lambda **_kw: str(ffmpeg_dir),
         )
         monkeypatch.setattr("audiobookdl.utils.validate_executable", lambda _path: None)
@@ -1129,7 +1129,7 @@ def test_gui_rejects_unrunnable_ffmpeg_and_resets_to_path(tmp_path, monkeypatch)
         lambda title, msg, parent=None: warnings.append((title, msg)),
     )
     monkeypatch.setattr(
-        "audiobookdl.gui.app.filedialog.askdirectory",
+        "audiobookdl.gui.ffmpeg_assistant.filedialog.askdirectory",
         lambda **_kw: str(bad_dir.parent),
     )
 
@@ -1138,11 +1138,11 @@ def test_gui_rejects_unrunnable_ffmpeg_and_resets_to_path(tmp_path, monkeypatch)
         assert "Unusable" in app.ffmpeg_status_var.get()
 
         # Selecting an unrunnable binary is rejected and keeps config unchanged
-        assert app.browse_ffmpeg_dir() is False
+        assert app._ffmpeg_assistant.browse_dir() is False
         assert warnings and warnings[-1][0] == "Invalid FFmpeg Binary"
 
         # Resetting clears ffmpeg_dir and updates status
-        app.reset_ffmpeg_dir()
+        app._ffmpeg_assistant.reset_dir()
         assert load_config(str(cfg_path)).ffmpeg_dir is None
         assert "Not found" in app.ffmpeg_status_var.get()
     finally:
@@ -1169,12 +1169,12 @@ def test_gui_resume_and_m4b_bitrate_sync_and_persistence(tmp_path):
         app.resume_var.set(True)
         app.audio_bitrate_var.set("192k")
         app.m4b_var.set(True)
-        app._on_m4b_toggled()
+        app._options.on_m4b_toggled()
 
         opts = app.build_options()
         assert opts.resume is True
         assert opts.audio_bitrate == "192k"
-        app._save_run_preferences(opts)
+        app._options.save_run_preferences(opts)
     finally:
         root.destroy()
 
@@ -1201,7 +1201,7 @@ def test_gui_log_caps_line_count(tmp_path):
     try:
         app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
         for i in range(AudiobookDLApp.MAX_LOG_LINES + 50):
-            app._queue_panel.append_log(f"line {i}")
+            app.download_page.queue_panel.append_log(f"line {i}")
         total_lines = int(app.log_text.index("end-1c").split(".")[0])
         assert total_lines <= AudiobookDLApp.MAX_LOG_LINES + 1
         assert "line 0" not in app.log_text.get("1.0", "2.0")
@@ -1229,18 +1229,18 @@ def test_gui_queue_move_remove_retry_and_clear(tmp_path, monkeypatch):
             ctrl.batch_total = 2
             ctrl.run_seen_urls = {job_a.url, job_b.url}
             ctrl.pending_jobs.extend([job_a, job_b])
-        app._queue_panel.register_queue_job(job_a)
-        app._queue_panel.register_queue_job(job_b)
+        app.download_page.queue_panel.register_queue_job(job_a)
+        app.download_page.queue_panel.register_queue_job(job_b)
 
         # Move job_b up before job_a
         app.queue_tree.selection_set("job_b")
-        app._queue_panel.move_selected_item(-1)
+        app.download_page.queue_panel.move_selected_item(-1)
         assert [j.job_id for j in ctrl.pending_jobs if j is not None] == ["job_b", "job_a"]
         assert list(app.queue_tree.get_children()) == ["job_b", "job_a"]
 
         # Remove job_a
         app.queue_tree.selection_set("job_a")
-        app._queue_panel.remove_selected_item()
+        app.download_page.queue_panel.remove_selected_item()
         assert [j.job_id for j in ctrl.pending_jobs if j is not None] == ["job_b"]
         assert list(app.queue_tree.get_children()) == ["job_b"]
         assert ctrl.batch_total == 1
@@ -1248,16 +1248,16 @@ def test_gui_queue_move_remove_retry_and_clear(tmp_path, monkeypatch):
         # Retry failed items and clear history
         ctrl.pending_jobs.clear()
         ctrl.worker_has_active_run = False
-        app._queue_panel.update_queue_row("job_b", "Failed", "timeout")
+        app.download_page.queue_panel.update_queue_row("job_b", "Failed", "timeout")
 
         retried = {}
         monkeypatch.setattr(app._ffmpeg_assistant, "ensure_available", lambda _opts: True)
-        monkeypatch.setattr(app, "_save_run_preferences", lambda _opts: None)
-        monkeypatch.setattr(app, "_start_new_run", lambda specs: retried.setdefault("urls", [s[0] for s in specs]))
-        app._retry_failed_queue_items()
+        monkeypatch.setattr(app._options, "save_run_preferences", lambda _opts: None)
+        monkeypatch.setattr(app._runs, "start_new_run", lambda specs: retried.setdefault("urls", [s[0] for s in specs]))
+        app._runs.retry_failed_queue_items()
         assert retried["urls"] == ["https://librivox.org/book-b"]
 
-        app._queue_panel.clear_completed_history()
+        app.download_page.queue_panel.clear_completed_history()
         assert list(app.queue_tree.get_children()) == []
     finally:
         root.destroy()
@@ -1301,7 +1301,7 @@ def test_gui_series_preview_filter_and_shift_range(tmp_path):
         series = Series(title="My Series", books=books)
         fake_source = MagicMock()
         fake_source.name = "storytel"
-        dialog = app._show_preview_dialog("https://www.storytel.com/series/1", fake_source, series)
+        dialog = app._preview.show_preview_dialog("https://www.storytel.com/series/1", fake_source, series)
         root.update_idletasks()
         try:
             assert "[Exists]" in dialog._item_labels[0]
@@ -1342,12 +1342,12 @@ def test_gui_ignores_stale_item_progress_and_warns_mixed_services(tmp_path, monk
     root.withdraw()
     try:
         app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
-        app._queue_panel.current_ui_run_id = 2
-        app._handle_event(ItemProgressEvent(run_id=1, current=3, total=5, title="Old Run Book"))
-        assert app._queue_panel.ui_book_index == 0
-        app._handle_event(ItemProgressEvent(run_id=2, current=1, total=4, title="Current Run Book"))
-        assert app._queue_panel.ui_book_index == 1
-        assert app._queue_panel.ui_book_total == 4
+        app.download_page.queue_panel.current_ui_run_id = 2
+        app._events.handle_event(ItemProgressEvent(run_id=1, current=3, total=5, title="Old Run Book"))
+        assert app.download_page.queue_panel.ui_book_index == 0
+        app._events.handle_event(ItemProgressEvent(run_id=2, current=1, total=4, title="Current Run Book"))
+        assert app.download_page.queue_panel.ui_book_index == 1
+        assert app.download_page.queue_panel.ui_book_total == 4
 
         app.service_label_var.set("Storytel")
         acct = app.navigate("accounts")
@@ -1378,7 +1378,7 @@ def test_gui_template_preset_and_live_preview(tmp_path):
         app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
         app.output_dir_var.set(str(tmp_path))
         app.template_preset_var.set("Audiobookshelf")
-        app._on_preset_selected()
+        app._options.on_preset_selected()
         assert "series_order_padded" in app.template_var.get()
         preview = app.template_preview_var.get().replace("\\", "/")
         assert "Frank Herbert/Dune Chronicles/Book 01 - Dune" in preview
@@ -1456,12 +1456,12 @@ def test_gui_verify_auth_catalog_browser_and_update_handlers(tmp_path, monkeypat
             lambda title, msg, parent=None: shown_info.append((title, msg)),
         )
         app._auth.is_verifying_auth = True
-        app._handle_event(AuthVerifiedEvent(service_label="Storytel", ok=True, error=None))
+        app._events.handle_event(AuthVerifiedEvent(service_label="Storytel", ok=True, error=None))
         assert not app._auth.is_verifying_auth
         assert "Login OK: Storytel" in app.status_var.get()
         assert shown_info[-1][0] == "Test Login"
 
-        app._handle_event(
+        app._events.handle_event(
             UpdateCheckedEvent(
                 info=UpdateInfo(current_version="0.7.7", latest_version="1.2.0", has_update=True),
                 interactive=True,
@@ -1571,7 +1571,7 @@ def test_gui_media_type_option_persistence_and_ffmpeg_bypass(tmp_path, monkeypat
         monkeypatch.setattr("audiobookdl.gui.ffmpeg_assistant.find_executable", lambda _cmd: None)
         assert app._ffmpeg_assistant.ensure_available(opts) is True
 
-        app._save_run_preferences(opts)
+        app._options.save_run_preferences(opts)
     finally:
         root.destroy()
 
@@ -1742,7 +1742,7 @@ def test_gui_controls_build_options_and_config_loading(tmp_path, monkeypatch):
             'max_workers = 2\n',
             encoding="utf-8",
         )
-        app._reload_config()
+        app._options.reload_config()
         assert app.download_archive_var.get() is True
         assert app.overwrite_var.get() == "Overwrite"
         assert app.max_workers_var.get() == "2"
@@ -1844,7 +1844,7 @@ def test_gui_persists_all_toggles_on_close_and_run_start(tmp_path):
         app2.enrich_metadata_var.set(False)
         app2.download_archive_var.set(True)
         opts2 = app2.build_options(urls_override=["https://example.com/book"])
-        app2._save_run_preferences(opts2)
+        app2._options.save_run_preferences(opts2)
     finally:
         root2.destroy()
 
@@ -1919,7 +1919,7 @@ def test_preview_dialog_inline_metadata_and_cover_editing(tmp_path, monkeypatch)
 
         # 1. Cancelling via Close/destroy leaves audiobook untouched
         confirmed: list[tuple] = []
-        dialog_cancel = app._show_preview_dialog("https://example.com/1", fake_source, audiobook)  # type: ignore[arg-type]
+        dialog_cancel = app._preview.show_preview_dialog("https://example.com/1", fake_source, audiobook)  # type: ignore[arg-type]
         dialog_cancel._title_var.set("Unsaved Change")
         dialog_cancel._series_var.set("Unsaved Series")
         dialog_cancel.destroy()
@@ -1939,7 +1939,7 @@ def test_preview_dialog_inline_metadata_and_cover_editing(tmp_path, monkeypatch)
             skip_downloaded=False,
             series_book_exists=lambda _b: False,
             on_confirm=lambda url, prefetched, indices: confirmed.append((url, prefetched, indices)),
-            palette=app._palette,
+            palette=app._window.palette,
         )
         assert dialog._title_var.get() == "Original Title"
         assert dialog._authors_var.get() == "First Author"
@@ -2049,7 +2049,7 @@ def test_gui_theme_switching_live_and_persistence(tmp_path, monkeypatch):
             metadata=AudiobookMetadata(title="Themed Book"),
             files=[AudiobookFile(url="https://example.com/1.mp3", ext="mp3")],
         )
-        dialog = app._show_preview_dialog(
+        dialog = app._preview.show_preview_dialog(
             "https://example.com/1",
             SimpleNamespace(name="FakeSource"),  # type: ignore[arg-type]
             book,
@@ -2074,7 +2074,7 @@ def test_gui_theme_switching_live_and_persistence(tmp_path, monkeypatch):
     try:
         app2 = AudiobookDLApp(root2, config_location=str(cfg_path))
         assert app2.theme_mode == "dark"
-        assert app2._palette == DARK_PALETTE
+        assert app2._window.palette == DARK_PALETTE
     finally:
         root2.destroy()
 
@@ -2158,7 +2158,7 @@ def test_gui_cookie_import_dialog_states_and_apply(tmp_path):
             app._services,
             initial_service_key="overdrive",
             on_apply=_on_apply,
-            palette=app._palette,
+            palette=app._window.palette,
             browser_detector=lambda: {"firefox": True, "edge": False, "chrome": False, "brave": False, "chromium": False, "opera": False},
         )
         root.update_idletasks()
@@ -2290,19 +2290,19 @@ def test_gui_completion_notifications_and_toggle_persistence(tmp_path, monkeypat
         app = AudiobookDLApp(root, config_location=str(cfg_path))
         assert app.notify_on_complete_var.get() is True
 
-        app._finish_run(DownloadSummary(completed=2, failed=0), None)
+        app._runs.finish_run(DownloadSummary(completed=2, failed=0), None)
         assert sent_notifs == [
             ("audiobook-dl: Download Complete", "Finished downloading 2 audiobooks.")
         ]
 
         # Cancelled runs do not notify
         sent_notifs.clear()
-        app._finish_run(DownloadSummary(completed=0, cancelled=True), None)
+        app._runs.finish_run(DownloadSummary(completed=0, cancelled=True), None)
         assert sent_notifs == []
 
         # Disabled toggle suppresses notifications and persists on close
         app.notify_on_complete_var.set(False)
-        app._finish_run(DownloadSummary(completed=1, failed=0), None)
+        app._runs.finish_run(DownloadSummary(completed=1, failed=0), None)
         assert sent_notifs == []
 
         app._on_close()
@@ -2391,7 +2391,7 @@ def test_gui_preview_cancel_enables_cancel_button_and_cancels_cleanly(tmp_path):
     try:
         app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
         app.urls_text.insert("1.0", "https://example.com/slow-book")
-        app._set_previewing_state(True)
+        app._preview.set_previewing_state(True)
         assert str(app.cancel_btn.cget("state")) == "normal"
         assert str(app.preview_btn.cget("state")) == "disabled"
         assert str(app.download_btn.cget("state")) == "disabled"
@@ -2401,8 +2401,8 @@ def test_gui_preview_cancel_enables_cancel_button_and_cancels_cleanly(tmp_path):
         assert app.status_var.get() == "Cancelling preview..."
         assert str(app.cancel_btn.cget("state")) == "disabled"
 
-        app._handle_preview_done("https://example.com/slow-book", None, DownloadCancelled())
-        assert not app._is_previewing
+        app._preview.handle_preview_done("https://example.com/slow-book", None, DownloadCancelled())
+        assert not app.is_previewing
         assert app.status_var.get() == "Preview cancelled"
         assert str(app.preview_btn.cget("state")) == "normal"
         assert str(app.download_btn.cget("state")) == "normal"
@@ -2422,7 +2422,7 @@ def test_gui_persistent_queue_and_pause_resume_toggle(tmp_path):
     cfg_path.write_text("", encoding="utf-8")
     try:
         app1 = AudiobookDLApp(root, config_location=str(cfg_path))
-        app1._set_running_state(True)
+        app1._runs.set_running_state(True)
         assert str(app1.pause_btn.cget("state")) == "normal"
         assert app1.pause_btn.cget("text") == "Pause"
         app1.toggle_pause_queue()
@@ -2431,14 +2431,14 @@ def test_gui_persistent_queue_and_pause_resume_toggle(tmp_path):
         app1.toggle_pause_queue()
         assert app1.controller.is_paused() is False
         assert app1.pause_btn.cget("text") == "Pause"
-        app1._set_running_state(False)
+        app1._runs.set_running_state(False)
 
         # Simulate unresolved & completed queue records before restart
         j1 = QueuedJob(job_id="j_pend", run_id=1, url="https://librivox.org/pending", options=build_default_options(), interaction=MagicMock())
         j2 = QueuedJob(job_id="j_done", run_id=1, url="https://librivox.org/done", options=build_default_options(), interaction=MagicMock())
-        app1._queue_panel.register_queue_job(j1)
-        app1._queue_panel.register_queue_job(j2)
-        app1._queue_panel.update_queue_row("j_done", "Completed", "1 ok")
+        app1.download_page.queue_panel.register_queue_job(j1)
+        app1.download_page.queue_panel.register_queue_job(j2)
+        app1.download_page.queue_panel.update_queue_row("j_done", "Completed", "1 ok")
         app1.controller.shutdown(is_running=False, is_previewing=False)
     finally:
         root.destroy()
@@ -2467,7 +2467,7 @@ def test_gui_queue_panel_tracks_stage_subprogress(tmp_path):
     root.withdraw()
     try:
         app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
-        panel = app._queue_panel
+        panel = app.download_page.queue_panel
         panel.prepare_run_ui_state(1, 1, "--- Starting ---")
         assert panel.stage_var.get() == "Stage: Preparing"
 
@@ -2485,7 +2485,7 @@ def test_gui_queue_panel_tracks_stage_subprogress(tmp_path):
         panel.handle_activity_event(LogEvent(level="INFO", message="Enriching metadata from providers"))
         assert panel.stage_var.get() == "Stage: Enriching metadata"
 
-        app._finish_run(DownloadSummary(completed=1, failed=0, cancelled=False), None)
+        app._runs.finish_run(DownloadSummary(completed=1, failed=0, cancelled=False), None)
         assert panel.stage_var.get() == ""
     finally:
         root.destroy()
@@ -2613,18 +2613,18 @@ def test_gui_preview_closes_source_on_dismiss_and_on_job_completion(tmp_path, mo
 
         app.output_dir_var.set(str(tmp_path))
         monkeypatch.setattr(app._ffmpeg_assistant, "ensure_available", lambda _opts: True)
-        monkeypatch.setattr(app, "_save_run_preferences", lambda _opts: None)
+        monkeypatch.setattr(app._options, "save_run_preferences", lambda _opts: None)
         monkeypatch.setattr(
             "audiobookdl.gui.controller.run_downloads",
             lambda *_a, **_kw: DownloadSummary(completed=1, books_completed=1),
         )
-        app._enqueue_from_preview("https://example.com/confirm", (src_confirm, book), None)
+        app._preview.enqueue_from_preview("https://example.com/confirm", (src_confirm, book), None)
         import time
 
         deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline and app._is_running:
+        while time.monotonic() < deadline and app.is_running:
             root.update()
-            app._poll_queue()
+            app._events.poll_queue()
             time.sleep(0.04)
         src_confirm.close.assert_called_once()
     finally:
@@ -2740,18 +2740,18 @@ def test_gui_retry_failed_allowed_during_active_run_and_poll_continues_in_modal(
             ctrl.batch_total = 2
             ctrl.run_seen_urls = {job_a.url, job_b.url}
             ctrl.pending_jobs.append(job_b)
-        app._is_running = True
-        app._queue_panel.register_queue_job(job_a)
-        app._queue_panel.register_queue_job(job_b)
-        app._queue_panel.update_queue_row("ja", "Failed", "network timeout")
+        app._runs.is_running = True
+        app.download_page.queue_panel.register_queue_job(job_a)
+        app.download_page.queue_panel.register_queue_job(job_b)
+        app.download_page.queue_panel.update_queue_row("ja", "Failed", "network timeout")
 
-        app._retry_failed_queue_items()
+        app._runs.retry_failed_queue_items()
         pending_urls = [j.url for j in ctrl.pending_jobs if j is not None]
         assert "https://librivox.org/fail-a" in pending_urls
         assert ctrl.batch_total == 3
 
         # Simulate nested modal wait_window during prompt_choice: logs queued afterwards still drain!
-        app._cancel_poll_timer()
+        app._events.cancel_poll_timer()
         holder: dict[str, Any] = {"value": None}
         done = threading.Event()
         ctrl.event_queue.put(
@@ -2775,7 +2775,7 @@ def test_gui_retry_failed_allowed_during_active_run_and_poll_continues_in_modal(
             dlg.destroy()
 
         monkeypatch.setattr(root, "wait_window", _fake_wait_window)
-        app._poll_queue()
+        app._events.poll_queue()
         assert done.is_set()
         assert holder["value"] == 1
         assert "Background progress during modal" in app.log_text.get("1.0", tk.END)
@@ -2801,18 +2801,18 @@ def test_gui_debounces_save_queue_state_and_hoists_series_build_options(tmp_path
             (f"https://librivox.org/book-{i}", app.build_options(urls_override=[f"https://librivox.org/book-{i}"]), None, None)
             for i in range(5)
         ]
-        app._start_new_run(specs)
+        app._runs.start_new_run(specs)
         assert len(save_calls) == 1
 
         # Series preview hoists build_options() once instead of per book in _series_book_exists
         build_calls = []
-        orig_build = app.build_options
+        orig_build = app._options.build_options
 
         def spy_build(*a, **kw):
             build_calls.append(1)
             return orig_build(*a, **kw)
 
-        monkeypatch.setattr(app, "build_options", spy_build)
+        monkeypatch.setattr(app._options, "build_options", spy_build)
         app.skip_downloaded_var.set(True)
         sess = requests.Session()
         series = Series(
@@ -2822,7 +2822,7 @@ def test_gui_debounces_save_queue_state_and_hoists_series_build_options(tmp_path
                 for i in range(6)
             ],
         )
-        dlg = app._show_preview_dialog("https://example.com/series", SimpleNamespace(name="Fake"), series)  # type: ignore[arg-type]
+        dlg = app._preview.show_preview_dialog("https://example.com/series", SimpleNamespace(name="Fake"), series)  # type: ignore[arg-type]
         try:
             assert len(build_calls) == 1
         finally:
@@ -2840,7 +2840,7 @@ def test_gui_debounces_save_queue_state_and_hoists_series_build_options(tmp_path
         monkeypatch.setattr(os, "listdir", spy_listdir)
         app.output_dir_var.set(str(tmp_path))
         app.template_var.set("{title}")
-        dlg2 = app._show_preview_dialog("https://example.com/series", SimpleNamespace(name="Fake"), series)  # type: ignore[arg-type]
+        dlg2 = app._preview.show_preview_dialog("https://example.com/series", SimpleNamespace(name="Fake"), series)  # type: ignore[arg-type]
         try:
             assert len(listdir_calls) == 1
         finally:
@@ -2854,7 +2854,7 @@ def test_gui_debounces_save_queue_state_and_hoists_series_build_options(tmp_path
             app.controller.event_queue.put(
                 JobStatusEvent(job_id=job_id, status="Cancelled", detail="Cancelled")
             )
-        app.controller.drain_events(app._handle_event)
+        app.controller.drain_events(app._events.handle_event)
         assert len(save_calls) == 1
     finally:
         app.controller.shutdown(is_running=False, is_previewing=False)
@@ -2934,9 +2934,9 @@ def test_gui_options_panel_exposes_new_pipeline_options_and_roundtrips(tmp_path)
         assert opts.chapters_from_silence is True
         assert opts.override_chapters is True
         app.no_chapters_var.set(True)
-        assert str(app._options_panel._cb_override_chapters.cget("state")) == "disabled"
+        assert str(app.download_page.options_panel._cb_override_chapters.cget("state")) == "disabled"
         app.no_chapters_var.set(False)
-        assert str(app._options_panel._cb_override_chapters.cget("state")) == "normal"
+        assert str(app.download_page.options_panel._cb_override_chapters.cget("state")) == "normal"
         assert opts.chapter_offset_ms == -250
         assert opts.square_cover is True
         assert opts.max_cover_size == 1200
@@ -3025,18 +3025,18 @@ def test_gui_sync_libraries_and_windows_toast_powershell_preference(tmp_path, mo
         monkeypatch.setattr(app.controller, "start_library_sync", lambda opts: started.append(opts))
         monkeypatch.setattr("audiobookdl.gui.app.messagebox.showinfo", lambda t, _m, parent=None: shown.append(t))
 
-        app._sync_libraries(services=["librivox"])
+        app._sync.sync_libraries(services=["librivox"])
         assert len(started) == 1
         assert started[0].services == ["librivox"]
-        assert app._is_syncing is True
+        assert app.is_syncing is True
 
-        app._handle_event(
+        app._events.handle_event(
             SyncDoneEvent(
                 cycle=SyncCycleResult(books_discovered=3, newly_added=1, downloaded=1),
                 error=None,
             )
         )
-        assert not app._is_syncing
+        assert not app.is_syncing
         assert "Sync complete" in app.status_var.get()
         assert shown == ["Library Sync Complete"]
     finally:
@@ -3151,7 +3151,7 @@ def test_gui_queue_row_actions_context_menu_double_click_and_multiselect(tmp_pat
     try:
         app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
         ctrl = app.controller
-        panel = app._queue_panel
+        panel = app.download_page.queue_panel
         interaction = GuiInteractionHandler(ctrl.event_queue, ctrl.cancel_event)
 
         out_file = tmp_path / "Finished Book.m4b"
@@ -3203,6 +3203,7 @@ def test_gui_queue_row_actions_context_menu_double_click_and_multiselect(tmp_pat
 
         # Double-click completed row opens output path; double-click failed row opens JobInspectorDialog
         from audiobookdl.gui.queue_panel import JobInspectorDialog
+        from audiobookdl.gui.window_manager import open_path_in_os
 
         opened: list[tuple[str, bool]] = []
         monkeypatch.setattr(panel, "_on_open_path", lambda p, rev=False: opened.append((p, rev)))
@@ -3212,16 +3213,16 @@ def test_gui_queue_row_actions_context_menu_double_click_and_multiselect(tmp_pat
 
         # Verify app._open_path_in_os handles direct open and reveal-in-folder
         popen_calls: list[list[str]] = []
-        monkeypatch.setattr("audiobookdl.gui.app.subprocess.Popen", lambda cmd: popen_calls.append(list(cmd)))
+        monkeypatch.setattr("audiobookdl.gui.window_manager.subprocess.Popen", lambda cmd: popen_calls.append(list(cmd)))
         if hasattr(os, "startfile"):
             startfile_calls: list[str] = []
             monkeypatch.setattr(os, "startfile", lambda p: startfile_calls.append(p))
-            app._open_path_in_os(str(out_file), reveal_in_folder=False)
+            open_path_in_os(app.root, str(out_file), reveal_in_folder=False)
             assert startfile_calls == [str(out_file)]
         else:
-            app._open_path_in_os(str(out_file), reveal_in_folder=False)
+            open_path_in_os(app.root, str(out_file), reveal_in_folder=False)
             assert len(popen_calls) == 1
-        app._open_path_in_os(str(out_file), reveal_in_folder=True)
+        open_path_in_os(app.root, str(out_file), reveal_in_folder=True)
         assert len(popen_calls) >= 1
 
         monkeypatch.setattr(app.queue_tree, "identify_row", lambda _y: "j_fail")
@@ -3393,7 +3394,7 @@ def test_gui_retry_preserves_profile_and_selected_indices(tmp_path, monkeypatch)
 
         opts = app.build_options(urls_override=["https://storytel.com/series/1"])
         opts.profile = "work"
-        app._start_new_run([("https://storytel.com/series/1", opts, [1, 3], None)])
+        app._runs.start_new_run([("https://storytel.com/series/1", opts, [1, 3], None)])
         for _ in range(100):
             root.update()
             if not app.is_running:
@@ -3403,7 +3404,7 @@ def test_gui_retry_preserves_profile_and_selected_indices(tmp_path, monkeypatch)
         assert seen_calls == [("work", [1, 3])]
         # Change current UI profile to default, then retry failed job; original profile and indices must remain.
         app.profile_var.set("default")
-        app._retry_failed_queue_items()
+        app._runs.retry_failed_queue_items()
         for _ in range(100):
             root.update()
             if not app.is_running:
@@ -3430,14 +3431,14 @@ def test_gui_preview_filter_focus_and_series_book_exists_for_book_id(tmp_path, m
         app = AudiobookDLApp(root, config_location=str(cfg_path))
         app.output_dir_var.set(str(tmp_path))
         app.download_archive_var.set(True)
-        with DownloadArchive(app._archive_ledger_path(), persistent=True) as archive:
+        with DownloadArchive(app._sync.archive_ledger_path(), persistent=True) as archive:
             archive.record("librivox", "k1", title="Book One", author="A", status="downloaded")
 
         b1 = BookId(id="1", title="Book One")
         b2 = BookId(id="2", title="Book Two")
         series = Series(title="My Series", books=[b1, b2])
         source = SimpleNamespace(name="LibriVox", close=lambda: None)
-        dlg = app._show_preview_dialog("https://librivox.org/s", source, series)  # type: ignore[arg-type]
+        dlg = app._preview.show_preview_dialog("https://librivox.org/s", source, series)  # type: ignore[arg-type]
         assert isinstance(dlg, PreviewDialog)
         assert "[Exists]" in dlg._item_labels[0]
         assert "[Exists]" not in dlg._item_labels[1]
@@ -3484,17 +3485,17 @@ def test_gui_sync_cancel_and_auth_panel_preserves_profile(tmp_path, monkeypatch)
             return SyncCycleResult(cancelled=True)
 
         monkeypatch.setattr("audiobookdl.sync.run_sync_once", fake_run_sync_once)
-        app._sync_libraries()
-        assert app._is_syncing is True
-        assert str(app._queue_panel.cancel_btn.cget("state")) == "normal"
+        app._sync.sync_libraries()
+        assert app.is_syncing is True
+        assert str(app.download_page.queue_panel.cancel_btn.cget("state")) == "normal"
         app.cancel_download()
         assert cancelled_seen.wait(timeout=2.0)
         for _ in range(100):
             root.update()
-            if not app._is_syncing:
+            if not app.is_syncing:
                 break
             threading.Event().wait(0.02)
-        assert not app._is_syncing
+        assert not app.is_syncing
     finally:
         app.controller.shutdown(is_running=False, is_previewing=False)
         root.destroy()
@@ -3545,18 +3546,18 @@ def test_gui_m2_sorting_collapsible_dependencies_log_batch_and_tokens(tmp_path):
 
         # 3. OptionsPanel dynamic dependency enabling & interactive mutual exclusion
         app.enrich_metadata_var.set(False)
-        assert str(app._options_panel._cb_enrich_interactive.cget("state")) == "disabled"
+        assert str(app.download_page.options_panel._cb_enrich_interactive.cget("state")) == "disabled"
         app.enrich_metadata_var.set(True)
-        assert str(app._options_panel._cb_enrich_interactive.cget("state")) == "normal"
+        assert str(app.download_page.options_panel._cb_enrich_interactive.cget("state")) == "normal"
 
         app.cover_only_var.set(True)
-        assert str(app._options_panel._format_combo.cget("state")) == "disabled"
+        assert str(app.download_page.options_panel._format_combo.cget("state")) == "disabled"
         app.cover_only_var.set(False)
-        assert str(app._options_panel._format_combo.cget("state")) == "readonly"
+        assert str(app.download_page.options_panel._format_combo.cget("state")) == "readonly"
 
         app.combine_var.set(True)
         app.split_chapters_var.set(True)
-        app._options_panel._on_split_chapters_clicked()
+        app.download_page.options_panel._on_split_chapters_clicked()
         assert app.combine_var.get() is False
 
         # 4. Log batch coalescing & level/search filtering
@@ -3564,14 +3565,14 @@ def test_gui_m2_sorting_collapsible_dependencies_log_batch_and_tokens(tmp_path):
             app.controller.event_queue.put(LogEvent(level="INFO", message=f"Info line {i}"))
         app.controller.event_queue.put(LogEvent(level="ERROR", message="Failure boom"))
         app.controller.event_queue.put(LogEvent(level="DEBUG", message="Verbose trace"))
-        app._poll_queue()
+        app._events.poll_queue()
         text_all = app.log_text.get("1.0", tk.END)
         assert "Info line 4" in text_all
         assert "[ERROR] Failure boom" in text_all
         assert "[DEBUG] Verbose trace" in text_all
 
-        app._queue_panel.log_level_var.set("Errors Only")
-        app._queue_panel._rerender_logs()
+        app.download_page.queue_panel.log_level_var.set("Errors Only")
+        app.download_page.queue_panel._rerender_logs()
         text_err = app.log_text.get("1.0", tk.END)
         assert "[ERROR] Failure boom" in text_err
         assert "Info line 4" not in text_err
@@ -3756,7 +3757,7 @@ def test_gui_m3_queue_inspector_reorder_filter_sync_accounts_and_archive(tmp_pat
     app = AudiobookDLApp(root, config_location=str(cfg_path))
     try:
         ctrl = app.controller
-        panel = app._queue_panel
+        panel = app.download_page.queue_panel
         inter = GuiInteractionHandler(ctrl.event_queue, ctrl.cancel_event)
 
         # 1. Queue reorder to edge/target + filter & search + JobInspectorDialog
@@ -3845,7 +3846,7 @@ def test_gui_m3_queue_inspector_reorder_filter_sync_accounts_and_archive(tmp_pat
         # 4. Live URL validation highlights invalid lines, drop & paste open PackPage
         app.urls_text.delete("1.0", tk.END)
         app.urls_text.insert("1.0", "https://librivox.org/valid\nnot-a-valid-url")
-        app._on_urls_changed()
+        app._urls.on_urls_changed()
         assert len(app.urls_text.tag_ranges("warning_line")) == 2
         assert "1 URL" in str(app.download_page.url_frame.cget("text"))
 
@@ -3853,12 +3854,12 @@ def test_gui_m3_queue_inspector_reorder_filter_sync_accounts_and_archive(tmp_pat
         drop_dir.mkdir()
         opened_packs: list[list[str]] = []
         monkeypatch.setattr(app, "open_pack_with_paths", lambda paths: opened_packs.append(list(paths)))
-        app._on_url_drop(SimpleNamespace(data=f"{{{drop_dir}}}"))
+        app._urls.on_url_drop(SimpleNamespace(data=f"{{{drop_dir}}}"))
         assert opened_packs == [[str(drop_dir)]]
 
         root.clipboard_clear()
         root.clipboard_append(str(drop_dir))
-        app._paste_urls_from_clipboard()
+        app._urls.paste_urls_from_clipboard()
         assert opened_packs == [[str(drop_dir)], [str(drop_dir)]]
     finally:
         app.controller.shutdown(is_running=False, is_previewing=False)
@@ -4015,8 +4016,8 @@ def test_gui_window_state_persistence_roundtrip_and_monitor_clamping(tmp_path):
         app.download_page.naming_section.toggle(False)
         root.geometry("920x660+60+40")
         root.update()
-        app._normal_geometry = "920x660+60+40"
-        app._is_maximized = True
+        app._window.normal_geometry = "920x660+60+40"
+        app._window.is_maximized = True
         app.download_page._split_ratio = 0.42
         app.download_page._user_dragged_split = True
         app.navigate("library")
@@ -4062,7 +4063,7 @@ def test_gui_modal_dialog_centering_clamping_grab_and_focus_restore(tmp_path, mo
         dlg = ModalDialog(
             root,
             "Test Modal",
-            palette=app._palette,
+            palette=app._window.palette,
             default_size=(600, 420),
             min_size=(300, 200),
         )
@@ -4088,7 +4089,7 @@ def test_gui_modal_dialog_centering_clamping_grab_and_focus_restore(tmp_path, mo
         assert restored_focus == [True]
 
         # AboutDialog uses ModalDialog
-        about = app._show_about_dialog()
+        about = app._window.show_about_dialog()
         assert about.grab_current() is about
         assert "audiobook-dl" in about._info_text
         about.destroy()
@@ -4172,7 +4173,7 @@ def test_gui_catalog_fetch_scopes_auth_to_catalog_service_and_shows_non_empty_er
 
         # UserNotAuthorized without a custom message still displays readable dialog text
         app.controller.catalog_request_id = 1
-        app._handle_event(
+        app._events.handle_event(
             CatalogLoadedEvent(
                 request_id=1,
                 target_tab=cat,
@@ -4367,8 +4368,8 @@ def test_gui02_non_download_startup_no_duplicate_queue_and_lazy_download_page(tm
 
         # Logging while on a non-download page buffers without instantiating DownloadPage
         app.controller.sink.on_log("INFO", "Background status check")
-        app._append_log("Direct buffered log")
-        app._poll_queue()
+        app._events.append_log("Direct buffered log")
+        app._events.poll_queue()
         assert app.shell.built_page_ids() == ("library",)
 
         # Repeated load_saved_queue_records calls remain idempotent
@@ -4565,7 +4566,7 @@ def test_gui05_queue_sorting_disabled_filter_safe_move_and_drag_threshold(tmp_pa
     app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
     try:
         ctrl = app.controller
-        panel = app._queue_panel
+        panel = app.download_page.queue_panel
         assert panel._scrolled_queue._enable_sorting is False
 
         inter = GuiInteractionHandler(ctrl.event_queue, ctrl.cancel_event)
@@ -4758,7 +4759,7 @@ def test_gui_08_debounced_filters_and_coalesced_log_inserts(tmp_path, monkeypatc
     root.withdraw()
     app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
     try:
-        panel = app._queue_panel
+        panel = app.download_page.queue_panel
         insert_calls: list[tuple] = []
         orig_insert = panel.log_text.insert
 
@@ -4905,7 +4906,7 @@ def test_gui_10_dropped_txt_url_file_and_local_folder(tmp_path, monkeypatch):
         opened_packs: list[list[str]] = []
         monkeypatch.setattr(app, "open_pack_with_paths", lambda p: opened_packs.append(list(p)))
 
-        app._on_url_drop(SimpleNamespace(data=f"{{{url_list_file}}} {{{pack_dir}}}"))
+        app._urls.on_url_drop(SimpleNamespace(data=f"{{{url_list_file}}} {{{pack_dir}}}"))
         urls_box_text = app.urls_text.get("1.0", tk.END)
         assert "https://librivox.org/book-1" in urls_box_text
         assert "https://librivox.org/book-2" in urls_box_text
@@ -5094,7 +5095,7 @@ def test_gui_16_queue_profile_column_live_row_progress_and_job_options_edit(tmp_
     app = AudiobookDLApp(root, config_location=str(cfg_path))
     try:
         ctrl = app.controller
-        panel = app._queue_panel
+        panel = app.download_page.queue_panel
         inter = GuiInteractionHandler(ctrl.event_queue, ctrl.cancel_event)
         opts = app.build_options(["https://www.storytel.com/books/1"])
         opts.profile = "work"
@@ -5585,7 +5586,7 @@ def test_settings_page_custom_providers_ui_and_app_integration(tmp_path, monkeyp
             app.enrich_providers_var.set("hardcover,itunes")
             opts = app.build_options(urls_override=[])
             assert opts.enrich_providers == "custom:hardcover,itunes"
-            assert app._read_persisted_gui_preferences()["enrich_providers"] == "custom:hardcover,itunes"
+            assert app._options.read_persisted_gui_preferences()["enrich_providers"] == "custom:hardcover,itunes"
 
             # Toggle Enabled persists to TOML
             app.navigate("settings")
@@ -5711,7 +5712,7 @@ def test_audit_regressions_queue_reset_pack_keys_sync_mode_filter_and_abs_chapte
                 interaction=interaction,
             )
             ctrl.pending_jobs.append(job)
-            app._queue_panel.register_queue_job(job, persist=False)
+            app.download_page.queue_panel.register_queue_job(job, persist=False)
 
             ctrl.update_queue_job_config("dl-ov-1", job_overrides={"output_format": "m4b", "audio_bitrate": "128k"})
             assert job.options.output_format == "m4b"
@@ -5733,7 +5734,7 @@ def test_audit_regressions_queue_reset_pack_keys_sync_mode_filter_and_abs_chapte
                 pack_request=PackJobRequest(paths=[str(tmp_path)], output_format="m4b"),
             )
             ctrl.pending_jobs.append(pack_job)
-            app._queue_panel.register_queue_job(pack_job, persist=False)
+            app.download_page.queue_panel.register_queue_job(pack_job, persist=False)
             updated_pack = ctrl.update_queue_job_config("pack-ov-1", job_overrides={"output_format": "mp3"})
             assert updated_pack is not None
             assert updated_pack["pack_request"]["output_format"] == "mp3"
@@ -5776,7 +5777,7 @@ def test_audit_regressions_queue_reset_pack_keys_sync_mode_filter_and_abs_chapte
             assert rescanned.audiobook.metadata.title == "Custom Title"
 
             # ActivityQueuePanel single-row filter detach/reattach on status update
-            panel = app._queue_panel
+            panel = app.download_page.queue_panel
             panel.queue_filter_var.set("Failed")
             panel._apply_queue_filter()
             assert "dl-ov-1" in panel._detached_iids
@@ -5808,8 +5809,8 @@ def test_gui_event_driven_idle_poll_wakes_on_bg_task_and_debounces_archive_selec
         app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
         try:
             # 1. Idle poll stops scheduling 250ms timers once queues and tasks are empty.
-            app._poll_queue()
-            assert app._poll_after_id is None
+            app._events.poll_queue()
+            assert app._events._poll_after_id is None
 
             # 2. Submitting a bounded pool task wakes polling cleanly and sleeps again once complete.
             gate = threading.Event()
@@ -5822,18 +5823,18 @@ def test_gui_event_driven_idle_poll_wakes_on_bg_task_and_debounces_archive_selec
 
             app.controller._submit_bg_task(_bg_job)
             assert app.controller.has_active_background_tasks() is True
-            assert app._poll_after_id is not None
+            assert app._events._poll_after_id is not None
 
             gate.set()
             assert done_flag.wait(timeout=2.0)
             deadline = time.monotonic() + 2.0
             while time.monotonic() < deadline and (
-                app._poll_after_id is not None or not app.controller.event_queue.empty()
+                app._events._poll_after_id is not None or not app.controller.event_queue.empty()
             ):
                 root.update()
                 time.sleep(0.01)
             assert app.controller.has_active_background_tasks() is False
-            assert app._poll_after_id is None
+            assert app._events._poll_after_id is None
         finally:
             app._on_close(force=True)
     finally:
@@ -5906,7 +5907,7 @@ def test_gui_p2_3_horizontal_scroll_live_system_theme_and_queue_concurrency(tmp_
     root.withdraw()
 
     system_theme = ["light"]
-    monkeypatch.setattr("audiobookdl.gui.app.detect_system_theme", lambda: system_theme[0])
+    monkeypatch.setattr("audiobookdl.gui.window_manager.detect_system_theme", lambda: system_theme[0])
     monkeypatch.setattr("audiobookdl.gui.theme.detect_system_theme", lambda: system_theme[0])
 
     cfg_path = tmp_path / "audiobook-dl.toml"
@@ -5929,13 +5930,13 @@ def test_gui_p2_3_horizontal_scroll_live_system_theme_and_queue_concurrency(tmp_
 
             # 2. Live OS theme change tracking when mode == "system"
             app.set_theme("system")
-            assert app._palette.mode == "light"
-            assert app._theme_watch_after_id is not None
+            assert app._window.palette.mode == "light"
+            assert app._window.theme_watch_after_id is not None
             system_theme[0] = "dark"
-            app._check_system_theme()
-            assert app._palette.mode == "dark"
+            app._window.check_system_theme()
+            assert app._window.palette.mode == "dark"
             app.set_theme("light")
-            assert app._theme_watch_after_id is None
+            assert app._window.theme_watch_after_id is None
 
             # 3. Queue concurrency UI spinbox persists to config
             dl_page = app.download_page
@@ -6098,11 +6099,11 @@ def test_p3_2_audition_tray_daemon_and_duplicate_preview(tmp_path, monkeypatch):
             tray_starts = []
             tray_stops = []
             monkeypatch.setattr(TrayIconController, "is_available", staticmethod(lambda: True))
-            monkeypatch.setattr(app._tray_controller, "start", lambda: (tray_starts.append(True), True)[1])
-            monkeypatch.setattr(app._tray_controller, "stop", lambda: tray_stops.append(True))
+            monkeypatch.setattr(app._window.tray_controller, "start", lambda: (tray_starts.append(True), True)[1])
+            monkeypatch.setattr(app._window.tray_controller, "stop", lambda: tray_stops.append(True))
 
             app.minimize_to_tray_var.set(True)
-            app._toggle_minimize_to_tray()
+            app._window.toggle_minimize_to_tray()
             assert load_config(str(cfg_path)).gui.minimize_to_tray is True
 
             # Normal close minimizes instead of destroying root
@@ -6117,7 +6118,7 @@ def test_p3_2_audition_tray_daemon_and_duplicate_preview(tmp_path, monkeypatch):
                 metadata=AudiobookMetadata(title="Dune", authors=["Frank Herbert"], asin="B000R3434M"),
                 files=[AudiobookFile(url="https://libro.fm/1.mp3", ext="mp3")],
             )
-            dlg = app._show_preview_dialog("https://libro.fm/book/dune", src, ab)  # type: ignore[arg-type]
+            dlg = app._preview.show_preview_dialog("https://libro.fm/book/dune", src, ab)  # type: ignore[arg-type]
             assert dlg._duplicate_warning is not None
             assert "storytel" in dlg._duplicate_warning
             dlg.destroy()
@@ -6381,7 +6382,7 @@ def test_gui_contextual_account_jump_and_view_in_download_action(tmp_path, monke
     try:
         dl = app.download_page
         dl.urls_text.insert("1.0", "https://librivox.org/test-book")
-        app._on_urls_changed()
+        app._urls.on_urls_changed()
 
         # Clicking account chip jumps to Accounts for the detected service, Back restores Download + URLs
         dl.account_chip_btn.invoke()
@@ -6440,7 +6441,7 @@ def test_gui_contextual_account_jump_and_view_in_download_action(tmp_path, monke
             label="Test Pack",
             output_format="m4b",
         )
-        app._on_pack_submitted([req], "m4b")
+        app._runs.on_pack_submitted([req], "m4b")
         assert app.shell.active_page_id == "pack"
         assert app.shell.context_action_btn.winfo_manager() == "grid"
         assert "View in Download" in str(app.shell.context_action_btn.cget("text"))

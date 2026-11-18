@@ -63,23 +63,23 @@ def test_gui_preview_and_download_m4b_end_to_end(
 
     app = gui_harness.start()
     app.urls_text.insert("1.0", f"{book_url}\n")
-    app._on_urls_changed()
+    app._urls.on_urls_changed()
     assert app.service_label_var.get() == "Librivox"
 
     # 1. Preview metadata through real background fetch + Tkinter dialog
     app.preview_metadata()
     gui_harness.pump_until(
-        lambda: not app.is_previewing and app._preview_dialog is not None,
+        lambda: not app.is_previewing and app._preview.dialog is not None,
         description="preview dialog to open",
     )
-    assert app._preview_dialog is not None
-    assert "GUI E2E Audiobook" in app._preview_dialog.title()
-    assert hasattr(app._preview_dialog, "_cover_photo")
-    app._preview_dialog.destroy()
+    assert app._preview.dialog is not None
+    assert "GUI E2E Audiobook" in app._preview.dialog.title()
+    assert hasattr(app._preview.dialog, "_cover_photo")
+    app._preview.dialog.destroy()
 
     # 2. Configure .m4b + JSON sidecar and run full download via real worker thread
     app.m4b_var.set(True)
-    app._on_m4b_toggled()
+    app._options.on_m4b_toggled()
     app.write_json_var.set(True)
     app.start_download()
     assert app.is_running

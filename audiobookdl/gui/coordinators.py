@@ -2,19 +2,26 @@
 
 from __future__ import annotations
 
+from collections import Counter
 import os
 import re
 import tkinter as tk
-from typing import Any
+from tkinter import filedialog, messagebox
+from typing import TYPE_CHECKING, Any
 from collections.abc import Callable, Sequence
 
 from audiobookdl import output
 from audiobookdl.config import DEFAULT_AUTO_SYNC_MODE, VALID_AUTO_SYNC_MODES
 from audiobookdl.options_schema import DownloadOptions
+from audiobookdl.gui.dnd import install_windows_file_drop
 from audiobookdl.gui.formatting import parse_url_text
 from audiobookdl.pack import SUPPORTED_PACK_EXTENSIONS
 from audiobookdl.sources import detect_service_key
 from audiobookdl.utils.audiobook import Audiobook, AudiobookMetadata, BookId
+
+if TYPE_CHECKING:
+    from audiobookdl.gui.auth_panel import ServiceAuthCoordinator
+    from audiobookdl.gui.pages import DownloadPage
 
 
 def split_dropped_tokens(raw_data: str) -> list[str]:
@@ -227,3 +234,228 @@ class AutomationCoordinator:
             else:
                 self._sync_libraries()
         self.configure_auto_sync_timer(True, self.auto_sync_minutes)
+
+
+class UrlInputCoordinator:
+    """Manages URL text input, clipboard pasting, .txt file loading, and drag-and-drop."""
+
+    def __init__(
+        self,
+        root: tk.Tk,
+        *,
+        status_var: tk.StringVar,
+        auth: ServiceAuthCoordinator,
+        get_download_page: Callable[[], DownloadPage | None],
+        ensure_download_page: Callable[[], DownloadPage],
+        navigate_download: Callable[[], object],
+        open_pack_with_paths: Callable[[Sequence[str]], object],
+        start_download: Callable[[], None],
+    ) -> None:
+        self._root = root
+        self._status_var = status_var
+        self._auth = auth
+        self._get_download_page = get_download_page
+        self._ensure_download_page = ensure_download_page
+        self._navigate_download = navigate_download
+        self._open_pack_with_paths = open_pack_with_paths
+        self._start_download = start_download
+        self._url_debounce_after_id: str | None = None
+        self._win_drop_installed = False
+
+    def cancel_debounce(self) -> None:
+        if self._url_debounce_after_id is not None:
+            try:
+                self._root.after_cancel(self._url_debounce_after_id)
+            except tk.TclError:
+                pass
+            self._url_debounce_after_id = None
+
+    def bind_drop_target(self, target: Any, *, stop_prop: bool) -> None:
+        if not (hasattr(target, "drop_target_register") and hasattr(target, "dnd_bind")):
+            return
+
+        def _handler(ev: Any) -> str | None:
+            self.on_url_drop(ev)
+            return "break" if stop_prop else None
+
+        try:
+            target.drop_target_register("DND_Text", "DND_Files")
+            target.dnd_bind("<<Drop>>", _handler)
+        except Exception:
+            try:
+                target.drop_target_register("DND_Text")
+                target.dnd_bind("<<Drop>>", _handler)
+            except Exception:
+                pass
+
+    def install_root_drop(self) -> None:
+        self.bind_drop_target(self._root, stop_prop=False)
+        if hasattr(self._root, "drop_target_register") and hasattr(self._root, "dnd_bind"):
+            return
+
+        def _ensure_win_drop(_ev: tk.Event | None = None) -> None:
+            if self._win_drop_installed:
+                return
+            try:
+                if not self._root.winfo_exists() or not self._root.winfo_ismapped():
+                    return
+            except tk.TclError:
+                return
+            self._win_drop_installed = True
+            install_windows_file_drop(self._root, self.on_dropped_paths)
+
+        if self._root.winfo_ismapped():
+            _ensure_win_drop()
+        else:
+            self._root.bind("<Map>", _ensure_win_drop, add="+")
+
+    def on_dropped_paths(self, tokens: Sequence[str]) -> None:
+        local_paths, url_tokens = partition_input_tokens(tokens)
+        if local_paths:
+            self._open_pack_with_paths(local_paths)
+        if url_tokens:
+            self.append_urls_to_input(url_tokens)
+
+    def on_url_drop(self, event: Any) -> None:
+        dropped = getattr(event, "data", "")
+        if not dropped:
+            return
+        tokens = split_dropped_tokens(str(dropped))
+        self.on_dropped_paths(tokens)
+
+    def append_urls_to_input(self, urls: Sequence[str]) -> list[str]:
+        box = self._ensure_download_page().urls_text
+        existing = parse_url_text(box.get("1.0", tk.END))
+        existing_set = set(existing)
+        added = [u for u in urls if u not in existing_set]
+        if added:
+            combined = "\n".join([*existing, *added])
+            box.delete("1.0", tk.END)
+            box.insert("1.0", combined)
+            self.on_urls_changed()
+        return added
+
+    def on_urls_modified(self, _event: tk.Event | None = None) -> None:
+        urls_text = self._ensure_download_page().urls_text
+        try:
+            if not urls_text.edit_modified():
+                return
+            urls_text.edit_modified(False)
+        except tk.TclError:
+            return
+        self.cancel_debounce()
+        self._url_debounce_after_id = self._root.after(100, self.on_urls_changed)
+
+    def on_urls_changed(self, _event: tk.Event | None = None) -> None:
+        self._url_debounce_after_id = None
+        dl_page = self._get_download_page()
+        if dl_page is None:
+            return
+        raw_text = dl_page.urls_text.get("1.0", tk.END)
+        urls = parse_url_text(raw_text)
+        self._auth.on_urls_changed(urls)
+
+        dl_page.urls_text.tag_remove("warning_line", "1.0", tk.END)
+        counts: Counter[str] = Counter()
+        valid_count = 0
+        for line_no, raw_line in enumerate(raw_text.splitlines(), start=1):
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            tokens = stripped.split()
+            line_valid = True
+            for tok in tokens:
+                is_http = tok.lower().startswith(("http://", "https://"))
+                svc_key = detect_service_key(tok)
+                if is_http:
+                    valid_count += 1
+                    label = self._auth.service_label_for_url(tok) if svc_key else "Generic"
+                    counts[label] += 1
+                else:
+                    line_valid = False
+            if not line_valid:
+                dl_page.urls_text.tag_add("warning_line", f"{line_no}.0", f"{line_no}.end")
+
+        if valid_count == 0:
+            dl_page.url_frame.configure(text="Audiobook URL(s)")
+        else:
+            breakdown = ", ".join(f"{cnt} {lbl}" for lbl, cnt in counts.most_common(3))
+            dl_page.url_frame.configure(
+                text=f"Audiobook URL(s) \u2014 {valid_count} URL{'s' if valid_count != 1 else ''} ({breakdown})"
+            )
+
+    def browse_url_file(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self._root,
+            title="Select URL list file",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                content = f.read().strip()
+        except OSError as exc:
+            messagebox.showerror("Error", f"Could not read file:\n{exc}", parent=self._root)
+            return
+        if content:
+            self._navigate_download()
+            urls_text = self._ensure_download_page().urls_text
+            existing = urls_text.get("1.0", tk.END).strip()
+            combined = f"{existing}\n{content}" if existing else content
+            urls_text.delete("1.0", tk.END)
+            urls_text.insert("1.0", combined)
+            self.on_urls_changed()
+
+    def clear_urls(self) -> None:
+        urls_text = self._ensure_download_page().urls_text
+        urls_text.delete("1.0", tk.END)
+        self.on_urls_changed()
+
+    def paste_urls_from_clipboard(self) -> list[str]:
+        """Insert URLs from the system clipboard into the URL box or open Pack for local paths."""
+        try:
+            raw = self._root.clipboard_get()
+        except tk.TclError:
+            self._status_var.set("Clipboard is empty")
+            return []
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        local_paths, _url_candidates = partition_input_tokens(lines)
+        pasted = [
+            u
+            for u in parse_url_text(raw)
+            if not (
+                os.path.isdir(u)
+                or (
+                    os.path.isfile(u)
+                    and os.path.splitext(u)[1].lstrip(".").lower() in SUPPORTED_PACK_EXTENSIONS
+                )
+            )
+        ]
+        if local_paths:
+            self._open_pack_with_paths(local_paths)
+        if not pasted:
+            if not local_paths:
+                self._status_var.set("No URLs found in clipboard")
+            return []
+        added = self.append_urls_to_input(pasted)
+        if added:
+            self._status_var.set(f"Pasted {len(added)} URL{'s' if len(added) != 1 else ''}")
+        else:
+            self._status_var.set("Clipboard URL(s) already listed")
+        return added
+
+    def paste_and_queue(self) -> None:
+        pasted = self.paste_urls_from_clipboard()
+        urls_text = self._ensure_download_page().urls_text
+        if pasted or parse_url_text(urls_text.get("1.0", tk.END)):
+            self._start_download()
+
+    def send_urls_to_input(self, urls: Sequence[str]) -> None:
+        added = self.append_urls_to_input(urls)
+        if added:
+            self._status_var.set(
+                f"Added {len(added)} URL{'s' if len(added) != 1 else ''} to input"
+            )
+        else:
+            self._status_var.set("URL(s) already in input")

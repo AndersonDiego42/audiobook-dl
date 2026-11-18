@@ -674,9 +674,9 @@ def test_app_wires_pack_button_and_submission(tmp_path: Path):
             patch("audiobookdl.pack.output.combine_audiofiles", side_effect=_fake_combine),
             patch("audiobookdl.pack.output_download.add_metadata_to_file"),
         ):
-            app._on_pack_submitted([req], "m4b")
+            app._runs.on_pack_submitted([req], "m4b")
             deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline and app._is_running:
+            while time.monotonic() < deadline and app.is_running:
                 root.update()
                 time.sleep(0.02)
             root.update()
@@ -685,11 +685,11 @@ def test_app_wires_pack_button_and_submission(tmp_path: Path):
         row_values = tree_item_values(app.queue_tree, children[0])
         assert row_values[0] == "Local Pack"
         assert app.queue_tree.set(children[0], "status") == "Completed", (
-            f"row={row_values}, running={app._is_running}, "
+            f"row={row_values}, running={app.is_running}, "
             f"status={app.status_var.get()!r}, log={app.log_text.get('1.0', tk.END)!r}"
         )
     finally:
-        app._controller.shutdown(is_running=False, is_previewing=False)
+        app.controller.shutdown(is_running=False, is_previewing=False)
         del app
         gc.collect()
         root.destroy()
@@ -845,7 +845,7 @@ def test_pack_dialog_preserves_explicit_fields_passes_output_dir_and_keeps_globa
 
         # Submitting a pack job with m4b must NOT overwrite global saved output_format="mp3"
         with patch.object(app.controller, "start_or_enqueue_pack_jobs", return_value=(True, 1, [], 1)):
-            app._on_pack_submitted(submitted[0][0], "m4b")
+            app._runs.on_pack_submitted(submitted[0][0], "m4b")
         reloaded = load_config(str(cfg_path))
         assert reloaded.output_format == "mp3"
     finally:
@@ -931,9 +931,9 @@ def test_pack_job_persistence_and_retry_across_restart(tmp_path: Path, monkeypat
             interaction=interaction,
             pack_request=PackJobRequest(paths=[str(src_dir)], label="Completed Pack", output_format="m4b"),
         )
-        app1._queue_panel.register_queue_job(j_pending, persist=False)
-        app1._queue_panel.register_queue_job(j_done, persist=False)
-        app1._queue_panel.update_queue_row("p_done", "Completed", "1 ok")
+        app1.download_page.queue_panel.register_queue_job(j_pending, persist=False)
+        app1.download_page.queue_panel.register_queue_job(j_done, persist=False)
+        app1.download_page.queue_panel.update_queue_row("p_done", "Completed", "1 ok")
         app1.controller.shutdown(is_running=False, is_previewing=False)
     finally:
         gc.collect()
@@ -969,9 +969,9 @@ def test_pack_job_persistence_and_retry_across_restart(tmp_path: Path, monkeypat
             patch("audiobookdl.pack.output.combine_audiofiles", side_effect=_fake_combine),
             patch("audiobookdl.pack.output_download.add_metadata_to_file"),
         ):
-            app2._retry_failed_queue_items([restored_id])
+            app2._runs.retry_failed_queue_items([restored_id])
             deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline and app2._is_running:
+            while time.monotonic() < deadline and app2.is_running:
                 root2.update()
                 time.sleep(0.02)
             root2.update()

@@ -354,8 +354,8 @@ class GuiHarness:
         if self.app is not None:
             self.diagnostics.record_gui_snapshot(self.snapshot())
             try:
-                if self.app._preview_dialog is not None and self.app._preview_dialog.winfo_exists():
-                    self.app._preview_dialog.destroy()
+                if self.app._preview.dialog is not None and self.app._preview.dialog.winfo_exists():
+                    self.app._preview.dialog.destroy()
             except tk.TclError:
                 pass
             try:
