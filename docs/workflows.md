@@ -43,6 +43,7 @@ sequenceDiagram
 ### Staging & Integrity Guarantees
 - **Multi-part & chapter-split safety**: [`audiobookdl/output/download.py`](../audiobookdl/output/download.py) downloads multi-file books into a sibling temporary `.staging-*` directory and verifies audio integrity with `ffprobe` (`output.verify_audio_integrity()`) before atomically committing targets or updating `downloads.db`.
 - **Resumable transfers**: With `resume` enabled, partial segments stay in `.tmp` files and resume via HTTP `Range` requests (`Content-Range` validated; stale temp files are reset automatically when servers ignore ranges).
+- **DRM / PSSH Inspection**: [`audiobookdl/utils/drm_inspect.py`](../audiobookdl/utils/drm_inspect.py) and the **Inspect…** dialog beside `decryption_key` perform parse-only inspection of ISO BMFF `pssh`/`tenc` boxes, HLS playlists, and DASH MPD `<ContentProtection>` (`cenc:pssh` and `cenc:default_KID`) without license acquisition.
 
 ---
 

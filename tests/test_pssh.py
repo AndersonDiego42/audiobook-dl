@@ -19,6 +19,7 @@ from audiobookdl.utils.pssh import (
     parse_pssh_box,
     parse_pssh_boxes,
     parse_tenc_default_kids,
+    read_mp4_init_boxes,
 )
 
 
@@ -319,3 +320,19 @@ def test_parse_hls_key_data_variants_and_errors():
     ):
         with pytest.raises(PsshParseError):
             parse_hls_key_data(bad_uri)
+
+
+def test_read_mp4_init_boxes_skips_mdat_and_reads_moov_at_end(tmp_path):
+    kid = bytes.fromhex("11223344556677889900aabbccddeeff")
+    pssh_box = _pssh_box(WIDEVINE_SYSTEM_ID, version=0, data=_pb_bytes(2, kid))
+    moov_box = _box(b"moov", pssh_box)
+    mp4_path = tmp_path / "moov_at_end.mp4"
+    mp4_path.write_bytes(
+        _box(b"ftyp", b"isom\x00\x00\x02\x00")
+        + _box(b"mdat", b"\x00" * 1024)
+        + moov_box
+    )
+
+    extracted = read_mp4_init_boxes(str(mp4_path))
+    assert extracted == moov_box
+    assert parse_pssh_boxes(extracted)[0].key_ids == (kid,)

@@ -49,6 +49,7 @@ All runtime keys below map directly from `audiobookdl/options_schema.py` and may
 | `loudnorm` | `bool` | `false` | Apply FFmpeg EBU R128 loudness normalization during audio processing |
 | `mono` | `bool` | `false` | Downmix audio streams to mono (1 channel) |
 | `chapters_from_silence` | `bool` | `false` | Detect pause boundaries via FFmpeg `silencedetect` when chapter metadata is absent |
+| `override_chapters` | `bool` | `false` | Replace existing source chapters when using metadata enrichment or silence detection |
 | `silence_noise_db` | `silence_noise_db` | `-35.0` | Noise floor threshold in dB for FFmpeg `silencedetect` |
 | `silence_min_seconds` | `positive_float` | `1.8` | Minimum silence duration in seconds for FFmpeg `silencedetect` |
 | `chapter_offset_ms` | `int` | `0` | Shift non-initial chapter timestamps by `N` milliseconds |

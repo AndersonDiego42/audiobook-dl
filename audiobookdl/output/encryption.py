@@ -1,6 +1,5 @@
 from collections.abc import Callable
 import os
-import struct
 import subprocess
 from typing import Literal, Protocol
 
@@ -19,7 +18,7 @@ from audiobookdl.utils.audiobook import (
     SampleAESEncryption,
     reconcile_cenc_decryption,
 )
-from audiobookdl.utils.pssh import extract_cenc_kids_safe
+from audiobookdl.utils.pssh import extract_cenc_kids_safe, read_mp4_init_boxes
 
 DECRYPT_CHUNK_SIZE = 64 * 1024  # 64 KiB, an exact multiple of AES's 16-byte block size
 AEAD_TAG_SIZE = 16
@@ -594,61 +593,6 @@ def _build_ffmpeg_cenc_args(method: CENCDecryption) -> list[str]:
     return args
 
 
-_MAX_CENC_METADATA_BOX_BYTES = 4 * 1024 * 1024
-_MAX_CENC_METADATA_TOTAL_BYTES = 8 * 1024 * 1024
-_MAX_CENC_TOP_LEVEL_BOXES = 128
-
-
-def _read_mp4_init_boxes(path: str) -> bytes:
-    """Read top-level `moov`/`moof`/`pssh` boxes from an MP4 file on disk without loading `mdat`."""
-    try:
-        file_size = os.path.getsize(path)
-    except OSError:
-        return b""
-    if file_size < 8:
-        return b""
-    collected = bytearray()
-    pos = 0
-    try:
-        with open(path, "rb") as src:
-            for _ in range(_MAX_CENC_TOP_LEVEL_BOXES):
-                if pos + 8 > file_size:
-                    break
-                src.seek(pos)
-                header = src.read(8)
-                if len(header) < 8:
-                    break
-                raw_size, box_type = struct.unpack(">I4s", header)
-                header_size = 8
-                if raw_size == 1:
-                    if pos + 16 > file_size:
-                        break
-                    ext_hdr = src.read(8)
-                    if len(ext_hdr) < 8:
-                        break
-                    box_size = struct.unpack(">Q", ext_hdr)[0]
-                    header_size = 16
-                elif raw_size == 0:
-                    box_size = file_size - pos
-                else:
-                    box_size = raw_size
-                if box_size < header_size or pos + box_size > file_size:
-                    break
-                if (
-                    box_type in (b"moov", b"moof", b"pssh")
-                    and box_size <= _MAX_CENC_METADATA_BOX_BYTES
-                    and len(collected) + box_size <= _MAX_CENC_METADATA_TOTAL_BYTES
-                ):
-                    src.seek(pos)
-                    chunk = src.read(box_size)
-                    if len(chunk) == box_size:
-                        collected.extend(chunk)
-                pos += box_size
-    except OSError:
-        return b""
-    return bytes(collected)
-
-
 def decrypt_file_cenc(
     path: str,
     method: CENCDecryption,
@@ -667,7 +611,7 @@ def decrypt_file_cenc(
     )
     known_kids = extract_cenc_kids_safe(prefix) if prefix else ()
     if not known_kids:
-        known_kids = extract_cenc_kids_safe(_read_mp4_init_boxes(path))
+        known_kids = extract_cenc_kids_safe(read_mp4_init_boxes(path))
     reconcile_cenc_decryption(effective_method, known_kids)
     key_args = _build_ffmpeg_cenc_args(effective_method)
     target = output_path or path

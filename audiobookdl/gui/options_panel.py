@@ -6,7 +6,8 @@ from typing import Any
 from collections.abc import Callable
 
 from audiobookdl.gui.formatting import MEDIA_TYPE_OPTIONS, OUTPUT_FORMATS, OVERWRITE_OPTIONS
-from audiobookdl.gui.theme import ThemePalette
+from audiobookdl.gui.pages.drm_inspect_dialog import DrmInspectDialog
+from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette
 from audiobookdl.gui.widgets import attach_tooltip
 from audiobookdl.options_schema import GUI_INTRO_CHAPTER_MODES, OPTIONS_BY_NAME
 from audiobookdl.utils import (
@@ -410,13 +411,21 @@ class OptionsPanel(ttk.LabelFrame):
             show="*",
         )
         decryption_key_entry.grid(row=4, column=1, columnspan=4, sticky="ew", padx=(0, 8), pady=(6, 0))
+        key_actions_frame = ttk.Frame(network_tab)
+        key_actions_frame.grid(row=4, column=5, sticky="w", pady=(6, 0))
         show_key_cb = ttk.Checkbutton(
-            network_tab,
+            key_actions_frame,
             text="Show key",
             variable=self._show_decryption_key_var,
             command=self._toggle_decryption_key_visibility,
         )
-        show_key_cb.grid(row=4, column=5, sticky="w", pady=(6, 0))
+        show_key_cb.pack(side=tk.LEFT)
+        inspect_drm_btn = ttk.Button(
+            key_actions_frame,
+            text="Inspect...",
+            command=self._open_drm_inspector,
+        )
+        inspect_drm_btn.pack(side=tk.LEFT, padx=(8, 0))
 
         ttk.Label(
             network_tab,
@@ -451,6 +460,7 @@ class OptionsPanel(ttk.LabelFrame):
         self._max_retries_spin = max_retries_spin
         self._limit_rate_entry = limit_rate_entry
         self._decryption_key_entry = decryption_key_entry
+        self._inspect_drm_btn = inspect_drm_btn
 
         self._tooltip_bindings: list[tuple[tk.Misc, str]] = [
             (cb_m4b, "Combine and convert output into a single .m4b audiobook with chapters"),
@@ -497,6 +507,7 @@ class OptionsPanel(ttk.LabelFrame):
             (post_exec_entry, _option_help("post_exec")),
             (decryption_key_entry, _option_help("decryption_key")),
             (show_key_cb, "Temporarily reveal or mask the session decryption key"),
+            (inspect_drm_btn, "Inspect a local file, HLS playlist, or DASH MPD for DRM systems, PSSH boxes, and KIDs"),
         ]
 
         self._widgets = [
@@ -578,6 +589,31 @@ class OptionsPanel(ttk.LabelFrame):
     def _toggle_decryption_key_visibility(self) -> None:
         self._decryption_key_entry.configure(
             show="" if self._show_decryption_key_var.get() else "*"
+        )
+
+    def _open_drm_inspector(self) -> None:
+        palette = self._palette_provider() if self._palette_provider is not None else LIGHT_PALETTE
+        proxy_var = getattr(self._vars, "proxy_var", None)
+        proxy = proxy_var.get().strip() or None if proxy_var is not None else None
+        impersonate_var = getattr(self._vars, "impersonate_var", None)
+        impersonate = impersonate_var.get().strip() or None if impersonate_var is not None else None
+        timeout: float | None = None
+        timeout_var = getattr(self._vars, "timeout_var", None)
+        if timeout_var is not None:
+            raw_timeout = str(timeout_var.get()).strip()
+            if raw_timeout:
+                try:
+                    parsed = float(raw_timeout)
+                    if parsed > 0:
+                        timeout = parsed
+                except ValueError:
+                    timeout = None
+        DrmInspectDialog(
+            self,
+            palette=palette,
+            proxy=proxy,
+            timeout=timeout,
+            impersonate=impersonate,
         )
 
     def _on_media_selected(self, _event: tk.Event | None = None) -> None:

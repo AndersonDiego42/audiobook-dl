@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import os
 import struct
 from collections.abc import Iterator
 from urllib.parse import unquote_to_bytes
@@ -35,6 +36,20 @@ _VIDEO_SAMPLE_ENTRY_TYPES = frozenset(
 _AUDIO_ENTRY_CHILD_OFFSETS = {0: 28, 1: 44, 2: 64}
 _ZERO_KID = b"\x00" * 16
 _PLAYREADY_KEYFORMAT = "com.microsoft.playready"
+_MAX_CENC_METADATA_BOX_BYTES = 4 * 1024 * 1024
+_MAX_CENC_METADATA_TOTAL_BYTES = 8 * 1024 * 1024
+_MAX_CENC_TOP_LEVEL_BOXES = 128
+
+
+def _parse_safe_xml(xml_text: str, *, context: str) -> ET.Element:
+    """Parse XML text after rejecting doctype/entity declarations."""
+    upper = xml_text.upper()
+    if "<!DOCTYPE" in upper or "<!ENTITY" in upper:
+        raise PsshParseError(f"Disallowed XML doctype or entity in {context}")
+    try:
+        return ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise PsshParseError(f"Invalid {context} XML: {exc}") from exc
 
 
 class PsshParseError(GenericAudiobookDLException):
@@ -112,13 +127,7 @@ def _parse_playready_wrmheader(xml_text: str) -> tuple[bytes, ...]:
     cleaned = xml_text.lstrip("\ufeff").rstrip("\x00").strip()
     if not cleaned:
         return ()
-    upper = cleaned.upper()
-    if "<!DOCTYPE" in upper or "<!ENTITY" in upper:
-        raise PsshParseError("Disallowed XML doctype or entity in PlayReady WRMHEADER")
-    try:
-        root = ET.fromstring(cleaned)
-    except ET.ParseError as exc:
-        raise PsshParseError(f"Invalid PlayReady WRMHEADER XML: {exc}") from exc
+    root = _parse_safe_xml(cleaned, context="PlayReady WRMHEADER")
     if root.tag.rsplit("}", 1)[-1] != "WRMHEADER":
         raise PsshParseError("Expected WRMHEADER root element in PlayReady header")
 
@@ -485,3 +494,160 @@ def parse_hls_key_data(uri: str, *, key_format: str | None = None) -> list[PsshB
         return [PsshBox(system_id=WIDEVINE_SYSTEM_ID, version=0, key_ids=kids, data=raw)]
 
     raise PsshParseError("Unrecognized DRM initialization payload in HLS #EXT-X-KEY data: URI")
+
+
+@frozen
+class MpdProtection:
+    """Parsed DASH MPD `<ContentProtection>` entry."""
+
+    scheme_id: str
+    system_id: UUID | None
+    default_kid: bytes | None
+    pssh_boxes: tuple[PsshBox, ...]
+
+    @property
+    def system_name(self) -> str:
+        """Human-readable DRM system name when `system_id` is known, else `scheme_id`."""
+        if self.system_id is not None:
+            return _SYSTEM_NAMES.get(self.system_id, str(self.system_id))
+        return self.scheme_id
+
+
+def parse_mpd_content_protection(xml: bytes) -> list[MpdProtection]:
+    """
+    Parse DASH MPD `<ContentProtection>` elements under `AdaptationSet` and `Representation`.
+
+    Extracts `schemeIdUri`, `cenc:default_KID`, `<cenc:pssh>` boxes, and `<mspr:pro>` records.
+    Raises `PsshParseError` for invalid XML, doctype declarations, or malformed `cenc:pssh`/KID values.
+    """
+    try:
+        text = xml.decode("utf-8-sig").strip()
+    except UnicodeDecodeError as exc:
+        raise PsshParseError("Invalid UTF-8 in DASH MPD XML") from exc
+    if not text:
+        raise PsshParseError("Empty DASH MPD XML")
+
+    root = _parse_safe_xml(text, context="DASH MPD")
+    if root.tag.rsplit("}", 1)[-1] != "MPD":
+        raise PsshParseError("Expected MPD root element in DASH manifest")
+
+    results: list[MpdProtection] = []
+    for parent in root.iter():
+        if parent.tag.rsplit("}", 1)[-1] not in ("AdaptationSet", "Representation"):
+            continue
+        for cp in parent:
+            if cp.tag.rsplit("}", 1)[-1] != "ContentProtection":
+                continue
+            scheme_id = (cp.attrib.get("schemeIdUri") or "").strip()
+            system_id: UUID | None = None
+            if scheme_id.lower().startswith("urn:uuid:"):
+                try:
+                    system_id = UUID(scheme_id[9:].strip())
+                except ValueError:
+                    system_id = None
+
+            default_kid: bytes | None = None
+            for attr_key, attr_val in cp.attrib.items():
+                if attr_key.rsplit("}", 1)[-1].lower() == "default_kid":
+                    raw_kid = attr_val.strip()
+                    if raw_kid:
+                        try:
+                            default_kid = UUID(raw_kid).bytes
+                        except ValueError as exc:
+                            raise PsshParseError(
+                                f"Invalid cenc:default_KID '{raw_kid}' in DASH MPD"
+                            ) from exc
+                    break
+
+            boxes: list[PsshBox] = []
+            for child in cp:
+                local = child.tag.rsplit("}", 1)[-1].lower()
+                if local == "pssh":
+                    b64_text = "".join((child.text or "").split())
+                    if not b64_text:
+                        raise PsshParseError("Empty <cenc:pssh> element in DASH MPD")
+                    try:
+                        raw_pssh = base64.b64decode(b64_text, validate=True)
+                    except (binascii.Error, ValueError) as exc:
+                        raise PsshParseError("Invalid base64 in DASH MPD <cenc:pssh>") from exc
+                    parsed = parse_pssh_boxes(raw_pssh)
+                    if not parsed:
+                        raise PsshParseError("No PSSH box found in DASH MPD <cenc:pssh>")
+                    boxes.extend(parsed)
+                elif local == "pro":
+                    b64_text = "".join((child.text or "").split())
+                    if not b64_text:
+                        raise PsshParseError("Empty <mspr:pro> element in DASH MPD")
+                    try:
+                        raw_pro = base64.b64decode(b64_text, validate=True)
+                    except (binascii.Error, ValueError) as exc:
+                        raise PsshParseError("Invalid base64 in DASH MPD <mspr:pro>") from exc
+                    pro_kids = _parse_playready_pssh_data(raw_pro)
+                    boxes.append(
+                        PsshBox(
+                            system_id=PLAYREADY_SYSTEM_ID,
+                            version=0,
+                            key_ids=pro_kids,
+                            data=raw_pro,
+                        )
+                    )
+
+            results.append(
+                MpdProtection(
+                    scheme_id=scheme_id,
+                    system_id=system_id,
+                    default_kid=default_kid,
+                    pssh_boxes=tuple(boxes),
+                )
+            )
+    return results
+
+
+def read_mp4_init_boxes(path: str) -> bytes:
+    """Read top-level `moov`/`moof`/`pssh` boxes from an MP4 file on disk without loading `mdat`."""
+    try:
+        file_size = os.path.getsize(path)
+    except OSError:
+        return b""
+    if file_size < 8:
+        return b""
+    collected = bytearray()
+    pos = 0
+    try:
+        with open(path, "rb") as src:
+            for _ in range(_MAX_CENC_TOP_LEVEL_BOXES):
+                if pos + 8 > file_size:
+                    break
+                src.seek(pos)
+                header = src.read(8)
+                if len(header) < 8:
+                    break
+                raw_size, box_type = struct.unpack(">I4s", header)
+                header_size = 8
+                if raw_size == 1:
+                    if pos + 16 > file_size:
+                        break
+                    ext_hdr = src.read(8)
+                    if len(ext_hdr) < 8:
+                        break
+                    box_size = struct.unpack(">Q", ext_hdr)[0]
+                    header_size = 16
+                elif raw_size == 0:
+                    box_size = file_size - pos
+                else:
+                    box_size = raw_size
+                if box_size < header_size or pos + box_size > file_size:
+                    break
+                if (
+                    box_type in (b"moov", b"moof", b"pssh")
+                    and box_size <= _MAX_CENC_METADATA_BOX_BYTES
+                    and len(collected) + box_size <= _MAX_CENC_METADATA_TOTAL_BYTES
+                ):
+                    src.seek(pos)
+                    chunk = src.read(box_size)
+                    if len(chunk) == box_size:
+                        collected.extend(chunk)
+                pos += box_size
+    except OSError:
+        return b""
+    return bytes(collected)

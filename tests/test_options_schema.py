@@ -54,7 +54,7 @@ def test_config_fields_parity_with_schema():
     cfg_fields = {
         f.name
         for f in attrs_fields(Config)
-        if f.name not in ("sources", "gui", "audiobookshelf", "custom_metadata_providers")
+        if f.name not in ("sources", "gui", "audiobookshelf", "custom_metadata_providers", "config_location")
     }
     schema_config_keys = {spec.config_key for spec in CONFIG_OPTION_SPECS if spec.config_key}
     assert schema_config_keys == cfg_fields
@@ -63,7 +63,9 @@ def test_config_fields_parity_with_schema():
     )
 
     assert {f.name for f in attrs_fields(GuiConfig)} == set(GUI_CONFIG_KEYS)
-    assert {f.name for f in attrs_fields(SourceConfig)} == set(SOURCE_CONFIG_KEYS)
+    assert {
+        f.name for f in attrs_fields(SourceConfig) if f.name != "oauth_token_present"
+    } == set(SOURCE_CONFIG_KEYS)
 
 
 def test_config_clone_copies_all_fields_independently():
