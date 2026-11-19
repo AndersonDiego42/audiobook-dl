@@ -4,7 +4,7 @@ import math
 import re
 import requests
 from typing import Generic, Literal, Optional, TypeVar, Any
-from collections.abc import Callable, Sequence, MutableMapping
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 import json
 from attrs import define, Factory, field
 from dateutil.parser import parse as _dateutil_parse
@@ -224,6 +224,70 @@ class AudiobookFile:
     chapter_index: int | None = None
     # Optional expected transfer size in bytes (when provided by source metadata or range)
     size: int | None = None
+    # Optional expected cryptographic digest(s) for verification (e.g. "sha256:..." or {"md5": "..."})
+    checksum: str | Mapping[str, str] | None = None
+
+
+_CHECKSUM_LEN_TO_ALGO: dict[int, str] = {
+    32: "md5",
+    40: "sha1",
+    64: "sha256",
+    128: "sha512",
+}
+_SUPPORTED_CHECKSUM_ALGOS: frozenset[str] = frozenset(_CHECKSUM_LEN_TO_ALGO.values())
+
+
+def _normalize_checksum_algo(raw_algo: str) -> str:
+    return raw_algo.strip().lower().replace("-", "")
+
+
+def _is_valid_hex_digest(value: str, expected_algo: str | None = None) -> bool:
+    if not value or len(value) % 2 != 0:
+        return False
+    if not all(ch in "0123456789abcdef" for ch in value):
+        return False
+    if expected_algo is not None:
+        expected_len = next((k for k, v in _CHECKSUM_LEN_TO_ALGO.items() if v == expected_algo), None)
+        if expected_len is not None and len(value) != expected_len:
+            return False
+    return True
+
+
+def normalize_checksums(raw: str | Mapping[str, str] | None) -> dict[str, str]:
+    """
+    Normalize a checksum string or mapping into `{algorithm: lowercase_hex}`.
+
+    Supports `"algo:hex"`, bare hex strings (length-inferred `md5`/`sha1`/`sha256`/`sha512`),
+    and `{algo: hex}` mappings. Invalid or unsupported entries are ignored.
+    """
+    if not raw:
+        return {}
+    normalized: dict[str, str] = {}
+    if isinstance(raw, str):
+        token = raw.strip()
+        if not token:
+            return {}
+        if ":" in token:
+            algo_part, digest_part = token.split(":", 1)
+            algo = _normalize_checksum_algo(algo_part)
+            digest = digest_part.strip().lower()
+            if algo in _SUPPORTED_CHECKSUM_ALGOS and _is_valid_hex_digest(digest, algo):
+                normalized[algo] = digest
+        else:
+            digest = token.lower()
+            algo = _CHECKSUM_LEN_TO_ALGO.get(len(digest), "")
+            if algo and _is_valid_hex_digest(digest, algo):
+                normalized[algo] = digest
+        return normalized
+    if isinstance(raw, Mapping):
+        for raw_algo, raw_digest in raw.items():
+            if not isinstance(raw_algo, str) or not isinstance(raw_digest, str):
+                continue
+            algo = _normalize_checksum_algo(raw_algo)
+            digest = raw_digest.strip().lower()
+            if algo in _SUPPORTED_CHECKSUM_ALGOS and _is_valid_hex_digest(digest, algo):
+                normalized[algo] = digest
+    return normalized
 
 
 _LANGUAGE_ALIASES: dict[str, str] = {

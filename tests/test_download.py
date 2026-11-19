@@ -1024,9 +1024,23 @@ def test_download_file_resolves_lazy_url_resolver(tmp_path):
     assert session.get.call_args.args[0] == "https://cdn.example.com/fresh-signed.mp3"
 
 
+def _make_minimal_epub_bytes() -> bytes:
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("mimetype", b"application/epub+zip", compress_type=zipfile.ZIP_STORED)
+        zf.writestr(
+            "META-INF/container.xml",
+            b'<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"></container>',
+        )
+    return buf.getvalue()
+
+
 def test_download_ebook_preserves_epub_skips_audio_conversion_and_writes_sidecars(tmp_path):
     session = MagicMock()
-    epub_bytes = b"PK\x03\x04fake-epub-archive"
+    epub_bytes = _make_minimal_epub_bytes()
     session.get.return_value = _mock_response(
         headers={"Content-Length": str(len(epub_bytes))},
         chunks=[epub_bytes],
@@ -2601,6 +2615,242 @@ def test_estimate_download_size_falls_back_to_range_get_when_head_rejected():
     session.get.assert_called_once()
     head_resp.close.assert_called_once()
     get_resp.close.assert_called_once()
+
+
+def test_flexible_mime_validation_accepts_media_variants_and_rejects_non_media():
+    from audiobookdl.utils.http import is_content_type_compatible, normalize_content_type
+
+    assert normalize_content_type(b'  "audio/mp4" ; codecs="mp4a.40.2" ') == "audio/mp4"
+    assert normalize_content_type(", audio/mpeg") == "audio/mpeg"
+
+    for actual, expected, ext in (
+        ("audio/mp4; codecs=mp4a.40.2", "audio/mpeg", "mp3"),
+        ("audio/x-m4b", "audio/mpeg", "m4b"),
+        ("audio/aac", "audio/mpeg", "aac"),
+        ("audio/ogg", "audio/mpeg", "ogg"),
+        ("audio/webm", "audio/mpeg", "webm"),
+        ("video/mp4", "audio/mpeg", "m4a"),
+        ("video/iso.segment", "video/mp2t", "m4s"),
+        ("application/force-download", "audio/mpeg", "mp3"),
+        ("application/download", "audio/mp4", "m4b"),
+        ("application/ogg", "audio/mpeg", "ogg"),
+        ("audio/x-flac", "audio/*", "flac"),
+        ("application/zip", "application/epub+zip", "epub"),
+        ("application/x-pdf", "application/pdf", "pdf"),
+    ):
+        ok, _ = is_content_type_compatible(actual, expected, file_ext=ext)
+        assert ok is True, f"Expected compatible: {actual!r} vs {expected!r} (.{ext})"
+
+    for bad_actual, expected, ext in (
+        ("text/html; charset=utf-8", "audio/mpeg", "mp3"),
+        ("application/json", "audio/mpeg", "mp3"),
+        ("application/xml", None, "epub"),
+        ("text/plain", "application/octet-stream", "mp3"),
+        ("image/jpeg", "audio/mpeg", "mp3"),
+        ("image/png", None, "mp3"),
+        ("application/pdf", "audio/mpeg", "mp3"),
+        ("application/pdf", None, "mp3"),
+        ("audio/mpeg", "application/epub+zip", "epub"),
+        ("audio/mpeg", None, "epub"),
+    ):
+        ok, _ = is_content_type_compatible(bad_actual, expected, file_ext=ext)
+        assert ok is False, f"Expected incompatible: {bad_actual!r} vs {expected!r} (.{ext})"
+
+
+def test_download_file_verifies_http_content_md5_and_repr_digest_with_retry(tmp_path, monkeypatch):
+    import base64
+    import hashlib
+
+    monkeypatch.setattr("audiobookdl.output.download.time.sleep", lambda _: None)
+    payload = b"valid-audio-stream-payload"
+    good_md5_b64 = base64.b64encode(hashlib.md5(payload).digest()).decode("ascii")
+    good_sha256_b64 = base64.b64encode(hashlib.sha256(payload).digest()).decode("ascii")
+    bad_md5_b64 = base64.b64encode(b"\x00" * 16).decode("ascii")
+
+    # 1. Content-MD5 mismatch on first attempt triggers retry and recovers on second attempt
+    session = MagicMock()
+    session.get.side_effect = [
+        _mock_response(
+            {"Content-Length": str(len(payload)), "Content-MD5": bad_md5_b64, "Content-Type": "audio/x-m4b"},
+            [payload],
+        ),
+        _mock_response(
+            {
+                "Content-Length": str(len(payload)),
+                "Content-MD5": good_md5_b64,
+                "Repr-Digest": f"sha-256=:{good_sha256_b64}:",
+                "Content-Type": "audio/mp4",
+            },
+            [payload],
+        ),
+    ]
+    book = Audiobook(
+        session=session,
+        metadata=AudiobookMetadata(title="Digest Retry"),
+        files=[AudiobookFile(url="https://cdn.example.com/book.m4b", ext="m4b", expected_content_type="audio/mpeg")],
+    )
+    out = download_file((book, str(tmp_path / "digest_ok"), 0, lambda _: None, None), max_retries=1)
+    assert Path(out).read_bytes() == payload
+    assert session.get.call_count == 2
+
+    # 2. Persistent Repr-Digest mismatch exhausts retries and leaves no committed target
+    session_bad = MagicMock()
+    session_bad.get.side_effect = [
+        _mock_response(
+            {
+                "Content-Length": str(len(payload)),
+                "Repr-Digest": f"sha-256=:{base64.b64encode(b'x' * 32).decode('ascii')}:",
+            },
+            [payload],
+        )
+        for _ in range(2)
+    ]
+    book_bad = Audiobook(
+        session=session_bad,
+        metadata=AudiobookMetadata(title="Digest Fail"),
+        files=[AudiobookFile(url="https://cdn.example.com/fail.mp3", ext="mp3")],
+    )
+    with pytest.raises(requests.exceptions.ChunkedEncodingError, match="digest mismatch"):
+        download_file((book_bad, str(tmp_path / "digest_fail"), 0, lambda _: None, None), max_retries=1)
+    assert not (tmp_path / "digest_fail.mp3").exists()
+    assert not (tmp_path / "digest_fail.mp3.tmp").exists()
+
+
+def test_download_file_verifies_source_checksum_and_retries_corrupt_url_resolver(tmp_path, monkeypatch):
+    import hashlib
+    from audiobookdl.exceptions import GenericAudiobookDLException
+
+    monkeypatch.setattr("audiobookdl.output.download.time.sleep", lambda _: None)
+    good_bytes = b"verified-source-payload"
+    good_sha256 = hashlib.sha256(good_bytes).hexdigest()
+
+    # 1. Matching source checksum commits cleanly; mismatching checksum preserves existing file
+    session_ok = MagicMock()
+    session_ok.get.return_value = _mock_response({"Content-Length": str(len(good_bytes))}, [good_bytes])
+    book_ok = Audiobook(
+        session=session_ok,
+        metadata=AudiobookMetadata(title="Checksum Book"),
+        files=[AudiobookFile(url="https://cdn.example.com/book.mp3", ext="mp3", checksum=f"sha256:{good_sha256}")],
+    )
+    target = Path(download_file((book_ok, str(tmp_path / "chk"), 0, lambda _: None, None), max_retries=0))
+    assert target.read_bytes() == good_bytes
+
+    session_mismatch = MagicMock()
+    session_mismatch.get.return_value = _mock_response({"Content-Length": "7"}, [b"corrupt"])
+    book_bad = Audiobook(
+        session=session_mismatch,
+        metadata=AudiobookMetadata(title="Checksum Book"),
+        files=[AudiobookFile(url="https://cdn.example.com/book.mp3", ext="mp3", checksum=f"sha256:{good_sha256}")],
+    )
+    with pytest.raises(GenericAudiobookDLException, match="failed media integrity verification"):
+        download_file((book_bad, str(tmp_path / "chk"), 0, lambda _: None, None), max_retries=0)
+    assert target.read_bytes() == good_bytes
+
+    # 2. Corrupt attempt with url_resolver retries and succeeds when fresh URL serves valid bytes
+    urls = iter(["https://cdn.example.com/v1.mp3", "https://cdn.example.com/v2.mp3"])
+    session_retry = MagicMock()
+    session_retry.get.side_effect = [
+        _mock_response({"Content-Length": "7"}, [b"corrupt"]),
+        _mock_response({"Content-Length": str(len(good_bytes))}, [good_bytes]),
+    ]
+    book_retry = Audiobook(
+        session=session_retry,
+        metadata=AudiobookMetadata(title="Checksum Retry"),
+        files=[
+            AudiobookFile(
+                url="https://cdn.example.com/init.mp3",
+                ext="mp3",
+                checksum=good_sha256,
+                url_resolver=lambda: next(urls),
+            )
+        ],
+    )
+    out_retry = download_file((book_retry, str(tmp_path / "chk_retry"), 0, lambda _: None, None), max_retries=1)
+    assert Path(out_retry).read_bytes() == good_bytes
+    assert session_retry.get.call_count == 2
+
+
+def test_download_file_validates_ebooks_and_rejects_corrupt_epub_or_pdf(tmp_path):
+    from audiobookdl.exceptions import GenericAudiobookDLException
+
+    # 1. Corrupt EPUB fails verification and does not commit target
+    session_bad_epub = MagicMock()
+    session_bad_epub.get.return_value = _mock_response(
+        {"Content-Type": "application/epub+zip", "Content-Length": "18"},
+        [b"not-a-valid-epub!!"],
+    )
+    bad_epub_book = Audiobook(
+        session=session_bad_epub,
+        metadata=AudiobookMetadata(title="Bad EPUB"),
+        files=[AudiobookFile(url="https://cdn.example.com/bad.epub", ext="epub")],
+    )
+    with pytest.raises(GenericAudiobookDLException, match="failed ebook integrity verification"):
+        download_file((bad_epub_book, str(tmp_path / "bad_epub"), 0, lambda _: None, None))
+    assert not (tmp_path / "bad_epub.epub").exists()
+
+    # 2. Valid PDF succeeds; truncated PDF missing %%EOF fails
+    valid_pdf = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n%%EOF\n"
+    session_pdf = MagicMock()
+    session_pdf.get.return_value = _mock_response(
+        {"Content-Type": "application/x-pdf", "Content-Length": str(len(valid_pdf))},
+        [valid_pdf],
+    )
+    pdf_book = Audiobook(
+        session=session_pdf,
+        metadata=AudiobookMetadata(title="Valid PDF"),
+        files=[AudiobookFile(url="https://cdn.example.com/book.pdf", ext="pdf", expected_content_type="application/pdf")],
+    )
+    pdf_out = download_file((pdf_book, str(tmp_path / "good_pdf"), 0, lambda _: None, None))
+    assert Path(pdf_out).read_bytes() == valid_pdf
+
+    session_trunc_pdf = MagicMock()
+    session_trunc_pdf.get.return_value = _mock_response(
+        {"Content-Type": "application/pdf", "Content-Length": "16"},
+        [b"%PDF-1.4\ntruncat"],
+    )
+    trunc_pdf_book = Audiobook(
+        session=session_trunc_pdf,
+        metadata=AudiobookMetadata(title="Trunc PDF"),
+        files=[AudiobookFile(url="https://cdn.example.com/trunc.pdf", ext="pdf")],
+    )
+    with pytest.raises(GenericAudiobookDLException, match="failed ebook integrity verification"):
+        download_file((trunc_pdf_book, str(tmp_path / "trunc_pdf"), 0, lambda _: None, None))
+    assert not (tmp_path / "trunc_pdf.pdf").exists()
+
+
+@pytest.mark.no_probe_stub
+def test_download_file_resume_redownloads_corrupt_existing_file(tmp_path):
+    from audiobookdl.output import output as output_mod
+    from audiobookdl.utils import AudioProbeInfo
+
+    existing = tmp_path / "Corrupt Resume.mp3"
+    existing.write_bytes(b"<html>corrupt-cached-html</html>")
+    valid_bytes = b"ID3\x03\x00\x00\x00\x00\x00\x00valid-audio-bytes"
+
+    session = MagicMock()
+    session.get.return_value = _mock_response(
+        {"Content-Length": str(len(valid_bytes)), "Content-Type": "audio/mpeg"},
+        [valid_bytes],
+    )
+    book = _make_audiobook(session)
+
+    def fake_probe(path: str) -> AudioProbeInfo:
+        data = Path(path).read_bytes()
+        if data.startswith(b"ID3"):
+            return AudioProbeInfo(duration=12.0, codec_name="mp3")
+        return AudioProbeInfo(duration=0.0, codec_name="")
+
+    with (
+        patch("audiobookdl.output.output.find_executable", return_value="ffprobe"),
+        patch.object(output_mod, "_probe_audio_info", side_effect=fake_probe),
+    ):
+        out_path = download_file(
+            (book, str(tmp_path / "Corrupt Resume"), 0, lambda _: None, None),
+            resume=True,
+        )
+
+    assert Path(out_path).read_bytes() == valid_bytes
+    session.get.assert_called_once()
 
 
 

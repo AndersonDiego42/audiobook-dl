@@ -12,6 +12,7 @@ from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Co
 from audiobookdl.exceptions import BookNotFound, RequestError
 from audiobookdl.utils.audiobook import (
     clean_html_description,
+    normalize_checksums,
     parse_duration_ms,
     parse_language,
     parse_release_date,
@@ -261,7 +262,21 @@ class ArchiveOrgSource(Source):
             file_url = f"https://archive.org/download/{quote(identifier)}/{quote(fname)}"
             raw_size_str = str(entry.get("size") or "").strip()
             file_size = int(raw_size_str) if raw_size_str.isdigit() and int(raw_size_str) > 0 else None
-            files.append(AudiobookFile(url=file_url, ext=ext, title=track_title, size=file_size))
+            raw_checksums = {
+                algo: str(entry[algo]).strip()
+                for algo in ("sha1", "md5")
+                if isinstance(entry.get(algo), str) and str(entry.get(algo)).strip()
+            }
+            file_checksums = normalize_checksums(raw_checksums) or None
+            files.append(
+                AudiobookFile(
+                    url=file_url,
+                    ext=ext,
+                    title=track_title,
+                    size=file_size,
+                    checksum=file_checksums,
+                )
+            )
             if all_have_lengths and dur_ms is not None:
                 chapters.append(Chapter(start=running_ms, title=track_title))
                 running_ms += dur_ms

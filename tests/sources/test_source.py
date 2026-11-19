@@ -459,6 +459,8 @@ def test_get_stream_files_selects_audio_rendition_decodes_data_key_and_rejects_u
 
 
 def test_download_file_invokes_lazy_encryption_resolver(tmp_path):
+    import io
+    import zipfile
     from Crypto.Cipher import AES
     from Crypto.Util.Padding import pad
     from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata
@@ -467,7 +469,11 @@ def test_download_file_invokes_lazy_encryption_resolver(tmp_path):
 
     key = b"0123456789abcdef"
     iv = b"abcdef9876543210"
-    plaintext = b"decrypted-ebook-payload"
+    epub_buf = io.BytesIO()
+    with zipfile.ZipFile(epub_buf, "w") as zf:
+        zf.writestr("mimetype", b"application/epub+zip", compress_type=zipfile.ZIP_STORED)
+        zf.writestr("META-INF/container.xml", b"<container/>")
+    plaintext = epub_buf.getvalue()
     ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(pad(plaintext, AES.block_size))
 
     session = MagicMock()

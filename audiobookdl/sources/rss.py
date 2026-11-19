@@ -19,6 +19,7 @@ from audiobookdl.utils.audiobook import (
     parse_duration_ms,
     parse_language,
 )
+from audiobookdl.utils.http import is_content_type_compatible, normalize_content_type
 
 _AUDIO_MIME_TO_EXT = {
     "audio/mpeg": "mp3",
@@ -28,15 +29,31 @@ _AUDIO_MIME_TO_EXT = {
     "audio/m4a": "m4a",
     "audio/x-m4b": "m4b",
     "audio/m4b": "m4b",
+    "video/mp4": "mp4",
+    "application/mp4": "mp4",
     "audio/ogg": "ogg",
     "application/ogg": "ogg",
     "audio/opus": "opus",
     "audio/flac": "flac",
+    "audio/x-flac": "flac",
     "audio/aac": "aac",
+    "audio/x-aac": "aac",
+    "audio/aacp": "aac",
     "audio/wav": "wav",
     "audio/x-wav": "wav",
+    "audio/webm": "webm",
+    "video/webm": "webm",
 }
-_AUDIO_EXTENSIONS = frozenset({"mp3", "m4a", "m4b", "ogg", "opus", "flac", "aac", "wav"})
+_AUDIO_EXTENSIONS = frozenset({"mp3", "m4a", "m4b", "mp4", "ogg", "opus", "flac", "aac", "wav", "webm"})
+
+
+def _is_supported_enclosure_media(mime_type: str | None, raw_ext: str) -> bool:
+    """Return True when an RSS enclosure MIME type or extension represents valid media."""
+    norm_mime = normalize_content_type(mime_type)
+    if not norm_mime:
+        return True
+    compatible, _ = is_content_type_compatible(norm_mime, "audio/mpeg", file_ext=raw_ext)
+    return compatible or raw_ext in _AUDIO_EXTENSIONS
 
 
 def _local_tag(elem: etree._Element) -> str:
@@ -197,9 +214,11 @@ class RssSource(Source):
                     if raw_len.isdigit() and int(raw_len) > 0:
                         enclosure_length = int(raw_len)
                 elif ctag == "content" and not enclosure_url and child.get("url"):
-                    ctype = (child.get("type") or "").lower()
-                    if not ctype or ctype.startswith("audio/"):
-                        enclosure_url = (child.get("url") or "").strip() or None
+                    cand_url = (child.get("url") or "").strip()
+                    ctype = (child.get("type") or "").strip()
+                    cand_ext = os.path.splitext(urlparse(cand_url).path)[1].lstrip(".").lower()
+                    if _is_supported_enclosure_media(ctype, cand_ext):
+                        enclosure_url = cand_url or None
                         enclosure_type = ctype or None
                         raw_len = (child.get("fileSize") or "").strip()
                         if raw_len.isdigit() and int(raw_len) > 0:
@@ -207,9 +226,8 @@ class RssSource(Source):
             if not enclosure_url:
                 continue
             abs_url = urljoin(base_url, enclosure_url)
-            mime_base = (enclosure_type or "").split(";", 1)[0].strip().lower()
             raw_ext = os.path.splitext(urlparse(abs_url).path)[1].lstrip(".").lower()
-            if mime_base and not mime_base.startswith("audio/") and mime_base != "application/ogg" and raw_ext not in _AUDIO_EXTENSIONS:
+            if not _is_supported_enclosure_media(enclosure_type, raw_ext):
                 continue
 
             ext = _guess_extension(abs_url, enclosure_type)

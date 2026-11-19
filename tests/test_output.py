@@ -1747,6 +1747,82 @@ def test_real_ffmpeg_custom_sample_rate_and_same_format_bitrate(tmp_path):
     assert info.bitrate is not None and 48000 <= info.bitrate <= 85000
 
 
+def test_verify_audio_integrity_fallback_when_ffprobe_unavailable(tmp_path):
+    mp3_ok = tmp_path / "ok.mp3"
+    mp3_ok.write_bytes(b"ID3\x03\x00\x00\x00\x00\x00\x00mp3data")
+    m4b_ok = tmp_path / "ok.m4b"
+    m4b_ok.write_bytes(b"\x00\x00\x00\x18ftypM4B \x00\x00\x00\x00M4B mp42")
+    ogg_ok = tmp_path / "ok.ogg"
+    ogg_ok.write_bytes(b"OggS\x00\x02")
+    html_bad = tmp_path / "error.mp3"
+    html_bad.write_bytes(b"<!DOCTYPE html><html><body>502 Bad Gateway</body></html>")
+    garbage_bad = tmp_path / "garbage.flac"
+    garbage_bad.write_bytes(b"not-flac-header-bytes")
+
+    with (
+        patch("audiobookdl.output.output.find_executable", return_value=None),
+        patch("audiobookdl.output.output._probe_audio_info", return_value=AudioProbeInfo()),
+    ):
+        output.verify_audio_integrity(str(mp3_ok))
+        output.verify_audio_integrity(str(m4b_ok))
+        output.verify_audio_integrity(str(ogg_ok))
+        with pytest.raises(FailedCombining, match="signature"):
+            output.verify_audio_integrity(str(html_bad))
+        with pytest.raises(FailedCombining, match="signature"):
+            output.verify_audio_integrity(str(garbage_bad))
+
+
+def test_verify_ebook_integrity_and_file_checksums(tmp_path):
+    import hashlib
+    import zipfile
+
+    # 1. Valid & corrupt EPUB / CBZ
+    epub_path = tmp_path / "book.epub"
+    with zipfile.ZipFile(epub_path, "w") as zf:
+        zf.writestr("mimetype", b"application/epub+zip")
+        zf.writestr("META-INF/container.xml", b"<container/>")
+    output.verify_ebook_integrity(str(epub_path))
+
+    bad_epub = tmp_path / "missing_manifest.epub"
+    with zipfile.ZipFile(bad_epub, "w") as zf:
+        zf.writestr("random.txt", b"hello")
+    with pytest.raises(FailedCombining, match="EPUB archive structure"):
+        output.verify_ebook_integrity(str(bad_epub))
+
+    cbz_path = tmp_path / "comic.cbz"
+    with zipfile.ZipFile(cbz_path, "w") as zf:
+        zf.writestr("001.jpg", b"\xff\xd8\xffdata")
+    output.verify_ebook_integrity(str(cbz_path))
+
+    # 2. MOBI and CBR signatures
+    mobi_ok = tmp_path / "book.mobi"
+    mobi_ok.write_bytes((b"\x00" * 60) + b"BOOKMOBI" + (b"\x00" * 16))
+    output.verify_ebook_integrity(str(mobi_ok))
+
+    mobi_bad = tmp_path / "bad.mobi"
+    mobi_bad.write_bytes(b'{"error": "unauthorized"}')
+    with pytest.raises(FailedCombining, match="text/HTML/XML"):
+        output.verify_ebook_integrity(str(mobi_bad))
+
+    cbr_ok = tmp_path / "comic.cbr"
+    cbr_ok.write_bytes(b"Rar!\x1a\x07\x01\x00archive")
+    output.verify_ebook_integrity(str(cbr_ok))
+
+    # 3. Checksum verification
+    payload = b"checksum-verified-content"
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(payload)
+    output.verify_file_checksums(
+        str(sample),
+        {
+            "md5": hashlib.md5(payload).hexdigest(),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        },
+    )
+    with pytest.raises(FailedCombining, match="SHA256 checksum mismatch"):
+        output.verify_file_checksums(str(sample), {"sha256": "0" * 64})
+
+
 
 
 

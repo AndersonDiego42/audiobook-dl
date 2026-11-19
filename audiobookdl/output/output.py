@@ -22,12 +22,14 @@ from audiobookdl.utils import (
     normalize_sample_rate,
     probe_audio_info,
 )
+from audiobookdl.utils.audiobook import is_ebook_extension
 from audiobookdl.utils.concurrency import (
     ffmpeg_progress_callback,
     run_cancellable_pool,
     run_cancellable_subprocess,
 )
 
+import hashlib
 import os
 import re
 import shutil
@@ -35,6 +37,7 @@ import platform
 import tempfile
 import threading
 import uuid
+import zipfile
 from typing import Any
 from collections.abc import Sequence, Mapping
 from urllib.parse import urlparse
@@ -148,6 +151,84 @@ def _get_cached_probe(
     return info
 
 
+_TEXT_ERROR_PREFIXES: tuple[bytes, ...] = (
+    b"<!doctype",
+    b"<html",
+    b"<head",
+    b"<error",
+    b"<?xml",
+    b"<rss",
+    b"<soap",
+)
+_ISO_BMFF_BOX_TYPES: frozenset[bytes] = frozenset(
+    {b"ftyp", b"styp", b"moov", b"moof", b"sidx", b"free", b"skip", b"mdat", b"wide"}
+)
+
+
+def _looks_like_text_error_payload(head: bytes) -> bool:
+    """Return True when leading bytes resemble an HTML, XML, or JSON error payload."""
+    if not head:
+        return False
+    cleaned = head.lstrip(b"\xef\xbb\xbf \t\r\n")
+    if not cleaned:
+        return True
+    lower = cleaned[:256].lower()
+    if lower.startswith(_TEXT_ERROR_PREFIXES):
+        return True
+    if lower.startswith(b"{") and b":" in lower[:256]:
+        # Treat plain printable JSON objects as text payloads rather than binary media.
+        sample = cleaned[:256]
+        if all(b in (9, 10, 13) or 32 <= b < 127 or b >= 128 for b in sample):
+            return True
+    return False
+
+
+def _has_valid_media_magic(path: str, ext: str) -> bool:
+    """Lightweight container signature check used when `ffprobe` is unavailable."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096)
+    except OSError:
+        return False
+    if _looks_like_text_error_payload(head):
+        return False
+    normalized_ext = ext.lstrip(".").lower()
+    if normalized_ext == "mp3":
+        if head.startswith(b"ID3"):
+            return True
+        if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+            return True
+        limit = min(len(head) - 1, 2048)
+        for i in range(limit):
+            b0, b1 = head[i], head[i + 1]
+            if b0 == 0xFF and (b1 & 0xE0) == 0xE0 and (b1 & 0x18) != 0x08 and (b1 & 0x06) != 0x00:
+                return True
+        return False
+    if normalized_ext in ("m4a", "m4b", "mp4", "m4v", "m4s", "mov"):
+        return len(head) >= 8 and head[4:8] in _ISO_BMFF_BOX_TYPES
+    if normalized_ext in ("ogg", "oga", "opus"):
+        return head.startswith(b"OggS")
+    if normalized_ext == "flac":
+        return head.startswith((b"fLaC", b"ID3"))
+    if normalized_ext == "wav":
+        return len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WAVE"
+    if normalized_ext == "ts":
+        if len(head) > 188:
+            return head[0] == 0x47 and head[188] == 0x47
+        return len(head) >= 1 and head[0] == 0x47
+    if normalized_ext == "aac":
+        if head.startswith((b"ADIF", b"ID3")):
+            return True
+        return len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xF0) == 0xF0
+    if normalized_ext in ("mkv", "webm"):
+        return head.startswith(b"\x1a\x45\xdf\xa3")
+    if normalized_ext in ("aiff", "aif"):
+        return len(head) >= 12 and head[:4] == b"FORM" and head[8:12] in (b"AIFF", b"AIFC")
+    if normalized_ext == "wma":
+        return head.startswith(b"\x30\x26\xb2\x75\x8e\x66\xcf\x11")
+    return True
+
+
 def verify_audio_integrity(
     path: str,
     *,
@@ -162,7 +243,8 @@ def verify_audio_integrity(
     `allow_video=True`) stream and positive duration, and was not materially
     truncated relative to `expected_duration`.
 
-    Raises `FailedCombining` on verification failure.
+    Falls back to container magic-byte and soft-error signature validation when
+    `ffprobe` is unavailable. Raises `FailedCombining` on verification failure.
     """
     if not (os.path.isfile(path) and os.path.getsize(path) > 0):
         raise FailedCombining(message=f"Media file is missing or empty: {path}")
@@ -197,8 +279,135 @@ def verify_audio_integrity(
             raise FailedCombining(
                 message=f"Invalid or corrupt media output: {os.path.basename(path)}"
             )
+        if not _has_valid_media_magic(path, get_extension(path)):
+            raise FailedCombining(
+                message=f"Invalid or corrupt media file signature: {os.path.basename(path)}"
+            )
 
     return info
+
+
+def verify_ebook_integrity(path: str, *, ext: str | None = None) -> None:
+    """
+    Validate that an ebook file exists, is non-empty, is not an HTML/XML/JSON soft error,
+    and matches the structural signature of its container format (`.epub`, `.cbz`, `.pdf`,
+    `.mobi`, `.azw3`, `.cbr`). Raises `FailedCombining` on verification failure.
+    """
+    if not (os.path.isfile(path) and os.path.getsize(path) > 0):
+        raise FailedCombining(message=f"Ebook file is missing or empty: {path}")
+    file_size = os.path.getsize(path)
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096)
+            if file_size > 4096:
+                f.seek(max(0, file_size - 4096))
+                tail = f.read(4096)
+            else:
+                tail = head
+    except OSError as exc:
+        raise FailedCombining(message=f"Failed reading ebook file '{os.path.basename(path)}': {exc}") from exc
+
+    if _looks_like_text_error_payload(head):
+        raise FailedCombining(
+            message=f"Invalid ebook payload (looks like text/HTML/XML error): {os.path.basename(path)}"
+        )
+
+    resolved_ext = (ext or get_extension(path)).lstrip(".").lower()
+    if resolved_ext in ("epub", "cbz"):
+        try:
+            with zipfile.ZipFile(path, "r") as zf:
+                names = zf.namelist()
+                if not names:
+                    raise FailedCombining(
+                        message=f"Ebook archive is empty: {os.path.basename(path)}"
+                    )
+                bad_member = zf.testzip()
+                if bad_member is not None:
+                    raise FailedCombining(
+                        message=f"Corrupt archive entry '{bad_member}' in {os.path.basename(path)}"
+                    )
+                if resolved_ext == "epub" and not (
+                    "META-INF/container.xml" in names or "mimetype" in names
+                ):
+                    raise FailedCombining(
+                        message=f"Invalid EPUB archive structure: {os.path.basename(path)}"
+                    )
+        except (zipfile.BadZipFile, OSError) as exc:
+            raise FailedCombining(
+                message=f"Invalid or corrupt {resolved_ext.upper()} archive: {os.path.basename(path)}"
+            ) from exc
+    elif resolved_ext == "pdf":
+        if b"%PDF-" not in head[:1024] or b"%%EOF" not in tail:
+            raise FailedCombining(
+                message=f"Invalid or truncated PDF document: {os.path.basename(path)}"
+            )
+    elif resolved_ext in ("mobi", "azw3"):
+        if not (len(head) >= 68 and (head[60:68] == b"BOOKMOBI" or head.startswith(b"TPZ"))):
+            raise FailedCombining(
+                message=f"Invalid or corrupt {resolved_ext.upper()} ebook header: {os.path.basename(path)}"
+            )
+    elif resolved_ext == "cbr":
+        if not head.startswith(b"Rar!\x1a\x07"):
+            raise FailedCombining(
+                message=f"Invalid or corrupt CBR archive: {os.path.basename(path)}"
+            )
+
+
+def verify_file_checksums(path: str, expected_checksums: Mapping[str, str]) -> None:
+    """
+    Verify `path` against all `(algorithm, expected_hex)` entries in `expected_checksums`.
+
+    Raises `FailedCombining` on digest mismatch.
+    """
+    if not expected_checksums:
+        return
+    if not os.path.isfile(path):
+        raise FailedCombining(message=f"File missing for checksum verification: {path}")
+    hashers = {algo: hashlib.new(algo) for algo in expected_checksums}
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            for hasher in hashers.values():
+                hasher.update(chunk)
+    for algo, expected_hex in expected_checksums.items():
+        actual_hex = hashers[algo].hexdigest().lower()
+        if actual_hex != expected_hex.lower():
+            raise FailedCombining(
+                message=(
+                    f"{algo.upper()} checksum mismatch for '{os.path.basename(path)}': "
+                    f"expected {expected_hex.lower()}, got {actual_hex}"
+                )
+            )
+
+
+def verify_downloaded_file_integrity(
+    path: str,
+    *,
+    ext: str,
+    allow_video: bool = False,
+    probe_cache: dict[str, AudioProbeInfo] | None = None,
+    require_ffprobe: bool = False,
+    expected_checksums: Mapping[str, str] | None = None,
+) -> AudioProbeInfo | None:
+    """
+    Validate a downloaded audio, video, or ebook file before committing it.
+
+    Verifies cryptographic `expected_checksums` (when supplied), ebook container
+    integrity for ebook extensions, and `verify_audio_integrity` for audio/video media.
+    """
+    if expected_checksums:
+        verify_file_checksums(path, expected_checksums)
+    if is_ebook_extension(ext):
+        verify_ebook_integrity(path, ext=ext)
+        return None
+    return verify_audio_integrity(
+        path,
+        probe_cache=probe_cache,
+        require_ffprobe=require_ffprobe,
+        allow_video=allow_video,
+    )
 
 
 def _resolve_aac_bitrate_from_info(
@@ -1664,6 +1873,16 @@ def merge_segment_groups_into_chapters(
                                 can_copy = src_info.sample_rate == target_sample_rate
                             if can_copy:
                                 shutil.copy2(src, out_path)
+                                if not (
+                                    os.path.isfile(out_path)
+                                    and os.path.getsize(out_path) == os.path.getsize(src)
+                                    and os.path.getsize(out_path) > 0
+                                ):
+                                    if os.path.exists(out_path):
+                                        os.remove(out_path)
+                                    raise FailedCombining(
+                                        message=f"Copied chapter file failed size verification: {os.path.basename(out_path)}"
+                                    )
                             else:
                                 convert_single_file(
                                     src,

@@ -1,3 +1,5 @@
+import base64
+import binascii
 from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 import email.utils
@@ -34,6 +36,11 @@ _GENERIC_BINARY_MIME_TYPES: frozenset[str] = frozenset(
         "binary/octet-stream",
         "application/binary",
         "application/x-binary",
+        "application/x-octet-stream",
+        "application/force-download",
+        "application/download",
+        "application/x-download",
+        "application/unknown",
     }
 )
 _SOFT_ERROR_MIME_TYPES: frozenset[str] = frozenset(
@@ -45,34 +52,157 @@ _SOFT_ERROR_MIME_TYPES: frozenset[str] = frozenset(
         "application/json",
         "application/problem+json",
         "text/plain",
+        "text/css",
+        "text/csv",
+        "text/javascript",
+        "application/javascript",
     }
 )
 _TEXT_DOCUMENT_EXTENSIONS: frozenset[str] = frozenset(
     {"txt", "html", "htm", "xml", "json", "m3u8", "srt", "vtt", "cue", "opf"}
+)
+_EBOOK_ONLY_MIME_TYPES: frozenset[str] = frozenset(
+    {
+        "application/epub+zip",
+        "application/epub",
+        "application/pdf",
+        "application/x-pdf",
+        "application/x-mobipocket-ebook",
+        "application/vnd.amazon.ebook",
+        "application/x-mobi8-ebook",
+        "application/x-cbz",
+        "application/vnd.comicbook+zip",
+        "application/x-cbr",
+        "application/vnd.comicbook-rar",
+    }
+)
+_EBOOK_FILE_EXTENSIONS: frozenset[str] = frozenset({"epub", "pdf", "mobi", "azw3", "cbz", "cbr"})
+_MEDIA_FILE_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        "mp3",
+        "m4a",
+        "m4b",
+        "mp4",
+        "m4v",
+        "m4s",
+        "aac",
+        "ogg",
+        "oga",
+        "opus",
+        "flac",
+        "wav",
+        "wma",
+        "ts",
+        "webm",
+        "mkv",
+        "mov",
+        "aiff",
+        "aif",
+        "caf",
+    }
 )
 _STREAM_COMPATIBLE_APP_TYPES: frozenset[str] = frozenset(
     {
         "application/mp4",
         "application/mp2t",
         "application/ogg",
+        "application/x-ogg",
+        "application/x-mp3",
+        "application/mp3",
+        "application/x-m4a",
+        "application/m4a",
+        "application/aac",
+        "application/x-aac",
+        "application/flac",
+        "application/x-flac",
+        "application/matroska",
+        "application/x-matroska",
+        "application/webm",
+        "application/mxf",
+        "application/dash+xml",
         "application/x-mpegurl",
         "application/vnd.apple.mpegurl",
     }
 )
 _MEDIA_MIME_EQUIVALENCE_GROUPS: tuple[frozenset[str], ...] = (
-    frozenset({"audio/mpeg", "audio/mp3", "audio/mpeg3", "audio/x-mpeg", "audio/x-mp3", "audio/x-mpeg-3"}),
-    frozenset({"audio/mp4", "audio/x-m4a", "audio/m4a", "audio/x-mp4", "application/mp4", "video/mp4"}),
-    frozenset({"audio/aac", "audio/x-aac", "audio/aacp", "audio/adts", "audio/x-hx-aac-adts"}),
+    frozenset(
+        {
+            "audio/mpeg",
+            "audio/mp3",
+            "audio/mpeg3",
+            "audio/x-mpeg",
+            "audio/x-mp3",
+            "audio/x-mpeg-3",
+            "application/x-mp3",
+            "application/mp3",
+        }
+    ),
+    frozenset(
+        {
+            "audio/mp4",
+            "audio/x-m4a",
+            "audio/m4a",
+            "audio/x-m4b",
+            "audio/m4b",
+            "audio/x-mp4",
+            "application/mp4",
+            "application/x-m4a",
+            "application/m4a",
+            "video/mp4",
+            "video/m4v",
+            "video/x-m4v",
+            "video/iso.segment",
+            "audio/iso.segment",
+        }
+    ),
+    frozenset(
+        {
+            "audio/aac",
+            "audio/x-aac",
+            "audio/aacp",
+            "audio/adts",
+            "audio/x-hx-aac-adts",
+            "audio/vnd.dlna.adts",
+            "application/aac",
+            "application/x-aac",
+        }
+    ),
     frozenset({"video/mp2t", "application/mp2t", "audio/mp2t"}),
-    frozenset({"audio/ogg", "application/ogg", "audio/opus", "audio/vorbis"}),
-    frozenset({"audio/flac", "audio/x-flac"}),
-    frozenset({"audio/wav", "audio/x-wav", "audio/wave"}),
-    frozenset({"application/epub+zip", "application/epub"}),
+    frozenset(
+        {
+            "audio/ogg",
+            "application/ogg",
+            "application/x-ogg",
+            "audio/opus",
+            "audio/vorbis",
+            "video/ogg",
+        }
+    ),
+    frozenset({"audio/flac", "audio/x-flac", "application/flac", "application/x-flac"}),
+    frozenset({"audio/wav", "audio/x-wav", "audio/wave", "audio/vnd.wave", "audio/l16"}),
+    frozenset({"audio/webm", "video/webm", "application/webm"}),
+    frozenset(
+        {
+            "audio/matroska",
+            "audio/x-matroska",
+            "video/x-matroska",
+            "application/matroska",
+            "application/x-matroska",
+        }
+    ),
+    frozenset({"audio/aiff", "audio/x-aiff"}),
+    frozenset({"audio/3gpp", "audio/3gpp2", "audio/amr", "audio/ac3", "audio/eac3", "audio/x-ms-wma"}),
+    frozenset({"application/epub+zip", "application/epub", "application/zip", "application/x-zip-compressed"}),
+    frozenset({"application/pdf", "application/x-pdf"}),
+    frozenset({"application/x-mobipocket-ebook", "application/vnd.amazon.ebook", "application/x-mobi8-ebook"}),
+    frozenset({"application/x-cbz", "application/vnd.comicbook+zip", "application/zip", "application/x-zip-compressed"}),
+    frozenset({"application/x-cbr", "application/vnd.comicbook-rar", "application/x-rar-compressed", "application/vnd.rar"}),
     frozenset({"application/vnd.apple.mpegurl", "application/x-mpegurl", "audio/mpegurl", "audio/x-mpegurl"}),
 )
-_MEDIA_MIME_TO_GROUP: dict[str, frozenset[str]] = {
-    mime: group for group in _MEDIA_MIME_EQUIVALENCE_GROUPS for mime in group
-}
+_MEDIA_MIME_TO_GROUPS: dict[str, list[frozenset[str]]] = {}
+for _group in _MEDIA_MIME_EQUIVALENCE_GROUPS:
+    for _mime in _group:
+        _MEDIA_MIME_TO_GROUPS.setdefault(_mime, []).append(_group)
 
 _HEADER_BYTE_RANGE_RE = re.compile(r"^bytes\s*=\s*(\d+)\s*-\s*(\d+)$", re.IGNORECASE)
 _CLOUDFLARE_CHALLENGE_MARKERS: tuple[str, ...] = (
@@ -217,11 +347,28 @@ def parse_byte_range_header(range_val: Any) -> tuple[int, int] | None:
 
 def normalize_content_type(value: Any) -> str | None:
     """Return the normalized lowercase MIME type (`type/subtype`), stripping parameters and quotes."""
+    if isinstance(value, (bytes, bytearray)):
+        value = bytes(value).decode("utf-8", errors="replace")
     if not isinstance(value, str):
         return None
-    primary = value.split(",", 1)[0]
-    media_type = primary.split(";", 1)[0].strip().strip("\"'").lower()
-    return media_type or None
+    for part in value.split(","):
+        media_type = part.split(";", 1)[0].strip().strip("\"'").lower()
+        if media_type:
+            return media_type
+    return None
+
+
+def _is_audio_video_media_mime(mime: str) -> bool:
+    return mime.startswith(("audio/", "video/")) or mime in _STREAM_COMPATIBLE_APP_TYPES
+
+
+def _matches_expected_mime(actual_ct: str, expected_set: set[str]) -> bool:
+    if actual_ct in expected_set or "*/*" in expected_set:
+        return True
+    for exp in expected_set:
+        if exp.endswith("/*") and actual_ct.startswith(exp[:-1]):
+            return True
+    return False
 
 
 def is_content_type_compatible(
@@ -231,10 +378,11 @@ def is_content_type_compatible(
     file_ext: str | None = None,
 ) -> tuple[bool, str | None]:
     """
-    Validate CDN `Content-Type` against `expected` while allowing MIME aliases and generic binary streams.
+    Validate CDN `Content-Type` against `expected` while flexibly accepting valid media types.
 
-    Rejects HTML/XML/JSON/text soft-error responses on non-text media/ebook downloads even when
-    `expected` is `None`. Returns `(is_compatible, normalized_actual)`.
+    Accepts MIME aliases, wildcards, generic binary/download types, and any valid audio/video
+    stream MIME type when expecting media, while rejecting HTML/XML/JSON/text soft-error
+    responses and incompatible non-media payloads. Returns `(is_compatible, normalized_actual)`.
     """
     actual_ct = normalize_content_type(actual_raw)
 
@@ -256,6 +404,13 @@ def is_content_type_compatible(
         return False, actual_ct
 
     if not expected_set:
+        if actual_ct is not None:
+            if ext in _MEDIA_FILE_EXTENSIONS and (
+                actual_ct.startswith("image/") or actual_ct in _EBOOK_ONLY_MIME_TYPES
+            ):
+                return False, actual_ct
+            if ext in _EBOOK_FILE_EXTENSIONS and actual_ct.startswith(("audio/", "video/", "image/")):
+                return False, actual_ct
         return True, actual_ct
 
     if actual_ct is None:
@@ -263,25 +418,106 @@ def is_content_type_compatible(
         expects_text_only = all(t in _SOFT_ERROR_MIME_TYPES for t in expected_set)
         return (not expects_text_only), None
 
-    if actual_ct in expected_set:
+    if _matches_expected_mime(actual_ct, expected_set):
         return True, actual_ct
 
     expects_text_only = all(t in _SOFT_ERROR_MIME_TYPES for t in expected_set)
     if actual_ct in _GENERIC_BINARY_MIME_TYPES and not expects_text_only:
         return True, actual_ct
 
-    if (_GENERIC_BINARY_MIME_TYPES & expected_set) and (
-        actual_ct.startswith(("audio/", "video/"))
-        or actual_ct in _STREAM_COMPATIBLE_APP_TYPES
-        or actual_ct in _GENERIC_BINARY_MIME_TYPES
+    actual_groups = _MEDIA_MIME_TO_GROUPS.get(actual_ct)
+    if actual_groups and any(exp in group for group in actual_groups for exp in expected_set):
+        return True, actual_ct
+
+    if (
+        ext in _EBOOK_FILE_EXTENSIONS
+        and (_GENERIC_BINARY_MIME_TYPES & expected_set)
+        and actual_ct in _EBOOK_ONLY_MIME_TYPES
     ):
         return True, actual_ct
 
-    actual_group = _MEDIA_MIME_TO_GROUP.get(actual_ct)
-    if actual_group is not None and any(exp in actual_group for exp in expected_set):
+    expects_media = any(
+        _is_audio_video_media_mime(exp) or exp in _GENERIC_BINARY_MIME_TYPES
+        for exp in expected_set
+    )
+    if expects_media and ext not in _EBOOK_FILE_EXTENSIONS and _is_audio_video_media_mime(actual_ct):
         return True, actual_ct
 
     return False, actual_ct
+
+
+_DIGEST_ALGO_LENGTHS: dict[str, int] = {
+    "md5": 16,
+    "sha1": 20,
+    "sha256": 32,
+    "sha512": 64,
+}
+
+
+def parse_content_md5(header_val: Any) -> str | None:
+    """
+    Parse an HTTP `Content-MD5` header into a lowercase 32-char hex MD5 digest.
+
+    Accepts standard RFC 1864 base64-encoded 16-byte digests as well as 32-char hex strings.
+    """
+    if isinstance(header_val, (bytes, bytearray)):
+        header_val = bytes(header_val).decode("ascii", errors="ignore")
+    if not isinstance(header_val, str):
+        return None
+    cleaned = header_val.strip().strip("\"'")
+    if not cleaned:
+        return None
+    if len(cleaned) == 32 and all(ch in "0123456789abcdefABCDEF" for ch in cleaned):
+        return cleaned.lower()
+    padded = cleaned + ("=" * ((4 - (len(cleaned) % 4)) % 4))
+    try:
+        raw = base64.b64decode(padded, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    return raw.hex() if len(raw) == 16 else None
+
+
+def parse_repr_digest(header_val: Any) -> dict[str, str]:
+    """
+    Parse RFC 9530 `Repr-Digest` or RFC 3230 `Digest` headers into `{algo: hex}`.
+
+    Supports `sha-256=:base64:`, `sha-512=:base64:`, `sha-1=:base64:`, and `md5=:base64:`
+    (with or without RFC 8941 byte-sequence `:` delimiters).
+    """
+    if isinstance(header_val, (bytes, bytearray)):
+        header_val = bytes(header_val).decode("ascii", errors="ignore")
+    if not isinstance(header_val, str) or not header_val.strip():
+        return {}
+    digests: dict[str, str] = {}
+    for entry in header_val.split(","):
+        part = entry.strip()
+        if "=" not in part:
+            continue
+        raw_algo, raw_val = part.split("=", 1)
+        algo = raw_algo.strip().lower().replace("-", "")
+        if algo == "sha":
+            algo = "sha1"
+        expected_len = _DIGEST_ALGO_LENGTHS.get(algo)
+        if expected_len is None:
+            continue
+        val = raw_val.strip()
+        if len(val) >= 2 and val.startswith(":") and val.endswith(":"):
+            val = val[1:-1].strip()
+        else:
+            val = val.strip("\"'")
+        if not val:
+            continue
+        if len(val) == expected_len * 2 and all(ch in "0123456789abcdefABCDEF" for ch in val):
+            digests[algo] = val.lower()
+            continue
+        padded = val + ("=" * ((4 - (len(val) % 4)) % 4))
+        try:
+            raw_bytes = base64.b64decode(padded, validate=True)
+        except (binascii.Error, ValueError):
+            continue
+        if len(raw_bytes) == expected_len:
+            digests[algo] = raw_bytes.hex()
+    return digests
 
 
 def is_cloudflare_challenge(response: Any, *, body: bytes | str | None = None) -> bool:

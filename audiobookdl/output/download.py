@@ -22,6 +22,7 @@ from audiobookdl.utils.audiobook import (
     is_ebook,
     is_ebook_extension,
     is_video,
+    normalize_checksums,
     resolve_audiobook_output_format,
 )
 from mutagen import File as MutagenFile
@@ -37,12 +38,15 @@ from audiobookdl.utils.http import (
     is_transient_network_error,
     parse_byte_range_header,
     parse_byte_rate,
+    parse_content_md5,
+    parse_repr_digest,
     sleep_or_cancel,
 )
 from . import metadata, output, encryption
 from .metadata import sidecars
 
 from dataclasses import dataclass
+import hashlib
 import os
 import re
 import shutil
@@ -53,7 +57,7 @@ import uuid
 import requests
 from functools import partial
 from typing import Any, cast
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from math import log10
 
@@ -104,24 +108,61 @@ def download(
         raise DownloadCancelled from None
 
 
+def _safe_remove(path: str | None) -> None:
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def _all_output_parts_exist(
     audiobook: Audiobook,
     output_dir: str,
     output_format: str | None,
+    *,
+    verify: bool = False,
+    allow_video: bool = False,
+    probe_cache: dict[str, Any] | None = None,
 ) -> bool:
-    """Return True when every expected multi-part output file already exists on disk."""
+    """Return True when every expected multi-part output file already exists (and passes integrity checks when `verify=True`)."""
     if not os.path.isdir(output_dir) or not audiobook.files:
         return False
     target_ext = output_format.lstrip(".").lower() if output_format else None
-    for idx in range(len(audiobook.files)):
+    for idx, file_spec in enumerate(audiobook.files):
         raw_path, _ = create_filepath(audiobook, output_dir, idx)
+        src_ext = file_spec.ext.lstrip(".").lower()
         if target_ext:
             base, _ = os.path.splitext(raw_path)
             expected_path = f"{base}.{target_ext}"
+            part_ext = target_ext
         else:
             expected_path = raw_path
+            part_ext = src_ext
         if not (os.path.exists(expected_path) and os.path.getsize(expected_path) > 0):
             return False
+        if verify:
+            checksums = (
+                normalize_checksums(getattr(file_spec, "checksum", None))
+                if part_ext == src_ext
+                else None
+            )
+            try:
+                info = output.verify_downloaded_file_integrity(
+                    expected_path,
+                    ext=part_ext,
+                    allow_video=allow_video,
+                    probe_cache=probe_cache,
+                    expected_checksums=checksums or None,
+                )
+                if info is not None:
+                    output.store_cached_probe(probe_cache, expected_path, info)
+            except FailedCombining as exc:
+                logging.log(
+                    f"[yellow]Warning:[/yellow] Existing part '{os.path.basename(expected_path)}' "
+                    f"failed integrity check ({exc}); will re-download."
+                )
+                return False
     return True
 
 
@@ -186,24 +227,57 @@ def download_audiobook(
         target_path = f"{output_dir}.{output_format}" if output_format else output_dir
 
     confirmed_target_overwrite = False
+    probe_cache: dict[str, Any] = {}
     if options.skip_downloaded or options.resume:
         if is_single_file:
             if target_path and os.path.exists(target_path) and (
                 (options.skip_downloaded and not options.resume)
                 or os.path.getsize(target_path) > 0
             ):
-                msg = (
-                    f"Resuming: skipping already downloaded [blue]{audiobook.title}[/], file already exists."
-                    if options.resume and not options.skip_downloaded
-                    else f"Skipping [blue]{audiobook.title}[/], file already exists."
-                )
-                logging.log(msg)
-                return
+                skip_ok = True
+                if options.resume and not options.skip_downloaded:
+                    target_ext = (
+                        resolve_audiobook_output_format(audiobook, options.output_format)
+                        or os.path.splitext(target_path)[1].lstrip(".").lower()
+                    )
+                    single_checksums = (
+                        normalize_checksums(getattr(audiobook.files[0], "checksum", None))
+                        if len(audiobook.files) == 1
+                        and target_ext == audiobook.files[0].ext.lstrip(".").lower()
+                        else None
+                    )
+                    try:
+                        info = output.verify_downloaded_file_integrity(
+                            target_path,
+                            ext=target_ext,
+                            allow_video=video,
+                            probe_cache=probe_cache,
+                            expected_checksums=single_checksums or None,
+                        )
+                        if info is not None:
+                            output.store_cached_probe(probe_cache, target_path, info)
+                    except FailedCombining as exc:
+                        logging.log(
+                            f"[yellow]Warning:[/yellow] Existing file '{os.path.basename(target_path)}' "
+                            f"failed integrity check ({exc}); re-downloading."
+                        )
+                        skip_ok = False
+                if skip_ok:
+                    msg = (
+                        f"Resuming: skipping already downloaded [blue]{audiobook.title}[/], file already exists."
+                        if options.resume and not options.skip_downloaded
+                        else f"Skipping [blue]{audiobook.title}[/], file already exists."
+                    )
+                    logging.log(msg)
+                    return
         elif options.resume and not expected_split_output:
             if _all_output_parts_exist(
                 audiobook,
                 output_dir,
                 resolve_audiobook_output_format(audiobook, options.output_format),
+                verify=(not options.skip_downloaded),
+                allow_video=video,
+                probe_cache=probe_cache,
             ):
                 msg = (
                     f"Resuming: skipping already downloaded [blue]{audiobook.title}[/], all files already exist."
@@ -247,7 +321,6 @@ def download_audiobook(
             download_output_dir = stage_dir
 
     try:
-        probe_cache: dict[str, Any] = {}
         # Downloading files
         filepaths = download_files_with_progress(
             audiobook,
@@ -1368,6 +1441,86 @@ PROGRESS_FLUSH_BYTES = 256 * 1024
 PROGRESS_FLUSH_INTERVAL = 0.05
 
 
+def _expected_http_digests(headers: Any) -> dict[str, str]:
+    """Extract supported HTTP integrity digests (`Content-MD5`, `Repr-Digest`, `Digest`)."""
+    digests = parse_repr_digest(get_header_ci(headers, "Repr-Digest"))
+    legacy_digest = parse_repr_digest(get_header_ci(headers, "Digest"))
+    for algo, val in legacy_digest.items():
+        digests.setdefault(algo, val)
+    content_md5 = parse_content_md5(get_header_ci(headers, "Content-MD5"))
+    if content_md5:
+        digests.setdefault("md5", content_md5)
+    return digests
+
+
+def _integrity_failure_heading(filepath: str, ext: str) -> str:
+    kind = "ebook" if is_ebook_extension(ext) else "media"
+    return f"Downloaded file '{os.path.basename(filepath)}' failed {kind} integrity verification"
+
+
+def _commit_verified_download(
+    *,
+    file: Any,
+    filepath: str,
+    filepath_tmp: str,
+    inline_dec_tmp: str | None,
+    decrypted_inline: bool,
+    ext: str,
+    video: bool,
+    expected_checksums: Mapping[str, str] | None,
+) -> Any:
+    """Decrypt (if needed), validate file integrity/checksums, and atomically commit `filepath`."""
+    verified_info: Any = None
+    if file.encryption_method and not decrypted_inline:
+        dec_tmp = f"{filepath}.dec.{uuid.uuid4().hex[:8]}.tmp"
+        try:
+            encryption.decrypt_file(
+                filepath_tmp,
+                file.encryption_method,
+                output_path=dec_tmp,
+                prefix=file.init_section or b"",
+            )
+            try:
+                verified_info = output.verify_downloaded_file_integrity(
+                    dec_tmp,
+                    ext=ext,
+                    allow_video=video,
+                    expected_checksums=expected_checksums or None,
+                )
+            except FailedCombining:
+                _safe_remove(filepath_tmp)
+                raise
+            os.replace(dec_tmp, filepath)
+        finally:
+            _safe_remove(dec_tmp)
+        _safe_remove(filepath_tmp)
+    elif inline_dec_tmp is not None:
+        try:
+            verified_info = output.verify_downloaded_file_integrity(
+                inline_dec_tmp,
+                ext=ext,
+                allow_video=video,
+                expected_checksums=expected_checksums or None,
+            )
+            os.replace(inline_dec_tmp, filepath)
+            _safe_remove(filepath_tmp)
+        finally:
+            _safe_remove(inline_dec_tmp)
+    else:
+        try:
+            verified_info = output.verify_downloaded_file_integrity(
+                filepath_tmp,
+                ext=ext,
+                allow_video=video,
+                expected_checksums=expected_checksums or None,
+            )
+        except FailedCombining:
+            _safe_remove(filepath_tmp)
+            raise
+        os.replace(filepath_tmp, filepath)
+    return verified_info
+
+
 def download_file(
     args: tuple[Audiobook, str, int, Any, threading.Event | None] | tuple[Audiobook, str, int, Any, threading.Event | None, Callable[[int], None] | None],
     *,
@@ -1388,10 +1541,29 @@ def download_file(
         raise DownloadCancelled
     file = audiobook.files[index]
     filepath, filepath_tmp = create_filepath(audiobook, output_dir, index)
+    ext = file.ext.lstrip(".").lower()
+    video = is_video(audiobook)
+    expected_checksums = normalize_checksums(getattr(file, "checksum", None))
+
     if resume and os.path.exists(filepath) and os.path.getsize(filepath) > 0:
-        logging.debug(f"Resuming: skipping already downloaded file {filepath}")
-        update_progress(1.0)
-        return filepath
+        try:
+            existing_info = output.verify_downloaded_file_integrity(
+                filepath,
+                ext=ext,
+                allow_video=video,
+                probe_cache=probe_cache,
+                expected_checksums=expected_checksums or None,
+            )
+            if existing_info is not None:
+                output.store_cached_probe(probe_cache, filepath, existing_info)
+            logging.debug(f"Resuming: skipping already downloaded file {filepath}")
+            update_progress(1.0)
+            return filepath
+        except FailedCombining as exc:
+            logging.log(
+                f"[yellow]Warning:[/yellow] Existing file '{os.path.basename(filepath)}' "
+                f"failed integrity check ({exc}); re-downloading."
+            )
     if file.url_resolver is not None:
         file.url = file.url_resolver()
     if file.encryption_method is None and file.encryption_resolver is not None:
@@ -1407,22 +1579,32 @@ def download_file(
     max_attempts = 1 + effective_retries
     attempt = 0
     reset_stale_tmp = False
-    decrypted_inline = False
-    inline_dec_tmp: str | None = None
     allow_ciphertext_range = file.encryption_method is None or len(audiobook.files) == 1
+    verified_info: Any = None
     if file.file_writer is not None:
         logging.wait_if_paused(cancel_event=cancel_event)
         try:
             file.file_writer(filepath_tmp)
+            verified_info = _commit_verified_download(
+                file=file,
+                filepath=filepath,
+                filepath_tmp=filepath_tmp,
+                inline_dec_tmp=None,
+                decrypted_inline=False,
+                ext=ext,
+                video=video,
+                expected_checksums=expected_checksums,
+            )
+        except FailedCombining as exc:
+            _safe_remove(filepath_tmp)
+            raise GenericAudiobookDLException(_integrity_failure_heading(filepath, ext), str(exc)) from exc
         except BaseException:
-            if os.path.exists(filepath_tmp):
-                try:
-                    os.remove(filepath_tmp)
-                except OSError:
-                    pass
+            _safe_remove(filepath_tmp)
             raise
+        if verified_info is not None:
+            output.store_cached_probe(probe_cache, filepath, verified_info)
         update_progress(1.0)
-        attempt = max_attempts
+        return filepath
     while attempt < max_attempts:
         logging.wait_if_paused(cancel_event=cancel_event)
         if attempt > 0 and file.url_resolver is not None:
@@ -1470,12 +1652,18 @@ def download_file(
                     logging.debug(f"Resumed file already complete in tmp: {filepath_tmp}")
                     update_progress(1.0)
                     advanced = 1.0
+                    verified_info = _commit_verified_download(
+                        file=file,
+                        filepath=filepath,
+                        filepath_tmp=filepath_tmp,
+                        inline_dec_tmp=None,
+                        decrypted_inline=False,
+                        ext=ext,
+                        video=video,
+                        expected_checksums=expected_checksums,
+                    )
                     break
-                if os.path.exists(filepath_tmp):
-                    try:
-                        os.remove(filepath_tmp)
-                    except OSError:
-                        pass
+                _safe_remove(filepath_tmp)
                 if not reset_stale_tmp:
                     reset_stale_tmp = True
                     continue
@@ -1605,11 +1793,7 @@ def download_file(
                         if range_total is not None and range_total > 0:
                             total_filesize = range_total
                     else:
-                        if os.path.exists(filepath_tmp):
-                            try:
-                                os.remove(filepath_tmp)
-                            except OSError:
-                                pass
+                        _safe_remove(filepath_tmp)
                         if not reset_stale_tmp:
                             reset_stale_tmp = True
                             continue
@@ -1633,6 +1817,19 @@ def download_file(
                         advanced += initial_progress
             if report_file_size is not None and total_filesize > 0:
                 report_file_size(index, total_filesize)
+
+            content_encoding = get_header_ci(request.headers, "Content-Encoding")
+            is_identity = not (
+                isinstance(content_encoding, str)
+                and content_encoding.strip()
+                and content_encoding.strip().lower() != "identity"
+            )
+            expected_http_digests = (
+                _expected_http_digests(request.headers)
+                if is_identity and request.status_code == 200 and open_mode == "wb" and not slicing_200_range
+                else {}
+            )
+            http_hashers = {algo: hashlib.new(algo) for algo in expected_http_digests}
 
             # Stream decryption inline into an isolated temp path when reading
             # from byte 0 so `filepath_tmp` only ever contains raw un-decrypted bytes.
@@ -1701,6 +1898,8 @@ def download_file(
                                 chunk_len = len(chunk)
                         if rate_limiter is not None:
                             rate_limiter.acquire(chunk_len, cancel_event=cancel_event)
+                        for hasher in http_hashers.values():
+                            hasher.update(chunk)
                         if stream_decryptor is not None:
                             out_chunk = stream_decryptor.decrypt_chunk(chunk)
                             if out_chunk:
@@ -1724,12 +1923,6 @@ def download_file(
             finally:
                 _flush_progress()
             final_size = (existing_bytes + bytes_written) if open_mode == "ab" else bytes_written
-            content_encoding = get_header_ci(request.headers, "Content-Encoding")
-            is_identity = not (
-                isinstance(content_encoding, str)
-                and content_encoding.strip()
-                and content_encoding.strip().lower() != "identity"
-            )
             if (
                 request.status_code == 200
                 and open_mode == "wb"
@@ -1739,33 +1932,66 @@ def download_file(
                 raise requests.exceptions.ChunkedEncodingError(
                     f"Empty 200 OK response from {file.url}"
                 )
-            if is_identity and total_filesize > 0 and final_size < total_filesize:
+            if is_identity and total_filesize > 0 and final_size != total_filesize:
+                if open_mode == "wb":
+                    _safe_remove(write_target)
                 raise requests.exceptions.ChunkedEncodingError(
                     f"Incomplete download for {file.url}: "
                     f"received {final_size} of {total_filesize} bytes"
                 )
+            for algo, expected_hex in expected_http_digests.items():
+                actual_hex = http_hashers[algo].hexdigest().lower()
+                if actual_hex != expected_hex:
+                    if open_mode == "wb":
+                        _safe_remove(write_target)
+                    raise requests.exceptions.ChunkedEncodingError(
+                        f"HTTP {algo.upper()} digest mismatch for {file.url}: "
+                        f"expected {expected_hex}, got {actual_hex}"
+                    )
             if total_filesize == 0:
                 update_progress(1.0)
                 advanced = 1.0
+            verified_info = _commit_verified_download(
+                file=file,
+                filepath=filepath,
+                filepath_tmp=filepath_tmp,
+                inline_dec_tmp=inline_dec_tmp,
+                decrypted_inline=decrypted_inline,
+                ext=ext,
+                video=video,
+                expected_checksums=expected_checksums,
+            )
             break
         except DownloadCancelled:
-            if inline_dec_tmp and os.path.exists(inline_dec_tmp):
-                try:
-                    os.remove(inline_dec_tmp)
-                except OSError:
-                    pass
-            if not resume and os.path.exists(filepath_tmp):
-                try:
-                    os.remove(filepath_tmp)
-                except OSError:
-                    pass
+            _safe_remove(inline_dec_tmp)
+            if not resume:
+                _safe_remove(filepath_tmp)
             raise
+        except FailedCombining as error:
+            _safe_remove(inline_dec_tmp)
+            can_retry_integrity = (
+                (file.url_resolver is not None or bool(expected_checksums))
+                and attempt + 1 < max_attempts
+            )
+            if not can_retry_integrity:
+                raise GenericAudiobookDLException(
+                    _integrity_failure_heading(filepath, ext),
+                    str(error),
+                ) from error
+            update_progress(-advanced)
+            delay = compute_retry_delay(attempt)
+            logging.log(
+                f"[yellow]Retrying[/yellow] {os.path.basename(filepath)} "
+                f"(attempt {attempt + 2}/{max_attempts}, waiting {delay:.1f}s): {error}"
+            )
+            logging.debug(
+                f"Download attempt {attempt + 1}/{max_attempts} failed integrity check for "
+                f"{file.url} ({error}); retrying in {delay:.2f}s"
+            )
+            sleep_or_cancel(delay, cancel_event, sleep_fn=time.sleep)
+            attempt += 1
         except Exception as error:
-            if inline_dec_tmp and os.path.exists(inline_dec_tmp):
-                try:
-                    os.remove(inline_dec_tmp)
-                except OSError:
-                    pass
+            _safe_remove(inline_dec_tmp)
             if not (
                 isinstance(error, requests.exceptions.RequestException)
                 or is_transient_network_error(error)
@@ -1789,74 +2015,6 @@ def download_file(
         finally:
             if request is not None:
                 request.close()
-    # Decrypt file if necessary (when resume mode wrote raw ciphertext to tmp),
-    # verify audio integrity before committing, and keep any existing target intact on failure.
-    ext = file.ext.lstrip(".").lower()
-    video = is_video(audiobook)
-    verified_info: Any = None
-    if file.encryption_method and not decrypted_inline:
-        dec_tmp = f"{filepath}.dec.{uuid.uuid4().hex[:8]}.tmp"
-        try:
-            encryption.decrypt_file(
-                filepath_tmp,
-                file.encryption_method,
-                output_path=dec_tmp,
-                prefix=file.init_section or b"",
-            )
-            if not is_ebook_extension(ext):
-                try:
-                    verified_info = output.verify_audio_integrity(dec_tmp, allow_video=video)
-                except FailedCombining as exc:
-                    raise GenericAudiobookDLException(
-                        f"Downloaded file '{os.path.basename(filepath)}' failed media integrity verification"
-                    ) from exc
-            os.replace(dec_tmp, filepath)
-        finally:
-            if os.path.exists(dec_tmp):
-                try:
-                    os.remove(dec_tmp)
-                except OSError:
-                    pass
-        try:
-            os.remove(filepath_tmp)
-        except OSError:
-            pass
-    elif inline_dec_tmp is not None:
-        try:
-            if not is_ebook_extension(ext):
-                try:
-                    verified_info = output.verify_audio_integrity(inline_dec_tmp, allow_video=video)
-                except FailedCombining as exc:
-                    raise GenericAudiobookDLException(
-                        f"Downloaded file '{os.path.basename(filepath)}' failed media integrity verification"
-                    ) from exc
-            os.replace(inline_dec_tmp, filepath)
-            if os.path.exists(filepath_tmp):
-                try:
-                    os.remove(filepath_tmp)
-                except OSError:
-                    pass
-        finally:
-            if os.path.exists(inline_dec_tmp):
-                try:
-                    os.remove(inline_dec_tmp)
-                except OSError:
-                    pass
-    else:
-        if not is_ebook_extension(ext):
-            try:
-                verified_info = output.verify_audio_integrity(filepath_tmp, allow_video=video)
-            except FailedCombining as exc:
-                if os.path.exists(filepath_tmp):
-                    try:
-                        os.remove(filepath_tmp)
-                    except OSError:
-                        pass
-                raise GenericAudiobookDLException(
-                    f"Downloaded file '{os.path.basename(filepath)}' failed media integrity verification"
-                ) from exc
-        # Atomically move into place (overwrites confirmed existing single-file outputs on Windows)
-        os.replace(filepath_tmp, filepath)
     if verified_info is not None:
         output.store_cached_probe(probe_cache, filepath, verified_info)
     # Return filepath

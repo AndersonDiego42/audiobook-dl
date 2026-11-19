@@ -276,3 +276,48 @@ def test_rss_atom_iso8601_and_podcast_chapters(tmp_path):
         (60000, "Episode 2"),
     ]
 
+
+def test_archiveorg_attaches_checksums_and_rss_accepts_flexible_media_mimes(tmp_path):
+    sha1_hex = "a" * 40
+    md5_hex = "b" * 32
+    ia_payload = {
+        "metadata": {"title": "Checked IA Book"},
+        "files": [
+            {
+                "name": "01.mp3",
+                "format": "VBR MP3",
+                "size": "1234",
+                "sha1": sha1_hex,
+                "md5": md5_hex,
+            }
+        ],
+    }
+    ia_src = ArchiveOrgSource(_opts(tmp_path))
+    ia_src.get_json = lambda *_a, **_kw: ia_payload  # type: ignore[method-assign]
+    ia_book = ia_src.download("https://archive.org/details/checked_ia")
+    assert ia_book.files[0].checksum == {"sha1": sha1_hex, "md5": md5_hex}
+
+    rss_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0">
+      <channel>
+        <title>Flexible Feed</title>
+        <item>
+          <title>Ep 1</title>
+          <enclosure url="https://cdn.example.com/stream?id=1" type="video/mp4" length="500"/>
+        </item>
+        <item>
+          <title>Ep 2</title>
+          <enclosure url="https://cdn.example.com/stream?id=2" type="application/octet-stream" length="600"/>
+        </item>
+        <item>
+          <title>Cover Image Ignored</title>
+          <enclosure url="https://cdn.example.com/cover.jpg" type="image/jpeg" length="50"/>
+        </item>
+      </channel>
+    </rss>"""
+    rss_src = RssSource(_opts(tmp_path))
+    rss_src.get = lambda *_a, **_kw: rss_xml  # type: ignore[method-assign]
+    rss_book = rss_src.download("https://example.org/feed.rss")
+    assert [f.title for f in rss_book.files] == ["Ep 1", "Ep 2"]
+    assert rss_book.files[0].ext == "mp4"
+
