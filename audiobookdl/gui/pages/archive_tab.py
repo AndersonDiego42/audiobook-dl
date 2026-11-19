@@ -239,6 +239,19 @@ class ArchiveTab(ttk.Frame):
         self._tree.tag_configure("trashed", foreground=palette.error)
         apply_theme_to_widget_tree(self._context_menu, palette)
 
+    def set_archive_path(self, archive_path: str) -> None:
+        """Update ledger file path when `database_directory` changes cleanly."""
+        if archive_path == self._archive_path:
+            return
+        self._archive_path = archive_path
+        if self._ledger is not None:
+            try:
+                self._ledger.close()
+            except Exception:
+                pass
+            self._ledger = None
+        self._refresh()
+
     def refresh(self) -> None:
         """Reload entries from the SQLite ledger."""
         self._refresh()
@@ -476,7 +489,8 @@ class ArchiveTab(ttk.Frame):
             self._detail_cover_label.configure(image="", text="No Cover")
 
     def _on_double_click(self, event: tk.Event) -> None:
-        if not self._tree.identify_row(event.y):
+        row_iid = self._tree.identify_row(event.y)
+        if not row_iid or self._tree.get_children(row_iid):
             return
         self._open_selected_output(reveal=False)
 
@@ -488,6 +502,7 @@ class ArchiveTab(ttk.Frame):
         entries = self._selected_entries()
         single = entries[0] if len(entries) == 1 else None
         has_path = bool(single and single.output_path and os.path.exists(single.output_path))
+        any_path = any(bool(e.output_path and os.path.exists(e.output_path)) for e in entries)
         self._context_menu.entryconfigure(
             "Open Audio File",
             state="normal" if (has_path and self._on_open_path is not None) else "disabled",
@@ -502,7 +517,7 @@ class ArchiveTab(ttk.Frame):
         )
         self._context_menu.entryconfigure(
             "Repackage in Pack Page...",
-            state="normal" if (has_path and self._on_pack_paths is not None) else "disabled",
+            state="normal" if (any_path and self._on_pack_paths is not None) else "disabled",
         )
         self._context_menu.entryconfigure(
             "Edit Metadata...",
@@ -826,20 +841,46 @@ class ArchiveTab(ttk.Frame):
         ledger = self._get_ledger()
         if ledger is None:
             return
-        first_entry = self._entries_by_id.get(selected_ids[0])
-        initial = " ".join(first_entry.tags) if first_entry else ""
-        raw = simpledialog.askstring(
-            "Edit Tags",
-            "Space-separated tags (letters, numbers, underscores; use 'hidden' to hide):",
-            initialvalue=initial,
-            parent=self.winfo_toplevel(),
-        )
-        if raw is None:
+        entries = [self._entries_by_id[eid] for eid in selected_ids if eid in self._entries_by_id]
+        if not entries:
             return
-        parsed = parse_tags_input(raw)
-        with ledger.batch_connection():
-            for entry_id in selected_ids:
-                ledger.set_tags(entry_id, parsed)
+        if len(entries) == 1:
+            initial = " ".join(entries[0].tags)
+            prompt = "Space-separated tags (letters, numbers, underscores; use 'hidden' to hide):"
+            raw = simpledialog.askstring(
+                "Edit Tags",
+                prompt,
+                initialvalue=initial,
+                parent=self.winfo_toplevel(),
+            )
+            if raw is None:
+                return
+            parsed = parse_tags_input(raw)
+            with ledger.batch_connection():
+                ledger.set_tags(entries[0].id, parsed)
+        else:
+            tag_sets = [set(e.tags) for e in entries]
+            common_set = set.intersection(*tag_sets) if tag_sets else set()
+            common_ordered = [t for t in entries[0].tags if t in common_set]
+            raw = simpledialog.askstring(
+                "Edit Tags (Multi-Select)",
+                f"Editing common tags across {len(entries)} books (distinct per-book tags are preserved):",
+                initialvalue=" ".join(common_ordered),
+                parent=self.winfo_toplevel(),
+            )
+            if raw is None:
+                return
+            parsed = parse_tags_input(raw)
+            parsed_set = set(parsed)
+            added = [t for t in parsed if t not in common_set]
+            removed = common_set - parsed_set
+            with ledger.batch_connection():
+                for entry in entries:
+                    kept = [t for t in entry.tags if t not in removed]
+                    for tag in added:
+                        if tag not in kept:
+                            kept.append(tag)
+                    ledger.set_tags(entry.id, kept)
         self._refresh()
 
     def _edit_selected_metadata(self) -> None:

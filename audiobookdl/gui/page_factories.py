@@ -7,7 +7,7 @@ import os
 from tkinter import ttk
 from typing import TYPE_CHECKING, Any
 
-from audiobookdl.config import DEFAULT_PROFILE, list_source_profiles, load_config, normalize_profile_name
+from audiobookdl.config import DEFAULT_PROFILE, list_source_profiles, normalize_profile_name
 from audiobookdl.gui.formatting import default_output_dir
 from audiobookdl.gui.pages import (
     AccountsPage,
@@ -152,12 +152,12 @@ def create_library_page(app: AudiobookDLApp, parent: ttk.Frame) -> LibraryPage:
         return list_source_profiles(app.controller.config_snapshot(), service_key)
 
     def _on_save_to_library(svc_key: str, prof: str, books: Sequence[Any]) -> tuple[int, int]:
-        archive = DownloadArchive(app._sync.archive_ledger_path())
-        inserted, updated = archive.upsert_catalog_items(
-            svc_key,
-            list(books),
-            profile=normalize_profile_name(prof),
-        )
+        with DownloadArchive(app._sync.archive_ledger_path()) as archive:
+            inserted, updated = archive.upsert_catalog_items(
+                svc_key,
+                list(books),
+                profile=normalize_profile_name(prof),
+            )
         app.status_var.set(f"Library DB: +{inserted} new, {updated} refreshed")
         return inserted, updated
 
@@ -246,7 +246,10 @@ def create_accounts_page(app: AudiobookDLApp, parent: ttk.Frame) -> AccountsPage
         app.controller,
         app._services,
         app._auth,
-        on_import_cookies=lambda sk: app._auth.show_cookie_import_dialog(svc_key_override=sk),
+        on_import_cookies=lambda sk, prof=None: app._auth.show_cookie_import_dialog(
+            svc_key_override=sk,
+            profile_override=prof,
+        ),
         on_context_label=app.shell.set_breadcrumb_detail,
         palette=app._window.palette,
     )
@@ -257,7 +260,7 @@ def create_settings_page(app: AudiobookDLApp, parent: ttk.Frame) -> SettingsPage
     config_loc = app.controller.config_location
 
     def _on_abs_saved(_updated: Any) -> None:
-        app.controller.config = load_config(config_loc)
+        app.controller.reload_config()
         app.status_var.set("Saved Audiobookshelf configuration.")
 
     def _on_save_custom_provider(
@@ -291,6 +294,7 @@ def create_settings_page(app: AudiobookDLApp, parent: ttk.Frame) -> SettingsPage
         tray_available=app._window.tray_controller.is_available(),
         on_toggle_minimize_to_tray=app._window.toggle_minimize_to_tray,
         on_theme_changed=app.set_theme,
+        on_toggle_notify_on_complete=app._toggle_notify_on_complete,
         on_toggle_clipboard_monitor=app._toggle_clipboard_monitor,
         on_toggle_check_updates=app._toggle_check_updates,
         on_reload_config=app._options.reload_config,
@@ -298,6 +302,7 @@ def create_settings_page(app: AudiobookDLApp, parent: ttk.Frame) -> SettingsPage
         ffmpeg_assistant=app._ffmpeg_assistant,
         abs_config_provider=lambda: app.controller.config_snapshot().audiobookshelf,
         config_location=config_loc,
+        on_save_abs_config=app.controller.save_audiobookshelf_config,
         on_abs_saved=_on_abs_saved,
         custom_providers_provider=lambda: app.controller.config_snapshot().custom_metadata_providers,
         on_save_custom_provider=_on_save_custom_provider,

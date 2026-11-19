@@ -1,6 +1,7 @@
 """Reusable Tkinter composite widgets and input helpers for the desktop GUI."""
 
 from dataclasses import dataclass
+import logging as stdlib_logging
 import queue
 import re
 import sys
@@ -394,8 +395,10 @@ class ScrolledTreeview(ttk.Frame):
                 vals = self.tree.item(iid, "values")
                 raw_val = vals[col_idx] if isinstance(vals, (tuple, list)) and col_idx < len(vals) else ""
                 scored.append((_column_sort_key(raw_val, spec.sort_kind), iid))
-            scored.sort(key=lambda pair: pair[0], reverse=descending)
-            for pos, (_key, iid) in enumerate(scored):
+            non_empty = [pair for pair in scored if pair[0][0] == 0]
+            empty_tail = [pair for pair in scored if pair[0][0] != 0]
+            non_empty.sort(key=lambda pair: pair[0][1], reverse=descending)
+            for pos, (_key, iid) in enumerate(non_empty + empty_tail):
                 self.tree.move(iid, parent_iid, pos)
 
         _sort_children("")
@@ -716,7 +719,7 @@ def attach_url_context_menu(
     menu.add_command(label="Cut", command=lambda: text_widget.event_generate("<<Cut>>"))
     menu.add_command(label="Copy", command=lambda: text_widget.event_generate("<<Copy>>"))
     menu.add_command(label="Paste", command=on_paste)
-    menu.add_command(label="Paste && Queue", command=on_paste_and_queue)
+    menu.add_command(label="Paste & Queue", command=on_paste_and_queue)
     menu.add_separator()
     menu.add_command(label="Select All", command=lambda: text_widget.tag_add(tk.SEL, "1.0", tk.END))
     menu.add_command(label="Clear", command=on_clear)
@@ -737,9 +740,18 @@ def attach_url_context_menu(
 class MainThreadCallbackQueue:
     """Thread-safe queue delivering background worker callbacks onto the Tk main thread."""
 
-    def __init__(self, widget: tk.Misc, interval_ms: int = 30) -> None:
+    MAX_BATCH = 100
+
+    def __init__(
+        self,
+        widget: tk.Misc,
+        interval_ms: int = 30,
+        *,
+        max_batch: int = MAX_BATCH,
+    ) -> None:
         self._widget = widget
         self._interval_ms = max(10, interval_ms)
+        self._max_batch = max(1, int(max_batch))
         self._queue: queue.Queue[Callable[[], None]] = queue.Queue()
         self._after_id: str | None = None
         self._destroyed = False
@@ -759,74 +771,118 @@ class MainThreadCallbackQueue:
 
     def post(self, callback: Callable[[], None]) -> None:
         """Enqueue `callback` from any thread without touching Tcl/Tk."""
+        with self._lock:
+            if self._destroyed:
+                return
         self._queue.put(callback)
+        if threading.current_thread() is threading.main_thread():
+            self._ensure_polling()
 
     def finish_worker(self) -> None:
         """Mark one background worker complete from any thread."""
         with self._lock:
             self._active_workers = max(0, self._active_workers - 1)
 
+    def _is_destroyed(self) -> bool:
+        with self._lock:
+            return self._destroyed
+
     def _ensure_polling(self, delay_ms: int | None = None) -> None:
-        if self._destroyed or self._after_id is not None:
-            return
+        with self._lock:
+            if self._destroyed or self._after_id is not None:
+                return
         delay = self._interval_ms if delay_ms is None else delay_ms
         try:
-            if self._widget.winfo_exists():
-                self._after_id = self._widget.after(delay, self._poll)
+            if not self._widget.winfo_exists():
+                with self._lock:
+                    self._destroyed = True
+                return
+            after_id = self._widget.after(delay, self._poll)
         except tk.TclError:
-            self._after_id = None
+            with self._lock:
+                self._after_id = None
+            return
+        cancel_immediately = False
+        with self._lock:
+            if self._destroyed or self._after_id is not None:
+                cancel_immediately = True
+            else:
+                self._after_id = after_id
+        if cancel_immediately:
+            try:
+                self._widget.after_cancel(after_id)
+            except tk.TclError:
+                pass
 
     def _poll(self) -> None:
-        self._after_id = None
-        if self._destroyed:
-            return
+        with self._lock:
+            self._after_id = None
+            if self._destroyed:
+                return
         try:
             if not self._widget.winfo_exists():
-                self._destroyed = True
+                with self._lock:
+                    self._destroyed = True
                 return
         except tk.TclError:
-            self._destroyed = True
+            with self._lock:
+                self._destroyed = True
             return
 
         drained_any = False
-        while not self._destroyed:
-            try:
-                cb = self._queue.get_nowait()
-            except queue.Empty:
-                break
-            drained_any = True
-            try:
-                if not self._widget.winfo_exists():
-                    self._destroyed = True
+        processed = 0
+        try:
+            while processed < self._max_batch and not self._is_destroyed():
+                try:
+                    cb = self._queue.get_nowait()
+                except queue.Empty:
                     break
-            except tk.TclError:
-                self._destroyed = True
-                break
-            cb()
-
-        if self._destroyed:
-            return
-        with self._lock:
-            keep_polling = self._active_workers > 0 or not self._queue.empty()
-        if keep_polling:
-            if drained_any:
-                self._idle_polls = 0
-                next_delay = self._interval_ms
-            else:
-                self._idle_polls = min(self._idle_polls + 1, 4)
-                next_delay = min(120, self._interval_ms + self._idle_polls * self._interval_ms)
-            self._ensure_polling(next_delay)
+                drained_any = True
+                processed += 1
+                try:
+                    if not self._widget.winfo_exists():
+                        with self._lock:
+                            self._destroyed = True
+                        break
+                except tk.TclError:
+                    with self._lock:
+                        self._destroyed = True
+                    break
+                try:
+                    cb()
+                except Exception:
+                    stdlib_logging.getLogger(__name__).exception(
+                        "MainThreadCallbackQueue callback raised an unhandled exception"
+                    )
+        finally:
+            with self._lock:
+                destroyed = self._destroyed
+                keep_polling = not destroyed and (
+                    self._active_workers > 0 or not self._queue.empty()
+                )
+            if keep_polling:
+                if drained_any or not self._queue.empty():
+                    self._idle_polls = 0
+                    next_delay = self._interval_ms
+                else:
+                    self._idle_polls = min(self._idle_polls + 1, 4)
+                    next_delay = min(
+                        120, self._interval_ms + self._idle_polls * self._interval_ms
+                    )
+                self._ensure_polling(next_delay)
 
     def _on_destroy(self, event: tk.Event) -> None:
         if getattr(event, "widget", None) is not self._widget:
             return
-        self._destroyed = True
-        if self._after_id is not None:
+        with self._lock:
+            self._destroyed = True
+            after_id = self._after_id
+            self._after_id = None
+        if after_id is not None:
             try:
-                self._widget.after_cancel(self._after_id)
+                self._widget.after_cancel(after_id)
             except tk.TclError:
                 pass
-            self._after_id = None
         while True:
             try:
                 self._queue.get_nowait()
@@ -1053,7 +1109,54 @@ class ModalDialog(tk.Toplevel):
         self.bind("<Map>", self._on_modal_map, add="+")
         self._finalized = False
 
+    def _safe_grab_current(self) -> tk.Misc | None:
+        try:
+            return self.grab_current()  # type: ignore[no-untyped-call]
+        except (tk.TclError, KeyError):
+            return None
+
+    def _grab_current_name(self) -> str:
+        try:
+            return str(self.tk.call("grab", "current", str(self)) or "")
+        except tk.TclError:
+            return ""
+
+    def _is_combobox_popdown_active(self) -> bool:
+        if ".popdown" in self._grab_current_name():
+            return True
+        try:
+            focus_name = str(self.tk.call("focus") or "")
+            if ".popdown" in focus_name:
+                return True
+        except tk.TclError:
+            pass
+        return False
+
+    def _bind_combobox_escape_guards(self) -> None:
+        stack: list[tk.Misc] = [self]
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, ttk.Combobox):
+
+                def _on_cb_esc(_ev: tk.Event, cb: ttk.Combobox = cur) -> str | None:
+                    try:
+                        pd = str(self.tk.call("ttk::combobox::PopdownWindow", str(cb)))
+                        if bool(int(self.tk.call("winfo", "ismapped", pd))):
+                            self.tk.call("ttk::combobox::Unpost", str(cb))
+                            return "break"
+                    except tk.TclError:
+                        pass
+                    return None
+
+                cur.bind("<Escape>", _on_cb_esc, add="+")
+            try:
+                stack.extend(cur.winfo_children())
+            except tk.TclError:
+                pass
+
     def _on_escape(self, _event: tk.Event | None = None) -> str:
+        if self._is_combobox_popdown_active():
+            return "break"
         self.destroy()
         return "break"
 
@@ -1061,7 +1164,7 @@ class ModalDialog(tk.Toplevel):
         if not self._finalized:
             return
         try:
-            if self.winfo_exists() and self.grab_current() is None:  # type: ignore[no-untyped-call]
+            if self.winfo_exists() and self._safe_grab_current() is None and not self._grab_current_name():
                 self.grab_set()
         except tk.TclError:
             pass
@@ -1074,16 +1177,19 @@ class ModalDialog(tk.Toplevel):
     ) -> None:
         """Apply theme, size and center on owner clamped to monitor work area, show, grab, and focus."""
         self._finalized = True
+        self._bind_combobox_escape_guards()
         apply_theme_to_window(self, self._palette)
         self.update_idletasks()
         min_w = scale_px(self, self._min_size[0]) if self._min_size else scale_px(self, 240)
         min_h = scale_px(self, self._min_size[1]) if self._min_size else scale_px(self, 160)
+        natural_w = int(self.winfo_reqwidth())
+        natural_h = int(self.winfo_reqheight())
         if self._default_size is not None:
-            req_w = max(min_w, scale_px(self, self._default_size[0]))
-            req_h = max(min_h, scale_px(self, self._default_size[1]))
+            req_w = max(min_w, scale_px(self, self._default_size[0]), natural_w)
+            req_h = max(min_h, scale_px(self, self._default_size[1]), natural_h)
         else:
-            req_w = max(min_w, int(self.winfo_reqwidth()))
-            req_h = max(min_h, int(self.winfo_reqheight()))
+            req_w = max(min_w, natural_w)
+            req_h = max(min_h, natural_h)
 
         mon_areas = list(monitors) if monitors is not None else get_monitor_work_areas(self._owner)
         target_x: int | None = None
@@ -1125,14 +1231,26 @@ class ModalDialog(tk.Toplevel):
 
     def destroy(self) -> None:
         opener = self._opener_focus
+        owner = self._owner
         self._opener_focus = None
         try:
-            if self.grab_current() is self:  # type: ignore[no-untyped-call]
+            if self._safe_grab_current() is self:
                 self.grab_release()
         except tk.TclError:
             pass
         super().destroy()
-        if opener is not None:
+        restored_owner_focus = False
+        if isinstance(owner, ModalDialog):
+            try:
+                if owner.winfo_exists():
+                    owner.grab_set()
+                    owner.lift()
+                    if opener is None or not opener.winfo_exists():
+                        owner.focus_set()
+                        restored_owner_focus = True
+            except tk.TclError:
+                pass
+        if opener is not None and not restored_owner_focus:
             try:
                 if opener.winfo_exists():
                     opener.focus_set()

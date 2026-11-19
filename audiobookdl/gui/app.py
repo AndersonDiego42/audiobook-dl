@@ -152,8 +152,9 @@ class AudiobookDLApp:
             status_var=self.status_var,
             minimize_to_tray_var=self.minimize_to_tray_var,
             on_sync_now=lambda: self._sync.sync_from_tray(),
-            on_exit=lambda: self._on_close(force=True),
+            on_exit=self._on_tray_exit,
             on_theme_applied=self._on_theme_applied,
+            on_tray_started=lambda: self._events.schedule_poll_soon(250),
         )
 
         cfg_gui = self._controller.config.gui
@@ -288,6 +289,7 @@ class AudiobookDLApp:
             status_var=self.status_var,
             is_running_provider=lambda: self.is_running,
             is_previewing_provider=lambda: self.is_previewing,
+            is_in_tray_provider=lambda: self._window.tray_controller.is_running,
             schedule_poll_soon=lambda: self._events.schedule_poll_soon(),
             append_log=lambda msg: self._events.append_log(msg),
             register_enqueued_batch=self._runs.register_enqueued_batch,
@@ -307,10 +309,13 @@ class AudiobookDLApp:
             on_preview_done=self._preview.handle_preview_done,
             on_auth_verified=self._auth.handle_auth_verified,
             on_oauth_connected=self._auth.handle_oauth_connected,
+            on_oauth_disconnected=self._auth.handle_oauth_disconnected,
             on_ffmpeg_install_done=self._ffmpeg_assistant.handle_install_done,
             on_sync_done=self._sync.handle_sync_done,
             on_sync_enqueue_ready=self._sync.handle_sync_enqueue_ready,
             on_run_done=self._runs.finish_run,
+            is_tray_running_provider=lambda: self._window.tray_controller.is_running,
+            drain_tray_actions=lambda: self._window.tray_controller.drain_pending_actions(),
         )
 
         self.shell.register_page("download", lambda p: create_download_page(self, p))
@@ -507,10 +512,28 @@ class AudiobookDLApp:
         if page is not None:
             page.update_ffmpeg_banner(available, status_text)
 
-    def _on_credentials_changed(self) -> None:
+    def _on_credentials_changed(
+        self,
+        service_key: str | None = None,
+        profile: str | None = None,
+    ) -> None:
         acct_page = self.shell.get_page("accounts")
         if acct_page is not None:
+            if service_key is not None and profile is not None:
+                acct_page.invalidate_verification(service_key, profile)
             acct_page.refresh()
+
+    def _toggle_notify_on_complete(self) -> None:
+        enabled = bool(self.notify_on_complete_var.get())
+        try:
+            self._controller.save_gui_preferences(notify_on_complete=enabled)
+        except OSError:
+            pass
+        self.status_var.set(
+            "Completion notifications enabled"
+            if enabled
+            else "Completion notifications disabled"
+        )
 
     def _toggle_clipboard_monitor(self) -> None:
         self._automation.apply_clipboard_monitor(quiet=False, persist=True)
@@ -532,76 +555,102 @@ class AudiobookDLApp:
             self._events.cancel_poll_timer()
             self._window.cancel_theme_watch()
             self._urls.cancel_debounce()
-        self._automation.cancel_auto_sync()
-        self._automation.cancel_clipboard()
+            self._window.tray_controller.stop()
+            self._automation.cancel_auto_sync()
+            self._automation.cancel_clipboard()
 
-    def _on_close(self, *, force: bool = False) -> None:
-        if self._window.should_minimize_on_close(force=force):
+    def _on_tray_exit(self) -> None:
+        self._on_close(force=False, bypass_tray_minimize=True)
+
+    def _has_active_background_operations(self) -> bool:
+        return bool(
+            self.is_running
+            or self.is_syncing
+            or self.is_previewing
+            or self._controller.is_uploading_abs
+            or self._ffmpeg_assistant.is_installing
+        )
+
+    def _on_close(
+        self,
+        *,
+        force: bool = False,
+        bypass_tray_minimize: bool = False,
+    ) -> None:
+        if not bypass_tray_minimize and self._window.should_minimize_on_close(force=force):
             return
-        if not force and (self.is_running or self.is_syncing):
+        if not force and self._has_active_background_operations():
+            if bypass_tray_minimize:
+                self._window.restore_from_tray()
             if not messagebox.askyesno(
                 "Operation in Progress",
-                "A download or library sync is currently active. Cancel and exit anyway?",
+                "A download, preview, sync, upload, or installation is currently active. Cancel and exit anyway?",
                 parent=self.root,
             ):
                 return
         try:
-            saved_geom, maximized = self._window.collect_geometry_snapshot()
-            dl_page = self.shell.get_page("download")
-            split_ratio = (
-                dl_page.get_split_ratio()
-                if dl_page is not None
-                else self._controller.config.gui.download_split_ratio
+            try:
+                saved_geom, maximized = self._window.collect_geometry_snapshot()
+                dl_page = self.shell.get_page("download")
+                split_ratio = (
+                    dl_page.get_split_ratio()
+                    if dl_page is not None
+                    else self._controller.config.gui.download_split_ratio
+                )
+                options_collapsed = (
+                    dl_page.options_section.is_collapsed
+                    if dl_page is not None
+                    else self._controller.config.gui.options_collapsed
+                )
+                naming_collapsed = (
+                    dl_page.naming_section.is_collapsed
+                    if dl_page is not None
+                    else self._controller.config.gui.output_naming_collapsed
+                )
+                active_route = self.shell.active_route
+                if (
+                    active_route is not None
+                    and active_route.page_id == "library"
+                    and active_route.sub_tab in ("catalog", "sync")
+                ):
+                    saved_active_page: str | None = active_route.to_key()
+                else:
+                    saved_active_page = self.shell.active_page_id
+                self._controller.save_window_preferences(
+                    window_geometry=saved_geom,
+                    window_maximized=maximized,
+                    download_split_ratio=split_ratio,
+                    active_page=saved_active_page,
+                    options_collapsed=options_collapsed,
+                    output_naming_collapsed=naming_collapsed,
+                    output_dir=self.output_dir_var.get().strip(),
+                    output_template=self.template_var.get().strip(),
+                    use_download_archive=self.download_archive_var.get(),
+                    theme=self._window.theme_mode,
+                    notify_on_complete=self.notify_on_complete_var.get(),
+                    clipboard_monitor=self.clipboard_monitor_var.get(),
+                    queue_concurrency=self._controller.queue_concurrency,
+                    minimize_to_tray=self.minimize_to_tray_var.get(),
+                    output_prefs=self._options.read_persisted_gui_preferences(),
+                )
+            except (OSError, tk.TclError):
+                pass
+        finally:
+            self._events.cancel_poll_timer()
+            self._window.cancel_theme_watch()
+            self._urls.cancel_debounce()
+            self._window.tray_controller.stop()
+            self._automation.cancel_auto_sync()
+            self._automation.cancel_clipboard()
+            self._controller.shutdown(
+                is_running=self.is_running,
+                is_previewing=self.is_previewing,
             )
-            options_collapsed = (
-                dl_page.options_section.is_collapsed
-                if dl_page is not None
-                else self._controller.config.gui.options_collapsed
-            )
-            naming_collapsed = (
-                dl_page.naming_section.is_collapsed
-                if dl_page is not None
-                else self._controller.config.gui.output_naming_collapsed
-            )
-            active_route = self.shell.active_route
-            if (
-                active_route is not None
-                and active_route.page_id == "library"
-                and active_route.sub_tab in ("catalog", "sync")
-            ):
-                saved_active_page: str | None = active_route.to_key()
-            else:
-                saved_active_page = self.shell.active_page_id
-            self._controller.save_window_preferences(
-                window_geometry=saved_geom,
-                window_maximized=maximized,
-                download_split_ratio=split_ratio,
-                active_page=saved_active_page,
-                options_collapsed=options_collapsed,
-                output_naming_collapsed=naming_collapsed,
-                output_dir=self.output_dir_var.get().strip() or None,
-                output_template=self.template_var.get().strip() or None,
-                use_download_archive=self.download_archive_var.get(),
-                theme=self._window.theme_mode,
-                notify_on_complete=self.notify_on_complete_var.get(),
-                clipboard_monitor=self.clipboard_monitor_var.get(),
-                queue_concurrency=self._controller.queue_concurrency,
-                minimize_to_tray=self.minimize_to_tray_var.get(),
-                output_prefs=self._options.read_persisted_gui_preferences(),
-            )
-        except OSError:
-            pass
-        self._events.cancel_poll_timer()
-        self._window.cancel_theme_watch()
-        self._urls.cancel_debounce()
-        self._window.tray_controller.stop()
-        self._automation.cancel_auto_sync()
-        self._automation.cancel_clipboard()
-        self._controller.shutdown(
-            is_running=self.is_running,
-            is_previewing=self.is_previewing,
-        )
-        self.root.destroy()
+            try:
+                if self.root.winfo_exists():
+                    self.root.destroy()
+            except tk.TclError:
+                pass
 
 
 def parse_gui_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -668,6 +717,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     set_windows_process_app_id()
     root = create_tk_root()
     app = AudiobookDLApp(root, config_location=parsed.config_location)
+    app._options.prompt_pending_post_exec()
     app._events.schedule_update_check()
     root.mainloop()
 

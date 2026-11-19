@@ -1,6 +1,7 @@
 """Action bar, progress metrics, scrollable activity log, and job queue panel."""
 
 from collections import deque
+from dataclasses import dataclass
 import json
 import os
 import sys
@@ -57,6 +58,20 @@ from audiobookdl.utils import (
     normalize_audio_bitrate,
     normalize_sample_rate,
 )
+
+
+@dataclass
+class _JobProgressState:
+    """Per-job live download stage, percentage, throughput, and ETA."""
+
+    stage: str = "Stage: Downloading"
+    pct: float = 0.0
+    speed_bps: float = 0.0
+    eta_seconds: float | None = None
+    bytes_downloaded: int = 0
+    estimated_bytes: int | None = None
+    estimated_exact: bool = False
+    last_row_render_at: float = 0.0
 
 
 def export_queue_to_path(records: Sequence[Mapping[str, Any]], path: str) -> int:
@@ -117,6 +132,22 @@ def load_queue_import_file(path: str) -> list[dict[str, Any]]:
 class _JobOptionsDialog(ModalDialog):
     """Modal dialog for editing per-job profile and format overrides on queued/retryable jobs."""
 
+    _TRISTATE_CHOICES = ("Default", "On", "Off")
+    _OVERWRITE_CHOICES = ("Default (inherit)", "Ask", "Overwrite", "Keep existing")
+
+    @staticmethod
+    def _init_tristate(ov_map: Mapping[str, Any], key: str) -> str:
+        val = ov_map.get(key)
+        if val is True:
+            return "On"
+        if val is False:
+            return "Off"
+        return "Default"
+
+    @staticmethod
+    def _read_tristate(raw: str) -> bool | None:
+        return {"On": True, "Off": False}.get(raw)
+
     def __init__(
         self,
         parent: tk.Misc,
@@ -129,9 +160,9 @@ class _JobOptionsDialog(ModalDialog):
             parent,
             "Edit Job Options",
             palette=palette,
-            default_size=(460, 415),
-            min_size=(400, 360),
-            resizable=(True, False),
+            default_size=(460, 520),
+            min_size=(400, 420),
+            resizable=(True, True),
         )
         self.result: tuple[str, dict[str, Any]] | None = None
 
@@ -140,6 +171,7 @@ class _JobOptionsDialog(ModalDialog):
         pack_req = record.get("pack_request")
         pack_map: Mapping[str, Any] = pack_req if isinstance(pack_req, Mapping) else {}
         is_pack = record.get("job_kind", "download") == "pack"
+        self._is_pack = is_pack
 
         profile_values = [DEFAULT_PROFILE] + [p for p in profiles if p and p != DEFAULT_PROFILE]
         cur_prof = str(record.get("profile") or DEFAULT_PROFILE).strip().lower() or DEFAULT_PROFILE
@@ -155,8 +187,15 @@ class _JobOptionsDialog(ModalDialog):
         cur_bitrate = str(ov_map.get("audio_bitrate") or "").strip()
         raw_sr = ov_map.get("sample_rate")
         cur_sample_rate = "" if raw_sr is None else str(raw_sr).strip()
-        raw_skip = ov_map.get("skip_downloaded")
-        cur_skip = "On" if raw_skip is True else ("Off" if raw_skip is False else "Default")
+
+        if "overwrite" not in ov_map:
+            cur_overwrite = "Default (inherit)"
+        elif ov_map.get("overwrite") is True:
+            cur_overwrite = "Overwrite"
+        elif ov_map.get("overwrite") is False:
+            cur_overwrite = "Keep existing"
+        else:
+            cur_overwrite = "Ask"
 
         intro_binding = OPTIONS_BY_NAME["intro_chapter_mode"].gui
         assert intro_binding is not None
@@ -167,13 +206,15 @@ class _JobOptionsDialog(ModalDialog):
         self._media_var = tk.StringVar(value=cur_media)
         self._bitrate_var = tk.StringVar(value=cur_bitrate)
         self._sample_rate_var = tk.StringVar(value=cur_sample_rate)
-        self._skip_dl_var = tk.StringVar(value=cur_skip)
+        self._skip_dl_var = tk.StringVar(value=self._init_tristate(ov_map, "skip_downloaded"))
         self._intro_mode_var = tk.StringVar(value=cur_intro_mode)
-        self._combine_var = tk.BooleanVar(value=bool(ov_map.get("combine", False)))
-        self._split_var = tk.BooleanVar(value=bool(ov_map.get("split_chapters", False)))
-        self._overwrite_var = tk.BooleanVar(value=bool(ov_map.get("overwrite", False)))
-        self._write_abs_var = tk.BooleanVar(value=bool(ov_map.get("write_abs_metadata", False)))
-        self._upload_abs_var = tk.BooleanVar(value=bool(ov_map.get("upload_to_abs", False)))
+        self._combine_var = tk.StringVar(value=self._init_tristate(ov_map, "combine"))
+        self._split_var = tk.StringVar(value=self._init_tristate(ov_map, "split_chapters"))
+        self._overwrite_var = tk.StringVar(value=cur_overwrite)
+        self._write_abs_var = tk.StringVar(
+            value=self._init_tristate(ov_map, "write_abs_metadata")
+        )
+        self._upload_abs_var = tk.StringVar(value=self._init_tristate(ov_map, "upload_to_abs"))
 
         body = ttk.Frame(self, padding=scale_px(self, 14))
         body.pack(fill=tk.BOTH, expand=True)
@@ -225,7 +266,7 @@ class _JobOptionsDialog(ModalDialog):
         ttk.Combobox(
             body,
             textvariable=self._skip_dl_var,
-            values=("Default", "On", "Off"),
+            values=self._TRISTATE_CHOICES,
             state="disabled" if is_pack else "readonly",
         ).grid(row=5, column=1, sticky="ew", pady=4)
 
@@ -237,35 +278,48 @@ class _JobOptionsDialog(ModalDialog):
             state="readonly",
         ).grid(row=6, column=1, sticky="ew", pady=4)
 
-        toggles = ttk.Frame(body)
-        toggles.grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 2))
-        ttk.Checkbutton(
-            toggles,
-            text="Combine parts",
-            variable=self._combine_var,
-            state="disabled" if is_pack else "normal",
-        ).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Checkbutton(
-            toggles,
-            text="Split chapters",
-            variable=self._split_var,
-            state="disabled" if is_pack else "normal",
-        ).pack(side=tk.LEFT)
+        ttk.Label(body, text="Combine Parts:").grid(row=7, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Combobox(
+            body,
+            textvariable=self._combine_var,
+            values=self._TRISTATE_CHOICES,
+            state="disabled" if is_pack else "readonly",
+        ).grid(row=7, column=1, sticky="ew", pady=4)
 
-        toggles2 = ttk.Frame(body)
-        toggles2.grid(row=8, column=0, columnspan=2, sticky="w", pady=(2, 4))
-        ttk.Checkbutton(toggles2, text="Overwrite", variable=self._overwrite_var).pack(
-            side=tk.LEFT, padx=(0, 12)
-        )
-        ttk.Checkbutton(toggles2, text="Write ABS metadata", variable=self._write_abs_var).pack(
-            side=tk.LEFT, padx=(0, 12)
-        )
-        ttk.Checkbutton(toggles2, text="Upload to ABS", variable=self._upload_abs_var).pack(
-            side=tk.LEFT
-        )
+        ttk.Label(body, text="Split Chapters:").grid(row=8, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Combobox(
+            body,
+            textvariable=self._split_var,
+            values=self._TRISTATE_CHOICES,
+            state="disabled" if is_pack else "readonly",
+        ).grid(row=8, column=1, sticky="ew", pady=4)
+
+        ttk.Label(body, text="Overwrite Existing:").grid(row=9, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Combobox(
+            body,
+            textvariable=self._overwrite_var,
+            values=self._OVERWRITE_CHOICES,
+            state="readonly",
+        ).grid(row=9, column=1, sticky="ew", pady=4)
+
+        ttk.Label(body, text="Write ABS Metadata:").grid(row=10, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Combobox(
+            body,
+            textvariable=self._write_abs_var,
+            values=self._TRISTATE_CHOICES,
+            state="readonly",
+        ).grid(row=10, column=1, sticky="ew", pady=4)
+
+        ttk.Label(body, text="Upload to ABS:").grid(row=11, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Combobox(
+            body,
+            textvariable=self._upload_abs_var,
+            values=self._TRISTATE_CHOICES,
+            state="readonly",
+        ).grid(row=11, column=1, sticky="ew", pady=4)
 
         btns = ttk.Frame(body)
-        btns.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        btns.grid(row=12, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         ttk.Button(btns, text="Save", command=self._save, style="Accent.TButton").pack(side=tk.RIGHT)
         ttk.Button(btns, text="Cancel", command=self.destroy).pack(side=tk.RIGHT, padx=(0, 6))
 
@@ -282,23 +336,24 @@ class _JobOptionsDialog(ModalDialog):
         except ValueError as exc:
             messagebox.showwarning("Invalid Option", str(exc), parent=self)
             return
-        skip_dl = {"On": True, "Off": False}.get(self._skip_dl_var.get())
         intro_binding = OPTIONS_BY_NAME["intro_chapter_mode"].gui
         assert intro_binding is not None
         intro_mode = intro_binding.read_option(self._intro_mode_var.get())
+        overwrite_val = {"Overwrite": True, "Keep existing": False}.get(self._overwrite_var.get())
         overrides: dict[str, Any] = {
             "output_format": fmt,
-            "combine": self._combine_var.get(),
-            "split_chapters": self._split_var.get(),
             "intro_chapter_mode": intro_mode,
-            "media_type": media,
             "audio_bitrate": bitrate,
             "sample_rate": sample_rate,
-            "overwrite": self._overwrite_var.get(),
-            "skip_downloaded": skip_dl,
-            "write_abs_metadata": self._write_abs_var.get(),
-            "upload_to_abs": self._upload_abs_var.get(),
+            "overwrite": overwrite_val,
+            "write_abs_metadata": self._read_tristate(self._write_abs_var.get()),
+            "upload_to_abs": self._read_tristate(self._upload_abs_var.get()),
         }
+        if not self._is_pack:
+            overrides["media_type"] = media
+            overrides["skip_downloaded"] = self._read_tristate(self._skip_dl_var.get())
+            overrides["combine"] = self._read_tristate(self._combine_var.get())
+            overrides["split_chapters"] = self._read_tristate(self._split_var.get())
         self.result = (prof, overrides)
         self.destroy()
 
@@ -514,15 +569,10 @@ class ActivityQueuePanel(ttk.LabelFrame):
         self.ui_book_index = 0
         self.ui_book_total = 0
         self._run_start_time: float | None = None
-        self._last_pct = 0.0
-        self._last_speed_bps = 0.0
-        self._last_eta_seconds: float | None = None
-        self._last_bytes_downloaded = 0
-        self._last_estimated_bytes: int | None = None
-        self._last_estimated_exact = False
+        self._running_job_ids: list[str] = []
+        self._job_progress: dict[str, _JobProgressState] = {}
+        self._default_progress_key = "__default__"
         self._last_metrics_render_at = 0.0
-        self._last_row_progress_render_at = 0.0
-        self._active_job_id: str | None = None
         self._log_line_count = 0
         self._log_entries: deque[tuple[str, str]] = deque(maxlen=self.MAX_LOG_LINES)
         self.log_level_var = tk.StringVar(value="All")
@@ -540,6 +590,8 @@ class ActivityQueuePanel(ttk.LabelFrame):
         self._action_bar_mode: ResponsiveMode = "wide"
         self._log_toolbar_mode: ResponsiveMode = "wide"
         self._queue_toolbar_mode: ResponsiveMode = "wide"
+        self._last_is_previewing = False
+        self._last_is_syncing = False
 
         self._build_widgets()
         self.bind("<Destroy>", self._on_destroy, add="+")
@@ -660,7 +712,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
             command=lambda: self._open_selected_output(reveal_in_folder=False),
         )
         self.queue_clear_btn = ttk.Button(
-            self._queue_toolbar, text="Clear Completed", command=self.clear_completed_history
+            self._queue_toolbar, text="Clear Completed & Failed", command=self.clear_completed_history
         )
         self._conc_frame = ttk.Frame(self._queue_toolbar)
         ttk.Label(self._conc_frame, text="Parallel jobs:").pack(side=tk.LEFT, padx=(0, 4))
@@ -1141,15 +1193,20 @@ class ActivityQueuePanel(ttk.LabelFrame):
         is_previewing: bool,
         is_syncing: bool = False,
     ) -> None:
+        self._last_is_previewing = is_previewing
+        self._last_is_syncing = is_syncing
         if running:
-            self.download_btn.configure(text="Add to Queue", state="normal")
+            self.download_btn.configure(
+                text="Add to Queue",
+                state="disabled" if is_previewing else "normal",
+            )
             self.pause_btn.configure(
                 text="Resume" if self._controller.is_paused() else "Pause",
                 state="normal",
             )
             self.cancel_btn.configure(state="normal")
             self.preview_btn.configure(state="disabled")
-        elif is_syncing:
+        elif is_syncing or is_previewing:
             self.download_btn.configure(text="Download", state="disabled")
             self.pause_btn.configure(text="Pause", state="disabled")
             self.cancel_btn.configure(state="normal")
@@ -1158,17 +1215,21 @@ class ActivityQueuePanel(ttk.LabelFrame):
             self.download_btn.configure(text="Download", state="normal")
             self.pause_btn.configure(text="Pause", state="disabled")
             self.cancel_btn.configure(state="disabled")
-            self.preview_btn.configure(state="disabled" if is_previewing else "normal")
+            self.preview_btn.configure(state="normal")
 
-    def set_previewing_state(self, previewing: bool, *, is_running: bool) -> None:
-        if previewing:
-            self.preview_btn.configure(state="disabled")
-            self.download_btn.configure(state="disabled")
-            self.cancel_btn.configure(state="normal")
-        else:
-            self.preview_btn.configure(state="disabled" if is_running else "normal")
-            self.download_btn.configure(state="disabled" if is_running else "normal")
-            self.cancel_btn.configure(state="normal" if is_running else "disabled")
+    def set_previewing_state(
+        self,
+        previewing: bool,
+        *,
+        is_running: bool,
+        is_syncing: bool | None = None,
+    ) -> None:
+        effective_syncing = self._last_is_syncing if is_syncing is None else is_syncing
+        self.set_running_state(
+            is_running,
+            is_previewing=previewing,
+            is_syncing=effective_syncing,
+        )
 
     def toggle_pause(self, *, is_running: bool | None = None) -> None:
         """Toggle pause/resume state for remaining queued jobs."""
@@ -1192,6 +1253,85 @@ class ActivityQueuePanel(ttk.LabelFrame):
             parts.append(f"Book {self.ui_book_index} / {self.ui_book_total}")
         self.batch_var.set("  \u2022  ".join(parts))
 
+    def _resolve_progress_key(self, job_id: str | None) -> str:
+        if job_id is not None:
+            return job_id
+        if len(self._running_job_ids) == 1:
+            return self._running_job_ids[0]
+        return self._default_progress_key
+
+    def _get_or_create_progress_state(self, job_id: str | None) -> tuple[str, _JobProgressState]:
+        key = self._resolve_progress_key(job_id)
+        state = self._job_progress.get(key)
+        if state is None:
+            state = _JobProgressState()
+            self._job_progress[key] = state
+        return key, state
+
+    def _aggregate_progress_summary(
+        self,
+    ) -> tuple[float, int, int | None, bool, float, float | None, str]:
+        states = [
+            self._job_progress[jid]
+            for jid in self._running_job_ids
+            if jid in self._job_progress
+        ]
+        if not states and self._default_progress_key in self._job_progress:
+            states = [self._job_progress[self._default_progress_key]]
+        if not states:
+            return 0.0, 0, None, False, 0.0, None, ""
+        if len(states) == 1:
+            s = states[0]
+            return (
+                s.pct,
+                s.bytes_downloaded,
+                s.estimated_bytes,
+                s.estimated_exact,
+                s.speed_bps,
+                s.eta_seconds,
+                s.stage,
+            )
+        known_est = [s for s in states if s.estimated_bytes is not None and s.estimated_bytes > 0]
+        if len(known_est) == len(states):
+            total_est = sum(s.estimated_bytes for s in known_est if s.estimated_bytes is not None)
+            pct = (
+                sum(
+                    s.pct * (s.estimated_bytes or 0)
+                    for s in known_est
+                )
+                / total_est
+                if total_est > 0
+                else sum(s.pct for s in states) / len(states)
+            )
+        else:
+            pct = sum(s.pct for s in states) / len(states)
+        bytes_downloaded = sum(s.bytes_downloaded for s in states)
+        estimated_bytes = (
+            sum(s.estimated_bytes for s in known_est if s.estimated_bytes is not None)
+            if known_est
+            else None
+        )
+        estimated_exact = len(known_est) == len(states) and all(
+            s.estimated_exact for s in known_est
+        )
+        speed_bps = sum(s.speed_bps for s in states)
+        etas = [s.eta_seconds for s in states if s.eta_seconds is not None]
+        eta_seconds = max(etas) if etas else None
+        stages = {s.stage for s in states if s.stage}
+        stage = next(iter(stages)) if len(stages) == 1 else f"Stage: Running {len(states)} jobs"
+        return pct, bytes_downloaded, estimated_bytes, estimated_exact, speed_bps, eta_seconds, stage
+
+    def _refresh_header_progress(self, *, force_metrics: bool = False) -> None:
+        pct, _bytes, _est, _exact, _speed, _eta, stage = self._aggregate_progress_summary()
+        try:
+            if str(self.progressbar.cget("mode")) != "indeterminate":
+                self.progress_var.set(pct)
+        except tk.TclError:
+            self.progress_var.set(pct)
+        if stage:
+            self.stage_var.set(stage)
+        self.update_metrics_display(is_running=True, force=force_metrics)
+
     def update_metrics_display(self, *, is_running: bool, force: bool = False) -> None:
         if not is_running or self._run_start_time is None:
             return
@@ -1200,77 +1340,97 @@ class ActivityQueuePanel(ttk.LabelFrame):
             return
         self._last_metrics_render_at = now
         elapsed = max(0.0, now - self._run_start_time)
+        pct, bytes_downloaded, estimated_bytes, estimated_exact, speed_bps, eta_seconds, _stage = (
+            self._aggregate_progress_summary()
+        )
         parts = []
-        if self._last_pct > 0:
-            parts.append(f"{self._last_pct:.0f}%")
-        if self._last_estimated_bytes is not None and self._last_estimated_bytes > 0:
-            est_str = format_size_estimate(
-                self._last_estimated_bytes, is_exact=self._last_estimated_exact
-            )
-            if self._last_bytes_downloaded > 0:
-                parts.append(f"{format_bytes(self._last_bytes_downloaded)} / {est_str}")
+        if pct > 0:
+            parts.append(f"{pct:.0f}%")
+        if estimated_bytes is not None and estimated_bytes > 0:
+            est_str = format_size_estimate(estimated_bytes, is_exact=estimated_exact)
+            if bytes_downloaded > 0:
+                parts.append(f"{format_bytes(bytes_downloaded)} / {est_str}")
             else:
                 parts.append(f"Est. {est_str}")
-        elif self._last_bytes_downloaded > 0:
-            parts.append(format_bytes(self._last_bytes_downloaded))
-        if self._last_speed_bps > 0:
-            parts.append(format_speed(self._last_speed_bps))
+        elif bytes_downloaded > 0:
+            parts.append(format_bytes(bytes_downloaded))
+        if speed_bps > 0:
+            parts.append(format_speed(speed_bps))
         parts.append(f"Elapsed {format_duration(elapsed)}")
-        if self._last_eta_seconds is not None:
-            parts.append(f"ETA {format_duration(self._last_eta_seconds)}")
+        if eta_seconds is not None:
+            parts.append(f"ETA {format_duration(eta_seconds)}")
         self.metrics_var.set("  \u2022  ".join(parts))
 
-    def _update_stage_from_message(self, message: str) -> None:
+    @staticmethod
+    def _stage_from_message(message: str) -> str | None:
         lower = message.strip().lower()
         if not lower:
-            return
+            return None
         if "combining" in lower or "packing" in lower:
-            self.stage_var.set("Stage: Combining & muxing")
-        elif "converting" in lower:
-            self.stage_var.set("Stage: Converting audio")
-        elif "splitting" in lower:
-            self.stage_var.set("Stage: Splitting chapters")
-        elif "enrich" in lower:
-            self.stage_var.set("Stage: Enriching metadata")
-        elif "adding chapters" in lower:
-            self.stage_var.set("Stage: Writing chapters")
-        elif "adding metadata" in lower:
-            self.stage_var.set("Stage: Writing tags")
-        elif "embedding cover" in lower or "adding cover" in lower:
-            self.stage_var.set("Stage: Embedding cover")
-        elif "uploading" in lower or "audiobookshelf" in lower:
-            self.stage_var.set("Stage: Syncing library")
-        elif "downloading" in lower:
-            self.stage_var.set("Stage: Downloading")
-        self._update_active_row_live_detail(force=True)
+            return "Stage: Combining & muxing"
+        if "converting" in lower:
+            return "Stage: Converting audio"
+        if "splitting" in lower:
+            return "Stage: Splitting chapters"
+        if "enrich" in lower:
+            return "Stage: Enriching metadata"
+        if "adding chapters" in lower:
+            return "Stage: Writing chapters"
+        if "adding metadata" in lower:
+            return "Stage: Writing tags"
+        if "embedding cover" in lower or "adding cover" in lower:
+            return "Stage: Embedding cover"
+        if "uploading" in lower or "audiobookshelf" in lower:
+            return "Stage: Syncing library"
+        if "downloading" in lower:
+            return "Stage: Downloading"
+        return None
 
-    def _format_live_row_detail(self) -> str:
-        stage = self.stage_var.get().strip()
+    def _update_stage_from_message(
+        self, message: str, *, job_id: str | None = None
+    ) -> None:
+        stage = self._stage_from_message(message)
+        if stage is None:
+            return
+        if job_id is not None or len(self._running_job_ids) <= 1:
+            key, state = self._get_or_create_progress_state(job_id)
+            state.stage = stage
+            self._update_job_row_live_detail(key, force=True)
+            if len(self._running_job_ids) <= 1:
+                self.stage_var.set(stage)
+        else:
+            self.stage_var.set(stage)
+
+    @staticmethod
+    def _format_live_row_detail(state: _JobProgressState) -> str:
+        stage = state.stage.strip()
         if stage == "Stage: Downloading":
-            pct_str = f"Downloading {self._last_pct:.0f}%"
+            pct_str = f"Downloading {state.pct:.0f}%"
             extras: list[str] = []
-            if self._last_estimated_bytes is not None and self._last_estimated_bytes > 0:
+            if state.estimated_bytes is not None and state.estimated_bytes > 0:
                 est_str = format_size_estimate(
-                    self._last_estimated_bytes, is_exact=self._last_estimated_exact
+                    state.estimated_bytes, is_exact=state.estimated_exact
                 )
-                if self._last_bytes_downloaded > 0:
-                    extras.append(f"{format_bytes(self._last_bytes_downloaded)} / {est_str}")
+                if state.bytes_downloaded > 0:
+                    extras.append(f"{format_bytes(state.bytes_downloaded)} / {est_str}")
                 else:
                     extras.append(f"Est. {est_str}")
-            if self._last_speed_bps > 0:
-                extras.append(format_speed(self._last_speed_bps))
+            if state.speed_bps > 0:
+                extras.append(format_speed(state.speed_bps))
             return " \u2022 ".join([pct_str, *extras])
         return stage or "Running"
 
-    def _update_active_row_live_detail(self, *, force: bool = False) -> None:
-        job_id = self._active_job_id
-        if not job_id or not self.queue_tree.exists(job_id):
+    def _update_job_row_live_detail(self, job_id: str, *, force: bool = False) -> None:
+        if not job_id or job_id == self._default_progress_key or not self.queue_tree.exists(job_id):
+            return
+        state = self._job_progress.get(job_id)
+        if state is None:
             return
         now = time.monotonic()
-        if not force and (now - self._last_row_progress_render_at) < 0.5:
+        if not force and (now - state.last_row_render_at) < 0.5:
             return
-        self._last_row_progress_render_at = now
-        self.queue_tree.set(job_id, "detail", self._format_live_row_detail())
+        state.last_row_render_at = now
+        self.queue_tree.set(job_id, "detail", self._format_live_row_detail(state))
 
     def _set_progress(self, value: float, *, indeterminate: bool = False) -> None:
         if indeterminate:
@@ -1293,12 +1453,8 @@ class ActivityQueuePanel(ttk.LabelFrame):
         self.active_job_var.set("Starting...")
         self.stage_var.set("Stage: Preparing")
         self._run_start_time = time.monotonic()
-        self._last_pct = 0.0
-        self._last_speed_bps = 0.0
-        self._last_eta_seconds = None
-        self._last_bytes_downloaded = 0
-        self._last_estimated_bytes = None
-        self._last_estimated_exact = False
+        self._running_job_ids.clear()
+        self._job_progress.clear()
         self._last_metrics_render_at = 0.0
         self.current_ui_run_id = run_id
         self.ui_item_index = 1
@@ -1450,7 +1606,13 @@ class ActivityQueuePanel(ttk.LabelFrame):
         service_label = (
             "Local Pack" if job.pack_request is not None else self._service_label_for_url(job.url)
         )
-        rec = self._controller.register_queue_record(job, service_label, persist=persist)
+        existing = self._controller.get_queue_record(job.job_id)
+        if existing is not None:
+            rec = existing
+            if persist:
+                self._controller._request_save_queue_state()
+        else:
+            rec = self._controller.register_queue_record(job, service_label, persist=persist)
         self._queue_order.append(job.job_id)
         self.queue_tree.insert(
             "",
@@ -1649,7 +1811,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
             palette=self._palette,
             default_size=(340, 140),
             min_size=(300, 130),
-            resizable=(True, False),
+            resizable=(True, True),
         )
         prof_var = tk.StringVar(value=current_prof)
         chosen: list[str] = []
@@ -1751,7 +1913,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
         has_clearable = any(
             (rec := self._controller.get_queue_record(iid)) is not None
             and rec.get("status") in ("Completed", "Failed", "Cancelled", "Interrupted")
-            for iid in self.queue_tree.get_children()
+            for iid in self._queue_order
         )
 
         can_edit_job = (
@@ -1931,7 +2093,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
             self.append_log_batch([(level, f"{prefix}{message}")])
             if level == "INFO" and message.strip():
                 self.status_var.set(message.strip().splitlines()[0][:80])
-                self._update_stage_from_message(message)
+                self._update_stage_from_message(message, job_id=item.job_id)
             return True
         if isinstance(item, LogBatchEvent):
             formatted: list[tuple[str, str]] = []
@@ -1952,23 +2114,38 @@ class ActivityQueuePanel(ttk.LabelFrame):
                 self.ui_item_total = max(self.ui_item_total, item.item_total)
                 self.ui_book_index = 0
                 self.ui_book_total = 0
-                self.stage_var.set("Stage: Fetching metadata")
-                if item.target_url:
-                    self.active_job_var.set(item.target_url.strip()[:60])
+                if len(self._running_job_ids) <= 1:
+                    self.stage_var.set("Stage: Fetching metadata")
+                    if item.target_url:
+                        self.active_job_var.set(item.target_url.strip()[:60])
                 self.refresh_batch_label()
             return True
         if isinstance(item, JobStatusEvent):
             self.update_queue_row(item.job_id, item.status, item.detail)
             if item.status == "Running":
-                self._active_job_id = item.job_id
-                self._last_row_progress_render_at = 0.0
-                rec = self._controller.get_queue_record(item.job_id)
-                if rec is not None:
-                    label = str(rec.get("title") or rec.get("url") or "").strip()
-                    if label:
-                        self.active_job_var.set(label[:60])
-            elif self._active_job_id == item.job_id:
-                self._active_job_id = None
+                if item.job_id not in self._running_job_ids:
+                    self._running_job_ids.append(item.job_id)
+                self._job_progress[item.job_id] = _JobProgressState(stage="Stage: Preparing")
+                if len(self._running_job_ids) > 1:
+                    self.active_job_var.set(f"{len(self._running_job_ids)} active jobs")
+                else:
+                    rec = self._controller.get_queue_record(item.job_id)
+                    if rec is not None:
+                        label = str(rec.get("title") or rec.get("url") or "").strip()
+                        if label:
+                            self.active_job_var.set(label[:60])
+            else:
+                if item.job_id in self._running_job_ids:
+                    self._running_job_ids.remove(item.job_id)
+                self._job_progress.pop(item.job_id, None)
+                if len(self._running_job_ids) > 1:
+                    self.active_job_var.set(f"{len(self._running_job_ids)} active jobs")
+                elif len(self._running_job_ids) == 1:
+                    rem_rec = self._controller.get_queue_record(self._running_job_ids[0])
+                    if rem_rec is not None:
+                        label = str(rem_rec.get("title") or rem_rec.get("url") or "").strip()
+                        if label:
+                            self.active_job_var.set(label[:60])
             return True
         if isinstance(item, JobMetaEvent):
             self.update_queue_row_metadata(
@@ -1976,62 +2153,64 @@ class ActivityQueuePanel(ttk.LabelFrame):
                 title=item.title or None,
                 output_path=item.output_path or None,
             )
-            if item.title:
+            if item.title and len(self._running_job_ids) <= 1:
                 self.active_job_var.set(item.title.strip()[:60])
             return True
         if isinstance(item, ItemProgressEvent):
             if item.run_id == self.current_ui_run_id:
                 self.ui_book_index = item.current
                 self.ui_book_total = item.total
-                if item.title:
+                if item.title and len(self._running_job_ids) <= 1:
                     self.active_job_var.set(item.title.strip()[:60])
                 self.refresh_batch_label()
             return True
         if isinstance(item, ProgressStartEvent):
             self._set_progress(0.0)
-            self._last_pct = 0.0
-            self._last_speed_bps = 0.0
-            self._last_eta_seconds = None
-            self._last_bytes_downloaded = 0
-            self._last_estimated_bytes = None
-            self._last_estimated_exact = False
-            self.stage_var.set("Stage: Downloading")
-            self.update_metrics_display(is_running=True, force=True)
-            self._update_active_row_live_detail(force=True)
-            self._last_row_progress_render_at = 0.0
+            key, state = self._get_or_create_progress_state(item.job_id)
+            state.pct = 0.0
+            state.speed_bps = 0.0
+            state.eta_seconds = None
+            state.bytes_downloaded = 0
+            state.estimated_bytes = None
+            state.estimated_exact = False
+            state.stage = "Stage: Downloading"
+            self._refresh_header_progress(force_metrics=True)
+            self._update_job_row_live_detail(key, force=True)
+            state.last_row_render_at = 0.0
             self.status_var.set(item.description[:80])
-            if item.description.strip():
+            if item.description.strip() and len(self._running_job_ids) <= 1:
                 self.active_job_var.set(item.description.strip()[:60])
             return True
         if isinstance(item, DownloadEstimateEvent):
-            self._last_estimated_bytes = item.estimated_bytes
-            self._last_estimated_exact = item.is_exact
-            self.update_metrics_display(is_running=True, force=True)
-            self._update_active_row_live_detail(force=True)
+            key, state = self._get_or_create_progress_state(item.job_id)
+            state.estimated_bytes = item.estimated_bytes
+            state.estimated_exact = item.is_exact
+            self._refresh_header_progress(force_metrics=True)
+            self._update_job_row_live_detail(key, force=True)
             return True
         if isinstance(item, ProgressAdvanceEvent):
+            key, state = self._get_or_create_progress_state(item.job_id)
             pct = (item.completed / item.total * 100.0) if item.total > 0 else 0.0
-            clamped = min(100.0, max(0.0, pct))
-            self._last_pct = clamped
-            self.progress_var.set(clamped)
-            self._update_active_row_live_detail(force=False)
+            state.pct = min(100.0, max(0.0, pct))
+            self._refresh_header_progress(force_metrics=False)
+            self._update_job_row_live_detail(key, force=False)
             return True
         if isinstance(item, ProgressMetricsEvent):
+            key, state = self._get_or_create_progress_state(item.job_id)
             pct = (item.completed / item.total * 100.0) if item.total > 0 else 0.0
-            self._last_pct = min(100.0, max(0.0, pct))
-            self.progress_var.set(self._last_pct)
-            self._last_bytes_downloaded = item.bytes_downloaded
-            self._last_speed_bps = item.speed_bps
-            self._last_eta_seconds = item.eta_seconds
-            self.update_metrics_display(is_running=True, force=True)
-            self._update_active_row_live_detail(force=False)
+            state.pct = min(100.0, max(0.0, pct))
+            state.bytes_downloaded = item.bytes_downloaded
+            state.speed_bps = item.speed_bps
+            state.eta_seconds = item.eta_seconds
+            self._refresh_header_progress(force_metrics=True)
+            self._update_job_row_live_detail(key, force=False)
             return True
         if isinstance(item, ProgressFinishEvent):
-            self._last_pct = 100.0
-            self._last_eta_seconds = 0.0
-            self.progress_var.set(100.0)
-            self.update_metrics_display(is_running=True, force=True)
-            self._update_active_row_live_detail(force=True)
+            key, state = self._get_or_create_progress_state(item.job_id)
+            state.pct = 100.0
+            state.eta_seconds = 0.0
+            self._refresh_header_progress(force_metrics=True)
+            self._update_job_row_live_detail(key, force=True)
             return True
         return False
 
@@ -2052,6 +2231,8 @@ class ActivityQueuePanel(ttk.LabelFrame):
             else None
         )
         self._run_start_time = None
+        self._running_job_ids.clear()
+        self._job_progress.clear()
         self.batch_var.set("")
         self.stage_var.set("")
         if exc is not None:

@@ -59,6 +59,30 @@ def partition_input_tokens(tokens: Sequence[str]) -> tuple[list[str], list[str]]
     return local_paths, url_tokens
 
 
+_AUDIO_BOOK_EXTENSIONS = frozenset(
+    {
+        ".m4b",
+        ".m4a",
+        ".mp3",
+        ".opus",
+        ".ogg",
+        ".flac",
+        ".aac",
+        ".wav",
+        ".wma",
+        ".mp4",
+        ".mkv",
+        ".webm",
+        ".epub",
+        ".pdf",
+    }
+)
+
+
+def _norm_stem(name: str) -> str:
+    return name.casefold() if os.name == "nt" else name
+
+
 def series_book_exists(
     book: BookId[Any] | Audiobook,
     *,
@@ -75,11 +99,25 @@ def series_book_exists(
         book_title = meta.title.strip()
     else:
         raw_title = getattr(book, "title", None)
-        if not raw_title and isinstance(getattr(book, "id", None), dict):
-            raw_title = book.id.get("title") or book.id.get("name")
+        id_dict = book.id if isinstance(getattr(book, "id", None), dict) else {}
+        if not raw_title and id_dict:
+            raw_title = id_dict.get("title") or id_dict.get("name")
         if raw_title:
             book_title = str(raw_title).strip()
-            meta = AudiobookMetadata(title=book_title, series=series_title)
+            raw_authors = getattr(book, "authors", None) or id_dict.get("authors") or []
+            if isinstance(raw_authors, str):
+                authors_list = [raw_authors]
+            else:
+                authors_list = [str(a) for a in raw_authors if a]
+            meta = AudiobookMetadata(
+                title=book_title,
+                authors=authors_list,
+                series=series_title,
+                series_order=getattr(book, "series_order", None) or id_dict.get("series_order"),
+                isbn=getattr(book, "isbn", None) or id_dict.get("isbn"),
+                asin=getattr(book, "asin", None) or id_dict.get("asin"),
+                source=getattr(book, "source", None) or id_dict.get("source"),
+            )
     if archive_titles_cache and book_title and book_title.casefold() in archive_titles_cache:
         return True
     if meta is None:
@@ -87,19 +125,37 @@ def series_book_exists(
     try:
         template = options.output_template or "{title}"
         if not isinstance(book, Audiobook):
-            if "{author" in template or "{narrator" in template:
+            missing_tokens = (
+                ("{author", not meta.authors),
+                ("{narrator", not meta.narrators),
+                ("{year", meta.release_date is None),
+                ("{series_order", meta.series_order is None),
+                ("{isbn", not meta.isbn),
+                ("{asin", not meta.asin),
+                ("{source", not meta.source),
+            )
+            if any(tok in template and is_missing for tok, is_missing in missing_tokens):
                 return False
         target = output.gen_output_location(template, meta, options.remove_chars)
         if os.path.exists(target):
             return True
-        if options.output_format and os.path.exists(f"{target}.{options.output_format}"):
+        ext = (options.output_format or "").lstrip(".")
+        if ext and os.path.exists(f"{target}.{ext}"):
             return True
         parent = os.path.dirname(target) or "."
-        base = os.path.basename(target)
+        base = _norm_stem(os.path.basename(target))
         if dir_stems_cache is not None and parent in dir_stems_cache:
             return base in dir_stems_cache[parent]
         if os.path.isdir(parent):
-            stems = {os.path.splitext(entry)[0] for entry in os.listdir(parent)}
+            stems: set[str] = set()
+            for entry in os.listdir(parent):
+                full_entry = os.path.join(parent, entry)
+                if os.path.isdir(full_entry):
+                    stems.add(_norm_stem(entry))
+                else:
+                    stem, file_ext = os.path.splitext(entry)
+                    if file_ext.casefold() in _AUDIO_BOOK_EXTENSIONS:
+                        stems.add(_norm_stem(stem))
             if dir_stems_cache is not None:
                 dir_stems_cache[parent] = stems
             return base in stems
@@ -229,10 +285,14 @@ class AutomationCoordinator:
             return
         if self._can_run_auto_sync():
             targets = list(self.auto_sync_targets or [])
-            if targets:
-                self._execute_sync_targets(targets, self.auto_sync_mode)
-            else:
-                self._sync_libraries()
+            self.is_auto_sync_running = True
+            try:
+                if targets:
+                    self._execute_sync_targets(targets, self.auto_sync_mode)
+                else:
+                    self._sync_libraries()
+            finally:
+                self.is_auto_sync_running = False
         self.configure_auto_sync_timer(True, self.auto_sync_minutes)
 
 
@@ -325,13 +385,19 @@ class UrlInputCoordinator:
 
     def append_urls_to_input(self, urls: Sequence[str]) -> list[str]:
         box = self._ensure_download_page().urls_text
-        existing = parse_url_text(box.get("1.0", tk.END))
-        existing_set = set(existing)
-        added = [u for u in urls if u not in existing_set]
+        existing_text = box.get("1.0", tk.END)
+        existing_set = set(parse_url_text(existing_text))
+        added = [u for u in urls if u and u not in existing_set]
         if added:
-            combined = "\n".join([*existing, *added])
-            box.delete("1.0", tk.END)
-            box.insert("1.0", combined)
+            box.edit_separator()
+            current_stripped = existing_text.rstrip("\r\n")
+            prefix = "\n" if current_stripped else ""
+            box.insert("end-1c", f"{prefix}{chr(10).join(added)}")
+            try:
+                box.edit_modified(False)
+            except tk.TclError:
+                pass
+            self.cancel_debounce()
             self.on_urls_changed()
         return added
 
@@ -393,19 +459,23 @@ class UrlInputCoordinator:
         if not path:
             return
         try:
-            with open(path, encoding="utf-8") as f:
+            with open(path, encoding="utf-8-sig") as f:
                 content = f.read().strip()
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             messagebox.showerror("Error", f"Could not read file:\n{exc}", parent=self._root)
             return
         if content:
             self._navigate_download()
-            urls_text = self._ensure_download_page().urls_text
-            existing = urls_text.get("1.0", tk.END).strip()
-            combined = f"{existing}\n{content}" if existing else content
-            urls_text.delete("1.0", tk.END)
-            urls_text.insert("1.0", combined)
-            self.on_urls_changed()
+            urls = parse_url_text(content)
+            if urls:
+                self.append_urls_to_input(urls)
+            else:
+                urls_text = self._ensure_download_page().urls_text
+                existing = urls_text.get("1.0", tk.END).strip()
+                prefix = "\n" if existing else ""
+                urls_text.insert(tk.END, f"{prefix}{content}")
+                self.cancel_debounce()
+                self.on_urls_changed()
 
     def clear_urls(self) -> None:
         urls_text = self._ensure_download_page().urls_text
@@ -420,18 +490,12 @@ class UrlInputCoordinator:
             self._status_var.set("Clipboard is empty")
             return []
         lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-        local_paths, _url_candidates = partition_input_tokens(lines)
-        pasted = [
-            u
-            for u in parse_url_text(raw)
-            if not (
-                os.path.isdir(u)
-                or (
-                    os.path.isfile(u)
-                    and os.path.splitext(u)[1].lstrip(".").lower() in SUPPORTED_PACK_EXTENSIONS
-                )
-            )
-        ]
+        local_paths, url_candidates = partition_input_tokens(lines)
+        pasted: list[str] = []
+        for cand in url_candidates:
+            for tok in parse_url_text(cand):
+                if tok not in pasted:
+                    pasted.append(tok)
         if local_paths:
             self._open_pack_with_paths(local_paths)
         if not pasted:

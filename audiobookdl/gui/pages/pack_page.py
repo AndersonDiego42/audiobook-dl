@@ -143,6 +143,7 @@ class PackPage(ttk.Frame):
         self._scan_token = 0
         self._is_scanning = False
         self._cb_queue = MainThreadCallbackQueue(self)
+        self.bind("<Destroy>", self._on_destroy_page, add="+")
 
         default_fmt = "m4b"
         try:
@@ -320,17 +321,24 @@ class PackPage(ttk.Frame):
         scan_bar.columnconfigure(1, weight=1)
         self._scan_btn = ttk.Button(scan_bar, text="Scan & Preview", command=self._start_scan)
         self._scan_btn.grid(row=0, column=0, padx=(0, 6))
+        self._cancel_scan_btn = ttk.Button(
+            scan_bar,
+            text="Cancel Scan",
+            command=self._cancel_scan_clicked,
+            state="disabled",
+        )
+        self._cancel_scan_btn.grid(row=0, column=1, padx=(0, 6))
         self._edit_book_btn = ttk.Button(
             scan_bar, text="Edit Book...", command=self._edit_selected_book
         )
-        self._edit_book_btn.grid(row=0, column=1, padx=(0, 10))
+        self._edit_book_btn.grid(row=0, column=2, padx=(0, 10))
         scan_bar.columnconfigure(1, weight=0)
-        scan_bar.columnconfigure(2, weight=1)
+        scan_bar.columnconfigure(3, weight=1)
         ttk.Label(scan_bar, textvariable=self.status_var, style="Secondary.TLabel").grid(
-            row=0, column=2, sticky="w"
+            row=0, column=3, sticky="w"
         )
         self._loading_bar = ttk.Progressbar(scan_bar, mode="indeterminate", length=120)
-        self._loading_bar.grid(row=0, column=3, sticky="e", padx=(8, 0))
+        self._loading_bar.grid(row=0, column=4, sticky="e", padx=(8, 0))
         self._loading_bar.grid_remove()
 
         # Row 4: Preview Tree & Chapters Editor Notebook
@@ -425,6 +433,23 @@ class PackPage(ttk.Frame):
             return os.path.normcase(os.path.abspath(self._paths[0]))
         return None
 
+    def _on_destroy_page(self, event: tk.Event) -> None:
+        if getattr(event, "widget", None) is not self:
+            return
+        self._scan_token += 1
+        self._cancel_active_scan()
+
+    def _cancel_scan_clicked(self) -> None:
+        self._scan_token += 1
+        self._cancel_active_scan()
+        self._is_scanning = False
+        self._loading_bar.stop()
+        self._loading_bar.grid_remove()
+        self._scan_btn.configure(state="normal")
+        self._cancel_scan_btn.configure(state="disabled")
+        self._pack_btn.configure(state="normal")
+        self.status_var.set("Scan cancelled.")
+
     def _cancel_active_scan(self) -> None:
         if self._scan_cancel_event is not None:
             self._scan_cancel_event.set()
@@ -445,6 +470,7 @@ class PackPage(ttk.Frame):
         self._loading_bar.stop()
         self._loading_bar.grid_remove()
         self._scan_btn.configure(state="normal")
+        self._cancel_scan_btn.configure(state="disabled")
         self._pack_btn.configure(state="normal")
         self._preview_specs.clear()
         if clear_edits:
@@ -688,10 +714,11 @@ class PackPage(ttk.Frame):
         if book_ov:
             if book_ov.get("title"):
                 merged.title = str(book_ov["title"])
-            if book_ov.get("authors"):
+            if "authors" in book_ov:
                 merged.authors = list(book_ov["authors"])
-            if book_ov.get("series_order") is not None:
-                merged.series_order = int(book_ov["series_order"])
+            if "series_order" in book_ov:
+                raw_so = book_ov["series_order"]
+                merged.series_order = int(raw_so) if raw_so is not None else None
         return merged
 
     def _clone_options_for_pack(self) -> DownloadOptions | None:
@@ -727,6 +754,7 @@ class PackPage(ttk.Frame):
         self._scan_cancel_event = cancel_event
         self._is_scanning = True
         self._scan_btn.configure(state="disabled")
+        self._cancel_scan_btn.configure(state="normal")
         self._pack_btn.configure(state="disabled")
         self._scrolled_tree.set_empty_state(False)
         self._loading_bar.grid()
@@ -746,6 +774,7 @@ class PackPage(ttk.Frame):
             self._loading_bar.stop()
             self._loading_bar.grid_remove()
             self._scan_btn.configure(state="normal")
+            self._cancel_scan_btn.configure(state="disabled")
             self._pack_btn.configure(state="normal")
             for iid in self._tree.get_children():
                 self._tree.delete(iid)
@@ -813,15 +842,20 @@ class PackPage(ttk.Frame):
             except Exception as exc:
                 err = str(exc)
             finally:
-                def _post_scan() -> None:
-                    if cancelled:
-                        return
-                    _apply(specs, err)
-
-                self._cb_queue.post(_post_scan)
+                self._cb_queue.post(
+                    lambda: (
+                        self._finish_cancelled_scan(token)
+                        if cancelled
+                        else _apply(specs, err)
+                    )
+                )
                 self._cb_queue.finish_worker()
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _finish_cancelled_scan(self, token: int) -> None:
+        if self.winfo_exists() and token == self._scan_token:
+            self._cancel_scan_clicked()
 
     def _submit(self) -> None:
         if not self._paths:

@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from audiobookdl.options_schema import build_default_options
 from audiobookdl.config import (
     DEFAULT_PROFILE,
     list_source_profiles,
@@ -18,10 +15,9 @@ from audiobookdl.config import (
 )
 from audiobookdl.credentials import get_credential_store
 from audiobookdl.gui.auth_panel import ServiceAuthCoordinator, ServiceAuthPanel
-from audiobookdl.gui.controller import GuiController, GuiInteractionHandler
+from audiobookdl.gui.controller import GuiController
 from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, make_bold_font, scale_px
-from audiobookdl.gui.widgets import MainThreadCallbackQueue, ScrolledTreeview, TreeColumnSpec, tree_item_values
-from audiobookdl.pipeline import verify_service_auth
+from audiobookdl.gui.widgets import ScrolledTreeview, TreeColumnSpec, tree_item_values
 from audiobookdl.sources import ServiceInfo
 
 
@@ -44,7 +40,7 @@ class AccountsPage(ttk.Frame):
         services: Sequence[ServiceInfo],
         auth_coordinator: ServiceAuthCoordinator,
         *,
-        on_import_cookies: Callable[[str], None] | None = None,
+        on_import_cookies: Callable[..., None] | None = None,
         on_context_label: Callable[[str], None] | None = None,
         palette: ThemePalette | None = None,
     ) -> None:
@@ -56,11 +52,10 @@ class AccountsPage(ttk.Frame):
         self._on_import_cookies = on_import_cookies
         self._on_context_label = on_context_label
         self._palette = palette or LIGHT_PALETTE
-        self._cb_queue = MainThreadCallbackQueue(self)
         self._rows: list[tuple[str, str]] = []
         self._is_testing = False
-        self._test_cancel_event: threading.Event | None = None
-        self._test_interaction: GuiInteractionHandler | None = None
+        self._active_test_run_id: int | None = None
+        self._verification_cache: dict[tuple[str, str], tuple[str, str]] = {}
         self.bind("<Destroy>", self._on_destroy)
 
         self.columnconfigure(0, weight=1)
@@ -178,6 +173,15 @@ class AccountsPage(ttk.Frame):
             return "Keyring"
         return "Plaintext" if store.is_secure is False else cls_name
 
+    def invalidate_verification(self, service_key: str, profile: str | None = None) -> None:
+        """Clear cached login verification status for `(service_key, profile)` or all of `service_key`."""
+        if profile is None:
+            to_drop = [k for k in self._verification_cache if k[0] == service_key]
+            for k in to_drop:
+                self._verification_cache.pop(k, None)
+        else:
+            self._verification_cache.pop((service_key, normalize_profile_name(profile)), None)
+
     def refresh(self) -> None:
         existing = self._tree.get_children()
         if existing:
@@ -218,16 +222,19 @@ class AccountsPage(ttk.Frame):
                         )
                     )
                 )
-                if oauth_connected and src_cfg and not any((src_cfg.username, src_cfg.password, src_cfg.cookie_file)):
-                    status = "OAuth Connected"
+                cached = self._verification_cache.get((svc.key, prof))
+                if cached is not None and has_creds:
+                    status, row_tag = cached
+                elif oauth_connected and src_cfg and not any((src_cfg.username, src_cfg.password, src_cfg.cookie_file)):
+                    status, row_tag = "OAuth Connected", ""
                 elif oauth_connected:
-                    status = "Configured (OAuth)"
+                    status, row_tag = "Configured (OAuth)", ""
                 elif has_creds:
-                    status = "Configured"
+                    status, row_tag = "Configured", ""
                 elif not svc.auth_methods:
-                    status = "No auth needed"
+                    status, row_tag = "No auth needed", ""
                 else:
-                    status = "Unconfigured"
+                    status, row_tag = "Unconfigured", ""
                 iid = f"{svc.key}:{prof}"
                 self._rows.append((svc.key, prof))
                 self._tree.insert(
@@ -235,6 +242,7 @@ class AccountsPage(ttk.Frame):
                     tk.END,
                     iid=iid,
                     values=(svc.label, prof, auth_label, caps_label, vault_label, status),
+                    tags=(row_tag,) if row_tag else (),
                 )
         self._status_var.set(f"{len(self._rows)} account entries across {len(self._services)} services.")
 
@@ -252,8 +260,12 @@ class AccountsPage(ttk.Frame):
         if self._on_import_cookies is None:
             return
         picked = self._selected_service_profile()
-        self._on_import_cookies(picked[0] if picked else "")
-        self.refresh()
+        svc_arg = picked[0] if picked else ""
+        prof_arg = picked[1] if picked else None
+        try:
+            self._on_import_cookies(svc_arg, prof_arg)
+        except TypeError:
+            self._on_import_cookies(svc_arg)
 
     def _select_in_form(self) -> None:
         picked = self._selected_service_profile()
@@ -276,6 +288,7 @@ class AccountsPage(ttk.Frame):
             return
         self._auth_coord.select_service_profile(picked[0], picked[1])
         if self._auth_coord.rename_current_profile():
+            self.invalidate_verification(picked[0], picked[1])
             self.refresh()
             self._sync_active_row_and_breadcrumb()
 
@@ -290,6 +303,7 @@ class AccountsPage(ttk.Frame):
             parent=self.winfo_toplevel(),
         ):
             return
+        self.invalidate_verification(svc_key, prof)
         self._controller.delete_source_profile(svc_key, profile=prof)
         self._auth_coord.load_service_into_form()
         self._auth_coord.update_field_states()
@@ -301,16 +315,13 @@ class AccountsPage(ttk.Frame):
             return
         self._cancel_test_btn.configure(state="disabled")
         self._status_var.set("Cancelling login verification...")
-        if self._test_cancel_event is not None:
-            self._test_cancel_event.set()
-        if self._test_interaction is not None:
-            self._test_interaction.release_all()
+        self._controller.cancel_accounts_verification()
 
     def _test_all_logins(self) -> None:
         if self._is_testing:
             return
         cfg = self._controller.config_snapshot()
-        targets: list[tuple[str, str]] = []
+        targets: list[tuple[str, str, str]] = []
         for svc in self._services:
             if not svc.auth_methods:
                 continue
@@ -324,7 +335,7 @@ class AccountsPage(ttk.Frame):
                         getattr(src_cfg, "oauth_token_present", False),
                     )
                 ):
-                    targets.append((svc.key, prof))
+                    targets.append((svc.key, svc.label, prof))
         if not targets:
             self._status_var.set("No configured accounts with credentials to verify.")
             return
@@ -334,126 +345,53 @@ class AccountsPage(ttk.Frame):
         self._loading_bar.grid()
         self._loading_bar.start(12)
         self._status_var.set(f"Verifying {len(targets)} configured account(s)...")
+        self._active_test_run_id = self._controller.start_accounts_verification(targets)
 
-        def _update_row(svc_key: str, prof: str, ok: bool, err: str | None) -> None:
-            if not self.winfo_exists():
-                return
-            iid = f"{svc_key}:{prof}"
-            if self._tree.exists(iid):
-                vals = tree_item_values(self._tree, iid)
-                if len(vals) >= 6:
-                    vals[5] = "Valid" if ok else (f"Failed: {err}" if err else "Failed")
-                    self._tree.item(iid, values=tuple(vals), tags=("ok" if ok else "err",))
+    def handle_verification_item(
+        self,
+        run_id: int,
+        svc_key: str,
+        prof: str,
+        ok: bool,
+        err: str | None,
+    ) -> None:
+        if run_id != self._active_test_run_id or not self.winfo_exists():
+            return
+        status_text = "Valid" if ok else (f"Failed: {err}" if err else "Failed")
+        tag = "ok" if ok else "err"
+        self._verification_cache[(svc_key, prof)] = (status_text, tag)
+        iid = f"{svc_key}:{prof}"
+        if self._tree.exists(iid):
+            vals = tree_item_values(self._tree, iid)
+            if len(vals) >= 6:
+                vals[5] = status_text
+                self._tree.item(iid, values=tuple(vals), tags=(tag,))
 
-        def _finish(valid_count: int, checked_count: int, total: int, cancelled: bool) -> None:
-            if not self.winfo_exists():
-                return
-            self._is_testing = False
-            self._loading_bar.stop()
-            self._loading_bar.grid_remove()
-            self._cancel_test_btn.configure(state="disabled")
-            self._test_all_btn.configure(state="normal")
-            if cancelled:
-                self._status_var.set(
-                    f"Verification cancelled ({checked_count}/{total} checked, {valid_count} valid)."
-                )
-            else:
-                self._status_var.set(f"Verified {valid_count}/{total} configured account(s).")
-
-        cancel_ev = threading.Event()
-        interaction = GuiInteractionHandler(self._controller.event_queue, cancel_ev)
-        self._test_cancel_event = cancel_ev
-        self._test_interaction = interaction
-        self._controller._register_aux_interaction(interaction)
-        self._cb_queue.begin_task()
-
-        def _worker() -> None:
-            valid = 0
-            checked = 0
-            was_cancelled = False
-            counter_lock = threading.Lock()
-
-            def _check_one(svc_key: str, prof: str) -> None:
-                nonlocal valid, checked, was_cancelled
-                if cancel_ev.is_set():
-                    return
-                opts = build_default_options(
-                    config_location=self._controller.config_location,
-                    profile=None if prof == DEFAULT_PROFILE else prof,
-                )
-                ok = False
-                err: str | None = None
-                try:
-                    ok = verify_service_auth(
-                        svc_key,
-                        opts,
-                        cfg,
-                        interaction=interaction,
-                    )
-                except Exception as exc:
-                    err = str(exc) or type(exc).__name__
-                if cancel_ev.is_set():
-                    with counter_lock:
-                        was_cancelled = True
-                    return
-                with counter_lock:
-                    checked += 1
-                    if ok:
-                        valid += 1
-
-                def _emit_row(
-                    sk: str = svc_key,
-                    pf: str = prof,
-                    res: bool = ok,
-                    er: str | None = err,
-                ) -> None:
-                    _update_row(sk, pf, res, er)
-
-                self._cb_queue.post(_emit_row)
-
-            try:
-                max_workers = min(4, len(targets))
-                if max_workers <= 1:
-                    for svc_key, prof in targets:
-                        if cancel_ev.is_set():
-                            was_cancelled = True
-                            break
-                        _check_one(svc_key, prof)
-                else:
-                    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                        futures = [pool.submit(_check_one, svc_key, prof) for svc_key, prof in targets]
-                        for fut in as_completed(futures):
-                            if cancel_ev.is_set():
-                                was_cancelled = True
-                                for pending_fut in futures:
-                                    pending_fut.cancel()
-                                break
-                            fut.result()
-            finally:
-                cancel_ev.set()
-                interaction.release_all()
-                self._controller._unregister_aux_interaction(interaction)
-                self._test_cancel_event = None
-                self._test_interaction = None
-                total = len(targets)
-
-                def _emit_finish(
-                    v: int = valid,
-                    chk: int = checked,
-                    tot: int = total,
-                    can: bool = was_cancelled,
-                ) -> None:
-                    _finish(v, chk, tot, can)
-
-                self._cb_queue.post(_emit_finish)
-                self._cb_queue.finish_worker()
-
-        threading.Thread(target=_worker, daemon=True).start()
+    def handle_verification_done(
+        self,
+        run_id: int,
+        valid_count: int,
+        checked_count: int,
+        total_count: int,
+        cancelled: bool,
+    ) -> None:
+        if run_id != self._active_test_run_id or not self.winfo_exists():
+            return
+        self._is_testing = False
+        self._active_test_run_id = None
+        self._loading_bar.stop()
+        self._loading_bar.grid_remove()
+        self._cancel_test_btn.configure(state="disabled")
+        self._test_all_btn.configure(state="normal")
+        if cancelled:
+            self._status_var.set(
+                f"Verification cancelled ({checked_count}/{total_count} checked, {valid_count} valid)."
+            )
+        else:
+            self._status_var.set(f"Verified {valid_count}/{total_count} configured account(s).")
 
     def _on_destroy(self, event: tk.Event) -> None:
         if event.widget is not self:
             return
-        if self._test_cancel_event is not None:
-            self._test_cancel_event.set()
-        if self._test_interaction is not None:
-            self._test_interaction.release_all()
+        if self._is_testing:
+            self._controller.cancel_accounts_verification()

@@ -10,7 +10,7 @@ from typing import Any, Literal
 from audiobookdl.gui.formatting import TEMPLATE_PRESET_LABELS
 from audiobookdl.gui.options_panel import OptionsPanel
 from audiobookdl.gui.queue_panel import ActivityQueuePanel
-from audiobookdl.gui.theme import ThemePalette, scale_px
+from audiobookdl.gui.theme import ThemePalette, apply_theme_to_widget_tree, scale_px
 from audiobookdl.gui.widgets import (
     CollapsibleSection,
     ResponsiveMode,
@@ -114,6 +114,8 @@ class DownloadPage(ttk.Frame):
         self._ffmpeg_banner_dismissed = False
         self._ffmpeg_available = True
         self._fit_after_id: str | None = None
+        self._profile_menu: tk.Menu | None = None
+        self.bind("<Destroy>", self._on_destroy_page, add="+")
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
@@ -382,7 +384,14 @@ class DownloadPage(ttk.Frame):
 
     def show_profile_menu(self, event: tk.Event | None = None) -> None:
         """Open a quick context menu to switch active profile or manage accounts."""
+        if self._profile_menu is not None:
+            try:
+                self._profile_menu.destroy()
+            except tk.TclError:
+                pass
+            self._profile_menu = None
         menu = tk.Menu(self, tearoff=False)
+        self._profile_menu = menu
         profiles = self._profile_choices_provider() if self._profile_choices_provider is not None else ["default"]
         if not profiles:
             profiles = ["default"]
@@ -397,6 +406,7 @@ class DownloadPage(ttk.Frame):
             )
         menu.add_separator()
         menu.add_command(label="Manage Accounts...", command=self._on_open_accounts)
+        apply_theme_to_widget_tree(menu, self._palette_provider())
         if event is not None:
             x, y = event.x_root, event.y_root
         else:
@@ -559,8 +569,30 @@ class DownloadPage(ttk.Frame):
         except tk.TclError:
             self._fit_after_id = None
 
+    def _on_destroy_page(self, event: tk.Event) -> None:
+        if getattr(event, "widget", None) is not self:
+            return
+        after_id = self._fit_after_id
+        self._fit_after_id = None
+        if after_id is not None:
+            try:
+                self.after_cancel(after_id)
+            except tk.TclError:
+                pass
+        if self._profile_menu is not None:
+            try:
+                self._profile_menu.destroy()
+            except tk.TclError:
+                pass
+            self._profile_menu = None
+
     def _run_scheduled_fit(self) -> None:
         self._fit_after_id = None
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
         if self._layout_mode == "horizontal":
             self._apply_horizontal_split_for_width(self._hpaned.winfo_width())
         else:

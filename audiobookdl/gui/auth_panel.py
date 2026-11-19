@@ -55,9 +55,14 @@ class ServiceAuthCoordinator:
         self._last_detected_service: str | None = None
         self._is_verifying_auth = False
         self._is_connecting_oauth = False
+        self._is_disconnecting_oauth = False
         self._oauth_cancel_event: threading.Event | None = None
         self._cookie_dialog: CookieImportDialog | None = None
         self._panel: ServiceAuthPanel | None = None
+        self._loaded_service_profile: tuple[str, str] | None = None
+        self._clean_form_snapshot: tuple[str, ...] = ()
+        self._prompting_discard = False
+        self._cookie_import_profile: str | None = None
 
         self._status_var = status_var
         self.service_label_var = service_label_var
@@ -78,7 +83,47 @@ class ServiceAuthCoordinator:
         self._build_verify_options = build_verify_options
         self._is_running_provider = is_running_provider
         self._on_log = on_log
-        self._on_credentials_changed = on_credentials_changed
+        self._on_credentials_changed: Callable[..., None] | None = on_credentials_changed
+
+    def _form_snapshot(self) -> tuple[str, ...]:
+        return (
+            self.cookie_file_var.get(),
+            self.username_var.get(),
+            self.password_var.get(),
+            self.library_var.get(),
+            self.locale_var.get(),
+            self.oauth_client_id_var.get(),
+        )
+
+    def _is_form_dirty(self) -> bool:
+        return self._loaded_service_profile is not None and self._form_snapshot() != self._clean_form_snapshot
+
+    def _confirm_discard_dirty(self) -> bool:
+        if not self._is_form_dirty():
+            return True
+        if self._prompting_discard:
+            return False
+        self._prompting_discard = True
+        try:
+            return bool(
+                messagebox.askyesno(
+                    "Unsaved Credential Edits",
+                    "You have unsaved credential changes in the form. Discard them?",
+                    parent=self._window,
+                )
+            )
+        finally:
+            self._prompting_discard = False
+
+    def _notify_credentials_changed(
+        self, service_key: str | None = None, profile: str | None = None
+    ) -> None:
+        if self._on_credentials_changed is None:
+            return
+        try:
+            self._on_credentials_changed(service_key, profile)
+        except TypeError:
+            self._on_credentials_changed()
 
     def attach_panel(self, panel: "ServiceAuthPanel | None") -> None:
         self._panel = panel
@@ -142,10 +187,37 @@ class ServiceAuthCoordinator:
         svc = self._services_by_key.get(service_key) if service_key else self.selected_service()
         if svc is None:
             return
+        if (
+            self._loaded_service_profile is not None
+            and svc.key != self._loaded_service_profile[0]
+            and not self._confirm_discard_dirty()
+        ):
+            prev_svc = self._services_by_key.get(self._loaded_service_profile[0])
+            if prev_svc is not None:
+                self.service_label_var.set(prev_svc.label)
+            return
         if self.service_label_var.get() != svc.label:
             self.service_label_var.set(svc.label)
         resolved = resolve_effective_source_profile(self._controller.config_snapshot(), svc.key)
         self.profile_var.set(resolved)
+        self.load_service_into_form()
+        self.update_field_states()
+
+    def handle_profile_changed(self) -> None:
+        """Reload credentials only when `(service, profile)` actually changed, guarding dirty edits."""
+        service = self.selected_service()
+        normalized = normalize_profile_name(self.profile_var.get())
+        if self.profile_var.get() != normalized:
+            self.profile_var.set(normalized)
+        if service is None:
+            return
+        target = (service.key, normalized)
+        if target == self._loaded_service_profile:
+            return
+        if not self._confirm_discard_dirty():
+            assert self._loaded_service_profile is not None
+            self.profile_var.set(self._loaded_service_profile[1])
+            return
         self.load_service_into_form()
         self.update_field_states()
 
@@ -193,6 +265,8 @@ class ServiceAuthCoordinator:
         self.cookie_file_var.set((saved.cookie_file or "") if saved else "")
         self.locale_var.set((saved.locale or "") if saved else "")
         self.oauth_client_id_var.set((saved.oauth_client_id or "") if saved else "")
+        self._loaded_service_profile = (service.key, active_profile)
+        self._clean_form_snapshot = self._form_snapshot()
 
         oauth_connected = bool(saved and getattr(saved, "oauth_token_present", False))
         self.oauth_status_var.set("Connected" if oauth_connected else "Not connected")
@@ -239,13 +313,23 @@ class ServiceAuthCoordinator:
         if panel is not None:
             panel.set_running_state(running)
 
-    def show_cookie_import_dialog(self, svc_key_override: str | None = None) -> None:
+    def show_cookie_import_dialog(
+        self,
+        svc_key_override: str | None = None,
+        *,
+        profile_override: str | None = None,
+    ) -> None:
         """Open or raise the interactive browser-cookie importer dialog."""
+        self._cookie_import_profile = (
+            normalize_profile_name(profile_override)
+            if profile_override
+            else normalize_profile_name(self.profile_var.get())
+        )
         if self._cookie_dialog is not None and self._cookie_dialog.winfo_exists():
             if svc_key_override:
                 svc = self._services_by_key.get(svc_key_override)
                 if svc is not None and "cookies" in svc.auth_methods:
-                    self._cookie_dialog._service_var.set(svc.label)
+                    self._cookie_dialog.select_service(svc.key)
             self._cookie_dialog.lift()
             self._cookie_dialog.focus_set()
             return
@@ -268,13 +352,22 @@ class ServiceAuthCoordinator:
     def on_cookies_imported(self, service_key: str, cookie_path: str, count: int) -> None:
         """Apply an imported Netscape cookie file to the selected service form."""
         service = self._services_by_key.get(service_key)
-        if service is not None and self.service_label_var.get() != service.label:
+        target_profile = self._cookie_import_profile or normalize_profile_name(self.profile_var.get())
+        self._cookie_import_profile = None
+        if service is not None and (
+            self.service_label_var.get() != service.label
+            or normalize_profile_name(self.profile_var.get()) != target_profile
+        ):
             self.service_label_var.set(service.label)
+            self.profile_var.set(target_profile)
             self.load_service_into_form()
             self.update_field_states()
         self.cookie_file_var.set(cookie_path)
+        active_profile = normalize_profile_name(self.profile_var.get())
         if self.remember_login_var.get() and service is not None and "cookies" in service.auth_methods:
             self.save_current_credentials(quiet=True)
+        else:
+            self._notify_credentials_changed(service_key, active_profile)
         self._status_var.set(f"Imported {count} cookies to {os.path.basename(cookie_path)}")
         self._on_log(f"Imported {count} browser cookie(s) to {cookie_path}")
 
@@ -314,8 +407,7 @@ class ServiceAuthCoordinator:
         self.saved_badge_var.set("Saved" if has_saved else "")
         self.load_service_into_form()
         self.update_field_states()
-        if self._on_credentials_changed is not None:
-            self._on_credentials_changed()
+        self._notify_credentials_changed(service.key, active_profile)
         profile_suffix = f" ({active_profile})" if active_profile != DEFAULT_PROFILE else ""
         if not quiet:
             if has_saved:
@@ -341,8 +433,7 @@ class ServiceAuthCoordinator:
         self.saved_badge_var.set("")
         self.load_service_into_form()
         self.update_field_states()
-        if self._on_credentials_changed is not None:
-            self._on_credentials_changed()
+        self._notify_credentials_changed(service.key, active_profile)
         profile_suffix = f" ({active_profile})" if active_profile != DEFAULT_PROFILE else ""
         self._status_var.set(f"Removed saved login for {service.label}{profile_suffix}")
         self._on_log(f"Removed saved login settings for {service.label}{profile_suffix}.")
@@ -401,8 +492,7 @@ class ServiceAuthCoordinator:
         self.profile_var.set(new_profile)
         self.load_service_into_form()
         self.update_field_states()
-        if self._on_credentials_changed is not None:
-            self._on_credentials_changed()
+        self._notify_credentials_changed(service.key, old_profile)
         self._status_var.set(f"Renamed {service.label} profile '{old_profile}' to '{new_profile}'")
         return True
 
@@ -448,7 +538,9 @@ class ServiceAuthCoordinator:
             self._status_var.set("Cancelling OAuth authorization...")
 
     def disconnect_oauth(self) -> None:
-        """Revoke and delete stored OAuth tokens for the active profile."""
+        """Revoke and delete stored OAuth tokens for the active profile in a background task."""
+        if self._is_disconnecting_oauth or self._is_connecting_oauth or self._is_running_provider():
+            return
         service = self.selected_service()
         if service is None:
             return
@@ -456,14 +548,49 @@ class ServiceAuthCoordinator:
         if options is None:
             return
         active_profile = normalize_profile_name(self.profile_var.get())
-        self._controller.disconnect_oauth(service.key, options, profile=active_profile)
-        self.oauth_status_var.set("Not connected")
-        self.load_service_into_form()
+        if not messagebox.askyesno(
+            "Disconnect OAuth",
+            f"Disconnect and revoke OAuth tokens for {service.label} ({active_profile})?",
+            parent=self._window,
+        ):
+            return
+        self._is_disconnecting_oauth = True
+        self.oauth_status_var.set("Disconnecting...")
         self.update_field_states()
-        if self._on_credentials_changed is not None:
-            self._on_credentials_changed()
-        self._status_var.set(f"Disconnected OAuth for {service.label} ({active_profile})")
-        self._on_log(f"Disconnected OAuth tokens for {service.label} ({active_profile}).")
+        self._status_var.set(f"Disconnecting OAuth for {service.label} ({active_profile})...")
+        self._controller.start_oauth_disconnect(
+            service.key,
+            service.label,
+            active_profile,
+            options,
+        )
+
+    def handle_oauth_disconnected(
+        self,
+        service_key: str,
+        service_label: str,
+        profile: str,
+        revoked: bool,
+        auth_exc: Exception | None,
+    ) -> None:
+        """Handle completion of background OAuth 2.0 disconnect/revoke flow."""
+        self._is_disconnecting_oauth = False
+        cur_svc = self.selected_service()
+        cur_prof = normalize_profile_name(self.profile_var.get())
+        if cur_svc is not None and cur_svc.key == service_key and cur_prof == profile:
+            self.load_service_into_form()
+        self.update_field_states()
+        self._notify_credentials_changed(service_key, profile)
+        if auth_exc is not None:
+            self._status_var.set(f"OAuth disconnect failed for {service_label} ({profile})")
+            self._on_log(
+                f"[ERROR] OAuth disconnect failed for {service_label} ({profile}): {auth_exc}"
+            )
+            messagebox.showerror("OAuth Disconnect Failed", str(auth_exc), parent=self._window)
+        else:
+            status_suffix = "" if revoked else " (local token cleared)"
+            self._status_var.set(f"Disconnected OAuth for {service_label} ({profile}){status_suffix}")
+            self._on_log(f"Disconnected OAuth tokens for {service_label} ({profile}).")
 
     def handle_oauth_connected(
         self,
@@ -478,10 +605,12 @@ class ServiceAuthCoordinator:
         self._oauth_cancel_event = None
         if ok:
             self._controller.reload_config()
-        self.load_service_into_form()
+        cur_svc = self.selected_service()
+        cur_prof = normalize_profile_name(self.profile_var.get())
+        if cur_svc is not None and cur_svc.key == service_key and cur_prof == profile:
+            self.load_service_into_form()
         self.update_field_states()
-        if self._on_credentials_changed is not None:
-            self._on_credentials_changed()
+        self._notify_credentials_changed(service_key, profile)
         if auth_exc is not None:
             self._status_var.set(f"OAuth connection failed for {service_label} ({profile})")
             self._on_log(f"[ERROR] OAuth authorization failed for {service_label} ({profile}): {auth_exc}")
@@ -764,7 +893,11 @@ class ServiceAuthPanel(ttk.LabelFrame):
         self.user_entry.grid(row=2, column=1, sticky="ew", padx=(0, 10), pady=(0, 4))
 
         ttk.Label(self, text="Password:").grid(row=2, column=2, sticky="w", padx=(0, 8), pady=(0, 4))
-        self.password_entry = ttk.Entry(self, textvariable=self.password_var, show="*")
+        self.password_entry = ttk.Entry(
+            self,
+            textvariable=self.password_var,
+            show="" if self.show_password_var.get() else "*",
+        )
         self.password_entry.grid(row=2, column=3, sticky="ew", pady=(0, 4))
         self.show_pw_btn = ttk.Checkbutton(
             self,
@@ -840,11 +973,7 @@ class ServiceAuthPanel(ttk.LabelFrame):
         self._coord.select_service_smart()
 
     def on_profile_changed(self, _event: tk.Event | None = None) -> None:
-        normalized = normalize_profile_name(self.profile_var.get())
-        if self.profile_var.get() != normalized:
-            self.profile_var.set(normalized)
-        self.load_service_into_form()
-        self.update_field_states()
+        self._coord.handle_profile_changed()
 
     def on_urls_changed(self, urls: Sequence[str]) -> None:
         self._coord.on_urls_changed(urls)
@@ -918,10 +1047,24 @@ class ServiceAuthPanel(ttk.LabelFrame):
         if supports_oauth:
             self._oauth_row.grid()
             connecting = self._coord._is_connecting_oauth
-            self.oauth_client_entry.configure(state="disabled" if connecting else "normal")
-            self.oauth_connect_btn.configure(state="disabled" if connecting else "normal")
+            disconnecting = self._coord._is_disconnecting_oauth
+            self.oauth_client_entry.configure(
+                state="disabled" if (connecting or disconnecting) else "normal"
+            )
+            if connecting:
+                self.oauth_connect_btn.configure(
+                    text="Cancel OAuth",
+                    command=self._coord.cancel_oauth_connect,
+                    state="normal",
+                )
+            else:
+                self.oauth_connect_btn.configure(
+                    text="Connect OAuth...",
+                    command=self._coord.connect_oauth,
+                    state="disabled" if disconnecting else "normal",
+                )
             self.oauth_disconnect_btn.configure(
-                state="normal" if (oauth_connected and not connecting) else "disabled"
+                state="normal" if (oauth_connected and not connecting and not disconnecting) else "disabled"
             )
         else:
             self._oauth_row.grid_remove()

@@ -11,6 +11,7 @@ from typing import Any, TypeAlias
 class LogEvent:
     level: str
     message: str
+    job_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,12 +53,14 @@ class ItemProgressEvent:
 class ProgressStartEvent:
     description: str
     total: float
+    job_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class ProgressAdvanceEvent:
     completed: float
     total: float
+    job_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,11 +71,12 @@ class ProgressMetricsEvent:
     speed_bps: float
     elapsed_seconds: float
     eta_seconds: float | None
+    job_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class ProgressFinishEvent:
-    pass
+    job_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +85,7 @@ class DownloadEstimateEvent:
     is_exact: bool
     known_files: int
     total_files: int
+    job_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,11 +127,38 @@ class AuthVerifiedEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class AccountsVerificationItemEvent:
+    run_id: int
+    service_key: str
+    profile: str
+    ok: bool
+    error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class AccountsVerificationDoneEvent:
+    run_id: int
+    valid_count: int
+    checked_count: int
+    total_count: int
+    cancelled: bool
+
+
+@dataclass(frozen=True, slots=True)
 class OAuthConnectedEvent:
     service_key: str
     service_label: str
     profile: str
     ok: bool
+    error: Exception | None
+
+
+@dataclass(frozen=True, slots=True)
+class OAuthDisconnectedEvent:
+    service_key: str
+    service_label: str
+    profile: str
+    revoked: bool
     error: Exception | None
 
 
@@ -194,7 +226,10 @@ ControllerEvent: TypeAlias = (
     | PromptChoiceEvent
     | PreviewDoneEvent
     | AuthVerifiedEvent
+    | AccountsVerificationItemEvent
+    | AccountsVerificationDoneEvent
     | OAuthConnectedEvent
+    | OAuthDisconnectedEvent
     | CatalogLoadedEvent
     | FfmpegInstallDoneEvent
     | UpdateCheckedEvent

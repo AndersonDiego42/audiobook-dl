@@ -62,7 +62,7 @@ class _CustomProviderDialog(ModalDialog):
             palette=palette,
             default_size=(480, 250),
             min_size=(420, 220),
-            resizable=(True, False),
+            resizable=(True, True),
         )
         self.result: tuple[str, str, str | None, bool] | None = None
         self._is_edit = existing is not None
@@ -162,6 +162,7 @@ class SettingsPage(ttk.Frame):
         tray_available: bool = False,
         on_toggle_minimize_to_tray: Callable[[], None] | None = None,
         on_theme_changed: Callable[[str], object],
+        on_toggle_notify_on_complete: Callable[[], None] | None = None,
         on_toggle_clipboard_monitor: Callable[[], None],
         on_toggle_check_updates: Callable[[], None] | None = None,
         on_reload_config: Callable[[], None],
@@ -169,6 +170,7 @@ class SettingsPage(ttk.Frame):
         ffmpeg_assistant: FFmpegAssistant,
         abs_config_provider: Callable[[], AudiobookshelfConfig],
         config_location: str | None = None,
+        on_save_abs_config: Callable[..., object] | None = None,
         on_abs_saved: Callable[[AudiobookshelfConfig], None] | None = None,
         custom_providers_provider: Callable[[], Mapping[str, CustomMetadataProviderConfig]] | None = None,
         on_save_custom_provider: Callable[..., object] | None = None,
@@ -180,8 +182,11 @@ class SettingsPage(ttk.Frame):
     ) -> None:
         super().__init__(parent, padding=scale_px(parent, 12))
         self._config_location = config_location
+        self._on_save_abs_config = on_save_abs_config
         self._on_abs_saved = on_abs_saved
         self._abs_config_provider = abs_config_provider
+        self._loading_abs = False
+        self._abs_dirty = False
         self._custom_providers_provider = custom_providers_provider
         self._on_save_custom_provider = on_save_custom_provider
         self._on_delete_custom_provider = on_delete_custom_provider
@@ -211,6 +216,7 @@ class SettingsPage(ttk.Frame):
             self,
             style=style,
             content_padding=(scale_px(self, 2), scale_px(self, 2)),
+            inner_scrollables=lambda: (self._custom_tree,),
         )
         self._scroll.grid(row=1, column=0, sticky="nsew")
         body = self._scroll.content_frame
@@ -239,11 +245,15 @@ class SettingsPage(ttk.Frame):
                 command=_make_theme_cb(mode),
             ).pack(side=tk.LEFT, padx=(0, 12))
 
-        ttk.Checkbutton(
-            app_frame,
-            text="Send OS notification when a download run finishes",
-            variable=notify_on_complete_var,
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 2))
+        notify_kwargs: dict[str, object] = {
+            "text": "Send OS notification when a download run finishes",
+            "variable": notify_on_complete_var,
+        }
+        if on_toggle_notify_on_complete is not None:
+            notify_kwargs["command"] = on_toggle_notify_on_complete
+        ttk.Checkbutton(app_frame, **notify_kwargs).grid(  # type: ignore[arg-type]
+            row=1, column=0, columnspan=2, sticky="w", pady=(6, 2)
+        )
 
         ttk.Checkbutton(
             app_frame,
@@ -308,6 +318,14 @@ class SettingsPage(ttk.Frame):
         self._library_var = tk.StringVar(value=current.library_id or "")
         self._auto_upload_var = tk.BooleanVar(value=bool(current.auto_upload))
         self._auto_scan_var = tk.BooleanVar(value=bool(current.auto_scan))
+        for abs_var in (
+            self._url_var,
+            self._token_var,
+            self._library_var,
+            self._auto_upload_var,
+            self._auto_scan_var,
+        ):
+            abs_var.trace_add("write", lambda *_args: self._mark_abs_dirty())
         self._status_var = tk.StringVar(value="Enter your Audiobookshelf URL and API token.")
 
         ttk.Label(abs_frame, text="Server URL:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
@@ -431,9 +449,11 @@ class SettingsPage(ttk.Frame):
 
         cfg_btns = ttk.Frame(cfg_frame)
         cfg_btns.grid(row=2, column=0, sticky="w")
-        ttk.Button(cfg_btns, text="Reload Config", command=on_reload_config).pack(
-            side=tk.LEFT, padx=(0, 6)
-        )
+        ttk.Button(
+            cfg_btns,
+            text="Reload Config",
+            command=lambda: self._reload_config_and_reset_abs(on_reload_config),
+        ).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(cfg_btns, text="Check for Updates...", command=on_check_updates).pack(
             side=tk.LEFT, padx=(0, 10)
         )
@@ -447,15 +467,28 @@ class SettingsPage(ttk.Frame):
         self._custom_tree.tag_configure("err", foreground=palette.error)
         self._scroll.apply_theme(palette)
 
+    def _mark_abs_dirty(self) -> None:
+        if not self._loading_abs:
+            self._abs_dirty = True
+
+    def _reload_config_and_reset_abs(self, on_reload_config: Callable[[], None]) -> None:
+        self._abs_dirty = False
+        on_reload_config()
+
     def on_show(self) -> None:
         """Refresh FFmpeg, Audiobookshelf, and custom provider values from current config."""
         self._ffmpeg.update_status()
-        current = self._abs_config_provider()
-        self._url_var.set(current.url or "")
-        self._token_var.set(current.api_key or "")
-        self._library_var.set(current.library_id or "")
-        self._auto_upload_var.set(bool(current.auto_upload))
-        self._auto_scan_var.set(bool(current.auto_scan))
+        if not self._abs_dirty:
+            current = self._abs_config_provider()
+            self._loading_abs = True
+            try:
+                self._url_var.set(current.url or "")
+                self._token_var.set(current.api_key or "")
+                self._library_var.set(current.library_id or "")
+                self._auto_upload_var.set(bool(current.auto_upload))
+                self._auto_scan_var.set(bool(current.auto_scan))
+            finally:
+                self._loading_abs = False
         self._refresh_custom_providers()
 
     def _get_custom_providers(self) -> dict[str, CustomMetadataProviderConfig]:
@@ -754,17 +787,27 @@ class SettingsPage(ttk.Frame):
         auto_upload = bool(self._auto_upload_var.get())
         auto_scan = bool(self._auto_scan_var.get())
         try:
-            save_audiobookshelf_config(
-                url=url,
-                library_id=lib_id,
-                api_key=token,
-                auto_upload=auto_upload,
-                auto_scan=auto_scan,
-                overwrite=self._config_location,
-            )
+            if self._on_save_abs_config is not None:
+                self._on_save_abs_config(
+                    url=url,
+                    library_id=lib_id,
+                    api_key=token,
+                    auto_upload=auto_upload,
+                    auto_scan=auto_scan,
+                )
+            else:
+                save_audiobookshelf_config(
+                    url=url,
+                    library_id=lib_id,
+                    api_key=token,
+                    auto_upload=auto_upload,
+                    auto_scan=auto_scan,
+                    overwrite=self._config_location,
+                )
         except Exception as exc:
             messagebox.showerror("Save Error", str(exc), parent=self.winfo_toplevel())
             return
+        self._abs_dirty = False
         updated = AudiobookshelfConfig(
             url=url or None,
             api_key=token or None,

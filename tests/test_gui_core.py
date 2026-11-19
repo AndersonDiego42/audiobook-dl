@@ -1057,14 +1057,14 @@ def test_gui_start_download_validates_ffmpeg_upfront(tmp_path, monkeypatch):
             "audiobookdl.gui.app.messagebox.showinfo",
             lambda title, _msg, parent=None: guidance_calls.append(title),
         )
-        # Cancel in prompt aborts before download starts and opens guidance
+        # Cancel/close-X in prompt aborts before download starts without opening a second guidance dialog
         monkeypatch.setattr(
             "audiobookdl.gui.app.messagebox.askyesnocancel",
             lambda *_a, **_kw: None,
         )
         app.start_download()
         assert not app.is_running
-        assert guidance_calls == ["FFmpeg Setup Guide"]
+        assert guidance_calls == []
 
         # Yes in prompt lets user pick FFmpeg dir and proceeds
         ffmpeg_dir = tmp_path / "ff"
@@ -1723,7 +1723,7 @@ def test_gui_controls_build_options_and_config_loading(tmp_path, monkeypatch):
         app.output_format_var.set("Original")
         split_opts = app.build_options(urls_override=["https://example.com/book"])
         assert split_opts.split_chapters is True
-        assert app.template_preview_var.get().endswith("/01.m4b")
+        assert app.template_preview_var.get().endswith(f"{os.sep}01.m4b")
         monkeypatch.setattr("audiobookdl.gui.app.messagebox.askyesnocancel", lambda *_a, **_kw: False)
         assert app._ffmpeg_assistant.ensure_available(split_opts) is True
 
@@ -2357,7 +2357,7 @@ def test_gui_preview_dialog_enrichment_updates_fields_and_cover(tmp_path):
             asin="B002V5B16O",
         )
 
-        def fake_apply(target: Audiobook, _cand: EnrichmentCandidate):
+        def fake_apply(target: Audiobook, _cand: EnrichmentCandidate, _opts: Any = None):
             target.metadata.narrators = ["Scott Brick"]
             target.metadata.asin = "B002V5B16O"
             target.cover = cover
@@ -2373,7 +2373,7 @@ def test_gui_preview_dialog_enrichment_updates_fields_and_cover(tmp_path):
             skip_downloaded=False,
             series_book_exists=lambda _b: False,
             on_confirm=lambda *_args: None,
-            on_search_enrichment=lambda _b: [candidate],
+            on_search_enrichment=lambda _b, _opts: [candidate],
             on_apply_enrichment=fake_apply,
         )
         fields, cover_updated, chapters_updated = fake_apply(book, candidate)
@@ -3084,10 +3084,9 @@ def test_gui_sync_libraries_and_windows_toast_powershell_preference(tmp_path, mo
 
 @pytest.mark.gui
 def test_gui_queue_title_resolution_and_output_path(tmp_path, monkeypatch):
-    from audiobookdl.gui.controller import GuiLogSink
-    import queue as pyqueue
+    from audiobookdl.gui.controller import ControllerEventQueue, GuiLogSink
 
-    q: pyqueue.Queue[ControllerEvent] = pyqueue.Queue()
+    q = ControllerEventQueue()
     sink = GuiLogSink(q)
     sink.set_active_run_id(4)
     sink.set_active_job_id("job_series")
@@ -4428,13 +4427,14 @@ def test_gui03_accounts_test_all_logins_uses_gui_interaction(tmp_path, monkeypat
         seen_handlers: list[Any] = []
         monkeypatch.setattr(simpledialog, "askstring", lambda *_a, **_kw: "123456")
 
-        def fake_verify(svc_key, _opts, _cfg, *, interaction=None):
+        def fake_verify(svc_key, _opts, _cfg, *, interaction=None, cancel_event=None):
             seen_handlers.append(interaction)
-            assert isinstance(interaction, GuiInteractionHandler)
+            assert interaction is not None
+            assert isinstance(getattr(interaction, "_inner", interaction), GuiInteractionHandler)
             code = interaction.ask_input("2FA Code")
             return svc_key == "storytel" and code == "123456"
 
-        monkeypatch.setattr("audiobookdl.gui.pages.accounts_page.verify_service_auth", fake_verify)
+        monkeypatch.setattr("audiobookdl.gui.controller.verify_service_auth", fake_verify)
         acct_page = app.navigate("accounts")
         acct_page._test_all_logins()
         deadline = time.monotonic() + 3.0
@@ -4982,7 +4982,6 @@ def test_gui_11_controller_fetch_cover_bytes_uses_pooled_session_proxy_and_cap(t
 
 @pytest.mark.gui
 def test_gui_13_catalog_and_accounts_cancel_and_scrollable_router_cleanup(tmp_path):
-    from audiobookdl.gui.pages.accounts_page import AccountsPage
     from audiobookdl.gui.widgets import ScrollableFrame, _SCROLLABLE_TOPLEVEL_ROUTES
 
     try:
@@ -5014,7 +5013,7 @@ def test_gui_13_catalog_and_accounts_cancel_and_scrollable_router_cleanup(tmp_pa
         assert "cancelled" in cat._status_var.get().lower()
 
         # 3. AccountsPage Cancel Test stops remaining verifications
-        apage = AccountsPage(root, app.controller, app._services, app._auth)
+        apage = app.open_accounts()
         checked_services: list[str] = []
         entered = threading.Event()
         release = threading.Event()
@@ -5025,17 +5024,17 @@ def test_gui_13_catalog_and_accounts_cancel_and_scrollable_router_cleanup(tmp_pa
             release.wait(timeout=2.0)
             return True
 
-        with patch("audiobookdl.gui.pages.accounts_page.verify_service_auth", side_effect=_slow_verify):
+        with patch("audiobookdl.gui.controller.verify_service_auth", side_effect=_slow_verify):
             apage._test_all_logins()
             assert entered.wait(timeout=2.0)
             apage._cancel_test_logins()
             release.set()
             deadline = time.monotonic() + 2.0
             while apage._is_testing and time.monotonic() < deadline:
+                app._events.poll_queue()
                 root.update()
                 time.sleep(0.01)
         assert "cancelled" in apage._status_var.get().lower()
-        apage.destroy()
     finally:
         app.controller.shutdown(is_running=False, is_previewing=False)
         root.destroy()
@@ -5657,6 +5656,8 @@ def test_settings_page_custom_providers_ui_and_app_integration(tmp_path, monkeyp
             pass
 
 
+
+
 @pytest.mark.gui
 def test_audit_regressions_queue_reset_pack_keys_sync_mode_filter_and_abs_chapters(tmp_path: Path):
     import json
@@ -5806,6 +5807,8 @@ def test_audit_regressions_queue_reset_pack_keys_sync_mode_filter_and_abs_chapte
             pass
 
 
+
+
 @pytest.mark.gui
 def test_gui_event_driven_idle_poll_wakes_on_bg_task_and_debounces_archive_selection(tmp_path):
     from audiobookdl.gui.pages.archive_tab import ArchiveTab
@@ -5855,6 +5858,8 @@ def test_gui_event_driven_idle_poll_wakes_on_bg_task_and_debounces_archive_selec
                 root.destroy()
         except tk.TclError:
             pass
+
+
 
     # 3. ArchiveTab._on_entry_selected debounces rapid selection switches and skips intermediate walk.
     root2 = tk.Tk()
@@ -5964,6 +5969,8 @@ def test_gui_p2_3_horizontal_scroll_live_system_theme_and_queue_concurrency(tmp_
                 root.destroy()
         except tk.TclError:
             pass
+
+
 
     # 4. GuiController runs queued jobs concurrently when queue_concurrency == 2
     ctrl = GuiController(config_location=str(cfg_path))
@@ -6525,6 +6532,7 @@ def test_gui_skip_unavailable_and_download_size_estimate_displays(tmp_path):
             series_book_exists=lambda _b: False,
             on_confirm=lambda *_a: None,
         )
+        assert dlg._readonly_frame is not None
         labels = [
             str(w.cget("text"))
             for w in dlg._readonly_frame.winfo_children()
@@ -6639,9 +6647,13 @@ def test_gui_oauth_panel_connect_disconnect_and_accounts_status(tmp_path, monkey
         assert app._auth.oauth_status_var.get() == "Connected"
         assert app.saved_badge_var.get() == "Saved"
         accounts.refresh()
-        assert accounts._tree.item("customoauth:default", "values")[5] == "OAuth Connected"
+        assert tree_item_values(accounts._tree, "customoauth:default")[5] == "OAuth Connected"
 
-        # Disconnect OAuth cleanly removes persisted token
+        # Disconnect OAuth prompts confirmation, runs asynchronously via start_oauth_disconnect, and removes token
+        monkeypatch.setattr(
+            "audiobookdl.gui.auth_panel.messagebox.askyesno",
+            lambda *_a, **_kw: True,
+        )
         monkeypatch.setattr(
             app.controller,
             "disconnect_oauth",
@@ -6651,6 +6663,11 @@ def test_gui_oauth_panel_connect_disconnect_and_accounts_status(tmp_path, monkey
             ),
         )
         panel.oauth_disconnect_btn.invoke()
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and app._auth._is_disconnecting_oauth:
+            app._events.poll_queue()
+            root.update()
+            time.sleep(0.01)
         assert app._auth.oauth_status_var.get() == "Not connected"
         assert load_source_oauth_token("customoauth", profile="default", overwrite=str(cfg_path)) is None
     finally:
@@ -6742,6 +6759,1397 @@ def test_gui_custom_bitrate_and_sample_rate_validation_persistence_and_ffmpeg_ch
             app2.controller.shutdown(is_running=False, is_previewing=False)
     finally:
         root2.destroy()
+
+
+@pytest.mark.gui
+def test_aud001_enrichment_builds_options_on_main_thread(tmp_path, monkeypatch):
+    from audiobookdl import Audiobook, AudiobookMetadata
+    from audiobookdl.utils.enrichment import EnrichmentCandidate
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+        try:
+            # Calling build_options off the main thread must fail immediately
+            worker_exc: list[Exception] = []
+
+            def _off_thread_build() -> None:
+                try:
+                    app._options.build_options(urls_override=["https://example.com/book"])
+                except Exception as exc:
+                    worker_exc.append(exc)
+
+            t = threading.Thread(target=_off_thread_build)
+            t.start()
+            t.join(timeout=2.0)
+            assert len(worker_exc) == 1
+            assert isinstance(worker_exc[0], RuntimeError)
+
+            # PreviewCoordinator enrichment snapshots DownloadOptions on main thread before worker
+            observed_threads: dict[str, int] = {}
+            main_ident = threading.get_ident()
+            orig_build = app._options.build_options
+
+            def spy_build(*a, **kw):
+                observed_threads["build_options"] = threading.get_ident()
+                return orig_build(*a, **kw)
+
+            monkeypatch.setattr(app._options, "build_options", spy_build)
+
+            cand = EnrichmentCandidate(provider="audnexus", score=0.95, title="Dune")
+
+            def fake_search(_book, opts):
+                observed_threads["search_worker"] = threading.get_ident()
+                assert opts.urls == ["https://example.com/dune"]
+                return [cand]
+
+            def fake_apply(target, chosen, opts):
+                observed_threads["apply_worker"] = threading.get_ident()
+                assert opts.urls == ["https://example.com/dune"]
+                target.metadata.title = chosen.title
+                return ["title"], False, False
+
+            monkeypatch.setattr(app.controller, "search_enrichment_for_audiobook", fake_search)
+            monkeypatch.setattr(app.controller, "apply_enrichment_candidate", fake_apply)
+
+            class _PickerStub:
+                def __init__(self, *_a, **_kw):
+                    self.selected_candidate = cand
+
+                def destroy(self):
+                    pass
+
+            monkeypatch.setattr("audiobookdl.gui.preview_dialog._EnrichmentPickerDialog", _PickerStub)
+            monkeypatch.setattr(
+                "audiobookdl.gui.preview_dialog.PreviewDialog.wait_window",
+                lambda _self, _win: None,
+            )
+
+            book = Audiobook(
+                session=requests.Session(),
+                metadata=AudiobookMetadata(title="Dune"),
+                files=[],
+            )
+            src = SimpleNamespace(name="Fake", close=lambda: None)
+            dlg = app._preview.show_preview_dialog("https://example.com/dune", src, book)  # type: ignore[arg-type]
+            try:
+                dlg._start_enrichment(book)
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and "apply_worker" not in observed_threads:
+                    root.update()
+                    time.sleep(0.02)
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and "Updated: title" not in dlg._enrich_status_var.get():
+                    root.update()
+                    time.sleep(0.02)
+                assert observed_threads["build_options"] == main_ident
+                assert observed_threads["search_worker"] != main_ident
+                assert observed_threads["apply_worker"] != main_ident
+                assert dlg._enrich_status_var.get() == "Updated: title"
+            finally:
+                if dlg.winfo_exists():
+                    dlg.destroy()
+        finally:
+            app._on_close(force=True)
+    finally:
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
+
+
+
+@pytest.mark.gui
+def test_aud002_tray_queue_dispatch_platform_guards_and_stop_join(tmp_path, monkeypatch):
+    import sys as _sys
+    import types
+    from audiobookdl.gui.tray import TrayIconController, is_tray_supported
+
+    # Platform checks: darwin disabled, headless linux disabled
+    with monkeypatch.context() as mp:
+        mp.setattr("audiobookdl.gui.tray.importlib.util.find_spec", lambda _name: object())
+        mp.setattr(_sys, "platform", "darwin")
+        assert is_tray_supported() is False
+
+        mp.setattr(_sys, "platform", "linux")
+        mp.delenv("DISPLAY", raising=False)
+        mp.delenv("WAYLAND_DISPLAY", raising=False)
+        assert is_tray_supported() is False
+
+        mp.setenv("DISPLAY", ":0")
+        assert is_tray_supported() is True
+
+    # TrayIconController queues actions from background thread without calling root.after()
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+        try:
+            restored: list[int] = []
+            synced: list[int] = []
+            stopped_flag = threading.Event()
+            menu_callbacks: dict[str, Any] = {}
+
+            class _FakeMenu:
+                SEPARATOR = object()
+
+                def __init__(self, *items):
+                    self.items = items
+
+            class _FakeMenuItem:
+                def __init__(self, text, action, default=False):
+                    menu_callbacks[text] = action
+
+            class _FakeIcon:
+                def __init__(self, _name, _image, _tooltip, _menu):
+                    self.visible = False
+
+                def run(self, setup=None):
+                    if setup is not None:
+                        setup(self)
+                    stopped_flag.wait(timeout=2.0)
+
+                def stop(self):
+                    stopped_flag.set()
+
+            fake_pystray = types.SimpleNamespace(
+                Menu=_FakeMenu,
+                MenuItem=_FakeMenuItem,
+                Icon=_FakeIcon,
+            )
+            monkeypatch.setitem(_sys.modules, "pystray", fake_pystray)
+            monkeypatch.setattr(TrayIconController, "is_available", staticmethod(lambda: True))
+
+            tray = TrayIconController(
+                on_restore=lambda: restored.append(threading.get_ident()),
+                on_sync_now=lambda: synced.append(threading.get_ident()),
+                on_exit=lambda: None,
+            )
+            app._window.tray_controller = tray
+            assert tray.start() is True
+            assert tray.is_running is True
+
+            # Trigger tray callbacks from a non-main thread
+            bg = threading.Thread(
+                target=lambda: (
+                    menu_callbacks["Sync Now"](None),
+                    menu_callbacks["Open audiobook-dl"](None),
+                )
+            )
+            bg.start()
+            bg.join(timeout=1.0)
+            assert restored == []
+            assert synced == []
+
+            # EventDispatcher.poll_queue() drains tray actions on the main thread
+            app._events.poll_queue()
+            assert synced == [threading.get_ident()]
+            assert restored == [threading.get_ident()]
+            assert app._events._poll_after_id is not None
+
+            thread_ref = tray._thread
+            tray.stop()
+            assert not tray.is_running
+            assert stopped_flag.is_set()
+            assert thread_ref is not None and not thread_ref.is_alive()
+
+            # Backend error during Icon construction returns False cleanly instead of raising
+            class _BrokenIcon:
+                def __init__(self, *_a):
+                    raise RuntimeError("no dbus")
+
+            fake_pystray.Icon = _BrokenIcon
+            assert tray.start() is False
+            assert tray.is_running is False
+        finally:
+            app._on_close(force=True)
+    finally:
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
+
+
+
+@pytest.mark.gui
+def test_aud003_parallel_workers_state_pause_remove_and_per_job_progress(tmp_path, monkeypatch):
+    from audiobookdl.gui.controller import GuiController
+    from audiobookdl.gui.events import ProgressAdvanceEvent, ProgressMetricsEvent, ProgressStartEvent
+    from audiobookdl.pipeline import DownloadSummary
+
+    ctrl = GuiController(config_location=str(tmp_path / "audiobook-dl.toml"))
+    ctrl.set_queue_concurrency(2)
+
+    j1_started = threading.Event()
+    j2_started = threading.Event()
+    j1_release = threading.Event()
+    j2_release = threading.Event()
+    executed: list[str] = []
+
+    def fake_run_downloads(urls, _opts, _cfg, **_kw):
+        url = urls[0]
+        executed.append(url)
+        if url.endswith("/1"):
+            j1_started.set()
+            j1_release.wait(timeout=3.0)
+        elif url.endswith("/2"):
+            j2_started.set()
+            j2_release.wait(timeout=3.0)
+        return DownloadSummary(completed=1, books_completed=1)
+
+    monkeypatch.setattr("audiobookdl.gui.controller.run_downloads", fake_run_downloads)
+    try:
+        opts = build_default_options(database_directory=str(tmp_path))
+        _run_id, jobs = ctrl.start_new_run(
+            [
+                ("https://example.com/1", opts, None, None),
+                ("https://example.com/2", opts, None, None),
+            ]
+        )
+        for j in jobs:
+            ctrl.register_queue_record(j, "Example")
+
+        assert j1_started.wait(timeout=2.0)
+        assert j2_started.wait(timeout=2.0)
+        # Both jobs are running concurrently; pause_queue must emit Paused for BOTH
+        ctrl.pause_queue()
+        paused_events: list[ControllerEvent] = []
+        ctrl.drain_events(paused_events.append)
+        paused_ids = {
+            ev.job_id for ev in paused_events if isinstance(ev, JobStatusEvent) and ev.status == "Paused"
+        }
+        assert paused_ids == {jobs[0].job_id, jobs[1].job_id}
+
+        ctrl.resume_queue()
+        resumed_events: list[ControllerEvent] = []
+        ctrl.drain_events(resumed_events.append)
+        resumed_ids = {
+            ev.job_id for ev in resumed_events if isinstance(ev, JobStatusEvent) and ev.status == "Running"
+        }
+        assert resumed_ids == {jobs[0].job_id, jobs[1].job_id}
+
+        # Release job 2 first while job 1 is still active -> worker_has_active_run must stay True!
+        j2_release.set()
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and jobs[1].job_id in ctrl.active_job_ids:
+            time.sleep(0.02)
+        assert ctrl.worker_has_active_run is True
+        assert ctrl.has_active_background_tasks() is True
+
+        j1_release.set()
+        events: list[ControllerEvent] = []
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            ctrl.drain_events(events.append)
+            if any(isinstance(ev, RunDoneEvent) for ev in events):
+                break
+            time.sleep(0.02)
+        assert not ctrl.worker_has_active_run
+        assert not ctrl.has_active_background_tasks()
+    finally:
+        j1_release.set()
+        j2_release.set()
+        ctrl.shutdown(is_running=False, is_previewing=False)
+
+    # Paused job popped by a sibling worker must be cleanly cancelled on remove_pending_job
+    ctrl2 = GuiController(config_location=str(tmp_path / "audiobook-dl-2.toml"))
+    ctrl2.set_queue_concurrency(2)
+    gate_a_started = threading.Event()
+    gate_b_started = threading.Event()
+    gate_a_release = threading.Event()
+    gate_b_release = threading.Event()
+    ran_urls2: list[str] = []
+
+    def fake_run2(urls, _opts, _cfg, **_kw):
+        url = urls[0]
+        if url.endswith("/gate-a"):
+            gate_a_started.set()
+            gate_a_release.wait(timeout=3.0)
+        elif url.endswith("/gate-b"):
+            gate_b_started.set()
+            gate_b_release.wait(timeout=3.0)
+        else:
+            ran_urls2.append(url)
+        return DownloadSummary(completed=1, books_completed=1)
+
+    monkeypatch.setattr("audiobookdl.gui.controller.run_downloads", fake_run2)
+    try:
+        opts = build_default_options(database_directory=str(tmp_path))
+        _rid, jobs2 = ctrl2.start_new_run(
+            [
+                ("https://example.com/gate-a", opts, None, None),
+                ("https://example.com/gate-b", opts, None, None),
+                ("https://example.com/paused-sibling", opts, None, None),
+                ("https://example.com/keep", opts, None, None),
+            ]
+        )
+        for j in jobs2:
+            ctrl2.register_queue_record(j, "Example")
+        assert gate_a_started.wait(timeout=2.0)
+        assert gate_b_started.wait(timeout=2.0)
+        ctrl2.pause_queue()
+        gate_b_release.set()
+        # Wait until worker 2 pops jobs2[2] ("paused-sibling") and pauses on it
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and jobs2[2].job_id not in ctrl2.active_job_ids:
+            time.sleep(0.02)
+        assert jobs2[2].job_id in ctrl2.active_job_ids
+        assert jobs2[2].job_id not in ctrl2.running_job_ids
+        removed, new_total, is_running = ctrl2.remove_pending_job(jobs2[2].job_id)
+        assert removed is True
+        assert is_running is False
+        assert new_total == 3
+        assert jobs2[2].job_id in ctrl2.cancelled_job_ids
+
+        gate_a_release.set()
+        ctrl2.resume_queue()
+        events2: list[ControllerEvent] = []
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            ctrl2.drain_events(events2.append)
+            if any(isinstance(ev, RunDoneEvent) for ev in events2):
+                break
+            time.sleep(0.02)
+        assert "https://example.com/paused-sibling" not in ran_urls2
+        assert "https://example.com/keep" in ran_urls2
+    finally:
+        gate_a_release.set()
+        gate_b_release.set()
+        ctrl2.shutdown(is_running=False, is_previewing=False)
+
+    # ActivityQueuePanel tracks independent per-job row progress & aggregate header progress
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "ui.toml"))
+        try:
+            panel = app.download_page.queue_panel
+            inter = GuiInteractionHandler(app.controller.event_queue, app.controller.cancel_event)
+            opts_u = app.build_options(["https://librivox.org/a"])
+            ja = QueuedJob("ja", 1, "https://librivox.org/a", opts_u, inter)
+            jb = QueuedJob("jb", 1, "https://librivox.org/b", opts_u, inter)
+            panel.register_queue_job(ja, persist=False)
+            panel.register_queue_job(jb, persist=False)
+            panel.prepare_run_ui_state(1, 2, "--- Parallel ---")
+
+            panel.handle_activity_event(JobStatusEvent(job_id="ja", status="Running"))
+            panel.handle_activity_event(JobStatusEvent(job_id="jb", status="Running"))
+            panel.handle_activity_event(ProgressStartEvent(description="A", total=100.0, job_id="ja"))
+            panel.handle_activity_event(ProgressStartEvent(description="B", total=100.0, job_id="jb"))
+            panel.handle_activity_event(
+                ProgressMetricsEvent(20.0, 100.0, 200, 100.0, 2.0, 8.0, job_id="ja")
+            )
+            panel.handle_activity_event(
+                ProgressMetricsEvent(80.0, 100.0, 800, 300.0, 2.0, 1.0, job_id="jb")
+            )
+
+            assert "20%" in str(app.queue_tree.set("ja", "detail"))
+            assert "80%" in str(app.queue_tree.set("jb", "detail"))
+            assert app.progress_var.get() == pytest.approx(50.0)
+            assert "50%" in app.metrics_var.get()
+
+            # Finishing ja must NOT freeze jb updates
+            panel.handle_activity_event(JobStatusEvent(job_id="ja", status="Completed", detail="1 ok"))
+            panel._job_progress["jb"].last_row_render_at = 0.0
+            panel.handle_activity_event(ProgressAdvanceEvent(90.0, 100.0, job_id="jb"))
+            assert "90%" in str(app.queue_tree.set("jb", "detail"))
+            assert app.progress_var.get() == pytest.approx(90.0)
+        finally:
+            app._on_close(force=True)
+    finally:
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
+
+
+
+@pytest.mark.gui
+def test_aud004_child_widget_destroy_preserves_automation_timers(tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+        try:
+            app.clipboard_monitor_var.set(True)
+            app._automation.apply_clipboard_monitor(quiet=True, persist=False)
+            app._automation.configure_auto_sync_timer(True, 5)
+            assert app._automation.clipboard_after_id is not None
+            assert app._automation.auto_sync_after_id is not None
+
+            child_top = tk.Toplevel(root)
+            child_top.withdraw()
+            child_menu = tk.Menu(root)
+            root.update()
+            child_top.destroy()
+            child_menu.destroy()
+            root.update()
+
+            assert app._automation.clipboard_after_id is not None
+            assert app._automation.auto_sync_after_id is not None
+        finally:
+            app._on_close(force=True)
+    finally:
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
+
+
+
+@pytest.mark.gui
+def test_aud005_polling_exception_recovery_bounded_queues_and_modal_drain(tmp_path, monkeypatch):
+    from audiobookdl.gui.events import ProgressAdvanceEvent
+    from audiobookdl.gui.widgets import MainThreadCallbackQueue
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+        try:
+            # 1. Unhandled exception in one event does not kill EventDispatcher polling
+            app._runs.is_running = True
+            seen_messages: list[str] = []
+            orig_handle = app._events.handle_event
+
+            def flaky_handle(item: ControllerEvent) -> None:
+                if isinstance(item, LogEvent) and item.message == "explode":
+                    raise RuntimeError("boom")
+                if isinstance(item, LogEvent):
+                    seen_messages.append(item.message)
+                orig_handle(item)
+
+            monkeypatch.setattr(app._events, "handle_event", flaky_handle)
+            app.controller.event_queue.put(LogEvent(level="INFO", message="explode"))
+            app.controller.event_queue.put(JobMetaEvent(job_id="missing", title="sep"))
+            app.controller.event_queue.put(LogEvent(level="INFO", message="recovered"))
+            app._events.poll_queue()
+            assert "recovered" in seen_messages
+            assert app._events._poll_after_id is not None
+            app._runs.is_running = False
+
+            # 2. MainThreadCallbackQueue bounds batch to max_batch, survives callback error,
+            #    and schedules polling on main-thread post() without begin_task()
+            cbq = MainThreadCallbackQueue(root, interval_ms=10, max_batch=3)
+            ran: list[int] = []
+
+            def _bad_cb() -> None:
+                raise RuntimeError("cb boom")
+
+            cbq.post(_bad_cb)
+            for idx in range(5):
+                cbq.post(lambda i=idx: ran.append(i))
+            assert cbq._after_id is not None
+            cbq._poll()
+            # First tick ran at most max_batch=3 items (_bad_cb + 0 + 1) and rescheduled
+            assert ran == [0, 1]
+            assert cbq._after_id is not None
+            cbq._poll()
+            assert ran == [0, 1, 2, 3, 4]
+
+            # 3. ControllerEventQueue stays bounded under flood without dropping critical events
+            q = app.controller.event_queue
+            while not q.empty():
+                q.get_nowait()
+            for i in range(6000):
+                q.put(LogEvent(level="DEBUG", message=f"dbg-{i}"))
+                q.put(ProgressAdvanceEvent(completed=float(i), total=6000.0, job_id="j1"))
+            q.put(JobStatusEvent(job_id="j1", status="Completed", detail="ok"))
+            assert q.qsize() <= 4096 + 4
+
+            drained: list[ControllerEvent] = []
+            while not q.empty():
+                drained.append(q.get_nowait())
+            assert any(
+                isinstance(ev, JobStatusEvent) and ev.job_id == "j1" and ev.status == "Completed"
+                for ev in drained
+            )
+
+            # 4. EventDispatcher continues draining logs WHILE a modal wait_window is open
+            monkeypatch.setattr(app._events, "handle_event", orig_handle)
+            app._events.cancel_poll_timer()
+            holder: dict[str, Any] = {"value": None}
+            done = threading.Event()
+            q.put(
+                PromptChoiceEvent(
+                    title="Modal Drain Test",
+                    choices=("X", "Y"),
+                    default_index=0,
+                    holder=holder,
+                    done=done,
+                )
+            )
+            observed_during_modal: list[bool] = []
+
+            def _wait_and_check(dlg):
+                q.put(LogEvent(level="INFO", message="Drained live inside modal"))
+                deadline = time.monotonic() + 1.5
+                while time.monotonic() < deadline:
+                    root.update()
+                    if "Drained live inside modal" in app.log_text.get("1.0", tk.END):
+                        observed_during_modal.append(True)
+                        break
+                    time.sleep(0.02)
+                dlg.selected_index = 0
+                dlg.destroy()
+
+            monkeypatch.setattr(root, "wait_window", _wait_and_check)
+            app._events.poll_queue()
+            assert observed_during_modal == [True]
+            assert done.is_set()
+        finally:
+            app._on_close(force=True)
+    finally:
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
+
+@pytest.mark.gui
+def test_aud006_preview_dialog_worker_refcount_snapshot_and_subdialog_guards(tmp_path, monkeypatch):
+    from audiobookdl import Audiobook, AudiobookMetadata, Series
+    from audiobookdl.gui.preview_dialog import PreviewDialog
+    from audiobookdl.utils.enrichment import EnrichmentCandidate
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        # 1. Confirm button disabled during enrichment, snapshot mutated off-thread, atomic commit
+        book = Audiobook(
+            session=requests.Session(),
+            metadata=AudiobookMetadata(title="Original Title"),
+            files=[],
+        )
+        closed_count = 0
+
+        class _FakeSrc:
+            name = "Fake"
+            _session = book.session
+
+            def close(self):
+                nonlocal closed_count
+                closed_count += 1
+
+        cand = EnrichmentCandidate(provider="audnexus", score=0.95, title="Enriched Title")
+        apply_started = threading.Event()
+        apply_release = threading.Event()
+        passed_snapshots: list[Audiobook] = []
+
+        def fake_apply(target: Audiobook, _cand: EnrichmentCandidate, _opts: Any):
+            passed_snapshots.append(target)
+            apply_started.set()
+            apply_release.wait(timeout=2.0)
+            target.metadata.title = "Enriched Title"
+            return ["title"], False, False
+
+        class _PickerStub:
+            def __init__(self, *_a, **_kw):
+                self.selected_candidate = cand
+
+            def destroy(self):
+                pass
+
+        monkeypatch.setattr("audiobookdl.gui.preview_dialog._EnrichmentPickerDialog", _PickerStub)
+        monkeypatch.setattr(
+            "audiobookdl.gui.preview_dialog.PreviewDialog.wait_window",
+            lambda _self, _win: None,
+        )
+
+        dlg = PreviewDialog(
+            root,
+            "https://example.com/book",
+            _FakeSrc(),  # type: ignore[arg-type]
+            book,
+            is_running=False,
+            skip_downloaded=False,
+            series_book_exists=lambda _b: False,
+            on_confirm=lambda *_a: None,
+            on_search_enrichment=lambda _b, _opts: [cand],
+            on_apply_enrichment=fake_apply,
+        )
+        try:
+            dlg._start_enrichment(book)
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and not apply_started.is_set():
+                root.update()
+                time.sleep(0.02)
+            assert apply_started.is_set()
+            assert dlg._confirm_btn is not None
+            assert str(dlg._confirm_btn.cget("state")) == "disabled"
+            # Live Audiobook is NOT mutated while _apply_worker is mid-flight
+            assert book.metadata.title == "Original Title"
+            assert passed_snapshots[0] is not book
+
+            # Destroy dialog while worker is active -> source.close() must defer until worker exits!
+            dlg.destroy()
+            assert closed_count == 0
+            apply_release.set()
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and closed_count == 0:
+                time.sleep(0.02)
+            assert closed_count == 1
+        finally:
+            apply_release.set()
+            if dlg.winfo_exists():
+                dlg.destroy()
+
+        # 2. Series sub-dialog deduplication, confirm block while open, and cleanup on parent destroy
+        b1 = Audiobook(
+            session=requests.Session(),
+            metadata=AudiobookMetadata(title="Book 1"),
+            files=[],
+        )
+        series = Series(title="My Series", books=[b1])
+        series_closed = 0
+
+        class _FakeSeriesSrc:
+            name = "FakeSeries"
+
+            def close(self):
+                nonlocal series_closed
+                series_closed += 1
+
+        confirmed: list[Any] = []
+        sdlg = PreviewDialog(
+            root,
+            "https://example.com/series",
+            _FakeSeriesSrc(),  # type: ignore[arg-type]
+            series,
+            is_running=False,
+            skip_downloaded=False,
+            series_book_exists=lambda _b: False,
+            on_confirm=lambda *a: confirmed.append(a),
+        )
+        try:
+            sub1 = sdlg._open_series_book_subdialog(0, b1)
+            sub2 = sdlg._open_series_book_subdialog(0, b1)
+            assert sub1 is sub2
+            assert sub1.winfo_exists()
+
+            info_shown: list[str] = []
+            monkeypatch.setattr(
+                "audiobookdl.gui.preview_dialog.messagebox.showinfo",
+                lambda title, _msg, parent=None: info_shown.append(title),
+            )
+            assert sdlg._confirm_btn is not None
+            sdlg._confirm_btn.invoke()
+            assert info_shown == ["Open Book Preview"]
+            assert confirmed == []
+
+            sdlg.destroy()
+            assert not sub1.winfo_exists()
+            assert series_closed == 1
+        finally:
+            if sdlg.winfo_exists():
+                sdlg.destroy()
+    finally:
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
+
+@pytest.mark.gui
+def test_aud007_job_options_dialog_preserves_tristate_overwrite_and_pack_fields(tmp_path):
+    from audiobookdl.gui.queue_panel import _JobOptionsDialog
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        # 1. Download job with unset overwrite ("Ask" / None) and unset booleans
+        dl_rec = {
+            "job_id": "j1",
+            "job_kind": "download",
+            "profile": "default",
+            "status": "Queued",
+            "job_overrides": {"output_format": "m4b"},
+        }
+        dlg = _JobOptionsDialog(root, dl_rec, profiles=["default", "work"])
+        try:
+            assert dlg._overwrite_var.get() == "Default (inherit)"
+            assert dlg._combine_var.get() == "Default"
+            assert dlg._split_var.get() == "Default"
+            assert dlg._write_abs_var.get() == "Default"
+            assert dlg._upload_abs_var.get() == "Default"
+            dlg._profile_var.set("work")
+            dlg._save()
+            assert dlg.result is not None
+            prof, ov = dlg.result
+            assert prof == "work"
+            assert ov["overwrite"] is None
+            assert ov["combine"] is None
+            assert ov["split_chapters"] is None
+            assert ov["write_abs_metadata"] is None
+            assert ov["upload_to_abs"] is None
+        finally:
+            if dlg.winfo_exists():
+                dlg.destroy()
+
+        # 2. Pack job omits disabled download-only fields
+        pack_rec = {
+            "job_id": "p1",
+            "job_kind": "pack",
+            "status": "Queued",
+            "pack_request": {"paths": [str(tmp_path)], "output_format": "m4b"},
+            "job_overrides": {"output_format": "m4b", "overwrite": True},
+        }
+        pdlg = _JobOptionsDialog(root, pack_rec)
+        try:
+            assert pdlg._overwrite_var.get() == "Overwrite"
+            pdlg._overwrite_var.set("Ask")
+            pdlg._save()
+            assert pdlg.result is not None
+            _pprof, pov = pdlg.result
+            assert pov["overwrite"] is None
+            assert "combine" not in pov
+            assert "split_chapters" not in pov
+            assert "skip_downloaded" not in pov
+            assert "media_type" not in pov
+        finally:
+            if pdlg.winfo_exists():
+                pdlg.destroy()
+    finally:
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
+
+@pytest.mark.gui
+def test_aud008_nested_modal_grab_restore_sizing_and_combobox_escape():
+    from tkinter import ttk
+    from audiobookdl.gui.formatting import parse_geometry
+    from audiobookdl.gui.widgets import ModalDialog
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    try:
+        root.attributes("-alpha", 0.0)
+    except tk.TclError:
+        pass
+    root.geometry("400x300+40+40")
+    root.update_idletasks()
+    try:
+        # Parent modal with intentionally small default_size -> finalize_modal expands to reqheight!
+        parent_dlg = ModalDialog(
+            root,
+            "Parent Modal",
+            default_size=(200, 80),
+            min_size=(180, 70),
+        )
+        tall_frame = ttk.Frame(parent_dlg, width=320, height=220)
+        tall_frame.pack_propagate(False)
+        tall_frame.pack(padx=10, pady=10)
+        cb = ttk.Combobox(tall_frame, values=("One", "Two"), state="readonly")
+        cb.pack(pady=10)
+        parent_dlg.finalize_modal(initial_focus=cb, monitors=[(0, 0, 1280, 800)])
+        root.update_idletasks()
+        parsed = parse_geometry(parent_dlg.geometry())
+        assert parsed is not None
+        assert parsed[0] >= 320
+        assert parsed[1] >= 220
+        assert parent_dlg.grab_current() is parent_dlg
+
+        # Open nested child ModalDialog -> closing child restores grab_set() to parent_dlg
+        child_dlg = ModalDialog(parent_dlg, "Child Modal", default_size=(260, 140))
+        child_entry = ttk.Entry(child_dlg)
+        child_entry.pack(padx=12, pady=12)
+        child_dlg.finalize_modal(initial_focus=child_entry, monitors=[(0, 0, 1280, 800)])
+        assert child_dlg.grab_current() is child_dlg
+
+        child_dlg.destroy()
+        assert not child_dlg.winfo_exists()
+        assert parent_dlg.winfo_exists()
+        assert parent_dlg.grab_current() is parent_dlg
+
+        # Escape while Combobox popdown is posted unposts popdown without closing parent_dlg
+        cb.focus_set()
+        root.tk.call("ttk::combobox::Post", str(cb))
+        root.update()
+        pd = str(root.tk.call("ttk::combobox::PopdownWindow", str(cb)))
+        assert bool(int(root.tk.call("winfo", "ismapped", pd)))
+        assert parent_dlg._is_combobox_popdown_active() is True
+        cb.event_generate("<Escape>")
+        root.update()
+        assert parent_dlg.winfo_exists()
+        assert not bool(int(root.tk.call("winfo", "ismapped", pd)))
+        parent_dlg.destroy()
+    finally:
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
+
+@pytest.mark.gui
+def test_aud009_interaction_release_preregistration_and_shutdown(tmp_path, monkeypatch):
+    from audiobookdl.gui.controller import GuiController, GuiInteractionHandler
+    from audiobookdl.pipeline import DownloadSummary
+
+    ctrl = GuiController(config_location=str(tmp_path / "audiobook-dl.toml"))
+    try:
+        # 1. GuiInteractionHandler never blocks if released concurrently
+        cancel_ev = threading.Event()
+        inter = GuiInteractionHandler(ctrl.event_queue, cancel_ev)
+        inter.release_all()
+        assert inter.confirm("Proceed?") is False
+        assert inter.choose_index("Pick", ["A", "B"]) is None
+        with pytest.raises(DownloadCancelled):
+            inter.ask_input("Code")
+
+        # 2. start_new_run pre-registers queue_records before workers run; update_queue_record returns copy
+        seen_record_in_worker: list[dict[str, Any] | None] = []
+
+        def fake_run_downloads(urls, _opts, _cfg, **_kw):
+            with ctrl.queue_lock:
+                seen_record_in_worker.append(next(iter(ctrl.queue_records.values()), None))
+            return DownloadSummary(completed=1, books_completed=1)
+
+        monkeypatch.setattr("audiobookdl.gui.controller.run_downloads", fake_run_downloads)
+        opts = build_default_options(database_directory=str(tmp_path))
+        _rid, jobs = ctrl.start_new_run(
+            [("https://librivox.org/book-1", opts, None, None)],
+            service_label_resolver=lambda _u: "LibriVox",
+        )
+        assert jobs[0].job_id in ctrl.queue_records
+        assert ctrl.queue_records[jobs[0].job_id]["service"] == "LibriVox"
+
+        updated_copy = ctrl.update_queue_record(jobs[0].job_id, "Running", "ok")
+        assert updated_copy is not None
+        updated_copy["status"] = "MUTATED_OUTSIDE"
+        assert ctrl.queue_records[jobs[0].job_id]["status"] != "MUTATED_OUTSIDE"
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and not seen_record_in_worker:
+            time.sleep(0.02)
+        assert seen_record_in_worker and seen_record_in_worker[0] is not None
+
+        # 3. shutdown() cancels OAuth/sync/preview unconditionally even if is_running=False
+        oauth_cancel = threading.Event()
+        oauth_inter = GuiInteractionHandler(ctrl.event_queue, oauth_cancel)
+        ctrl._register_aux_interaction(oauth_inter, oauth_cancel)
+        ctrl.shutdown(is_running=False, is_previewing=False)
+        assert ctrl.cancel_event.is_set()
+        assert ctrl.preview_cancel_event.is_set()
+        assert oauth_cancel.is_set()
+        assert oauth_inter._released is True
+    finally:
+        ctrl.shutdown(is_running=False, is_previewing=False)
+
+
+@pytest.mark.gui
+def test_aud010_post_exec_startup_trust_and_argv_list_preservation(tmp_path, monkeypatch):
+    from audiobookdl.config import load_config
+
+    trust_file = tmp_path / "trust" / "trusted_post_exec.json"
+    monkeypatch.setattr(
+        "audiobookdl.gui.options_state._post_exec_trust_store_path",
+        lambda: str(trust_file),
+    )
+    cfg_path = tmp_path / "untrusted.toml"
+    cfg_path.write_text(
+        'post_exec = ["my_script.exe", "--flag", "arg with spaces"]\n',
+        encoding="utf-8",
+    )
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        # 1. Untrusted post_exec is NOT loaded silently at startup
+        app = AudiobookDLApp(root, config_location=str(cfg_path))
+        try:
+            assert app.post_exec_var.get() == ""
+            assert app.build_options(urls_override=[]).post_exec is None
+
+            # Declining prompt keeps post_exec disabled
+            monkeypatch.setattr(
+                "audiobookdl.gui.options_state.messagebox.askyesno",
+                lambda *_a, **_kw: False,
+            )
+            app._options.prompt_pending_post_exec()
+            assert app.post_exec_var.get() == ""
+            assert app.build_options(urls_override=[]).post_exec is None
+        finally:
+            app._on_close(force=True)
+    finally:
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
+    # 2. Approving argv list preserves list[str] across build_options, save, and restart without shell=True
+    cfg_path.write_text(
+        'post_exec = ["my_script.exe", "--flag", "arg with spaces"]\n',
+        encoding="utf-8",
+    )
+    root2 = tk.Tk()
+    root2.withdraw()
+    try:
+        app2 = AudiobookDLApp(root2, config_location=str(cfg_path))
+        try:
+            monkeypatch.setattr(
+                "audiobookdl.gui.options_state.messagebox.askyesno",
+                lambda *_a, **_kw: True,
+            )
+            app2._options.prompt_pending_post_exec()
+            assert app2.post_exec_var.get().startswith("[argv, shell=False] ")
+            opts2 = app2.build_options(urls_override=["https://example.com/b"])
+            assert opts2.post_exec == ["my_script.exe", "--flag", "arg with spaces"]
+            assert trust_file.is_file()
+        finally:
+            app2._on_close(force=True)
+    finally:
+        try:
+            if root2.winfo_exists():
+                root2.destroy()
+        except tk.TclError:
+            pass
+
+    # Saved TOML keeps list[str] intact (never flattened to str), and trusted launch loads automatically
+    reloaded = load_config(str(cfg_path))
+    assert reloaded.post_exec == ["my_script.exe", "--flag", "arg with spaces"]
+
+    root3 = tk.Tk()
+    root3.withdraw()
+    try:
+        app3 = AudiobookDLApp(root3, config_location=str(cfg_path))
+        try:
+            assert app3._options._pending_untrusted_post_exec is None
+            assert app3.build_options(urls_override=[]).post_exec == [
+                "my_script.exe",
+                "--flag",
+                "arg with spaces",
+            ]
+        finally:
+            app3._on_close(force=True)
+    finally:
+        try:
+            if root3.winfo_exists():
+                root3.destroy()
+        except tk.TclError:
+            pass
+
+
+@pytest.mark.gui
+def test_aud011_accounts_verification_cancel_prefix_cache_and_cookie_refresh(tmp_path, monkeypatch):
+    from audiobookdl.gui.app import AudiobookDLApp
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    cfg_path.write_text(
+        '[sources.bookbeat]\nusername = "alice"\n[sources.storytel]\nusername = "bob"\n',
+        encoding="utf-8",
+    )
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    app = AudiobookDLApp(root, config_location=str(cfg_path))
+    try:
+        gate = threading.Event()
+        prompts_seen: list[str] = []
+
+        def fake_verify(svc_key, opts, cfg, *, interaction=None, persist_cookies=True, cancel_event=None):
+            if svc_key == "storytel":
+                assert interaction is not None
+                prompts_seen.append(interaction._prefixed("OTP code"))
+                gate.wait(timeout=15.0)
+                return False
+            return True
+
+        monkeypatch.setattr("audiobookdl.gui.controller.verify_service_auth", fake_verify)
+
+        acct_page = app.open_accounts()
+        t0 = time.monotonic()
+        acct_page._test_all_logins()
+        assert acct_page._is_testing is True
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            app._events.poll_queue()
+            if ("bookbeat", "default") in acct_page._verification_cache:
+                break
+            root.update()
+            time.sleep(0.01)
+        assert acct_page._verification_cache[("bookbeat", "default")] == ("Valid", "ok")
+        assert any("[Storytel" in p for p in prompts_seen)
+
+        acct_page._cancel_test_logins()
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and acct_page._is_testing:
+            app._events.poll_queue()
+            root.update()
+            time.sleep(0.01)
+        elapsed = time.monotonic() - t0
+        assert not acct_page._is_testing
+        assert elapsed < 3.0
+        gate.set()
+
+        acct_page.refresh()
+        vals = tree_item_values(acct_page._tree, "bookbeat:default")
+        assert vals[5] == "Valid"
+        acct_page.invalidate_verification("storytel", "default")
+        assert ("bookbeat", "default") in acct_page._verification_cache
+
+        app.remember_login_var.set(False)
+        refreshes: list[bool] = []
+        orig_refresh = acct_page.refresh
+        acct_page.refresh = lambda: (refreshes.append(True), orig_refresh())[1]  # type: ignore[method-assign]
+        app._auth.on_cookies_imported("libro.fm", str(tmp_path / "cookies.txt"), 3)
+        assert len(refreshes) == 1
+        assert ("bookbeat", "default") in acct_page._verification_cache
+    finally:
+        app._on_close(force=True)
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
+
+@pytest.mark.gui
+def test_aud012_settings_abs_lock_dirty_scroll_and_notify_persist(tmp_path):
+    from audiobookdl.gui.app import AudiobookDLApp
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    cfg_path.write_text(
+        '[audiobookshelf]\nurl = "http://abs.local:13378"\n',
+        encoding="utf-8",
+    )
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    app = AudiobookDLApp(root, config_location=str(cfg_path))
+    try:
+        settings_page = app.navigate("settings")
+        assert settings_page._scroll._inner_scrollables is not None
+        assert settings_page._scroll._inner_scrollables() == (settings_page._custom_tree,)
+
+        settings_page._url_var.set("http://edited.local:8080")
+        assert settings_page._abs_dirty is True
+        app.navigate("download")
+        app.navigate("settings")
+        assert settings_page._url_var.get() == "http://edited.local:8080"
+
+        settings_page._token_var.set("secret-tok")
+        settings_page._library_var.set("lib-1")
+        settings_page._save()
+        assert not settings_page._abs_dirty
+        assert app.controller.config_snapshot().audiobookshelf.url == "http://edited.local:8080"
+        assert app.controller.config_snapshot().audiobookshelf.library_id == "lib-1"
+
+        app.notify_on_complete_var.set(False)
+        app._toggle_notify_on_complete()
+        assert app.controller.config_snapshot().gui.notify_on_complete is False
+    finally:
+        app._on_close(force=True)
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
+
+@pytest.mark.gui
+def test_aud013_oauth_cancel_async_disconnect_profile_focusout_and_cookie_dialog(tmp_path, monkeypatch):
+    from audiobookdl.gui.app import AudiobookDLApp
+    from audiobookdl.gui.cookie_dialog import CookieImportDialog, default_imported_cookie_path
+    from audiobookdl.sources import ServiceInfo
+
+    svc_oauth = ServiceInfo(
+        key="customoauth",
+        label="CustomOAuth",
+        auth_methods=("oauth", "login"),
+        login_fields=("username", "password"),
+    )
+    svc_cookie_a = ServiceInfo(
+        key="storytel",
+        label="Storytel",
+        auth_methods=("cookies", "login"),
+        login_fields=("username", "password"),
+    )
+    svc_cookie_b = ServiceInfo(
+        key="audiobooks.com",
+        label="audiobooks.com",
+        auth_methods=("cookies",),
+        login_fields=(),
+    )
+    svc_free = ServiceInfo(key="librivox", label="Librivox", auth_methods=(), login_fields=())
+    monkeypatch.setattr(
+        "audiobookdl.gui.app.get_available_services",
+        lambda: [svc_free, svc_oauth, svc_cookie_a, svc_cookie_b],
+    )
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    app = AudiobookDLApp(root, config_location=str(cfg_path))
+    try:
+        app.show_password_var.set(True)
+        acct_page = app.open_accounts()
+        panel = acct_page.auth_panel
+        assert str(panel.password_entry.cget("show")) == ""
+
+        app._auth.select_service_profile("customoauth", "default")
+        app.username_var.set("unsaved_user")
+        panel.on_profile_changed()
+        assert app.username_var.get() == "unsaved_user"
+
+        oauth_ev = threading.Event()
+        monkeypatch.setattr(
+            app.controller,
+            "start_oauth_connect",
+            lambda *_a, **_kw: oauth_ev,
+        )
+        app._auth.connect_oauth()
+        assert panel.oauth_connect_btn.cget("text") == "Cancel OAuth"
+        assert str(panel.oauth_connect_btn.cget("state")) == "normal"
+        panel.oauth_connect_btn.invoke()
+        assert oauth_ev.is_set()
+
+        app._auth.select_service_profile("librivox", "default")
+        app.username_var.set("keep_me")
+        monkeypatch.setattr(
+            "audiobookdl.gui.auth_panel.messagebox.showinfo",
+            lambda *_a, **_kw: None,
+        )
+        app._auth.handle_oauth_connected("customoauth", "CustomOAuth", "default", True, None)
+        assert app.username_var.get() == "keep_me"
+
+        dlg = CookieImportDialog(
+            root,
+            app._services,
+            initial_service_key="storytel",
+            on_apply=lambda *_a: None,
+            browser_detector=lambda: {"firefox": True},
+        )
+        dlg._on_output_edited()
+        assert dlg._custom_output_path is False
+        dlg.select_service("audiobooks.com")
+        assert dlg._output_var.get() == default_imported_cookie_path("audiobooks.com")
+        dlg.destroy()
+    finally:
+        app._on_close(force=True)
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
+
+@pytest.mark.gui
+def test_aud014_close_cleanup_tray_exit_zoomed_and_unattended_sync(tmp_path, monkeypatch):
+    from audiobookdl.gui.app import AudiobookDLApp
+    from audiobookdl.sync import SyncCycleResult
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    app = AudiobookDLApp(root, config_location=str(cfg_path))
+    try:
+        app._window.normal_geometry = "800x600+20+20"
+        monkeypatch.setattr(app._window, "is_window_maximized", lambda: True)
+        app._window.on_root_configure(type("Ev", (), {"widget": app.root})())
+        assert app._window.is_maximized is True
+        assert app._window.normal_geometry == "800x600+20+20"
+
+        modal_calls: list[str] = []
+        toast_calls: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            "audiobookdl.gui.sync_coordinator.messagebox.showinfo",
+            lambda *a, **kw: modal_calls.append("info"),
+        )
+        monkeypatch.setattr(
+            "audiobookdl.gui.sync_coordinator.send_os_notification_async",
+            lambda title, msg: toast_calls.append((title, msg)),
+        )
+        app._sync._last_sync_unattended = True
+        cycle = SyncCycleResult(books_discovered=2, newly_added=1, downloaded=1, skipped=1, failed=0)
+        app._sync.handle_sync_done(cycle, None)
+        assert modal_calls == []
+        assert len(toast_calls) == 1
+
+        monkeypatch.setattr(type(app.controller), "is_uploading_abs", property(lambda _self: True))
+        assert app._has_active_background_operations() is True
+        monkeypatch.setattr(app._window, "collect_geometry_snapshot", lambda: (_ for _ in ()).throw(tk.TclError("bad window")))
+        app._on_close(force=True)
+        try:
+            destroyed = not root.winfo_exists()
+        except tk.TclError:
+            destroyed = True
+        assert destroyed
+    finally:
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
+
+@pytest.mark.gui
+def test_aud015_cross_page_validation_state_and_helpers(tmp_path):
+    from audiobookdl.gui.formatting import clamp_geometry_to_monitors
+    from audiobookdl.gui.options_state import _join_output_template
+    from audiobookdl.gui.widgets import ScrolledTreeview, TreeColumnSpec
+    from audiobookdl.gui.app import AudiobookDLApp
+    from audiobookdl.pack import PackBookSpec, PackOverrides
+    from audiobookdl.utils.audiobook import Audiobook, AudiobookMetadata, BookId, Series
+
+    assert clamp_geometry_to_monitors("300x220+10+10", [(0, 0, 1280, 800)], min_width=240, min_height=180) == "300x220+10+10"
+
+    joined = _join_output_template(str(tmp_path), "/{series}/{title}")
+    assert joined.startswith(str(tmp_path))
+    assert ("/" not in joined[len(str(tmp_path)) :]) if os.sep == "\\" else True
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    app = AudiobookDLApp(root, config_location=str(cfg_path))
+    try:
+        dl_page = app.download_page
+        qp = dl_page.queue_panel
+        qp.set_previewing_state(False, is_running=True)
+        assert qp.download_btn.cget("text") == "Add to Queue"
+        assert str(qp.download_btn.cget("state")) == "normal"
+
+        st = ScrolledTreeview(
+            root,
+            (TreeColumnSpec("title", "Title", width=120), TreeColumnSpec("num", "Num", width=60, sort_kind="number")),
+        )
+        st.tree.insert("", tk.END, iid="r1", values=("Alpha", "10"))
+        st.tree.insert("", tk.END, iid="r2", values=("Beta", "-"))
+        st.tree.insert("", tk.END, iid="r3", values=("Gamma", "2"))
+        st.sort_by_column("num", descending=True)
+        assert list(st.tree.get_children()) == ["r1", "r3", "r2"]
+        st.destroy()
+
+        app.split_chapters_var.set(True)
+        app.m4b_var.set(True)
+        app._options.on_m4b_toggled()
+        assert app.split_chapters_var.get() is False
+        assert app.combine_var.get() is True
+        cfg_path.write_text("[gui]\nqueue_concurrency = 3\n", encoding="utf-8")
+        app._options.reload_config()
+        assert app.controller.queue_concurrency == 3
+
+        pack_page = app.navigate("pack")
+        spec = PackBookSpec(
+            source_root=str(tmp_path / "book1"),
+            track_paths=[str(tmp_path / "book1" / "01.mp3")],
+            audiobook=Audiobook(
+                session=None,  # type: ignore[arg-type]
+                files=[],
+                metadata=AudiobookMetadata(title="Book 1"),
+            ),
+            output_format="m4b",
+            output_path=str(tmp_path / "Book 1.m4b"),
+        )
+        pack_page._preview_specs = [spec]
+        bkey = pack_page._spec_key(spec)
+        pack_page._book_overrides_by_key[bkey] = {"authors": [], "series_order": None}
+        merged = pack_page._merge_book_overrides(PackOverrides(authors=["Base Author"], series_order=5), 0)
+        assert merged is not None
+        assert merged.authors == []
+        assert merged.series_order is None
+
+        from audiobookdl.gui.preview_dialog import PreviewDialog
+
+        class _DummySrc:
+            name = "Dummy"
+
+            def close(self) -> None:
+                pass
+
+        series_res = Series(
+            title="S",
+            books=[
+                BookId(id="a", title="Book Z"),
+                BookId(id="b", title="Book A"),
+                BookId(id="c", title="Book M"),
+            ],
+        )
+        pdlg = PreviewDialog(
+            root,
+            "https://example.com/s",
+            _DummySrc(),  # type: ignore[arg-type]
+            series_res,
+            is_running=False,
+            skip_downloaded=False,
+            series_book_exists=lambda _b: False,
+            on_confirm=lambda *_a: None,
+        )
+        assert pdlg._tree is not None
+        pdlg._tree.move("1", "", 0)
+        pdlg._tree.move("2", "", 1)
+        pdlg._tree.move("0", "", 2)
+        for v in pdlg._check_vars:
+            v.set(False)
+        pdlg._check_vars[1].set(True)
+        pdlg._toggle_series_item(1, False)
+        pdlg._check_vars[2].set(True)
+        pdlg._toggle_series_item(2, True)
+        assert [v.get() for v in pdlg._check_vars] == [False, True, True]
+        pdlg.destroy()
+    finally:
+        app._on_close(force=True)
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
 
 
 

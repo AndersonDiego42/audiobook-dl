@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
+import logging as stdlib_logging
 import tkinter as tk
 from tkinter import messagebox, simpledialog
 from typing import TYPE_CHECKING, Any
@@ -11,6 +12,8 @@ from typing import TYPE_CHECKING, Any
 from audiobookdl.gui.controller import GuiController
 from audiobookdl.gui.events import (
     AbsUploadDoneEvent,
+    AccountsVerificationDoneEvent,
+    AccountsVerificationItemEvent,
     AuthVerifiedEvent,
     BatchItemEvent,
     CatalogLoadedEvent,
@@ -23,6 +26,7 @@ from audiobookdl.gui.events import (
     LogBatchEvent,
     LogEvent,
     OAuthConnectedEvent,
+    OAuthDisconnectedEvent,
     PreviewDoneEvent,
     ProgressAdvanceEvent,
     ProgressFinishEvent,
@@ -69,12 +73,15 @@ class EventDispatcher:
         on_preview_done: Callable[[str, tuple[Source, Result] | None, Exception | None], None],
         on_auth_verified: Callable[[str, bool, Exception | None], None],
         on_oauth_connected: Callable[[str, str, str, bool, Exception | None], None] | None = None,
+        on_oauth_disconnected: Callable[[str, str, str, bool, Exception | None], None] | None = None,
         on_ffmpeg_install_done: Callable[[bool, str], None],
         on_sync_done: Callable[[Any, Exception | None], None],
         on_sync_enqueue_ready: Callable[
             [Sequence[tuple[str, str, list[str]]], dict[str, Any], Exception | None], None
         ],
         on_run_done: Callable[[DownloadSummary | None, Exception | None], None],
+        is_tray_running_provider: Callable[[], bool] | None = None,
+        drain_tray_actions: Callable[[], int] | None = None,
     ) -> None:
         self._root = root
         self._controller = controller
@@ -90,10 +97,13 @@ class EventDispatcher:
         self._on_preview_done = on_preview_done
         self._on_auth_verified = on_auth_verified
         self._on_oauth_connected = on_oauth_connected
+        self._on_oauth_disconnected = on_oauth_disconnected
         self._on_ffmpeg_install_done = on_ffmpeg_install_done
         self._on_sync_done = on_sync_done
         self._on_sync_enqueue_ready = on_sync_enqueue_ready
         self._on_run_done = on_run_done
+        self._is_tray_running_provider = is_tray_running_provider
+        self._drain_tray_actions = drain_tray_actions
 
         self._pending_log_entries: deque[tuple[str | None, str]] = deque(
             maxlen=ActivityQueuePanel.MAX_LOG_LINES
@@ -201,6 +211,28 @@ class EventDispatcher:
         except tk.TclError:
             self._poll_after_id = None
 
+    def _log_dispatch_error(self, context: str, exc: Exception) -> None:
+        stdlib_logging.getLogger(__name__).exception("Unhandled error in %s", context, exc_info=exc)
+        try:
+            self.append_log(f"[ERROR] Dispatch error ({context}): {exc}", level="ERROR")
+        except Exception:
+            pass
+
+    def _safe_handle_event(self, item: ControllerEvent) -> None:
+        try:
+            self.handle_event(item)
+        except Exception as exc:
+            self._log_dispatch_error(type(item).__name__, exc)
+
+    def _run_modal_with_polling(self, fn: Callable[[], object]) -> None:
+        was_active = self._modal_prompt_active
+        self._modal_prompt_active = True
+        self.schedule_poll_soon(50)
+        try:
+            fn()
+        finally:
+            self._modal_prompt_active = was_active
+
     def poll_queue(self) -> None:
         self._poll_after_id = None
         try:
@@ -208,27 +240,56 @@ class EventDispatcher:
                 return
         except tk.TclError:
             return
-        processed = self._controller.drain_events(
-            self.handle_event,
-            max_batch=self._controller.MAX_QUEUE_BATCH,
-        )
-        while not self._modal_prompt_active and self._deferred_modal_events:
-            self.handle_event(self._deferred_modal_events.popleft())
-        if self._is_running_provider():
-            dl_page = self._shell.get_page("download")
-            if dl_page is not None:
-                dl_page.queue_panel.update_metrics_display(is_running=True)
-        if processed >= self._controller.MAX_QUEUE_BATCH:
-            self.schedule_poll_soon(10)
-        elif (
-            self._is_running_provider()
-            or self._is_previewing_provider()
-            or self._is_syncing_provider()
-            or self._controller.has_active_background_tasks()
-            or bool(self._deferred_modal_events)
-            or not self._controller.event_queue.empty()
-        ):
-            self.schedule_poll_soon(50)
+
+        processed = 0
+        try:
+            processed = self._controller.drain_events(
+                self._safe_handle_event,
+                max_batch=self._controller.MAX_QUEUE_BATCH,
+            )
+            while not self._modal_prompt_active and self._deferred_modal_events:
+                self._safe_handle_event(self._deferred_modal_events.popleft())
+            if (
+                self._is_tray_running_provider is not None
+                and self._is_tray_running_provider()
+                and self._drain_tray_actions is not None
+            ):
+                try:
+                    self._drain_tray_actions()
+                except Exception as exc:
+                    self._log_dispatch_error("tray actions", exc)
+            if self._is_running_provider():
+                dl_page = self._shell.get_page("download")
+                if dl_page is not None:
+                    try:
+                        dl_page.queue_panel.update_metrics_display(is_running=True)
+                    except Exception as exc:
+                        self._log_dispatch_error("metrics update", exc)
+        finally:
+            try:
+                if self._root.winfo_exists():
+                    tray_running = (
+                        self._is_tray_running_provider is not None
+                        and self._is_tray_running_provider()
+                    )
+                    if processed >= self._controller.MAX_QUEUE_BATCH:
+                        self.schedule_poll_soon(10)
+                    elif (
+                        self._modal_prompt_active
+                        or self._is_running_provider()
+                        or self._is_previewing_provider()
+                        or self._is_syncing_provider()
+                        or self._controller.has_active_background_tasks()
+                        or bool(self._deferred_modal_events)
+                        or not self._controller.event_queue.empty()
+                    ):
+                        self.schedule_poll_soon(50)
+                    elif tray_running:
+                        self.schedule_poll_soon(250)
+                    else:
+                        self.cancel_poll_timer()
+            except tk.TclError:
+                pass
 
     def cancel_poll_timer(self) -> None:
         after_id = getattr(self, "_poll_after_id", None)
@@ -267,6 +328,7 @@ class EventDispatcher:
                 self._deferred_modal_events.append(item)
                 return
             self._modal_prompt_active = True
+            self.schedule_poll_soon(50)
             try:
                 if isinstance(item, PromptInputEvent):
                     item.holder["value"] = simpledialog.askstring(
@@ -275,12 +337,10 @@ class EventDispatcher:
                         show="*" if item.hidden else None,
                         parent=self._root,
                     )
-                    item.done.set()
                 elif isinstance(item, PromptConfirmEvent):
                     item.holder["value"] = messagebox.askyesno(
                         "Confirm", item.message, parent=self._root
                     )
-                    item.done.set()
                 elif isinstance(item, PromptChoiceEvent):
                     dlg = ChoiceDialog(
                         self._root,
@@ -291,13 +351,33 @@ class EventDispatcher:
                     )
                     self._root.wait_window(dlg)
                     item.holder["value"] = dlg.selected_index
-                    item.done.set()
             finally:
+                item.done.set()
                 self._modal_prompt_active = False
         elif isinstance(item, PreviewDoneEvent):
             self._on_preview_done(item.url, item.prepared, item.error)
         elif isinstance(item, AuthVerifiedEvent):
             self._on_auth_verified(item.service_label, item.ok, item.error)
+        elif isinstance(item, AccountsVerificationItemEvent):
+            acct_page = self._shell.get_page("accounts")
+            if acct_page is not None:
+                acct_page.handle_verification_item(
+                    item.run_id,
+                    item.service_key,
+                    item.profile,
+                    item.ok,
+                    item.error,
+                )
+        elif isinstance(item, AccountsVerificationDoneEvent):
+            acct_page = self._shell.get_page("accounts")
+            if acct_page is not None:
+                acct_page.handle_verification_done(
+                    item.run_id,
+                    item.valid_count,
+                    item.checked_count,
+                    item.total_count,
+                    item.cancelled,
+                )
         elif isinstance(item, OAuthConnectedEvent):
             if self._on_oauth_connected is not None:
                 self._on_oauth_connected(
@@ -305,6 +385,15 @@ class EventDispatcher:
                     item.service_label,
                     item.profile,
                     item.ok,
+                    item.error,
+                )
+        elif isinstance(item, OAuthDisconnectedEvent):
+            if self._on_oauth_disconnected is not None:
+                self._on_oauth_disconnected(
+                    item.service_key,
+                    item.service_label,
+                    item.profile,
+                    item.revoked,
                     item.error,
                 )
         elif isinstance(item, CatalogLoadedEvent):
@@ -321,7 +410,9 @@ class EventDispatcher:
                 first_line = err_text.splitlines()[0].strip()
                 catalog_tab.set_error_status(f"Error: {first_line}")
                 self.append_log(f"[ERROR] Catalog fetch failed: {err_text}")
-                messagebox.showerror("Catalog Error", err_text, parent=self._root)
+                self._run_modal_with_polling(
+                    lambda: messagebox.showerror("Catalog Error", err_text, parent=self._root)
+                )
             else:
                 if isinstance(item.payload, tuple) and len(item.payload) == 2:
                     books, statuses = item.payload
@@ -343,14 +434,21 @@ class EventDispatcher:
             else:
                 self._status_var.set("Audiobookshelf upload failed")
                 self.append_log(f"[ERROR] Audiobookshelf upload failed: {item.error_message}")
-                messagebox.showerror(
-                    "Audiobookshelf Upload Failed",
-                    str(item.error_message),
-                    parent=self._root,
+                self._run_modal_with_polling(
+                    lambda: messagebox.showerror(
+                        "Audiobookshelf Upload Failed",
+                        str(item.error_message),
+                        parent=self._root,
+                    )
                 )
         elif isinstance(item, RunDoneEvent):
             dl_page = self._shell.get_page("download")
-            if dl_page is None or item.run_id == dl_page.queue_panel.current_ui_run_id:
+            expected_run_id = (
+                dl_page.queue_panel.current_ui_run_id
+                if dl_page is not None
+                else self._controller.latest_run_id()
+            )
+            if item.run_id == expected_run_id:
                 self._on_run_done(item.summary, item.error)
 
     def schedule_update_check(self) -> None:
@@ -368,10 +466,12 @@ class EventDispatcher:
         if info is None:
             if interactive:
                 self._status_var.set("Update check failed")
-                messagebox.showwarning(
-                    "Update Check",
-                    "Could not reach update server to check for new releases.",
-                    parent=self._root,
+                self._run_modal_with_polling(
+                    lambda: messagebox.showwarning(
+                        "Update Check",
+                        "Could not reach update server to check for new releases.",
+                        parent=self._root,
+                    )
                 )
             return
         if info.has_update:
@@ -383,11 +483,15 @@ class EventDispatcher:
             self._status_var.set(f"Update available: v{info.latest_version}")
             self.append_log(f"Update available: v{info.latest_version} ({info.release_url})")
             if interactive:
-                messagebox.showinfo("Update Available", msg, parent=self._root)
+                self._run_modal_with_polling(
+                    lambda: messagebox.showinfo("Update Available", msg, parent=self._root)
+                )
         elif interactive:
             self._status_var.set(f"Up to date (v{info.current_version})")
-            messagebox.showinfo(
-                "Up to Date",
-                f"You are running the latest version (v{info.current_version}).",
-                parent=self._root,
+            self._run_modal_with_polling(
+                lambda: messagebox.showinfo(
+                    "Up to Date",
+                    f"You are running the latest version (v{info.current_version}).",
+                    parent=self._root,
+                )
             )

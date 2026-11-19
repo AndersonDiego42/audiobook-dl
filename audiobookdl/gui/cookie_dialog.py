@@ -89,7 +89,6 @@ class CookieImportDialog(ModalDialog):
 
         self._matched_cookies: list[http.cookiejar.Cookie] = []
         self._is_scanning = False
-        self._custom_output_path = bool(initial_cookie_path.strip())
         self._cb_queue = MainThreadCallbackQueue(self)
 
         self._browser_key_by_display: dict[str, str] = {}
@@ -116,10 +115,11 @@ class CookieImportDialog(ModalDialog):
             else ""
         )
         self._domains_var = tk.StringVar(value=initial_domains)
-        default_path = (
-            initial_cookie_path.strip()
-            if initial_cookie_path.strip()
-            else (default_imported_cookie_path(initial_service.key) if initial_service else "")
+        auto_default_path = default_imported_cookie_path(initial_service.key) if initial_service else ""
+        default_path = initial_cookie_path.strip() or auto_default_path
+        self._last_auto_output_path = auto_default_path
+        self._custom_output_path = bool(
+            initial_cookie_path.strip() and initial_cookie_path.strip() != auto_default_path
         )
         self._output_var = tk.StringVar(value=default_path)
         self._status_var = tk.StringVar(
@@ -207,16 +207,32 @@ class CookieImportDialog(ModalDialog):
     def _selected_browser_key(self) -> str:
         return self._browser_key_by_display.get(self._browser_var.get(), "firefox")
 
+    def select_service(self, service_key: str) -> None:
+        """Select `service_key` programmatically and refresh domains, output path, and preview."""
+        service = self._services_by_key.get(service_key)
+        if service is None:
+            return
+        self._service_var.set(service.label)
+        self._on_service_changed()
+
     def _on_output_edited(self, _event: tk.Event | None = None) -> None:
-        self._custom_output_path = True
+        current = self._output_var.get().strip()
+        self._custom_output_path = bool(current and current != self._last_auto_output_path)
 
     def _on_service_changed(self, _event: tk.Event | None = None) -> None:
         service = self._current_service()
         if service is None:
             return
         self._domains_var.set(", ".join(default_domains_for_service(service.key)))
-        if not self._custom_output_path or not self._output_var.get().strip():
-            self._output_var.set(default_imported_cookie_path(service.key))
+        current_output = self._output_var.get().strip()
+        is_custom = bool(current_output and current_output != self._last_auto_output_path)
+        new_auto_path = default_imported_cookie_path(service.key)
+        self._last_auto_output_path = new_auto_path
+        if not is_custom:
+            self._custom_output_path = False
+            self._output_var.set(new_auto_path)
+        else:
+            self._custom_output_path = True
         self._clear_preview()
         self._set_status(
             "Service changed. Click 'Scan Browser' to look for matching cookies.",

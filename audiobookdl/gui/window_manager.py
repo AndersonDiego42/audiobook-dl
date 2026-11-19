@@ -246,6 +246,7 @@ class WindowManager:
         on_sync_now: Callable[[], None],
         on_exit: Callable[[], None],
         on_theme_applied: Callable[[ThemePalette], None],
+        on_tray_started: Callable[[], None] | None = None,
     ) -> None:
         self._root = root
         self._controller = controller
@@ -254,6 +255,7 @@ class WindowManager:
         self._status_var = status_var
         self._minimize_to_tray_var = minimize_to_tray_var
         self._on_theme_applied = on_theme_applied
+        self._on_tray_started = on_tray_started
 
         self.normal_geometry: str | None = None
         self.is_maximized = False
@@ -268,7 +270,6 @@ class WindowManager:
         self.about_dialog: AboutDialog | None = None
 
         self.tray_controller = TrayIconController(
-            dispatch=lambda cb: self._root.after(0, cb),
             on_restore=self.restore_from_tray,
             on_sync_now=on_sync_now,
             on_exit=on_exit,
@@ -351,10 +352,10 @@ class WindowManager:
         if getattr(event, "widget", None) is not self._root:
             return
         try:
-            state = self._root.state()
-            if state == "zoomed":
+            if self.is_window_maximized():
                 self.is_maximized = True
                 return
+            state = self._root.state()
             if state == "normal":
                 self.is_maximized = False
                 geom = self._root.geometry()
@@ -453,7 +454,10 @@ class WindowManager:
         self.tray_controller.stop()
         try:
             if self._root.winfo_exists():
+                was_maximized = self.is_maximized
                 self._root.deiconify()
+                if was_maximized:
+                    self.apply_maximized_state()
                 self._root.lift()
                 self._root.focus_force()
         except tk.TclError:
@@ -468,6 +472,8 @@ class WindowManager:
             self.tray_controller.stop()
             return False
         self._status_var.set("Minimized to system tray (scheduled sync active)")
+        if self._on_tray_started is not None:
+            self._on_tray_started()
         return True
 
     def should_minimize_on_close(self, *, force: bool) -> bool:

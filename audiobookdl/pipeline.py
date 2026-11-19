@@ -1336,12 +1336,21 @@ def verify_service_auth(
     *,
     interaction: logging.InteractionHandler | None = None,
     persist_cookies: bool = True,
+    cancel_event: threading.Event | None = None,
 ) -> bool:
     """Authenticate against `service_name` and optionally cache session cookies."""
-    with logging.job_context(apply_runtime_options(options, config)):
+    ctx = apply_runtime_options(options, config)
+    ctx.cancel_event = cancel_event
+    with logging.job_context(ctx):
+        if cancel_event is not None and cancel_event.is_set():
+            raise DownloadCancelled("Verification cancelled")
         source = _init_service_source(service_name, options, config, interaction=interaction)
         try:
+            if cancel_event is not None and cancel_event.is_set():
+                raise DownloadCancelled("Verification cancelled")
             ok = source.verify_auth()
+            if cancel_event is not None and cancel_event.is_set():
+                raise DownloadCancelled("Verification cancelled")
             if ok and persist_cookies and source.supports_cookies and len(source._session.cookies) > 0:
                 source.save_cookie_file()
             return ok

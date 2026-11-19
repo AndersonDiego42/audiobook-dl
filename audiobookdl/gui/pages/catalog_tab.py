@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 import sys
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 from typing import Any
 import webbrowser
 
@@ -74,6 +74,9 @@ class CatalogTab(ttk.Frame):
         self._loaded_books: list[CatalogBook] = []
         self._book_statuses: list[str] = []
         self._visible_count = 0
+        self._is_fetching = False
+        self._pending_fetch_service_key: str = ""
+        self._pending_fetch_profile: str = "default"
         self._loaded_service_key: str = ""
         self._loaded_profile: str = "default"
         self._palette = palette or LIGHT_PALETTE
@@ -658,14 +661,22 @@ class CatalogTab(ttk.Frame):
         profiles = list(self._profile_resolver(svc.key)) if self._profile_resolver else ["default"]
         if "default" not in profiles:
             profiles = ["default", *profiles]
-        self._profile_combo.configure(values=profiles, state="readonly")
         if self._profile_var.get() not in profiles:
             self._profile_var.set("default")
+        if self._is_fetching:
+            self._profile_combo.configure(values=profiles, state="disabled")
+            self._query_entry.configure(state="disabled")
+            self._search_btn.configure(state="disabled")
+            self._library_btn.configure(state="disabled")
+            return
+        self._profile_combo.configure(values=profiles, state="readonly")
         self._query_entry.configure(state="normal" if svc.supports_search else "disabled")
         self._search_btn.configure(state="normal" if svc.supports_search else "disabled")
         self._library_btn.configure(state="normal" if svc.supports_library else "disabled")
 
     def run_fetch(self, mode: str) -> None:
+        if self._is_fetching:
+            return
         svc = self._services_by_label.get(self._service_var.get())
         if svc is None:
             return
@@ -673,13 +684,16 @@ class CatalogTab(ttk.Frame):
         if mode == "search" and not query_text:
             self._status_var.set("Enter a search term first.")
             return
+        self._is_fetching = True
+        self._profile_combo.configure(state="disabled")
+        self._query_entry.configure(state="disabled")
         self._search_btn.configure(state="disabled")
         self._library_btn.configure(state="disabled")
         self._cancel_btn.configure(state="normal")
         if self._save_lib_btn is not None:
             self._save_lib_btn.configure(state="disabled")
-        self._loaded_service_key = svc.key
-        self._loaded_profile = self.selected_profile
+        self._pending_fetch_service_key = svc.key
+        self._pending_fetch_profile = self.selected_profile
         self._status_var.set(
             f"{'Searching' if mode == 'search' else 'Loading library for'} {svc.label}..."
         )
@@ -702,9 +716,12 @@ class CatalogTab(ttk.Frame):
             )
 
     def _stop_loading(self) -> None:
+        self._is_fetching = False
         self._loading_bar.stop()
         self._loading_bar.grid_remove()
         self._cancel_btn.configure(state="disabled")
+        if self._save_lib_btn is not None:
+            self._save_lib_btn.configure(state="normal" if self._loaded_books else "disabled")
 
     def set_error_status(self, message: str = "Error loading items") -> None:
         self._stop_loading()
@@ -820,6 +837,9 @@ class CatalogTab(ttk.Frame):
         statuses: Sequence[str] | None = None,
     ) -> None:
         self._stop_loading()
+        if self._pending_fetch_service_key:
+            self._loaded_service_key = self._pending_fetch_service_key
+            self._loaded_profile = self._pending_fetch_profile
         self._covers.cover_fetch_token += 1
         token = self._covers.cover_fetch_token
         self._loaded_books = list(books)
@@ -831,6 +851,7 @@ class CatalogTab(ttk.Frame):
         else:
             self._refresh_statuses()
         visible_count = self._render_tree()
+        self._visible_count = visible_count
         self.sync_buttons()
         if self._save_lib_btn is not None:
             self._save_lib_btn.configure(state="normal" if self._loaded_books else "disabled")
@@ -1077,7 +1098,7 @@ class CatalogTab(ttk.Frame):
         if self._on_save_to_library is not None:
             menu.entryconfigure(
                 "Save to Library DB",
-                state="normal" if bool(self._loaded_books) else "disabled",
+                state="normal" if (bool(self._loaded_books) and not self._is_fetching) else "disabled",
             )
         menu.entryconfigure(
             "Filter by Author",
@@ -1107,21 +1128,42 @@ class CatalogTab(ttk.Frame):
             return
         self._tree.selection_set(row_iid)
         self._tree.focus(row_iid)
+        self._on_tree_selected()
+        urls = self._selected_urls()
+        if not urls:
+            self._status_var.set("Selected book has no downloadable URL.")
+            return
         if self._on_download_urls is not None:
+            books = self._selected_books()
+            label = books[0].title if books else urls[0]
+            if not messagebox.askyesno(
+                "Download Catalog Book",
+                f"Download '{label}' now?",
+                parent=self.winfo_toplevel(),
+            ):
+                return
             self.download_selected()
         else:
             self.add_selected()
 
     def save_to_library(self) -> None:
-        if self._on_save_to_library is None or not self._loaded_books:
+        if self._on_save_to_library is None or not self._loaded_books or self._is_fetching:
             return
         service_key, profile = self._active_service_and_profile()
-        chosen = self._selected_books() or list(self._loaded_books)
+        chosen = self._selected_books()
+        if not chosen:
+            if not messagebox.askyesno(
+                "Save All Loaded Books",
+                f"No books are selected. Save all {len(self._loaded_books)} loaded book(s) to Library DB?",
+                parent=self.winfo_toplevel(),
+            ):
+                return
+            chosen = list(self._loaded_books)
         if not chosen or not service_key:
             return
         inserted, updated = self._on_save_to_library(service_key, profile, chosen)
         self._refresh_statuses()
-        self._render_tree()
+        self._visible_count = self._render_tree()
         self._update_details_pane()
         self._status_var.set(f"Saved to Library DB: +{inserted} new, {updated} updated.")
 

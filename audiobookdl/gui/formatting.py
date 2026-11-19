@@ -82,13 +82,13 @@ def format_geometry(width: int, height: int, x: int | None = None, y: int | None
     return f"{int(width)}x{int(height)}+{int(x)}+{int(y)}"
 
 
-def is_valid_geometry(geometry: str) -> bool:
+def is_valid_geometry(geometry: str, *, min_width: int = 400, min_height: int = 400) -> bool:
     """Validate a Tkinter geometry string (`WxH` or `WxH+X+Y`) with sane minimum dimensions."""
     parsed = parse_geometry(geometry)
     if parsed is None:
         return False
     width, height, _x, _y = parsed
-    return width >= 400 and height >= 400
+    return width >= min_width and height >= min_height
 
 
 def get_monitor_work_areas(widget: tk.Misc) -> list[tuple[int, int, int, int]]:
@@ -217,7 +217,7 @@ def clamp_geometry_to_monitors(
     if parsed is None:
         return None
     width, height, x, y = parsed
-    if width < 400 or height < 400:
+    if width < min_width or height < min_height:
         return None
     w, h, cx, cy = clamp_rect_to_monitor(
         width,

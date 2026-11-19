@@ -1,11 +1,13 @@
 """Modal dialog displaying editable audiobook metadata/cover or a selectable series checklist."""
 
+from collections.abc import Callable, Sequence
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
-from typing import Any
-from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Any
+
+import attrs
 
 from audiobookdl.gui.chapter_editor import ChapterEditorFrame
 from audiobookdl.gui.formatting import (
@@ -38,6 +40,28 @@ from audiobookdl.utils.enrichment import (
     apply_candidate_to_audiobook,
     search_enrichment_candidates,
 )
+
+if TYPE_CHECKING:
+    from audiobookdl.options_schema import DownloadOptions
+
+
+def _clone_audiobook_for_enrichment(audiobook: Audiobook) -> Audiobook:
+    """Create an isolated `Audiobook` snapshot so background workers never mutate live UI data."""
+    meta = attrs.evolve(
+        audiobook.metadata,
+        authors=list(audiobook.metadata.authors),
+        narrators=list(audiobook.metadata.narrators),
+        genres=list(audiobook.metadata.genres),
+    )
+    return Audiobook(
+        session=audiobook.session,
+        metadata=meta,
+        files=list(audiobook.files),
+        chapters=list(audiobook.chapters),
+        cover=audiobook.cover,
+        source_data=audiobook.source_data,
+        media_kind=audiobook.media_kind,
+    )
 
 
 _EDITABLE_PREVIEW_LABELS = frozenset(
@@ -274,8 +298,9 @@ class PreviewDialog(ModalDialog):
         series_book_exists: Callable[[BookId[Any] | Audiobook], bool],
         on_confirm: Callable[[str, tuple[Source, Result], list[int] | None], None],
         palette: ThemePalette | None = None,
-        on_search_enrichment: Callable[[Audiobook], list[EnrichmentCandidate]] | None = None,
-        on_apply_enrichment: Callable[[Audiobook, EnrichmentCandidate], tuple[list[str], bool, bool]] | None = None,
+        on_prepare_enrichment_options: Callable[[], DownloadOptions | None] | None = None,
+        on_search_enrichment: Callable[[Audiobook, DownloadOptions | None], list[EnrichmentCandidate]] | None = None,
+        on_apply_enrichment: Callable[[Audiobook, EnrichmentCandidate, DownloadOptions | None], tuple[list[str], bool, bool]] | None = None,
         manage_source_lifecycle: bool = True,
         confirm_button_text: str | None = None,
         duplicate_warning: str | None = None,
@@ -293,6 +318,7 @@ class PreviewDialog(ModalDialog):
         self._skip_downloaded = skip_downloaded
         self._series_book_exists = series_book_exists
         self._on_confirm = on_confirm
+        self._on_prepare_enrichment_options = on_prepare_enrichment_options
         self._on_search_enrichment = on_search_enrichment
         self._on_apply_enrichment = on_apply_enrichment
         self._manage_source_lifecycle = manage_source_lifecycle
@@ -300,6 +326,13 @@ class PreviewDialog(ModalDialog):
         self._duplicate_warning = duplicate_warning
         self._source_transferred = False
         self._source_closed = False
+        self._worker_lock = threading.Lock()
+        self._active_workers = 0
+        self._cancel_event = threading.Event()
+        self._close_requested = False
+        self._enrichment_in_progress = False
+        self._resolving_series_book = False
+        self._open_subdialogs: dict[int, PreviewDialog] = {}
         self._cb_queue = MainThreadCallbackQueue(self)
         self._initial_focus_widget: tk.Misc | None = None
 
@@ -311,6 +344,7 @@ class PreviewDialog(ModalDialog):
         self._readonly_frame: ttk.Frame | None = None
         self._probed_size_estimate: DownloadSizeEstimate | None = None
         self._enrich_btn: ttk.Button | None = None
+        self._confirm_btn: ttk.Button | None = None
         self._enrich_status_var = tk.StringVar(value="")
 
         self._title_var = tk.StringVar()
@@ -350,10 +384,28 @@ class PreviewDialog(ModalDialog):
         self.finalize_modal(initial_focus=self._initial_focus_widget)
         self.bind("<Destroy>", self._on_dialog_destroy, add="+")
 
+    def _begin_worker(self) -> None:
+        with self._worker_lock:
+            self._active_workers += 1
+
+    def _end_worker(self) -> None:
+        should_close = False
+        with self._worker_lock:
+            self._active_workers = max(0, self._active_workers - 1)
+            should_close = self._active_workers == 0 and self._close_requested
+        if should_close:
+            self._close_untransferred_source()
+
     def _close_untransferred_source(self) -> None:
-        if not self._manage_source_lifecycle or self._source_transferred or self._source_closed:
-            return
-        self._source_closed = True
+        with self._worker_lock:
+            if (
+                not self._manage_source_lifecycle
+                or self._source_transferred
+                or self._source_closed
+                or self._active_workers > 0
+            ):
+                return
+            self._source_closed = True
         close_fn = getattr(self._source, "close", None)
         if callable(close_fn):
             try:
@@ -363,9 +415,22 @@ class PreviewDialog(ModalDialog):
 
     def _on_dialog_destroy(self, event: tk.Event) -> None:
         if getattr(event, "widget", None) is self:
+            self._cancel_event.set()
+            with self._worker_lock:
+                self._close_requested = True
             self._close_untransferred_source()
 
     def destroy(self) -> None:
+        self._cancel_event.set()
+        with self._worker_lock:
+            self._close_requested = True
+        for child in list(self._open_subdialogs.values()):
+            try:
+                if child.winfo_exists():
+                    child.destroy()
+            except tk.TclError:
+                pass
+        self._open_subdialogs.clear()
         if self._filter_after_id is not None:
             try:
                 self.after_cancel(self._filter_after_id)
@@ -623,13 +688,16 @@ class PreviewDialog(ModalDialog):
         )
 
         def _confirm_book() -> None:
+            if self._enrichment_in_progress:
+                return
             if not self._apply_audiobook_edits(audiobook):
                 return
             self._source_transferred = True
             self.destroy()
             self._on_confirm(self._url, (self._source, audiobook), None)
 
-        ttk.Button(btn_bar, text=action_text, command=_confirm_book).pack(side=tk.RIGHT)
+        self._confirm_btn = ttk.Button(btn_bar, text=action_text, command=_confirm_book)
+        self._confirm_btn.pack(side=tk.RIGHT)
         ttk.Button(btn_bar, text="Close", command=self.destroy).pack(side=tk.RIGHT, padx=(0, 6))
 
     def _on_chapters_edited(self, audiobook: Audiobook, chapters: list[Any]) -> None:
@@ -692,23 +760,32 @@ class PreviewDialog(ModalDialog):
         )
         if not needs_probe:
             return
+        probe_snapshot = _clone_audiobook_for_enrichment(audiobook)
+        self._begin_worker()
         self._cb_queue.begin_task()
 
         def _worker() -> None:
             est: DownloadSizeEstimate | None = None
             try:
-                est = estimate_download_size(audiobook, probe_remote=True, timeout=4.0)
+                if not self._cancel_event.is_set():
+                    est = estimate_download_size(probe_snapshot, probe_remote=True, timeout=4.0)
             except Exception:
                 est = None
             finally:
                 def _post() -> None:
-                    if not self._is_alive() or est is None or est.estimated_bytes is None:
+                    if (
+                        self._cancel_event.is_set()
+                        or not self._is_alive()
+                        or est is None
+                        or est.estimated_bytes is None
+                    ):
                         return
                     self._probed_size_estimate = est
                     self._render_readonly_metadata(audiobook)
 
                 self._cb_queue.post(_post)
                 self._cb_queue.finish_worker()
+                self._end_worker()
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -739,27 +816,42 @@ class PreviewDialog(ModalDialog):
             if meta.description:
                 self._desc_text.insert("1.0", meta.description.strip())
 
-    def _start_enrichment(self, audiobook: Audiobook) -> None:
-        if not self._apply_audiobook_edits(audiobook):
-            return
+    def _set_enrichment_busy(self, busy: bool, status: str = "") -> None:
+        self._enrichment_in_progress = busy
         if self._enrich_btn is not None:
-            self._enrich_btn.configure(state="disabled")
-        self._enrich_status_var.set("Searching providers...")
+            self._enrich_btn.configure(state="disabled" if busy else "normal")
+        if self._confirm_btn is not None:
+            self._confirm_btn.configure(state="disabled" if busy else "normal")
+        if status or not busy:
+            self._enrich_status_var.set(status)
+
+    def _start_enrichment(self, audiobook: Audiobook) -> None:
+        if self._enrichment_in_progress or not self._apply_audiobook_edits(audiobook):
+            return
+        options: DownloadOptions | None = None
+        if self._on_prepare_enrichment_options is not None:
+            options = self._on_prepare_enrichment_options()
+            if options is None:
+                return
+        self._set_enrichment_busy(True, "Searching providers...")
 
         search_fn = self._on_search_enrichment or (
-            lambda book: search_enrichment_candidates(
+            lambda book, _opts: search_enrichment_candidates(
                 book.metadata,
                 session=getattr(self._source, "_session", None),
             )
         )
+        search_snapshot = _clone_audiobook_for_enrichment(audiobook)
 
+        self._begin_worker()
         self._cb_queue.begin_task()
 
         def _worker() -> None:
             candidates: list[EnrichmentCandidate] = []
             exc: Exception | None = None
             try:
-                candidates = search_fn(audiobook)
+                if not self._cancel_event.is_set():
+                    candidates = search_fn(search_snapshot, options)
             except Exception as err:
                 exc = err
             finally:
@@ -768,6 +860,7 @@ class PreviewDialog(ModalDialog):
 
                 self._cb_queue.post(_post_search)
                 self._cb_queue.finish_worker()
+                self._end_worker()
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -777,11 +870,9 @@ class PreviewDialog(ModalDialog):
         candidates: list[EnrichmentCandidate],
         exc: Exception | None,
     ) -> None:
-        if not self._is_alive():
+        if self._cancel_event.is_set() or not self._is_alive():
             return
-        if self._enrich_btn is not None:
-            self._enrich_btn.configure(state="normal")
-        self._enrich_status_var.set("")
+        self._set_enrichment_busy(False, "")
         if exc is not None:
             messagebox.showerror("Enrichment Failed", str(exc), parent=self)
             return
@@ -800,24 +891,30 @@ class PreviewDialog(ModalDialog):
             palette=self._palette,
         )
         self.wait_window(picker)
-        if not self._is_alive():
+        if self._cancel_event.is_set() or not self._is_alive():
             return
         chosen = picker.selected_candidate
         if chosen is None:
             return
 
-        if self._enrich_btn is not None:
-            self._enrich_btn.configure(state="disabled")
-        self._enrich_status_var.set("Applying match...")
+        options: DownloadOptions | None = None
+        if self._on_prepare_enrichment_options is not None:
+            options = self._on_prepare_enrichment_options()
+            if options is None:
+                return
+
+        self._set_enrichment_busy(True, "Applying match...")
 
         apply_fn = self._on_apply_enrichment or (
-            lambda book, cand: apply_candidate_to_audiobook(
+            lambda book, cand, _opts: apply_candidate_to_audiobook(
                 book,
                 cand,
                 session=getattr(self._source, "_session", None),
             )
         )
+        apply_snapshot = _clone_audiobook_for_enrichment(audiobook)
 
+        self._begin_worker()
         self._cb_queue.begin_task()
 
         def _apply_worker() -> None:
@@ -826,17 +923,26 @@ class PreviewDialog(ModalDialog):
             chapters_updated = False
             err_exc: Exception | None = None
             try:
-                fields, cover_updated, chapters_updated = apply_fn(audiobook, chosen)
+                if not self._cancel_event.is_set():
+                    fields, cover_updated, chapters_updated = apply_fn(
+                        apply_snapshot, chosen, options
+                    )
             except Exception as err:
                 err_exc = err
             finally:
                 def _post_apply() -> None:
                     self._on_enrichment_applied(
-                        audiobook, fields, cover_updated, chapters_updated, err_exc
+                        audiobook,
+                        fields,
+                        cover_updated,
+                        chapters_updated,
+                        err_exc,
+                        enriched_snapshot=apply_snapshot,
                     )
 
                 self._cb_queue.post(_post_apply)
                 self._cb_queue.finish_worker()
+                self._end_worker()
 
         threading.Thread(target=_apply_worker, daemon=True).start()
 
@@ -847,15 +953,22 @@ class PreviewDialog(ModalDialog):
         cover_updated: bool,
         chapters_updated: bool,
         exc: Exception | None,
+        *,
+        enriched_snapshot: Audiobook | None = None,
     ) -> None:
-        if not self._is_alive():
+        if self._cancel_event.is_set() or not self._is_alive():
             return
-        if self._enrich_btn is not None:
-            self._enrich_btn.configure(state="normal")
+        self._set_enrichment_busy(False)
         if exc is not None:
             self._enrich_status_var.set("")
             messagebox.showerror("Enrichment Failed", str(exc), parent=self)
             return
+        if enriched_snapshot is not None:
+            audiobook.metadata = enriched_snapshot.metadata
+            if cover_updated:
+                audiobook.cover = enriched_snapshot.cover
+            if chapters_updated:
+                audiobook.chapters = list(enriched_snapshot.chapters)
         self._sync_editable_vars_from_audiobook(audiobook)
         if cover_updated:
             self._pending_cover = audiobook.cover
@@ -985,6 +1098,23 @@ class PreviewDialog(ModalDialog):
         action_text = "Queue Selected" if self._is_running else "Download Selected"
 
         def _confirm_series() -> None:
+            active_children = [
+                child
+                for child in list(self._open_subdialogs.values())
+                if self._widget_exists(child)
+            ]
+            if active_children:
+                messagebox.showinfo(
+                    "Open Book Preview",
+                    "Please close open book preview window(s) before confirming the series.",
+                    parent=self,
+                )
+                try:
+                    active_children[0].lift()
+                    active_children[0].focus_set()
+                except tk.TclError:
+                    pass
+                return
             indices = [i for i, v in enumerate(self._check_vars) if v.get()]
             if not indices:
                 messagebox.showwarning(
@@ -1000,12 +1130,13 @@ class PreviewDialog(ModalDialog):
             self.destroy()
             self._on_confirm(self._url, (self._source, series), indices)
 
-        ttk.Button(
+        self._confirm_btn = ttk.Button(
             btn_bar,
             text=action_text,
             command=_confirm_series,
             state="disabled" if book_count == 0 else "normal",
-        ).pack(side=tk.RIGHT)
+        )
+        self._confirm_btn.pack(side=tk.RIGHT)
         ttk.Button(btn_bar, text="Close", command=self.destroy).pack(side=tk.RIGHT, padx=(0, 6))
 
     def _selected_series_book_index(self) -> int | None:
@@ -1024,6 +1155,9 @@ class PreviewDialog(ModalDialog):
 
     def _sync_preview_book_btn(self) -> None:
         if self._preview_book_btn is None:
+            return
+        if self._resolving_series_book:
+            self._preview_book_btn.configure(state="disabled")
             return
         idx = self._selected_series_book_index()
         self._preview_book_btn.configure(state="normal" if idx is not None else "disabled")
@@ -1049,12 +1183,16 @@ class PreviewDialog(ModalDialog):
             )
             return
 
+        self._resolving_series_book = True
         if self._preview_book_btn is not None:
             self._preview_book_btn.configure(state="disabled", text="Loading...")
+        self._begin_worker()
         self._cb_queue.begin_task()
 
         def _worker() -> None:
             try:
+                if self._cancel_event.is_set():
+                    return
                 resolved = download_by_id(book_item.id)
                 audiobook: Audiobook | None = None
                 if isinstance(resolved, Audiobook):
@@ -1083,6 +1221,7 @@ class PreviewDialog(ModalDialog):
                 self._cb_queue.post(_deliver_err)
             finally:
                 self._cb_queue.finish_worker()
+                self._end_worker()
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -1092,7 +1231,8 @@ class PreviewDialog(ModalDialog):
         audiobook: Audiobook | None,
         exc: Exception | None,
     ) -> None:
-        if not self._is_alive():
+        self._resolving_series_book = False
+        if self._cancel_event.is_set() or not self._is_alive():
             return
         if self._preview_book_btn is not None:
             self._preview_book_btn.configure(text="Preview Selected Book...")
@@ -1123,7 +1263,28 @@ class PreviewDialog(ModalDialog):
         if self._tree.exists(str(idx)):
             self._tree.set(str(idx), "book", label)
 
+    @staticmethod
+    def _widget_exists(widget: tk.Misc | None) -> bool:
+        if widget is None:
+            return False
+        try:
+            return bool(widget.winfo_exists())
+        except tk.TclError:
+            return False
+
     def _open_series_book_subdialog(self, idx: int, audiobook: Audiobook) -> "PreviewDialog":
+        for open_idx, open_dlg in list(self._open_subdialogs.items()):
+            if not self._widget_exists(open_dlg):
+                self._open_subdialogs.pop(open_idx, None)
+        existing = self._open_subdialogs.get(idx)
+        if existing is not None and self._widget_exists(existing):
+            try:
+                existing.lift()
+                existing.focus_set()
+            except tk.TclError:
+                pass
+            return existing
+
         def _on_book_confirmed(_u: str, pair: tuple[Source, Result], _sel: list[int] | None) -> None:
             updated = pair[1]
             if isinstance(updated, Audiobook) and self._series_ref is not None:
@@ -1144,11 +1305,19 @@ class PreviewDialog(ModalDialog):
             series_book_exists=self._series_book_exists,
             on_confirm=_on_book_confirmed,
             palette=self._palette,
+            on_prepare_enrichment_options=self._on_prepare_enrichment_options,
             on_search_enrichment=self._on_search_enrichment,
             on_apply_enrichment=self._on_apply_enrichment,
             manage_source_lifecycle=False,
             confirm_button_text="Apply to Series",
         )
+        self._open_subdialogs[idx] = dlg
+
+        def _on_subdialog_destroy(event: tk.Event) -> None:
+            if getattr(event, "widget", None) is dlg and self._open_subdialogs.get(idx) is dlg:
+                self._open_subdialogs.pop(idx, None)
+
+        dlg.bind("<Destroy>", _on_subdialog_destroy, add="+")
         return dlg
 
     def _update_selected_count(self, book_count: int | None = None) -> None:
@@ -1183,12 +1352,28 @@ class PreviewDialog(ModalDialog):
 
     def _toggle_series_item(self, idx: int, shift_held: bool = False) -> None:
         if shift_held and self._last_clicked_index is not None:
-            start, end = sorted((self._last_clicked_index, idx))
             target_val = self._check_vars[idx].get()
-            query = self._filter_var.get().strip().lower()
-            for pos in range(start, end + 1):
-                if not query or query in self._item_labels[pos].lower():
-                    self._check_vars[pos].set(target_val)
+            if self._tree is not None:
+                visible_iids = list(self._tree.get_children(""))
+                prev_iid = str(self._last_clicked_index)
+                cur_iid = str(idx)
+                if prev_iid in visible_iids and cur_iid in visible_iids:
+                    v_start, v_end = sorted((visible_iids.index(prev_iid), visible_iids.index(cur_iid)))
+                    for row_iid in visible_iids[v_start : v_end + 1]:
+                        try:
+                            pos = int(row_iid)
+                        except ValueError:
+                            continue
+                        if 0 <= pos < len(self._check_vars):
+                            self._check_vars[pos].set(target_val)
+                else:
+                    self._check_vars[idx].set(target_val)
+            else:
+                start, end = sorted((self._last_clicked_index, idx))
+                query = self._filter_var.get().strip().lower()
+                for pos in range(start, end + 1):
+                    if not query or query in self._item_labels[pos].lower():
+                        self._check_vars[pos].set(target_val)
         self._last_clicked_index = idx
         self._sync_tree_marks()
         self._update_selected_count()

@@ -185,13 +185,18 @@ class PreviewCoordinator:
         if self.dialog is not None and self.dialog.winfo_exists():
             self.dialog.destroy()
 
-        def _search_enrichment(book: Audiobook) -> Any:
-            opts = self._options.build_options(urls_override=[url])
-            return self._controller.search_enrichment_for_audiobook(book, opts)
+        def _prepare_enrichment_options() -> DownloadOptions | None:
+            return self._options.try_build_options(urls_override=[url], parent=self.dialog)
 
-        def _apply_enrichment(book: Audiobook, candidate: Any) -> Any:
-            opts = self._options.build_options(urls_override=[url])
-            return self._controller.apply_enrichment_candidate(book, candidate, opts)
+        def _search_enrichment(book: Audiobook, opts: DownloadOptions | None) -> Any:
+            resolved = opts if opts is not None else DownloadOptions(urls=[url])
+            return self._controller.search_enrichment_for_audiobook(book, resolved)
+
+        def _apply_enrichment(
+            book: Audiobook, candidate: Any, opts: DownloadOptions | None
+        ) -> Any:
+            resolved = opts if opts is not None else DownloadOptions(urls=[url])
+            return self._controller.apply_enrichment_candidate(book, candidate, resolved)
 
         cached_series_opts = self._options.build_options() if isinstance(result, Series) else None
         dir_stems_cache: dict[str, set[str]] = {}
@@ -239,6 +244,7 @@ class PreviewCoordinator:
             ),
             on_confirm=self.enqueue_from_preview,
             palette=self._palette_provider(),
+            on_prepare_enrichment_options=_prepare_enrichment_options,
             on_search_enrichment=_search_enrichment,
             on_apply_enrichment=_apply_enrichment,
             duplicate_warning=duplicate_warning,
@@ -261,12 +267,16 @@ class PreviewCoordinator:
             self.close_prefetched_source(prefetched)
             return
         if self._is_running_provider():
+            queue_panel = self._download_page().queue_panel
             enqueued = self._controller.enqueue_from_preview(
-                url, options, prefetched, selected_indices
+                url,
+                options,
+                prefetched,
+                selected_indices,
+                service_label=queue_panel._service_label_for_url(url),
             )
             if enqueued is not None:
                 added_job, new_total = enqueued
-                queue_panel = self._download_page().queue_panel
                 queue_panel.register_queue_job(added_job)
                 queue_panel.ui_item_total = new_total
                 queue_panel.refresh_batch_label()

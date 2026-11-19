@@ -54,6 +54,7 @@ class LibraryPage(ttk.Frame):
         palette_provider: Callable[[], ThemePalette],
     ) -> None:
         super().__init__(parent, padding=scale_px(parent, 12))
+        self._archive_path_provider = archive_path_provider
         self._palette_provider = palette_provider
         self._on_tab_changed = on_tab_changed
         self._suppress_tab_event = False
@@ -155,7 +156,11 @@ class LibraryPage(ttk.Frame):
     def on_show(self) -> None:
         """Refresh archive, catalog statuses, and sync targets whenever Library is opened."""
         self._tab_events_armed = True
-        self.archive_tab.refresh()
+        latest_path = self._archive_path_provider()
+        if latest_path != self.archive_tab._archive_path:
+            self.archive_tab.set_archive_path(latest_path)
+        else:
+            self.archive_tab.refresh()
         self.catalog_tab.sync_buttons()
         self.catalog_tab.refresh_statuses()
         self.sync_tab.refresh_targets()

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from audiobookdl.config import VALID_AUTO_SYNC_MODES, make_source_profile_key
 from audiobookdl.gui.controller import GuiController
+from audiobookdl.gui.notifications import send_os_notification_async
 from audiobookdl.options_schema import DownloadOptions, SyncOptions
 from audiobookdl.utils.archive import resolve_archive_path
 
@@ -34,6 +35,7 @@ class SyncCoordinator:
         status_var: tk.StringVar,
         is_running_provider: Callable[[], bool],
         is_previewing_provider: Callable[[], bool],
+        is_in_tray_provider: Callable[[], bool] | None = None,
         schedule_poll_soon: Callable[[], None],
         append_log: Callable[[str], None],
         register_enqueued_batch: Callable[..., None],
@@ -47,11 +49,19 @@ class SyncCoordinator:
         self._status_var = status_var
         self._is_running_provider = is_running_provider
         self._is_previewing_provider = is_previewing_provider
+        self._is_in_tray_provider = is_in_tray_provider or (lambda: False)
         self._schedule_poll_soon = schedule_poll_soon
         self._append_log = append_log
         self._register_enqueued_batch = register_enqueued_batch
 
         self.is_syncing = False
+        self._last_sync_unattended = False
+
+    def _is_window_hidden(self) -> bool:
+        try:
+            return bool(self._is_in_tray_provider())
+        except Exception:
+            return False
 
     def archive_ledger_path(self) -> str:
         return resolve_archive_path(self._controller.config_snapshot())
@@ -88,24 +98,32 @@ class SyncCoordinator:
         )
         self._schedule_poll_soon()
 
-    def execute_sync_targets(self, targets: Sequence[tuple[str, str]], mode: str) -> None:
+    def execute_sync_targets(
+        self,
+        targets: Sequence[tuple[str, str]],
+        mode: str,
+        *,
+        unattended: bool = False,
+    ) -> None:
         normalized = str(mode or "").strip().lower()
         if normalized not in VALID_AUTO_SYNC_MODES:
             raise ValueError(
                 f"Invalid auto_sync_mode {mode!r}; expected one of {VALID_AUTO_SYNC_MODES}"
             )
         if normalized == "enqueue":
-            self.sync_and_enqueue_targets(targets)
+            self.sync_and_enqueue_targets(targets, unattended=unattended)
         elif normalized == "dry_run":
             self.sync_libraries(
                 services=[s for s, _p in targets],
                 scan_only=True,
                 dry_run=True,
+                unattended=unattended,
             )
         else:
             self.sync_libraries(
                 services=[s for s, _p in targets],
                 scan_only=True,
+                unattended=unattended,
             )
 
     def save_sync_schedule(
@@ -140,9 +158,17 @@ class SyncCoordinator:
         else:
             self._status_var.set("Saved auto-sync schedule (disabled)")
 
-    def sync_and_enqueue_targets(self, targets: Sequence[tuple[str, str]]) -> None:
+    def sync_and_enqueue_targets(
+        self,
+        targets: Sequence[tuple[str, str]],
+        *,
+        unattended: bool = False,
+    ) -> None:
         if self._is_running_provider():
             self._status_var.set("Wait for active downloads before syncing libraries")
+            return
+        if self._is_previewing_provider():
+            self._status_var.set("Wait for metadata preview before syncing libraries")
             return
         if self.is_syncing:
             self._status_var.set("Library sync already in progress")
@@ -150,6 +176,11 @@ class SyncCoordinator:
         options = self._options.try_build_options(urls_override=[])
         if options is None:
             return
+        self._last_sync_unattended = bool(
+            unattended
+            or getattr(self._automation, "is_auto_sync_running", False)
+            or self._is_window_hidden()
+        )
         self.set_syncing_state(True)
         self._status_var.set("Scanning libraries for pending books...")
         self._append_log("--- Scanning libraries for pending books ---")
@@ -169,10 +200,14 @@ class SyncCoordinator:
         services: Sequence[str] = (),
         scan_only: bool = False,
         dry_run: bool = False,
+        unattended: bool = False,
     ) -> None:
         """Run one library synchronization cycle in the background."""
         if self._is_running_provider():
             self._status_var.set("Wait for active downloads before syncing libraries")
+            return
+        if self._is_previewing_provider():
+            self._status_var.set("Wait for metadata preview before syncing libraries")
             return
         if self.is_syncing:
             self._status_var.set("Library sync already in progress")
@@ -180,6 +215,11 @@ class SyncCoordinator:
         options = self._options.try_build_options(urls_override=[])
         if options is None:
             return
+        self._last_sync_unattended = bool(
+            unattended
+            or getattr(self._automation, "is_auto_sync_running", False)
+            or self._is_window_hidden()
+        )
         self.set_syncing_state(True)
         self._status_var.set("Syncing libraries...")
         self._append_log("--- Starting library sync ---")
@@ -196,10 +236,15 @@ class SyncCoordinator:
 
     def handle_sync_done(self, cycle: Any, exc: Exception | None) -> None:
         self.set_syncing_state(False)
+        unattended = self._last_sync_unattended or self._is_window_hidden()
+        self._last_sync_unattended = False
         if exc is not None:
             self._status_var.set("Library sync failed")
             self._append_log(f"[ERROR] Library sync failed: {exc}")
-            messagebox.showerror("Library Sync Failed", str(exc), parent=self._root)
+            if unattended:
+                send_os_notification_async("Library Sync Failed", str(exc))
+            else:
+                messagebox.showerror("Library Sync Failed", str(exc), parent=self._root)
             return
         if cycle is None:
             self._status_var.set("Library sync finished")
@@ -219,7 +264,14 @@ class SyncCoordinator:
         lib_page = self._shell.get_page("library")
         if lib_page is not None:
             lib_page.archive_tab.refresh()
-        if cycle.failed > 0 or getattr(cycle, "errors", ()):
+        if unattended:
+            title = (
+                "Library Sync Finished with Warnings"
+                if (cycle.failed > 0 or getattr(cycle, "errors", ()))
+                else "Library Sync Complete"
+            )
+            send_os_notification_async(title, msg)
+        elif cycle.failed > 0 or getattr(cycle, "errors", ()):
             messagebox.showwarning("Library Sync Finished with Warnings", msg, parent=self._root)
         else:
             messagebox.showinfo("Library Sync Complete", msg, parent=self._root)
@@ -231,10 +283,15 @@ class SyncCoordinator:
         exc: Exception | None,
     ) -> None:
         self.set_syncing_state(False)
+        unattended = self._last_sync_unattended or self._is_window_hidden()
+        self._last_sync_unattended = False
         if exc is not None:
             self._status_var.set("Library sync failed")
             self._append_log(f"[ERROR] Library sync failed: {exc}")
-            messagebox.showerror("Library Sync Failed", str(exc), parent=self._root)
+            if unattended:
+                send_os_notification_async("Library Sync Failed", str(exc))
+            else:
+                messagebox.showerror("Library Sync Failed", str(exc), parent=self._root)
             return
         if stats.get("cancelled"):
             self._status_var.set("Library sync cancelled")
@@ -252,11 +309,15 @@ class SyncCoordinator:
             self._append_log(
                 f"--- Library sync finished: {discovered} discovered, 0 pending ---"
             )
+            if unattended:
+                send_os_notification_async(
+                    "Library Sync Complete", f"{discovered} discovered, 0 pending"
+                )
             return
         base_opts = self._options.try_build_options(urls_override=[])
         if base_opts is None:
             return
-        if not self._ffmpeg_assistant.ensure_available(base_opts):
+        if not unattended and not self._ffmpeg_assistant.ensure_available(base_opts):
             return
         dl_specs: list[tuple[str, DownloadOptions, list[int] | None, None]] = []
         for _svc, prof, urls in pending_groups:
@@ -265,8 +326,12 @@ class SyncCoordinator:
                 if prof:
                     opts.profile = prof
                 dl_specs.append((u, opts, None, None))
+        dl_page = self._shell.get_page("download")
         was_appended, run_id, queued_jobs, new_total = self._controller.start_or_enqueue_jobs(
-            download_specs=dl_specs
+            download_specs=dl_specs,
+            service_label_resolver=(
+                dl_page.queue_panel._service_label_for_url if dl_page is not None else None
+            ),
         )
         self._register_enqueued_batch(
             was_appended=was_appended,
@@ -277,12 +342,18 @@ class SyncCoordinator:
             append_status=f"Queued +{len(queued_jobs)} synced book(s) (total {new_total})",
             append_log_msg=f"--- Added {len(queued_jobs)} synced book(s) to queue (total {new_total}) ---",
         )
+        if unattended and queued_jobs:
+            send_os_notification_async(
+                "Library Sync Queued Books",
+                f"Queued {len(queued_jobs)} pending book(s) for download",
+            )
 
     def sync_from_tray(self) -> None:
         if self._automation.auto_sync_targets:
             self.execute_sync_targets(
                 self._automation.auto_sync_targets,
                 self._automation.auto_sync_mode,
+                unattended=True,
             )
         else:
-            self.sync_libraries()
+            self.sync_libraries(unattended=True)

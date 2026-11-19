@@ -141,9 +141,12 @@ class RunCoordinator:
         ],
     ) -> None:
         """Initialize UI and queue state for a fresh download run."""
-        run_id, queued_jobs = self._controller.start_new_run(job_specs)
-        self.set_running_state(True)
         queue_panel = self._download_page().queue_panel
+        run_id, queued_jobs = self._controller.start_new_run(
+            job_specs,
+            service_label_resolver=queue_panel._service_label_for_url,
+        )
+        self.set_running_state(True)
         queue_panel.prepare_run_ui_state(
             run_id,
             len(job_specs),
@@ -173,14 +176,15 @@ class RunCoordinator:
                 opts.profile = profile_override
             return opts
 
+        queue_panel = self._download_page().queue_panel
         has_active_run, added_jobs, new_total = self._controller.enqueue_additional_urls(
             urls,
             _build_for_url,
             allow_existing=allow_existing,
+            service_label_resolver=queue_panel._service_label_for_url,
         )
         if not has_active_run:
             return False
-        queue_panel = self._download_page().queue_panel
         if not added_jobs:
             self._status_var.set("URL(s) already in active queue")
             queue_panel.append_log("All entered URL(s) are already in the active queue.")
@@ -207,6 +211,8 @@ class RunCoordinator:
         append_status: str,
         append_log_msg: str,
     ) -> None:
+        if not was_appended and not queued_jobs:
+            return
         queue_panel = self._download_page().queue_panel
         if was_appended:
             for job in queued_jobs:
@@ -306,9 +312,11 @@ class RunCoordinator:
             return
         if not self._ffmpeg_assistant.ensure_available(base_opts):
             return
+        queue_panel = self._download_page().queue_panel
         was_appended, run_id, queued_jobs, new_total = self._controller.start_or_enqueue_jobs(
             download_specs=dl_specs,
             pack_requests=pack_specs,
+            service_label_resolver=queue_panel._service_label_for_url,
         )
         self.register_enqueued_batch(
             was_appended=was_appended,
@@ -321,8 +329,8 @@ class RunCoordinator:
         )
 
     def retry_failed_queue_items(self, job_ids: Sequence[str] | None = None) -> None:
-        queue_tree = self._download_page().queue_panel.queue_tree
-        target_ids = list(job_ids) if job_ids is not None else list(queue_tree.get_children())
+        queue_panel = self._download_page().queue_panel
+        target_ids = list(job_ids) if job_ids is not None else list(queue_panel._queue_order)
         retry_records = self._controller.retryable_jobs(target_ids)
         if not retry_records:
             self._status_var.set("No failed or cancelled jobs to retry")
@@ -343,7 +351,9 @@ class RunCoordinator:
                 prof = str(rec.get("profile") or "").strip()
                 raw_idx = rec.get("selected_indices")
                 idx_key = (
-                    tuple(i for i in raw_idx if isinstance(i, int))
+                    tuple(
+                        i for i in raw_idx if isinstance(i, int) and not isinstance(i, bool)
+                    )
                     if isinstance(raw_idx, list)
                     else None
                 )
@@ -356,44 +366,14 @@ class RunCoordinator:
             self._status_var.set("No failed or cancelled jobs to retry")
             return
 
-        if self.is_running:
-            if self._controller.cancel_event.is_set():
-                return
-            base_opts = self._options.try_build_options(urls_override=[])
-            if base_opts is None:
-                return
-            dl_specs = [self.build_retry_download_spec(base_opts, rec) for rec in download_recs]
-            pack_pairs = [
-                (req, self.build_retry_pack_options(base_opts, req, rec))
-                for req, rec in pack_entries
-            ]
-            was_appended, run_id, queued_jobs, new_total = self._controller.start_or_enqueue_jobs(
-                download_specs=dl_specs,
-                pack_requests=pack_pairs,
-            )
-            self.register_enqueued_batch(
-                was_appended=was_appended,
-                run_id=run_id,
-                queued_jobs=queued_jobs,
-                new_total=new_total,
-                start_header=f"--- Retrying {len(queued_jobs)} job(s) ---",
-                append_status=f"Queued +{len(queued_jobs)} retry job(s) (total {new_total})",
-                append_log_msg=f"--- Added {len(queued_jobs)} retry job(s) to queue (total {new_total}) ---",
-            )
+        if self.is_running and self._controller.cancel_event.is_set():
             return
-
+        if download_recs and not self._auth.validate_cookie_file():
+            return
         base_opts = self._options.try_build_options(urls_override=[])
         if base_opts is None:
             return
-        if download_recs and not pack_entries:
-            if not self._ffmpeg_assistant.ensure_available(base_opts):
-                return
-            self._options.save_run_preferences(base_opts)
-            dl_specs = [self.build_retry_download_spec(base_opts, rec) for rec in download_recs]
-            self.start_new_run(dl_specs)
-            return
-
-        pack_pairs = []
+        pack_pairs: list[tuple[PackJobRequest, DownloadOptions]] = []
         for req, rec in pack_entries:
             opts = self.build_retry_pack_options(base_opts, req, rec)
             if not self._ffmpeg_assistant.ensure_available(opts):
@@ -403,9 +383,15 @@ class RunCoordinator:
             return
         self._options.save_run_preferences(base_opts)
         dl_specs = [self.build_retry_download_spec(base_opts, rec) for rec in download_recs]
+
+        if not self.is_running and dl_specs and not pack_pairs:
+            self.start_new_run(dl_specs)
+            return
+
         was_appended, run_id, queued_jobs, new_total = self._controller.start_or_enqueue_jobs(
             download_specs=dl_specs,
             pack_requests=pack_pairs,
+            service_label_resolver=queue_panel._service_label_for_url,
         )
         self.register_enqueued_batch(
             was_appended=was_appended,
@@ -454,23 +440,22 @@ class RunCoordinator:
     ) -> None:
         if self._is_previewing_provider() or not urls:
             return
-        if self.is_running:
-            if self._controller.cancel_event.is_set():
-                return
-            if self.enqueue_additional_urls(urls, profile_override=profile_override):
-                return
-
+        if self.is_running and self._controller.cancel_event.is_set():
+            return
         if not self._auth.validate_cookie_file():
             return
         if not self._auth.warn_mixed_service_credentials(urls):
             return
-
         options = self._options.try_build_options(urls_override=urls)
         if options is None:
             return
         if not self._ffmpeg_assistant.ensure_available(options):
             return
         self._options.save_run_preferences(options)
+
+        if self.is_running:
+            if self.enqueue_additional_urls(urls, profile_override=profile_override):
+                return
 
         unique_urls = list(dict.fromkeys(urls))
         job_specs: list[

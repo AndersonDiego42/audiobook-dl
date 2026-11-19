@@ -1,5 +1,6 @@
 """Three-tab options panel for output format, metadata sidecars, and network settings."""
 
+import shlex
 import tkinter as tk
 from tkinter import ttk
 from typing import Any
@@ -17,6 +18,7 @@ from audiobookdl.utils import (
     normalize_sample_rate,
 )
 from audiobookdl.utils.audiobook import parse_decryption_key_spec
+from audiobookdl.utils.enrichment import parse_provider_list
 from audiobookdl.utils.http import parse_byte_rate
 
 OptionWidget = ttk.Entry | ttk.Checkbutton | ttk.Combobox | ttk.Spinbox
@@ -51,6 +53,7 @@ class OptionsPanel(ttk.LabelFrame):
         self._attach_tooltips()
         self._wire_dependencies()
         self.sync_dependency_states()
+        self._validate_inline_fields()
 
     def _build_widgets(self) -> None:
         self.columnconfigure(0, weight=1)
@@ -446,19 +449,31 @@ class OptionsPanel(ttk.LabelFrame):
         self._cb_combine = cb_combine
         self._bitrate_combo = bitrate_combo
         self._sample_rate_combo = sample_rate_combo
+        self._cb_enrich = cb_enrich
         self._cb_enrich_interactive = cb_enrich_interactive
         self._enrich_providers_entry = enrich_providers_entry
+        self._cb_no_chapters = cb_no_chapters
         self._cb_split_chapters = cb_split_chapters
         self._cb_silence_chapters = cb_silence_chapters
         self._cb_override_chapters = cb_override_chapters
         self._chapter_offset_entry = chapter_offset_entry
-        self._intro_chapter_combo = intro_chapter_combo
+        self._cb_json = cb_json
+        self._cb_opf = cb_opf
         self._cb_cue = cb_cue
+        self._cb_write_cover = cb_write_cover
+        self._cb_abs_meta = cb_abs_meta
+        self._cb_upload_abs = cb_upload_abs
+        self._cb_square_cover = cb_square_cover
+        self._intro_chapter_combo = intro_chapter_combo
         self._cb_loudnorm = cb_loudnorm
         self._cb_mono = cb_mono
         self._max_cover_entry = max_cover_entry
+        self._max_workers_spin = max_workers_spin
+        self._book_delay_spin = book_delay_spin
+        self._timeout_spin = timeout_spin
         self._max_retries_spin = max_retries_spin
         self._limit_rate_entry = limit_rate_entry
+        self._post_exec_entry = post_exec_entry
         self._decryption_key_entry = decryption_key_entry
         self._inspect_drm_btn = inspect_drm_btn
 
@@ -575,14 +590,28 @@ class OptionsPanel(ttk.LabelFrame):
         for entry in (
             self._bitrate_combo,
             self._sample_rate_combo,
+            self._enrich_providers_entry,
             self._chapter_offset_entry,
             self._max_cover_entry,
+            self._max_workers_spin,
+            self._book_delay_spin,
+            self._timeout_spin,
             self._max_retries_spin,
             self._limit_rate_entry,
+            self._post_exec_entry,
             self._decryption_key_entry,
         ):
             entry.bind("<KeyRelease>", lambda _e: self._validate_inline_fields(), add="+")
             entry.bind("<FocusOut>", lambda _e: self._validate_inline_fields(), add="+")
+        for spin in (
+            self._max_workers_spin,
+            self._book_delay_spin,
+            self._timeout_spin,
+            self._max_retries_spin,
+        ):
+            spin.configure(command=self._validate_inline_fields)
+            spin.bind("<<Increment>>", lambda _e: self._validate_inline_fields(), add="+")
+            spin.bind("<<Decrement>>", lambda _e: self._validate_inline_fields(), add="+")
         self._bitrate_combo.bind("<<ComboboxSelected>>", lambda _e: self._validate_inline_fields(), add="+")
         self._sample_rate_combo.bind("<<ComboboxSelected>>", lambda _e: self._validate_inline_fields(), add="+")
 
@@ -621,7 +650,7 @@ class OptionsPanel(ttk.LabelFrame):
             cur_fmt = self._vars.output_format_var.get().strip().lower()
             if cur_fmt in ("", "original", "m4b"):
                 self._vars.output_format_var.set("mp4")
-                self._vars.m4b_var.set(False)
+                self._on_format_selected(None)
         self.sync_dependency_states()
 
     def _on_split_chapters_clicked(self) -> None:
@@ -680,6 +709,43 @@ class OptionsPanel(ttk.LabelFrame):
                 parse_decryption_key_spec(raw_dec_key)
             except ValueError as exc:
                 errors.append(str(exc))
+        raw_workers = self._vars.max_workers_var.get().strip()
+        if raw_workers:
+            try:
+                if int(raw_workers) < 1:
+                    errors.append("Max workers must be >= 1")
+            except ValueError:
+                errors.append("Max workers must be an integer >= 1")
+        raw_delay = self._vars.book_delay_var.get().strip()
+        if raw_delay:
+            try:
+                if float(raw_delay) < 0:
+                    errors.append("Book delay must be >= 0")
+            except ValueError:
+                errors.append("Book delay must be a number >= 0")
+        raw_timeout = self._vars.timeout_var.get().strip()
+        if raw_timeout:
+            try:
+                if float(raw_timeout) <= 0:
+                    errors.append("Timeout must be > 0")
+            except ValueError:
+                errors.append("Timeout must be a number > 0")
+        raw_providers = self._vars.enrich_providers_var.get().strip()
+        if raw_providers and self._vars.enrich_metadata_var.get():
+            try:
+                parse_provider_list(raw_providers)
+            except ValueError as exc:
+                errors.append(str(exc))
+        raw_post_exec = self._vars.post_exec_var.get().strip()
+        if raw_post_exec:
+            check_text = raw_post_exec
+            if check_text.startswith("[argv, shell=False] "):
+                check_text = check_text[len("[argv, shell=False] ") :].strip()
+            if check_text:
+                try:
+                    shlex.split(check_text)
+                except ValueError as exc:
+                    errors.append(f"Post-exec syntax error: {exc}")
         if errors:
             self._validation_var.set(" • ".join(errors))
             self._validation_label.grid()
@@ -713,8 +779,9 @@ class OptionsPanel(ttk.LabelFrame):
             else:
                 widget.configure(state="normal")
 
-        _set_widget(self._cb_enrich_interactive, enrich_on)
-        _set_widget(self._enrich_providers_entry, enrich_on)
+        _set_widget(self._cb_enrich, not cover_only)
+        _set_widget(self._cb_enrich_interactive, (not cover_only) and enrich_on)
+        _set_widget(self._enrich_providers_entry, (not cover_only) and enrich_on)
 
         _set_widget(self._cb_m4b, not cover_only)
         _set_widget(self._format_combo, not cover_only, readonly_combo=True)
@@ -723,12 +790,20 @@ class OptionsPanel(ttk.LabelFrame):
         _set_widget(self._cb_loudnorm, not cover_only)
         _set_widget(self._cb_mono, not cover_only)
         _set_widget(self._cb_combine, (not cover_only) and (not split_on))
+        _set_widget(self._cb_no_chapters, not cover_only)
         _set_widget(self._cb_split_chapters, (not cover_only) and (not no_chapters))
         _set_widget(self._cb_silence_chapters, (not cover_only) and (not no_chapters))
         _set_widget(self._cb_override_chapters, (not cover_only) and (not no_chapters))
-        _set_widget(self._chapter_offset_entry, not no_chapters)
+        _set_widget(self._chapter_offset_entry, (not cover_only) and (not no_chapters))
         _set_widget(self._intro_chapter_combo, (not cover_only) and (not no_chapters), readonly_combo=True)
-        _set_widget(self._cb_cue, not no_chapters)
+        _set_widget(self._cb_json, not cover_only)
+        _set_widget(self._cb_opf, not cover_only)
+        _set_widget(self._cb_cue, (not cover_only) and (not no_chapters))
+        _set_widget(self._cb_write_cover, not cover_only)
+        _set_widget(self._cb_abs_meta, not cover_only)
+        _set_widget(self._cb_upload_abs, not cover_only)
+        _set_widget(self._cb_square_cover, not cover_only)
+        _set_widget(self._max_cover_entry, not cover_only)
 
     def set_enabled(self, enabled: bool) -> None:
         """Enable or disable interactive option controls cleanly."""

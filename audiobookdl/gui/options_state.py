@@ -3,19 +3,27 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+import hashlib
+import json
 import os
+import re
 import shlex
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from typing import TYPE_CHECKING, Any
+
+import platformdirs
 
 from audiobookdl import output
 from audiobookdl.config import (
     DEFAULT_PROFILE,
     VALID_AUTO_SYNC_MODES,
+    get_config_location,
     normalize_profile_name,
     split_source_profile_key,
 )
+from audiobookdl.utils.fs import atomic_write_text
 from audiobookdl.gui.formatting import (
     PRESET_LABEL_TO_TEMPLATE,
     SAMPLE_PREVIEW_METADATA,
@@ -50,6 +58,62 @@ SAMPLE_STANDALONE_METADATA = AudiobookMetadata(
 )
 
 
+_ARGV_DISPLAY_PREFIX = "[argv, shell=False] "
+
+
+def _join_output_template(output_dir: str, template: str) -> str:
+    """Safely join `output_dir` and `template` without mixing `/` or resetting rooted paths."""
+    cleaned = template.strip().lstrip("/\\") or "{title}"
+    parts = [p for p in re.split(r"[\\/]+", cleaned) if p]
+    return os.path.join(output_dir, *parts) if parts else output_dir
+
+
+def _post_exec_trust_store_path() -> str:
+    return os.path.join(
+        platformdirs.user_data_dir("audiobook-dl", "jo1gi"),
+        "trusted_post_exec.json",
+    )
+
+
+def _normalize_post_exec_value(raw_val: Any) -> str | list[str] | None:
+    if isinstance(raw_val, list):
+        cleaned = [str(part) for part in raw_val if str(part)]
+        return cleaned or None
+    if isinstance(raw_val, str):
+        cleaned_str = raw_val.strip()
+        return cleaned_str or None
+    return None
+
+
+def _post_exec_fingerprint(config_location: str | None, command: str | list[str]) -> str:
+    resolved_cfg = os.path.abspath(config_location or get_config_location(None))
+    payload = json.dumps(
+        {"config": os.path.normcase(resolved_cfg), "post_exec": command},
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _load_trusted_post_exec_hashes() -> set[str]:
+    path = _post_exec_trust_store_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError, TypeError):
+        return set()
+    entries = data.get("trusted") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return set()
+    return {str(item) for item in entries if isinstance(item, str) and item}
+
+
+def _save_trusted_post_exec_hashes(hashes: set[str]) -> None:
+    path = _post_exec_trust_store_path()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    atomic_write_text(path, json.dumps({"trusted": sorted(hashes)}, indent=2) + "\n")
+
+
 class OptionsCoordinator:
     """Manages GUI option variables, output templates, option building, and config reload."""
 
@@ -75,6 +139,9 @@ class OptionsCoordinator:
         self._auth: ServiceAuthCoordinator | None = None
         self._automation: AutomationCoordinator | None = None
         self._set_theme: Callable[[str], object] | None = None
+        self._loaded_post_exec_raw: str | list[str] | None = None
+        self._loaded_post_exec_display: str = ""
+        self._pending_untrusted_post_exec: str | list[str] | None = None
 
     def bind_collaborators(
         self,
@@ -121,6 +188,9 @@ class OptionsCoordinator:
             binding = spec.gui
             if binding is None:
                 continue
+            if spec.name == "post_exec":
+                setattr(o, binding.var_attr, tk.StringVar(value=""))
+                continue
             cfg_val = getattr(cfg, spec.config_key, None) if spec.config_key else None
             initial = binding.init_value(cfg_val)
             var: tk.Variable = (
@@ -129,6 +199,15 @@ class OptionsCoordinator:
                 else tk.StringVar(value=str(initial))
             )
             setattr(o, binding.var_attr, var)
+        initial_post_exec = _normalize_post_exec_value(cfg.post_exec)
+        if initial_post_exec is not None:
+            if self.is_post_exec_trusted(initial_post_exec):
+                self._apply_loaded_post_exec(initial_post_exec)
+            else:
+                self._apply_loaded_post_exec(None)
+                self._pending_untrusted_post_exec = initial_post_exec
+        else:
+            self._apply_loaded_post_exec(None)
         if cfg.gui.use_download_archive is not None:
             o.download_archive_var.set(cfg.gui.use_download_archive)
         o.m4b_var = tk.BooleanVar(value=(o.output_format_var.get() == "m4b"))
@@ -197,6 +276,8 @@ class OptionsCoordinator:
         if o.m4b_var.get():
             o.output_format_var.set("m4b")
             o.combine_var.set(True)
+            if o.split_chapters_var.get():
+                o.split_chapters_var.set(False)
         elif o.output_format_var.get() == "m4b":
             o.output_format_var.set("Original")
 
@@ -206,6 +287,8 @@ class OptionsCoordinator:
         o.m4b_var.set(is_m4b)
         if is_m4b:
             o.combine_var.set(True)
+            if o.split_chapters_var.get():
+                o.split_chapters_var.set(False)
 
     def on_preset_selected(self, _event: tk.Event | None = None) -> None:
         o = self._owner
@@ -225,7 +308,7 @@ class OptionsCoordinator:
         o = self._owner
         folder = o.output_dir_var.get().strip() or default_output_dir()
         tpl = o.template_var.get().strip() or "{title}"
-        full_tpl = os.path.join(folder, tpl)
+        full_tpl = _join_output_template(folder, tpl)
         fmt = o.output_format_var.get().strip()
         if fmt in ("", "Original"):
             media = o.media_type_var.get().strip().lower()
@@ -245,7 +328,7 @@ class OptionsCoordinator:
             elif o.split_chapters_var.get() or not o.combine_var.get():
                 intro_val = o.intro_chapter_mode_var.get().strip().lower()
                 first_num = "00" if intro_val.startswith("always") else "01"
-                suffix = f"/{first_num}.{ext}"
+                suffix = f"{os.sep}{first_num}.{ext}"
             else:
                 suffix = f".{ext}"
             o.template_preview_var.set(f"{rendered_series}{suffix}")
@@ -294,27 +377,117 @@ class OptionsCoordinator:
         suffix = f" ({', '.join(flags)})" if flags else ""
         dl_page.options_section.set_summary(f"Format: {fmt}{suffix}")
 
+    def is_post_exec_trusted(self, command: str | list[str]) -> bool:
+        fp = _post_exec_fingerprint(self._controller.config_location, command)
+        return fp in _load_trusted_post_exec_hashes()
+
+    def trust_post_exec(self, command: str | list[str]) -> None:
+        normalized = _normalize_post_exec_value(command)
+        if normalized is None:
+            return
+        fp = _post_exec_fingerprint(self._controller.config_location, normalized)
+        hashes = _load_trusted_post_exec_hashes()
+        if fp not in hashes:
+            hashes.add(fp)
+            try:
+                _save_trusted_post_exec_hashes(hashes)
+            except OSError:
+                pass
+
+    def _apply_loaded_post_exec(self, raw_val: str | list[str] | None) -> None:
+        normalized = _normalize_post_exec_value(raw_val)
+        self._loaded_post_exec_raw = list(normalized) if isinstance(normalized, list) else normalized
+        if isinstance(normalized, list):
+            display = f"{_ARGV_DISPLAY_PREFIX}{shlex.join(normalized)}"
+        else:
+            display = normalized or ""
+        self._loaded_post_exec_display = display
+        self._owner.post_exec_var.set(display)
+
+    def _confirm_post_exec_dialog(self, command: str | list[str], *, source_label: str) -> bool:
+        if isinstance(command, list):
+            mode_desc = "direct executable argv list (shell=False)"
+            display_cmd = shlex.join(command)
+        else:
+            mode_desc = "system shell command (shell=True)"
+            display_cmd = command
+        return bool(
+            messagebox.askyesno(
+                "Confirm Post-Exec Command",
+                f"The {source_label} defines a post-exec command ({mode_desc}):\n\n"
+                f"{display_cmd}\n\n"
+                "This command will run after each completed audiobook. "
+                "Trust and enable this command?",
+                parent=self._root,
+            )
+        )
+
+    def prompt_pending_post_exec(self) -> None:
+        """Prompt for any untrusted `post_exec` command discovered during startup config load."""
+        pending = self._pending_untrusted_post_exec
+        self._pending_untrusted_post_exec = None
+        if pending is None:
+            return
+        if self._confirm_post_exec_dialog(pending, source_label="startup configuration"):
+            self.trust_post_exec(pending)
+            self._apply_loaded_post_exec(pending)
+        else:
+            self._apply_loaded_post_exec(None)
+            self._on_log("[WARN] Disabled untrusted post_exec command from startup configuration.")
+
     def read_gui_option_value(self, spec: Any, custom_providers: Mapping[str, Any]) -> Any:
         raw_val = getattr(self._owner, spec.gui.var_attr).get()
         if spec.name == "enrich_providers":
             cleaned = str(raw_val).strip()
             if not cleaned:
                 return None
+            if not self._owner.enrich_metadata_var.get():
+                try:
+                    return ",".join(parse_provider_list(cleaned, custom_providers=custom_providers))
+                except ValueError:
+                    return None
             return ",".join(parse_provider_list(cleaned, custom_providers=custom_providers))
+        if spec.name == "post_exec":
+            text = str(raw_val).strip()
+            if not text:
+                return None
+            if (
+                self._loaded_post_exec_raw is not None
+                and text == self._loaded_post_exec_display
+            ):
+                return (
+                    list(self._loaded_post_exec_raw)
+                    if isinstance(self._loaded_post_exec_raw, list)
+                    else self._loaded_post_exec_raw
+                )
+            if text.startswith(_ARGV_DISPLAY_PREFIX):
+                rest = text[len(_ARGV_DISPLAY_PREFIX) :].strip()
+                if not rest:
+                    return None
+                try:
+                    parsed = shlex.split(rest)
+                except ValueError as exc:
+                    raise ValueError(f"Invalid post_exec argv syntax: {exc}") from exc
+                return parsed or None
+            return text
         return spec.gui.read_option(raw_val)
 
     def build_options(self, urls_override: Sequence[str] | None = None) -> DownloadOptions:
         """Build `DownloadOptions` from current UI field values."""
+        if threading.current_thread() is not threading.main_thread():
+            raise RuntimeError("OptionsCoordinator.build_options() must be called on the Tk main thread")
         o = self._owner
         output_dir = o.output_dir_var.get().strip() or default_output_dir()
         template = o.template_var.get().strip() or "{title}"
-        output_template = os.path.join(output_dir, template)
+        output_template = _join_output_template(output_dir, template)
         custom_providers = self._controller.config_snapshot().custom_metadata_providers
         option_values = {
             spec.name: self.read_gui_option_value(spec, custom_providers)
             for spec in GUI_OPTION_SPECS
             if spec.gui is not None
         }
+        if option_values.get("split_chapters"):
+            option_values["combine"] = False
         use_download_archive = bool(option_values.pop("download_archive", False))
         archive_path = resolve_archive_path(self._controller.config_snapshot())
         download_archive = archive_path if use_download_archive else None
@@ -380,6 +553,8 @@ class OptionsCoordinator:
         assert self._auth is not None
         if o.remember_login_var.get():
             self._auth.save_current_credentials(quiet=True)
+        if options.post_exec:
+            self.trust_post_exec(options.post_exec)
         self._controller.save_run_preferences(
             options,
             output_dir=o.output_dir_var.get().strip() or default_output_dir(),
@@ -423,35 +598,28 @@ class OptionsCoordinator:
         assert self._shell is not None
         assert self._set_theme is not None
         try:
-            previous_post_exec = o.post_exec_var.get().strip()
+            previous_post_exec_raw = self._loaded_post_exec_raw
             cfg = self._controller.reload_config()
-            if (cfg.gui.output_dir or "").strip():
-                o.output_dir_var.set((cfg.gui.output_dir or "").strip())
-            if (cfg.gui.output_template or "").strip():
-                o.template_var.set((cfg.gui.output_template or "").strip())
+            o.output_dir_var.set((cfg.gui.output_dir or "").strip() or default_output_dir())
+            o.template_var.set((cfg.gui.output_template or "").strip() or "{title}")
             for spec in GUI_OPTION_SPECS:
                 binding = spec.gui
-                if binding is None or not spec.config_key:
+                if binding is None or not spec.config_key or spec.name == "post_exec":
                     continue
                 cfg_val = getattr(cfg, spec.config_key, None)
                 getattr(o, binding.var_attr).set(binding.init_value(cfg_val))
-            raw_post_exec = cfg.post_exec
-            new_post_exec = (
-                shlex.join(raw_post_exec)
-                if isinstance(raw_post_exec, list)
-                else (raw_post_exec or "").strip()
-            )
-            if new_post_exec and new_post_exec != previous_post_exec:
-                approved = messagebox.askyesno(
-                    "Confirm Post-Exec Command",
-                    "The reloaded configuration defines a shell post-exec command:\n\n"
-                    f"{new_post_exec}\n\n"
-                    "This command will run via the system shell after each completed audiobook. "
-                    "Keep this command enabled?",
-                    parent=self._root,
-                )
-                if not approved:
-                    o.post_exec_var.set("")
+            new_post_exec = _normalize_post_exec_value(cfg.post_exec)
+            self._pending_untrusted_post_exec = None
+            if new_post_exec is None:
+                self._apply_loaded_post_exec(None)
+            elif new_post_exec == previous_post_exec_raw or self.is_post_exec_trusted(new_post_exec):
+                self._apply_loaded_post_exec(new_post_exec)
+            else:
+                if self._confirm_post_exec_dialog(new_post_exec, source_label="reloaded configuration"):
+                    self.trust_post_exec(new_post_exec)
+                    self._apply_loaded_post_exec(new_post_exec)
+                else:
+                    self._apply_loaded_post_exec(None)
                     self._on_log("[WARN] Disabled post_exec command from reloaded configuration.")
             if cfg.gui.use_download_archive is not None:
                 o.download_archive_var.set(cfg.gui.use_download_archive)
@@ -462,6 +630,10 @@ class OptionsCoordinator:
                 self._automation.apply_clipboard_monitor(quiet=True, persist=False)
             if cfg.gui.minimize_to_tray is not None:
                 o.minimize_to_tray_var.set(cfg.gui.minimize_to_tray)
+            if cfg.gui.queue_concurrency is not None:
+                clamped_qc = self._controller.set_queue_concurrency(cfg.gui.queue_concurrency)
+                if hasattr(o, "queue_concurrency_var"):
+                    o.queue_concurrency_var.set(str(clamped_qc))
             o.check_updates_var.set(cfg.check_updates is not False)
             if cfg.gui.auto_sync_enabled is not None:
                 self._automation.auto_sync_enabled = cfg.gui.auto_sync_enabled

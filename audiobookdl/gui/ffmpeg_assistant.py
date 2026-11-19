@@ -42,6 +42,12 @@ class FFmpegAssistant:
         self._status_label: ttk.Label | None = None
         self.locate_btn: ttk.Button | None = None
         self.is_available = True
+        self._is_installing = False
+
+    @property
+    def is_installing(self) -> bool:
+        """Whether a winget FFmpeg installation is currently running in the background."""
+        return self._is_installing
 
     def build_controls(self, parent: tk.Misc) -> ttk.Frame:
         """Build the header status label and Locate FFmpeg button inside `parent`."""
@@ -192,6 +198,7 @@ class FFmpegAssistant:
             options.combine
             or options.output_format
             or options.split_chapters
+            or getattr(options, "chapters_from_silence", False)
             or getattr(options, "loudnorm", False)
             or getattr(options, "mono", False)
             or has_explicit_bitrate
@@ -209,20 +216,30 @@ class FFmpegAssistant:
                 "Media integrity verification will fail until this is fixed.\n\n"
                 "Yes: Locate a working FFmpeg folder now\n"
                 "No: Continue anyway\n"
-                "Cancel: Stop and view help",
+                "Cancel: Cancel download",
                 parent=self._root,
             )
             if choice is True:
                 if self.browse_dir():
                     _, probe_err = self.check_tool("ffprobe")
-                    return probe_err is None
+                    if probe_err is not None:
+                        messagebox.showwarning(
+                            "FFprobe Still Unavailable",
+                            f"ffprobe validation failed:\n{probe_err}",
+                            parent=self._root,
+                        )
+                        return False
+                    return True
                 return False
             if choice is False:
                 return True
-            self.show_guidance()
             return False
 
-        needs_ffprobe = bool(options.combine or options.split_chapters)
+        needs_ffprobe = bool(
+            options.combine
+            or options.split_chapters
+            or getattr(options, "chapters_from_silence", False)
+        )
         has_ffmpeg = ffmpeg_path is not None and ffmpeg_err is None
         has_ffprobe = ffprobe_path is not None and ffprobe_err is None
         if has_ffmpeg and (not needs_ffprobe or has_ffprobe):
@@ -243,6 +260,8 @@ class FFmpegAssistant:
             reasons.append("combine parts")
         if options.split_chapters:
             reasons.append("split chapters")
+        if getattr(options, "chapters_from_silence", False):
+            reasons.append("detect silence chapters")
         if options.output_format:
             reasons.append(f"convert to .{options.output_format}")
         if (
@@ -260,22 +279,42 @@ class FFmpegAssistant:
             f"FFmpeg/FFprobe is unusable or missing, which is needed to {reason_text}:\n{issue_text}\n\n"
             "Yes: Locate FFmpeg folder now\n"
             "No: Continue anyway (may fail after downloading parts)\n"
-            "Cancel: Stop and view setup instructions",
+            "Cancel: Cancel download",
             parent=self._root,
         )
         if choice is True:
             if self.browse_dir():
                 ff_p, ff_e = self.check_tool("ffmpeg")
                 fp_p, fp_e = self.check_tool("ffprobe")
-                return bool(ff_p and not ff_e and (not needs_ffprobe or (fp_p and not fp_e)))
+                if not ff_p or ff_e:
+                    messagebox.showwarning(
+                        "FFmpeg Still Unavailable",
+                        ff_e or "ffmpeg.exe was not found in the selected folder.",
+                        parent=self._root,
+                    )
+                    return False
+                if needs_ffprobe and (not fp_p or fp_e):
+                    messagebox.showwarning(
+                        "FFprobe Still Unavailable",
+                        fp_e or "ffprobe.exe was not found alongside ffmpeg in the selected folder.",
+                        parent=self._root,
+                    )
+                    return False
+                return True
             return False
         if choice is False:
             return True
-        self.show_guidance()
         return False
 
     def install_via_winget(self) -> None:
         """Install FFmpeg via Windows winget (`Gyan.FFmpeg`) on a background thread."""
+        if self._is_installing:
+            messagebox.showinfo(
+                "Install in Progress",
+                "FFmpeg installation via winget is already running.",
+                parent=self._root,
+            )
+            return
         if not sys.platform.startswith("win") or not winget_available():
             messagebox.showinfo(
                 "winget Unavailable",
@@ -289,12 +328,18 @@ class FFmpegAssistant:
             parent=self._root,
         ):
             return
+        self._is_installing = True
         self._status_var.set("Installing FFmpeg via winget...")
         self._on_log("Installing FFmpeg via winget (Gyan.FFmpeg)...")
-        self._controller.start_winget_ffmpeg_install()
+        try:
+            self._controller.start_winget_ffmpeg_install()
+        except Exception:
+            self._is_installing = False
+            raise
 
     def handle_install_done(self, ok: bool, detail: str) -> None:
         """Update UI and notify the user when background winget installation finishes."""
+        self._is_installing = False
         self.update_status()
         if ok:
             self._status_var.set("FFmpeg installed")
@@ -349,10 +394,10 @@ class FFmpegAssistant:
             "FFmpeg Setup Guide",
             "FFmpeg and FFprobe are needed to combine multi-part books or convert to .m4b/.mp3.\n\n"
             "Quickest setup:\n"
-            "1. Click 'Locate FFmpeg...' in the top-right to point to an existing ffmpeg folder.\n"
+            "1. Open Settings -> FFmpeg (or click Locate FFmpeg...) to point to an existing ffmpeg folder.\n"
             f"2. Or place ffmpeg.exe and ffprobe.exe in:\n   {exe_dir}\n\n"
             "Install via package manager:\n"
-            "   Windows: winget install Gyan.FFmpeg\n"
+            "   Windows: winget install -e --id Gyan.FFmpeg\n"
             "   macOS:   brew install ffmpeg\n"
             "   Linux:   sudo apt install ffmpeg\n\n"
             "Download builds: https://ffmpeg.org/download.html",
