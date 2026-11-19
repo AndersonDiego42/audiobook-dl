@@ -291,7 +291,6 @@ def test_run_cancellable_subprocess_terminates_child_promptly():
         with pytest.raises(DownloadCancelled):
             run_cancellable_subprocess(
                 [sys.executable, "-c", "import time; time.sleep(30)"],
-                capture_output=True,
                 cancel_event=cancel_event,
                 poll_interval=0.05,
             )
@@ -662,7 +661,6 @@ def test_run_cancellable_subprocess_ffmpeg_progress_callback():
     with ffmpeg_progress_callback(reported.append):
         proc = run_cancellable_subprocess(
             [sys.executable, "-c", script, "-progress", "pipe:1"],
-            capture_output=True,
         )
 
     assert proc.returncode == 0
@@ -1821,6 +1819,156 @@ def test_verify_ebook_integrity_and_file_checksums(tmp_path):
     )
     with pytest.raises(FailedCombining, match="SHA256 checksum mismatch"):
         output.verify_file_checksums(str(sample), {"sha256": "0" * 64})
+
+
+def test_debug_mode_preserves_ffmpeg_progress_and_logs_stderr_to_sink(tmp_path):
+    from audiobookdl import logging
+    from audiobookdl.utils.concurrency import _ffmpeg_progress_var
+
+    class _RecordingSink:
+        def __init__(self) -> None:
+            self.logs: list[tuple[str, str]] = []
+            self.starts: list[tuple[str, float]] = []
+            self.advances: list[tuple[float, float]] = []
+            self.finishes = 0
+
+        def on_log(self, level: str, message: str) -> None:
+            self.logs.append((level, message))
+
+        def on_progress_start(self, description: str, total: float) -> None:
+            self.starts.append((description, total))
+
+        def on_progress_advance(self, completed: float, total: float) -> None:
+            self.advances.append((completed, total))
+
+        def on_progress_finish(self) -> None:
+            self.finishes += 1
+
+    src = tmp_path / "book.mp3"
+    src.write_bytes(b"mp3-bytes")
+    cmds: list[list[str]] = []
+
+    def fake_run(cmd, cancel_event=None):
+        cmds.append(list(cmd))
+        cb = _ffmpeg_progress_var.get()
+        if cb is not None:
+            cb(5.0)
+            cb(10.0)
+        if cmd[-1] == "-":
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"[silencedetect] silence_end: 5.0\r\n")
+        Path(cmd[-1]).write_bytes(b"m4b-bytes")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"ffmpeg version test\r\nsize= 128kB\r")
+
+    sink = _RecordingSink()
+    with (
+        patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
+        patch("audiobookdl.output.output._probe_audio_info", return_value=AudioProbeInfo(duration=10.0, codec_name="mp3")),
+        patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run),
+        logging.job_context(logging.JobContext(debug=True, sink=sink)),
+    ):
+        chapters = output.detect_silence_chapters(str(src))
+        out_path, _ = output.convert_single_file(str(src), "m4b", remove_source=False)
+
+    assert len(chapters) == 1
+    assert os.path.exists(out_path)
+    assert len(cmds) == 2
+    for cmd in cmds:
+        assert "-progress" in cmd and "pipe:1" in cmd and "-nostats" in cmd
+    assert [desc for desc, _total in sink.starts] == [
+        "Detecting silence chapters",
+        "Converting book.mp3",
+    ]
+    assert sink.finishes == 2
+    assert len(sink.advances) >= 2
+    debug_msgs = [msg for lvl, msg in sink.logs if lvl == "DEBUG"]
+    assert any("silence_end: 5.0" in m for m in debug_msgs)
+    assert any("ffmpeg version test" in m and "\r" not in m for m in debug_msgs)
+
+
+def test_combine_and_add_chapters_debug_mode_log_stderr_and_progress(tmp_path):
+    from audiobookdl import logging
+    from audiobookdl.utils.concurrency import _ffmpeg_progress_var
+
+    class _RecordingSink:
+        def __init__(self) -> None:
+            self.logs: list[tuple[str, str]] = []
+            self.starts: list[str] = []
+            self.finishes = 0
+
+        def on_log(self, level: str, message: str) -> None:
+            self.logs.append((level, message))
+
+        def on_progress_start(self, description: str, total: float) -> None:
+            self.starts.append(description)
+
+        def on_progress_advance(self, completed: float, total: float) -> None:
+            pass
+
+        def on_progress_finish(self) -> None:
+            self.finishes += 1
+
+    part = tmp_path / "part0.mp3"
+    part.write_bytes(b"mp3")
+    out_m4b = tmp_path / "combined.m4b"
+    cmds: list[list[str]] = []
+
+    def fake_run(cmd, cancel_event=None):
+        cmds.append(list(cmd))
+        cb = _ffmpeg_progress_var.get()
+        if cb is not None:
+            cb(10.0)
+        Path(cmd[-1]).write_bytes(b"m4b")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"mux stderr line\n")
+
+    sink = _RecordingSink()
+    with (
+        patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
+        patch("audiobookdl.output.output._probe_audio_info", return_value=AudioProbeInfo(duration=10.0, codec_name="mp3")),
+        patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run),
+        patch("audiobookdl.output.output._remux_to_mpegts", lambda _s, dst, **_kw: open(dst, "wb").write(b"ts") > 0),
+        patch("audiobookdl.output.output.verify_audio_integrity", return_value=AudioProbeInfo(duration=10.0)),
+        patch("audiobookdl.output.metadata.ffmpeg.utils.find_executable", return_value="ffmpeg"),
+        patch("audiobookdl.output.metadata.ffmpeg.create_tmp_chapter_file", return_value=";FFMETADATA1\n"),
+        patch("audiobookdl.output.metadata.ffmpeg.run_cancellable_subprocess", side_effect=fake_run),
+        logging.job_context(logging.JobContext(debug=True, sink=sink)),
+    ):
+        output.combine_audiofiles([str(part)], str(tmp_path / "work"), str(out_m4b))
+        ffmpeg_metadata.add_chapters_ffmpeg(str(out_m4b), [Chapter(0, "Ch 1")])
+
+    assert "-progress" in cmds[0] and "pipe:1" in cmds[0] and "-nostats" in cmds[0]
+    assert "Combining to .m4b" in sink.starts
+    assert sink.finishes == 2
+    debug_msgs = [msg for lvl, msg in sink.logs if lvl == "DEBUG"]
+    assert debug_msgs.count("mux stderr line") == 2
+
+
+def test_run_cancellable_subprocess_captures_stderr_and_streams_progress():
+    from audiobookdl.utils.concurrency import ffmpeg_progress_callback
+
+    seen_seconds: list[float] = []
+    script = (
+        "import sys; "
+        "sys.stdout.write('out_time_us=1500000\\n'); sys.stdout.flush(); "
+        "sys.stderr.write('captured-ffmpeg-stderr\\n'); sys.stderr.flush()"
+    )
+    with ffmpeg_progress_callback(seen_seconds.append):
+        res = run_cancellable_subprocess([sys.executable, "-c", script, "-progress", "pipe:1"])
+
+    assert res.returncode == 0
+    assert seen_seconds == [1.5]
+    assert b"captured-ffmpeg-stderr" in res.stderr
+
+
+def test_subprocess_kwargs_unconditional_create_no_window_on_windows(monkeypatch):
+    from audiobookdl import utils
+
+    monkeypatch.setattr(utils.os, "name", "nt")
+    monkeypatch.setattr(utils.subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
+    monkeypatch.setattr(utils.sys, "stdout", object())
+    assert utils.subprocess_kwargs() == {"creationflags": 0x08000000}
+
+    monkeypatch.setattr(utils.os, "name", "posix")
+    assert utils.subprocess_kwargs() == {}
 
 
 

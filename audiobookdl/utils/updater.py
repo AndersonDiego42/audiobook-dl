@@ -230,7 +230,7 @@ def install_ffmpeg_via_winget() -> tuple[bool, str]:
             capture_output=True,
             text=True,
             timeout=300,
-            **subprocess_kwargs(capture_output=True),
+            **subprocess_kwargs(),
         )
         if proc.returncode == 0:
             return True, "FFmpeg installed via winget. Restart or locate ffmpeg if not yet on PATH."

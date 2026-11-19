@@ -445,7 +445,7 @@ class PlaintextFallbackCredentialStore(CredentialStore):
         self, service_key: str, username: str | None, password: str
     ) -> None:
         if self.allow_plaintext:
-            logging.log(
+            logging.warning(
                 f"Warning: No OS keyring backend available; saving password for "
                 f"'{service_key}' in plaintext."
             )
@@ -458,7 +458,7 @@ class PlaintextFallbackCredentialStore(CredentialStore):
             else:
                 self._entries[service_key] = record
         else:
-            logging.log(
+            logging.warning(
                 f"Warning: No OS keyring backend available; password for '{service_key}' "
                 f"was not persisted. Set {PLAINTEXT_OPT_IN_ENV}=1 to allow plaintext storage."
             )

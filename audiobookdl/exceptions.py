@@ -1,4 +1,4 @@
-from .logging import error, print_error_file, strip_markup
+from .logging import error, print_error_file
 from .utils import read_asset_file
 
 
@@ -26,7 +26,7 @@ class AudiobookDLException(Exception):
                 try:
                     template = read_asset_file(f"assets/errors/{self.error_description}.txt")
                     rendered = template.format_map(_SafeFormatDict(self.data))
-                    base = strip_markup(rendered).strip()
+                    base = rendered.strip()
                 except Exception:
                     base = self.error_description.replace("_", " ").capitalize()
         detail = str(self.data.get("detail") or "").strip()

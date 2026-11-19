@@ -154,8 +154,8 @@ def run_post_exec_hook(
         if not stripped:
             return None
         if not allow_shell:
-            logging.log(
-                f"[yellow]Warning:[/yellow] Skipping shell post_exec command without shell opt-in: {stripped}"
+            logging.warning(
+                f"Warning: Skipping shell post_exec command without shell opt-in: {stripped}"
             )
             return None
         use_shell = True
@@ -187,7 +187,7 @@ def run_post_exec_hook(
             capture_output=True,
             text=True,
             timeout=timeout,
-            **subprocess_kwargs(capture_output=True),
+            **subprocess_kwargs(),
         )
     except subprocess.TimeoutExpired as exc:
         logging.error(
@@ -327,11 +327,9 @@ def apply_runtime_options(
         options.output_template = "{title}"
 
     ffmpeg_dir = config.ffmpeg_dir.strip() or None if config.ffmpeg_dir else None
-    ffmpeg_out = options.ffmpeg_output or options.debug
     return logging.JobContext(
         debug=options.debug,
         quiet=options.quiet,
-        ffmpeg_output=ffmpeg_out,
         ffmpeg_dir=ffmpeg_dir,
     )
 
@@ -608,7 +606,7 @@ class Downloader:
                         summary.books_skipped += 1
                         summary.completed += 1
                         reason = _describe_unavailable_reason(e)
-                        logging.log(f"Skipped [blue]{url}[/] ({reason})")
+                        logging.log(f"Skipped {url} ({reason})")
                         if logging.is_debug_mode():
                             logging.print_traceback()
                         continue
@@ -709,7 +707,7 @@ def prepare_source_result(
                 release_fn()
         if cancel_event is not None and cancel_event.is_set():
             raise DownloadCancelled
-        logging.debug(f"Downloading result of [underline]{url}")
+        logging.debug(f"Downloading result of {url}")
         try:
             result = source.download(url)
         except UserNotAuthorized:
@@ -854,7 +852,7 @@ def download_result(
     logging.log("")  # Empty line
     if isinstance(result, Audiobook):
         logging.emit_item_progress(1, 1, result.title)
-        logging.log(f"Downloading [blue]{result.title}[/] from [magenta]{source.name}[/]")
+        logging.log(f"Downloading {result.title} from {source.name}")
         processed = process_audiobook(
             source,
             result,
@@ -881,11 +879,11 @@ def download_result(
                     books_to_process.append(result.books[idx])
         count = len(books_to_process)
         if count == 0:
-            logging.log(f"No books selected from [blue]{result.title}[/]")
+            logging.log(f"No books selected from {result.title}")
             return
         logging.emit_item_progress(0, count, result.title)
         logging.log(
-            f"Downloading [yellow not bold]{count}[/] books in [blue]{result.title}[/] from [magenta]{source.name}[/]"
+            f"Downloading {count} books in {result.title} from {source.name}"
         )
         done_count = 0
         skip_count = 0
@@ -917,7 +915,7 @@ def download_result(
                             summary.outputs.append(_audiobook_output_entry(audiobook, options))
             except UNAVAILABLE_BOOK_EXCEPTIONS as e:
                 skip_count += 1
-                logging.log(f"Skipped [blue]{book}[/] ({_describe_unavailable_reason(e)})")
+                logging.log(f"Skipped {book} ({_describe_unavailable_reason(e)})")
                 continue
             except AudiobookDLException as e:
                 if isinstance(e, DownloadCancelled):
@@ -927,7 +925,7 @@ def download_result(
                 fail_count += 1
                 detail = str(e).strip() or e.error_description
                 errors.append((str(book), detail))
-                logging.log(f"Skipped [blue]{book}[/] ({detail})")
+                logging.log(f"Skipped {book} ({detail})")
                 if logging.is_debug_mode():
                     logging.print_traceback()
                 continue
@@ -1097,7 +1095,7 @@ def authenticate(
     explicit_inline_creds = _explicit_inline_credentials(options)
     req_profile = _resolve_request_profile(options, config, source)
     profile_label = f" ({req_profile})" if req_profile != DEFAULT_PROFILE else ""
-    logging.log(f"Authenticating with [magenta]{source.name}{profile_label}[/]")
+    logging.log(f"Authenticating with {source.name}{profile_label}")
     source_config = get_source_config(
         config,
         source.name,
@@ -1110,7 +1108,7 @@ def authenticate(
         and source_config is None
         and not explicit_inline_creds
     ):
-        logging.log(
+        logging.warning(
             f"Warning: profile '{req_profile}' not found in config for {source.name}"
         )
     source._loaded_cached_cookies = False
@@ -1556,7 +1554,7 @@ def process_audiobook(
             archive = DownloadArchive(ledger_path, persistent=True)
             if archive.contains(source_name, book_key):
                 logging.log(
-                    f"Skipping [blue]{audiobook.title}[/], already recorded in download archive."
+                    f"Skipping {audiobook.title}, already recorded in download archive."
                 )
                 return False
             dup = archive.find_cross_source_duplicate(
@@ -1571,11 +1569,11 @@ def process_audiobook(
                 dup_label = dup.get("output_path") or dup.get("title") or dup.get("source")
                 if options.skip_downloaded:
                     logging.log(
-                        f"Skipping [blue]{audiobook.title}[/], already archived from {dup['source']} ({dup_label})."
+                        f"Skipping {audiobook.title}, already archived from {dup['source']} ({dup_label})."
                     )
                     return False
-                logging.log(
-                    f"[yellow]Warning:[/yellow] [blue]{audiobook.title}[/] matches existing archive entry from {dup['source']} ({dup_label})."
+                logging.warning(
+                    f"Warning: {audiobook.title} matches existing archive entry from {dup['source']} ({dup_label})."
                 )
 
         enrich_result = None
@@ -1651,7 +1649,7 @@ def process_audiobook(
                 force_upload=force_abs,
                 session=getattr(audiobook, "session", None),
             ):
-                logging.log(f"Synced [blue]{audiobook.title}[/] to Audiobookshelf")
+                logging.log(f"Synced {audiobook.title} to Audiobookshelf")
         except Exception as exc:
             logging.error(f"Audiobookshelf sync failed for '{audiobook.title}': {exc}")
     run_post_exec_hook(

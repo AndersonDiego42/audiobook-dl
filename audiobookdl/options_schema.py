@@ -828,11 +828,6 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         ),
     ),
     OptionSpec(
-        name="ffmpeg_output",
-        default=False,
-        help="Include verbose ffmpeg output in logs",
-    ),
-    OptionSpec(
         name="username",
         default=None,
         help="Username for source",
@@ -1546,7 +1541,6 @@ class DownloadOptions:
     split_chapters: bool = False
     output_format: str | None = None
     media_type: str = "auto"
-    ffmpeg_output: bool = False
     username: str | None = None
     password: str | None = None
     library: str | None = None

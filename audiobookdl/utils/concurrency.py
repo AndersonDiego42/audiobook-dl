@@ -74,21 +74,20 @@ def _apply_ffmpeg_thread_limit(command: Sequence[str]) -> list[str]:
 def run_cancellable_subprocess(
     command: Sequence[str],
     *,
-    capture_output: bool = True,
     cancel_event: threading.Event | None = None,
     poll_interval: float = 0.1,
 ) -> subprocess.CompletedProcess[bytes]:
     """
     Run `command` via `Popen` while polling `cancel_event`.
 
-    Captures stderr to an unbuffered temporary file when `capture_output` is
-    True so large ffmpeg logs cannot deadlock on OS pipe buffers. Terminates
-    the child process cleanly and raises `DownloadCancelled` when cancelled.
+    Always captures stderr to an unbuffered temporary file so large ffmpeg logs
+    cannot deadlock on OS pipe buffers. Terminates the child process cleanly
+    and raises `DownloadCancelled` when cancelled.
     """
     if cancel_event is not None and cancel_event.is_set():
         raise DownloadCancelled
     effective_command = _apply_ffmpeg_thread_limit(command)
-    stderr_file = tempfile.TemporaryFile() if capture_output else None
+    stderr_file = tempfile.TemporaryFile()
     progress_cb = _ffmpeg_progress_var.get()
     wants_progress = progress_cb is not None and "-progress" in effective_command
     proc: subprocess.Popen[bytes] | None = None
@@ -96,9 +95,9 @@ def run_cancellable_subprocess(
     try:
         proc = subprocess.Popen(
             effective_command,
-            stdout=subprocess.PIPE if wants_progress else (subprocess.DEVNULL if capture_output else None),
+            stdout=subprocess.PIPE if wants_progress else subprocess.DEVNULL,
             stderr=stderr_file,
-            **subprocess_kwargs(capture_output=capture_output),
+            **subprocess_kwargs(),
         )
         if wants_progress and proc.stdout is not None and progress_cb is not None:
             cb = progress_cb

@@ -171,7 +171,7 @@ def validate_executable(path: str, *, probe_args: Sequence[str] = ("-version",))
             capture_output=True,
             text=True,
             timeout=10,
-            **subprocess_kwargs(capture_output=True),
+            **subprocess_kwargs(),
         )
     except OSError as exc:
         err = f"{os.path.basename(path)} failed to execute: {exc}"
@@ -315,7 +315,7 @@ def probe_audio_info(path: str) -> AudioProbeInfo:
             ],
             capture_output=True,
             text=True,
-            **subprocess_kwargs(capture_output=True),
+            **subprocess_kwargs(),
         )
     except OSError as exc:
         return AudioProbeInfo(probe_error=f"ffprobe failed to execute ({ffprobe}): {exc}")
@@ -415,14 +415,10 @@ def resolve_audio_bitrate(
     return f"{kbps}k"
 
 
-def subprocess_kwargs(capture_output: bool = True) -> dict[str, Any]:
+def subprocess_kwargs() -> dict[str, Any]:
     """Return platform-specific subprocess kwargs to avoid console flashes in windowed GUI apps."""
     kwargs: dict[str, Any] = {}
-    if (
-        os.name == "nt"
-        and hasattr(subprocess, "CREATE_NO_WINDOW")
-        and (capture_output or sys.stdout is None)
-    ):
+    if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     return kwargs
 

@@ -505,7 +505,7 @@ class StorytelSource(Source):
             corrections = metadata_corrections["books"][consumableId]
             for key, value in corrections.items():
                 logging.log(
-                    f"overriding metadata [yellow]{key}[/] from [blue]{getattr(metadata, key)}[/] to [magenta]{value}[/]"
+                    f"overriding metadata {key} from {getattr(metadata, key)} to {value}"
                 )
                 setattr(metadata, key, value)
 

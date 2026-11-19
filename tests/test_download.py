@@ -296,7 +296,7 @@ def test_download_file_midstream_cancel_cleans_tmp_and_raises(tmp_path):
     resp.close.assert_called_once()
 
 
-def test_download_file_raises_download_error_on_non_200_with_escaped_markup(tmp_path):
+def test_download_file_raises_download_error_on_non_200_with_raw_body(tmp_path):
     session = MagicMock()
     resp = MagicMock(
         status_code=403,
@@ -309,7 +309,7 @@ def test_download_file_raises_download_error_on_non_200_with_escaped_markup(tmp_
     with pytest.raises(DownloadError) as exc_info:
         download_file((audiobook, str(tmp_path / "err"), 0, lambda _: None, None))
 
-    assert r"\[red]Forbidden\[/red]" in exc_info.value.data["body"]
+    assert "[red]Forbidden[/red]" in exc_info.value.data["body"]
     resp.close.assert_called_once()
 
 

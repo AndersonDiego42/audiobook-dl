@@ -15,7 +15,7 @@ Format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 - **Media & HLS Pipeline**: FFmpeg concat-demuxer merging (eliminating redundant `combined.ts` byte copies), live `-progress` telemetry during silence detection, atomic staged container tagging prior to `os.replace`, `locale`-ranked HLS audio rendition selection, UTF-8 BOM tolerance, pre-write bandwidth rate limiting, and exposed `silence_noise_db` / `silence_min_seconds` options.
 - **Source Adapters & Auth Recovery**: Shared `Source.get_or_create_device_id()`, single automatic re-authentication retry when cached cookies fail with `UserNotAuthorized`, and lock-guarded `EreolenSource.refresh_library_domains()`.
-- **Configuration & Logging**: Comment-preserving TOML updates via `tomlkit`, regex-based markup stripping/escaping (removing the `rich` runtime dependency), and safer `post_exec` `list[str]` execution with `shell=False`.
+- **Configuration & Logging**: Comment-preserving TOML updates via `tomlkit`, plain-text `LogSink` logging with dedicated `logging.warning()` routing (removing `rich` and markup stripping/escaping), and safer `post_exec` `list[str]` execution with `shell=False`.
 
 ### Security
 - Hardened credential storage (DPAPI vault validation, Win32 owner-only DACL enforcement, atomic writes for `PlaintextFallbackCredentialStore`, non-loopback `http://` Bearer token warnings) and SQL-side host filtering for browser cookie imports.

@@ -1,4 +1,5 @@
-[red]ERROR: Can't add chapters to file[/red]
+ERROR: Can't add chapters to file
 
 audiobook-dl currently does not support adding chapters to {filetype} without
-ffmpeg. You can install ffmpeg from https://ffmpeg.org
+ffmpeg. Configure your FFmpeg folder in Settings -> FFmpeg & FFprobe (or Locate
+FFmpeg...), or install ffmpeg from https://ffmpeg.org

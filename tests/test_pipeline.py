@@ -118,7 +118,6 @@ def test_downloader_events_isolation_and_selective_workflow(monkeypatch):
 
     assert not logging.is_debug_mode()
     assert not logging.is_quiet_mode()
-    assert not logging.is_ffmpeg_output()
     assert logging.get_ui_sink() is None
 
     config = Config(sources={}, output_template=None, database_directory=None, skip_downloaded=None)
@@ -150,7 +149,6 @@ def test_downloader_events_isolation_and_selective_workflow(monkeypatch):
     # JobContext flags and sink remained isolated/untouched
     assert not logging.is_debug_mode()
     assert not logging.is_quiet_mode()
-    assert not logging.is_ffmpeg_output()
     assert logging.get_ui_sink() is None
     assert logging.get_job_context() is None
 
@@ -1288,7 +1286,7 @@ def test_post_exec_hook_supports_argv_list_without_shell_and_blocks_disallowed_s
     warnings: list[str] = []
     with (
         patch("audiobookdl.pipeline.subprocess.run", side_effect=fake_run),
-        patch("audiobookdl.pipeline.logging.log", side_effect=warnings.append),
+        patch("audiobookdl.pipeline.logging.warning", side_effect=warnings.append),
     ):
         rc_blocked = run_post_exec_hook(
             "echo unsafe",

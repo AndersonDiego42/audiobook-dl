@@ -142,6 +142,9 @@ def build(
         f"{ASSETS_DIR}{sep}audiobookdl/assets",
         "--collect-data",
         "pycountry",
+        # Source modules are loaded lazily via `importlib.import_module`, which PyInstaller cannot detect.
+        "--collect-submodules",
+        "audiobookdl.sources",
     ]
     for module in EXCLUDED_MODULES:
         cmd.extend(["--exclude-module", module])

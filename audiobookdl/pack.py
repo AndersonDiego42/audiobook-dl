@@ -282,7 +282,7 @@ def _probe_embedded_chapters(filepath: str) -> list[Chapter]:
             ],
             capture_output=True,
             text=True,
-            **subprocess_kwargs(capture_output=True),
+            **subprocess_kwargs(),
         )
     except OSError:
         return []
@@ -919,7 +919,7 @@ def run_pack(
                     logging.emit_item_progress(idx, total, spec.audiobook.title)
                     if dry_run:
                         logging.log(
-                            f"[Dry Run] [blue]{spec.audiobook.title}[/] "
+                            f"[Dry Run] {spec.audiobook.title} "
                             f"({len(spec.track_paths)} track{'s' if len(spec.track_paths) != 1 else ''}, "
                             f"{len(spec.audiobook.chapters)} chapter{'s' if len(spec.audiobook.chapters) != 1 else ''}) "
                             f"-> {spec.output_path}"
@@ -928,7 +928,7 @@ def run_pack(
                         summary.books_completed += 1
                         continue
 
-                    logging.log(f"Packing [blue]{spec.audiobook.title}[/] ({len(spec.track_paths)} tracks)")
+                    logging.log(f"Packing {spec.audiobook.title} ({len(spec.track_paths)} tracks)")
                     final_path = pack_book(
                         spec,
                         options,
@@ -941,7 +941,7 @@ def run_pack(
                     )
                     summary.output_paths.append(final_path)
                     summary.books_completed += 1
-                    logging.log(f"Packed [green]{final_path}[/]")
+                    logging.log(f"Packed {final_path}")
                     try:
                         from audiobookdl.integrations.audiobookshelf import sync_book_to_audiobookshelf
 
@@ -952,7 +952,7 @@ def run_pack(
                             force_upload=bool(getattr(options, "upload_to_abs", False)),
                             session=session,
                         ):
-                            logging.log(f"Synced [blue]{spec.audiobook.title}[/] to Audiobookshelf")
+                            logging.log(f"Synced {spec.audiobook.title} to Audiobookshelf")
                     except Exception as exc:
                         logging.error(f"Audiobookshelf sync failed for '{spec.audiobook.title}': {exc}")
                 except (DownloadCancelled, KeyboardInterrupt):

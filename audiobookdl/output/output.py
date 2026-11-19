@@ -89,6 +89,20 @@ def _require_executable(name: str) -> str:
     return path
 
 
+def _log_ffmpeg_stderr(result: Any, prefix: str = "") -> None:
+    """Emit captured FFmpeg stderr via `logging.debug` when debug logging is enabled."""
+    if not logging.is_debug_mode():
+        return
+    raw_stderr = getattr(result, "stderr", None)
+    if not raw_stderr:
+        return
+    text = raw_stderr.decode("utf-8", "replace") if isinstance(raw_stderr, bytes) else str(raw_stderr)
+    cleaned = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not cleaned:
+        return
+    logging.debug(f"{prefix}{cleaned}" if prefix else cleaned)
+
+
 def _probe_audio_info(path: str) -> AudioProbeInfo:
     """Return consolidated media info for `path` via a single `ffprobe` call."""
     return probe_audio_info(path)
@@ -435,7 +449,6 @@ def _run_mpegts_part(
 ) -> bool:
     """Run an FFmpeg step producing a single MPEG-TS segment at `ts_path`."""
     ffmpeg = _require_executable("ffmpeg")
-    capture = not logging.is_ffmpeg_output()
     stream_args = (
         ["-map", "0:v:0?", "-map", "0:a?", "-c:v", "copy"]
         if preserve_video
@@ -444,17 +457,15 @@ def _run_mpegts_part(
     try:
         result = run_cancellable_subprocess(
             [ffmpeg, "-y", "-i", source, *stream_args, *codec_args, "-f", "mpegts", ts_path],
-            capture_output=capture,
             cancel_event=cancel_event,
         )
     except DownloadCancelled:
         if os.path.exists(ts_path):
             os.remove(ts_path)
         raise
+    _log_ffmpeg_stderr(result)
     if os.path.exists(ts_path) and os.path.getsize(ts_path) > 0:
         return True
-    if result.stderr:
-        logging.debug(result.stderr.decode("utf8", "replace"))
     return False
 
 
@@ -788,7 +799,6 @@ def detect_silence_chapters(
     info = _get_cached_probe(filepath, probe_cache)
     expected = info.duration if info.duration > 0 else 0.0
     duration_ms = round(expected * 1000) if expected > 0 else None
-    capture = not logging.is_ffmpeg_output()
     command = [
         ffmpeg,
         "-hide_banner",
@@ -799,11 +809,11 @@ def detect_silence_chapters(
         "-f",
         "null",
     ]
-    if show_progress and capture and expected > 0:
+    if show_progress and expected > 0:
         command += ["-progress", "pipe:1", "-nostats"]
     command.append("-")
 
-    if show_progress and capture and expected > 0:
+    if show_progress and expected > 0:
         with logging.progress([]) as prog:
             task_id = prog.add_task("Detecting silence chapters", total=expected)
             reported = 0.0
@@ -817,11 +827,12 @@ def detect_silence_chapters(
                     prog.advance(task_id, delta)
 
             with ffmpeg_progress_callback(_on_silence_progress):
-                result = run_cancellable_subprocess(command, capture_output=True, cancel_event=cancel_event)
+                result = run_cancellable_subprocess(command, cancel_event=cancel_event)
             if reported < expected:
                 prog.advance(task_id, expected - reported)
     else:
-        result = run_cancellable_subprocess(command, capture_output=True, cancel_event=cancel_event)
+        result = run_cancellable_subprocess(command, cancel_event=cancel_event)
+    _log_ffmpeg_stderr(result)
     if result.returncode != 0:
         return []
     stderr_text = (result.stderr or b"").decode("utf-8", errors="replace")
@@ -878,7 +889,6 @@ def _encode_uniform_concat_part(
 ) -> bool:
     """Transcode a heterogeneous input track into a uniform intermediate part for concat demuxing."""
     ffmpeg = _require_executable("ffmpeg")
-    capture = not logging.is_ffmpeg_output()
     cmd = [ffmpeg, "-y", "-i", source, "-vn", "-c:a", codec]
     if bitrate:
         cmd += ["-b:a", bitrate]
@@ -890,17 +900,15 @@ def _encode_uniform_concat_part(
     try:
         result = run_cancellable_subprocess(
             cmd,
-            capture_output=capture,
             cancel_event=cancel_event,
         )
     except DownloadCancelled:
         if os.path.exists(dst_path):
             os.remove(dst_path)
         raise
+    _log_ffmpeg_stderr(result)
     if result.returncode == 0 and os.path.exists(dst_path) and os.path.getsize(dst_path) > 0:
         return True
-    if result.stderr:
-        logging.debug(result.stderr.decode("utf8", "replace"))
     return False
 
 
@@ -1243,11 +1251,10 @@ def combine_audiofiles(
             sample_rate=None if parts_encoded_audio else target_sample_rate,
             preserve_video=preserve_video,
         )
-        capture = not logging.is_ffmpeg_output()
-        if show_progress and capture and expected > 0:
+        if show_progress and expected > 0:
             command += ["-progress", "pipe:1", "-nostats"]
         command.append(output_path)
-        if show_progress and capture and expected > 0:
+        if show_progress and expected > 0:
             with logging.progress([]) as mux_prog:
                 mux_task = mux_prog.add_task(f"Combining to .{output_extension}", total=expected)
                 reported = 0.0
@@ -1263,7 +1270,6 @@ def combine_audiofiles(
                 with ffmpeg_progress_callback(_on_mux_progress):
                     result = run_cancellable_subprocess(
                         command,
-                        capture_output=capture,
                         cancel_event=cancel_event,
                     )
                 if reported < expected:
@@ -1271,15 +1277,13 @@ def combine_audiofiles(
         else:
             result = run_cancellable_subprocess(
                 command,
-                capture_output=capture,
                 cancel_event=cancel_event,
             )
+        _log_ffmpeg_stderr(result)
         if (
             result.returncode != 0
             or not (os.path.exists(output_path) and os.path.getsize(output_path) > 0)
         ):
-            if result.stderr:
-                logging.debug(result.stderr.decode("utf8", "replace"))
             raise FailedCombining
         # Guard against silent truncation or corrupt output before committing.
         verify_audio_integrity(
@@ -1356,7 +1360,6 @@ def convert_single_file(
             return new_path, False
 
     ffmpeg = _require_executable("ffmpeg")
-    capture = not logging.is_ffmpeg_output()
     info = _get_cached_probe(old_path, probe_cache)
     chapter_file = f"{new_path}.chapters.tmp.txt"
     cover_tmp_path: str | None = None
@@ -1399,7 +1402,7 @@ def convert_single_file(
         sample_rate=target_sample_rate,
         preserve_video=preserve_video,
     )
-    if show_progress and capture and info.duration > 0:
+    if show_progress and info.duration > 0:
         command += ["-progress", "pipe:1", "-nostats"]
     new_dir = os.path.dirname(os.path.abspath(new_path)) or os.getcwd()
     os.makedirs(new_dir, exist_ok=True)
@@ -1410,7 +1413,7 @@ def convert_single_file(
     command.append(staged_path)
 
     try:
-        if show_progress and capture and info.duration > 0:
+        if show_progress and info.duration > 0:
             with logging.progress([]) as conv_prog:
                 conv_task = conv_prog.add_task(
                     f"Converting {os.path.basename(old_path)}",
@@ -1429,7 +1432,6 @@ def convert_single_file(
                 with ffmpeg_progress_callback(_on_conv_progress):
                     result = run_cancellable_subprocess(
                         command,
-                        capture_output=capture,
                         cancel_event=cancel_event,
                     )
                 if reported < info.duration:
@@ -1437,7 +1439,6 @@ def convert_single_file(
         else:
             result = run_cancellable_subprocess(
                 command,
-                capture_output=capture,
                 cancel_event=cancel_event,
             )
     except DownloadCancelled:
@@ -1449,9 +1450,8 @@ def convert_single_file(
             os.remove(chapter_file)
         if cover_tmp_path is not None and os.path.exists(cover_tmp_path):
             os.remove(cover_tmp_path)
+    _log_ffmpeg_stderr(result)
     if result.returncode != 0 or not (os.path.exists(staged_path) and os.path.getsize(staged_path) > 0):
-        if result.stderr:
-            logging.debug(result.stderr.decode("utf8", "replace"))
         if os.path.exists(staged_path):
             os.remove(staged_path)
         raise GenericAudiobookDLException(
@@ -1517,7 +1517,6 @@ def _split_single_chapter(
     reencode_codec_args: Sequence[str],
     format_args: Sequence[str],
     accurate: bool,
-    capture: bool,
     cancel_event: threading.Event | None,
     probe_cache: dict[str, AudioProbeInfo] | None = None,
     *,
@@ -1558,7 +1557,6 @@ def _split_single_chapter(
         ]
     res = run_cancellable_subprocess(
         cmd,
-        capture_output=capture,
         cancel_event=cancel_event,
     )
     succeeded = (
@@ -1567,11 +1565,10 @@ def _split_single_chapter(
         and os.path.getsize(out_path) > 0
     )
     if not succeeded and not accurate and "copy" in fast_codec_args:
-        if res.stderr:
-            logging.debug(
-                f"Fast split chapter {chapter_index + 1} failed, retrying with exact seek/re-encode: "
-                + res.stderr.decode("utf8", "replace")
-            )
+        _log_ffmpeg_stderr(
+            res,
+            prefix=f"Fast split chapter {chapter_index + 1} failed, retrying with exact seek/re-encode: ",
+        )
         if os.path.exists(out_path):
             os.remove(out_path)
         fallback_cmd = [
@@ -1589,7 +1586,6 @@ def _split_single_chapter(
         ]
         res = run_cancellable_subprocess(
             fallback_cmd,
-            capture_output=capture,
             cancel_event=cancel_event,
         )
         succeeded = (
@@ -1597,9 +1593,10 @@ def _split_single_chapter(
             and os.path.exists(out_path)
             and os.path.getsize(out_path) > 0
         )
+        _log_ffmpeg_stderr(res)
+    else:
+        _log_ffmpeg_stderr(res)
     if not succeeded:
-        if res.stderr:
-            logging.debug(res.stderr.decode("utf8", "replace"))
         if os.path.exists(out_path):
             os.remove(out_path)
         raise GenericAudiobookDLException(
@@ -1699,7 +1696,6 @@ def split_audio_by_chapters(
         preserve_video=preserve_video,
     )
     format_args = ["-f", "mp4"] if target_format == "m4b" else []
-    capture = not logging.is_ffmpeg_output()
 
     if info.duration > 0:
         total_ms = max(1, round(info.duration * 1000))
@@ -1766,7 +1762,6 @@ def split_audio_by_chapters(
                         reencode_codec_args=reencode_codec_args,
                         format_args=format_args,
                         accurate=effective_accurate,
-                        capture=capture,
                         cancel_event=effective_cancel,
                         probe_cache=probe_cache,
                         preserve_video=preserve_video,
@@ -2374,7 +2369,7 @@ def gen_output_location(
 
     formatted = _join_segments(segments, kept_seps)
     if truncated_for_length:
-        logging.log(f"output path too long, using [blue]{segments[-1]}[/blue] as filename base")
+        logging.log(f"output path too long, using {segments[-1]} as filename base")
     return formatted
 
 

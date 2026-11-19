@@ -829,8 +829,8 @@ def warn_if_insecure_token_url(url: str, service_label: str) -> bool:
     host = (parsed.hostname or "").strip().lower()
     if host in _LOOPBACK_HOSTS:
         return False
-    logging.log(
-        f"[yellow]Warning:[/yellow] Sending {service_label} credentials over unencrypted "
+    logging.warning(
+        f"Warning: Sending {service_label} credentials over unencrypted "
         f"http:// to '{host or parsed.netloc}'. Prefer https:// outside trusted local networks."
     )
     return True

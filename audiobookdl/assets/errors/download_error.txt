@@ -1,4 +1,4 @@
-[red]Download failed[/red]
+Download failed
 
 Url: {url}
 Status code: {status_code}

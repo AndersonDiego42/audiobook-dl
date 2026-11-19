@@ -187,7 +187,7 @@ def test_check_for_updates_cache_ttl_etag_and_winget_subprocess_kwargs(tmp_path,
     monkeypatch.setattr("audiobookdl.utils.updater.shutil.which", lambda _n: "winget.exe")
     monkeypatch.setattr(
         "audiobookdl.utils.updater.subprocess_kwargs",
-        lambda capture_output=True: {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)},
+        lambda: {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)},
     )
 
     def _capture_run(*_a, **kw):

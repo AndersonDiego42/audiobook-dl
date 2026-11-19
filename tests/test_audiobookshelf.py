@@ -382,7 +382,7 @@ def test_audiobookshelf_warns_only_on_non_loopback_http(monkeypatch):
     from audiobookdl.integrations.audiobookshelf import AudiobookshelfClient
 
     logged: list[str] = []
-    monkeypatch.setattr(logging, "log", logged.append)
+    monkeypatch.setattr(logging, "warning", logged.append)
 
     AudiobookshelfClient("http://localhost:13378", "tok")
     AudiobookshelfClient("http://127.0.0.1:13378", "tok")

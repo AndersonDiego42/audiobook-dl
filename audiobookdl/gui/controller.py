@@ -486,7 +486,7 @@ class GuiInteractionHandler:
         holder: dict[str, Any] = {"value": False}
         if not self._await_prompt(
             lambda done: PromptConfirmEvent(
-                message=logging.strip_markup(message), holder=holder, done=done
+                message=message, holder=holder, done=done
             )
         ):
             return False
@@ -2258,7 +2258,6 @@ class GuiController:
                 ctx = logging.JobContext(
                     debug=options.debug,
                     quiet=options.quiet,
-                    ffmpeg_output=options.ffmpeg_output or options.debug,
                     ffmpeg_dir=ffmpeg_dir,
                     sink=self.sink,
                     interaction=interaction,

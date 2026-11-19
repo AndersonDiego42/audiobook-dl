@@ -653,8 +653,8 @@ flowchart TD
 ---
 
 ## Section D — Exhaustive CLI Remains Cleanup Plan
-
 ### AUD-029 — Remove Legacy `ffmpeg_output` Terminal Passthrough Breaking GUI Debug Logs & Progress
+
 - **Priority:** `P0` | **Categories:** `CLI Cleanup`, `UI`, `Reliability` | **Effort:** `M`
 - **Locations:**
   - [`audiobookdl/pipeline.py`](../audiobookdl/pipeline.py#L330), [`L334`](../audiobookdl/pipeline.py#L334)

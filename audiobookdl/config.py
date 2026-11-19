@@ -571,7 +571,7 @@ def _parse_oauth_scopes(raw: Any, section_label: str) -> tuple[str, ...] | None:
     if isinstance(raw, (list, tuple)) and all(isinstance(item, str) for item in raw):
         scopes = tuple(item.strip() for item in raw if item.strip())
         return scopes or None
-    logging.log(f"Warning: invalid 'oauth_scopes' in '{section_label}'; ignoring")
+    logging.warning(f"Warning: invalid 'oauth_scopes' in '{section_label}'; ignoring")
     return None
 
 
@@ -588,7 +588,7 @@ def _build_source_config_from_dict(
     """Validate and construct a `SourceConfig` from a parsed TOML source/profile table."""
     for key in values:
         if key not in allowed_keys:
-            logging.log(
+            logging.warning(
                 f"Warning: unknown key '{key}' in '{section_label}' ignored"
             )
     username = values.get("username")
@@ -599,17 +599,17 @@ def _build_source_config_from_dict(
         password = credential_store.get_password(raw_source_name, username)
     cookie_file = values.get("cookie_file")
     if cookie_file is not None and not isinstance(cookie_file, str):
-        logging.log(f"Warning: invalid 'cookie_file' in '{section_label}'; ignoring")
+        logging.warning(f"Warning: invalid 'cookie_file' in '{section_label}'; ignoring")
         cookie_file = None
     if cookie_file and not os.path.isabs(cookie_file):
         cookie_file = os.path.normpath(os.path.join(config_dir_path, cookie_file))
     raw_locale = values.get("locale")
     if raw_locale is not None and not isinstance(raw_locale, str):
-        logging.log(f"Warning: invalid 'locale' in '{section_label}'; ignoring")
+        logging.warning(f"Warning: invalid 'locale' in '{section_label}'; ignoring")
         raw_locale = None
     raw_client_id = values.get("oauth_client_id")
     if raw_client_id is not None and not isinstance(raw_client_id, str):
-        logging.log(f"Warning: invalid 'oauth_client_id' in '{section_label}'; ignoring")
+        logging.warning(f"Warning: invalid 'oauth_client_id' in '{section_label}'; ignoring")
         raw_client_id = None
     oauth_scopes = _parse_oauth_scopes(values.get("oauth_scopes"), section_label)
     oauth_token_present = False
@@ -635,7 +635,7 @@ def _read_gui_bool(gui_section: dict[str, Any], key: str) -> bool | None:
     if raw is None:
         return None
     if not isinstance(raw, bool):
-        logging.log(f"Warning: config '[gui].{key}' must be a boolean; ignoring")
+        logging.warning(f"Warning: config '[gui].{key}' must be a boolean; ignoring")
         return None
     return raw
 
@@ -646,7 +646,7 @@ def _read_gui_split_ratio(gui_section: dict[str, Any]) -> float | None:
     if raw is None:
         return None
     if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not 0.0 < float(raw) < 1.0:
-        logging.log("Warning: config '[gui].download_split_ratio' must be a number between 0 and 1; ignoring")
+        logging.warning("Warning: config '[gui].download_split_ratio' must be a number between 0 and 1; ignoring")
         return None
     return float(raw)
 
@@ -657,7 +657,7 @@ def _read_gui_positive_int(gui_section: dict[str, Any], key: str) -> int | None:
     if raw is None:
         return None
     if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
-        logging.log(f"Warning: config '[gui].{key}' must be an integer >= 1; ignoring")
+        logging.warning(f"Warning: config '[gui].{key}' must be an integer >= 1; ignoring")
         return None
     return raw
 
@@ -675,7 +675,7 @@ def _read_gui_sync_mode(gui_section: dict[str, Any]) -> str | None:
         normalized = raw.strip().lower()
         if normalized in VALID_AUTO_SYNC_MODES:
             return normalized
-    logging.log(
+    logging.warning(
         "Warning: config '[gui].auto_sync_mode' must be 'enqueue', 'scan_only', or 'dry_run'; ignoring"
     )
     return None
@@ -687,7 +687,7 @@ def _read_gui_sync_targets(gui_section: dict[str, Any]) -> list[str] | None:
     if raw is None:
         return None
     if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
-        logging.log("Warning: config '[gui].auto_sync_targets' must be a list of strings; ignoring")
+        logging.warning("Warning: config '[gui].auto_sync_targets' must be a list of strings; ignoring")
         return None
     return [item.strip() for item in raw if item.strip()]
 
@@ -707,24 +707,24 @@ def structure_config(
     # Warn on unknown top-level keys
     for key in config_dict:
         if key not in KNOWN_TOP_LEVEL_CONFIG_KEYS:
-            logging.log(f"Warning: unknown config key '{key}' ignored")
+            logging.warning(f"Warning: unknown config key '{key}' ignored")
 
     # Add sources with normalized canonical keys and validation warnings
     sources: dict[str, SourceConfig] = {}
     config_dir_path = os.path.dirname(os.path.abspath(config_location))
     raw_sources = config_dict.get("sources")
     if raw_sources is not None and not isinstance(raw_sources, dict):
-        logging.log("Warning: config '[sources]' must be a table; ignoring")
+        logging.warning("Warning: config '[sources]' must be a table; ignoring")
         raw_sources = {}
     if isinstance(raw_sources, dict):
         allowed_with_profiles = tuple(SOURCE_CONFIG_KEYS) + ("profiles",)
         for raw_source_name, values in raw_sources.items():
             if not isinstance(values, dict):
-                logging.log(f"Warning: config '[sources.{raw_source_name}]' must be a table; ignoring")
+                logging.warning(f"Warning: config '[sources.{raw_source_name}]' must be a table; ignoring")
                 continue
             base_service, base_profile = split_source_profile_key(raw_source_name)
             if base_service != raw_source_name.lower() and base_profile == DEFAULT_PROFILE:
-                logging.log(
+                logging.warning(
                     f"Warning: config source alias '{raw_source_name}' normalized to '{base_service}'"
                 )
             has_scalar_fields = any(
@@ -742,7 +742,7 @@ def structure_config(
                     allowed_keys=allowed_with_profiles,
                 )
                 if profile_key in sources and raw_source_name.lower() != profile_key:
-                    logging.log(
+                    logging.warning(
                         f"Warning: duplicate config for '{profile_key}' from alias '{raw_source_name}'; keeping canonical entry"
                     )
                 else:
@@ -750,20 +750,20 @@ def structure_config(
             else:
                 for key in values:
                     if key not in allowed_with_profiles:
-                        logging.log(
+                        logging.warning(
                             f"Warning: unknown key '{key}' in '[sources.{raw_source_name}]' ignored"
                         )
 
             raw_profiles = values.get("profiles")
             if raw_profiles is not None and not isinstance(raw_profiles, dict):
-                logging.log(
+                logging.warning(
                     f"Warning: config '[sources.{raw_source_name}.profiles]' must be a table; ignoring"
                 )
             elif isinstance(raw_profiles, dict):
                 for raw_prof_name, prof_values in raw_profiles.items():
                     section_label = f"[sources.{raw_source_name}.profiles.{raw_prof_name}]"
                     if not isinstance(prof_values, dict):
-                        logging.log(f"Warning: config '{section_label}' must be a table; ignoring")
+                        logging.warning(f"Warning: config '{section_label}' must be a table; ignoring")
                         continue
                     prof_key = make_source_profile_key(base_service, str(raw_prof_name))
                     prof_cfg = _build_source_config_from_dict(
@@ -776,7 +776,7 @@ def structure_config(
                         allowed_keys=tuple(SOURCE_CONFIG_KEYS),
                     )
                     if prof_key in sources and raw_source_name.lower() != base_service:
-                        logging.log(
+                        logging.warning(
                             f"Warning: duplicate config for '{prof_key}' from alias '{raw_source_name}'; keeping canonical entry"
                         )
                         continue
@@ -816,11 +816,11 @@ def structure_config(
     gui_section = config_dict.get("gui")
     gui_config = GuiConfig()
     if gui_section is not None and not isinstance(gui_section, dict):
-        logging.log("Warning: config '[gui]' must be a table; ignoring")
+        logging.warning("Warning: config '[gui]' must be a table; ignoring")
     elif isinstance(gui_section, dict):
         for key in gui_section:
             if key not in GUI_CONFIG_KEYS:
-                logging.log(f"Warning: unknown key '{key}' in '[gui]' ignored")
+                logging.warning(f"Warning: unknown key '{key}' in '[gui]' ignored")
         use_archive_val = _read_gui_bool(gui_section, "use_download_archive")
         theme_raw = gui_section.get("theme")
         theme_val: str | None = None
@@ -828,7 +828,7 @@ def structure_config(
             if isinstance(theme_raw, str) and theme_raw.strip().lower() in ("system", "light", "dark"):
                 theme_val = theme_raw.strip().lower()
             else:
-                logging.log(
+                logging.warning(
                     "Warning: config '[gui].theme' must be 'system', 'light', or 'dark'; ignoring"
                 )
         notify_val = _read_gui_bool(gui_section, "notify_on_complete")
@@ -860,12 +860,12 @@ def structure_config(
     abs_section = config_dict.get("audiobookshelf")
     abs_config = AudiobookshelfConfig()
     if abs_section is not None and not isinstance(abs_section, dict):
-        logging.log("Warning: config '[audiobookshelf]' must be a table; ignoring")
+        logging.warning("Warning: config '[audiobookshelf]' must be a table; ignoring")
     else:
         abs_dict = abs_section if isinstance(abs_section, dict) else {}
         for key in abs_dict:
             if key not in {"url", "api_key", "library_id", "auto_upload", "auto_scan"}:
-                logging.log(f"Warning: unknown key '{key}' in '[audiobookshelf]' ignored")
+                logging.warning(f"Warning: unknown key '{key}' in '[audiobookshelf]' ignored")
         raw_url = abs_dict.get("url")
         abs_url = raw_url.strip().rstrip("/") if isinstance(raw_url, str) else None
         if abs_url == "":
@@ -886,7 +886,7 @@ def structure_config(
                 try:
                     credential_store.set_password("integration:audiobookshelf", abs_account, abs_key)
                 except Exception as exc:
-                    logging.log(f"Warning: could not store Audiobookshelf token in OS vault: {exc}")
+                    logging.warning(f"Warning: could not store Audiobookshelf token in OS vault: {exc}")
             elif abs_key is None:
                 abs_key = credential_store.get_password("integration:audiobookshelf", abs_account)
                 if abs_key is None and abs_account != "api":
@@ -902,14 +902,14 @@ def structure_config(
     custom_providers: dict[str, CustomMetadataProviderConfig] = {}
     enrichment_section = config_dict.get("enrichment")
     if enrichment_section is not None and not isinstance(enrichment_section, dict):
-        logging.log("Warning: config '[enrichment]' must be a table; ignoring")
+        logging.warning("Warning: config '[enrichment]' must be a table; ignoring")
     elif isinstance(enrichment_section, dict):
         for key in enrichment_section:
             if key != "custom":
-                logging.log(f"Warning: unknown key '{key}' in '[enrichment]' ignored")
+                logging.warning(f"Warning: unknown key '{key}' in '[enrichment]' ignored")
         raw_custom = enrichment_section.get("custom")
         if raw_custom is not None and not isinstance(raw_custom, dict):
-            logging.log("Warning: config '[enrichment.custom]' must be a table; ignoring")
+            logging.warning("Warning: config '[enrichment.custom]' must be a table; ignoring")
         elif isinstance(raw_custom, dict):
             from audiobookdl.utils.enrichment import (
                 normalize_custom_provider_name,
@@ -919,29 +919,29 @@ def structure_config(
             for raw_name, raw_entry in raw_custom.items():
                 section_label = f"[enrichment.custom.{raw_name}]"
                 if not isinstance(raw_entry, dict):
-                    logging.log(f"Warning: config '{section_label}' must be a table; ignoring")
+                    logging.warning(f"Warning: config '{section_label}' must be a table; ignoring")
                     continue
                 try:
                     slug = normalize_custom_provider_name(str(raw_name))
                 except ValueError as exc:
-                    logging.log(f"Warning: invalid custom provider '{raw_name}': {exc}; ignoring")
+                    logging.warning(f"Warning: invalid custom provider '{raw_name}': {exc}; ignoring")
                     continue
                 for entry_key in raw_entry:
                     if entry_key not in {"url", "api_key", "enabled"}:
-                        logging.log(f"Warning: unknown key '{entry_key}' in '{section_label}' ignored")
+                        logging.warning(f"Warning: unknown key '{entry_key}' in '{section_label}' ignored")
                 raw_url = raw_entry.get("url")
                 if not isinstance(raw_url, str) or not raw_url.strip():
-                    logging.log(f"Warning: missing 'url' in '{section_label}'; ignoring")
+                    logging.warning(f"Warning: missing 'url' in '{section_label}'; ignoring")
                     continue
                 try:
                     norm_url = validate_custom_provider_url(raw_url)
                 except ValueError as exc:
-                    logging.log(f"Warning: invalid 'url' in '{section_label}': {exc}; ignoring")
+                    logging.warning(f"Warning: invalid 'url' in '{section_label}': {exc}; ignoring")
                     continue
                 raw_enabled = raw_entry.get("enabled")
                 enabled = raw_enabled if isinstance(raw_enabled, bool) else True
                 if raw_enabled is not None and not isinstance(raw_enabled, bool):
-                    logging.log(f"Warning: invalid 'enabled' in '{section_label}'; defaulting to true")
+                    logging.warning(f"Warning: invalid 'enabled' in '{section_label}'; defaulting to true")
                 raw_key = raw_entry.get("api_key")
                 prov_key = raw_key.strip() if isinstance(raw_key, str) and raw_key.strip() else None
                 vault_service = _custom_provider_vault_service(slug)
@@ -950,7 +950,7 @@ def structure_config(
                         try:
                             credential_store.set_password(vault_service, norm_url, prov_key)
                         except Exception as exc:
-                            logging.log(
+                            logging.warning(
                                 f"Warning: could not store API key for custom provider '{slug}': {exc}"
                             )
                     elif prov_key is None:
@@ -976,7 +976,7 @@ def structure_config(
             custom_providers=custom_providers if spec.config_kind == "enrich_providers" else None,
         )
         if warning is not None:
-            logging.log(warning)
+            logging.warning(warning)
         parsed_options[key] = value
 
     # Create config object

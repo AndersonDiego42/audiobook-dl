@@ -158,8 +158,8 @@ def _all_output_parts_exist(
                 if info is not None:
                     output.store_cached_probe(probe_cache, expected_path, info)
             except FailedCombining as exc:
-                logging.log(
-                    f"[yellow]Warning:[/yellow] Existing part '{os.path.basename(expected_path)}' "
+                logging.warning(
+                    f"Warning: Existing part '{os.path.basename(expected_path)}' "
                     f"failed integrity check ({exc}); will re-download."
                 )
                 return False
@@ -257,16 +257,16 @@ def download_audiobook(
                         if info is not None:
                             output.store_cached_probe(probe_cache, target_path, info)
                     except FailedCombining as exc:
-                        logging.log(
-                            f"[yellow]Warning:[/yellow] Existing file '{os.path.basename(target_path)}' "
+                        logging.warning(
+                            f"Warning: Existing file '{os.path.basename(target_path)}' "
                             f"failed integrity check ({exc}); re-downloading."
                         )
                         skip_ok = False
                 if skip_ok:
                     msg = (
-                        f"Resuming: skipping already downloaded [blue]{audiobook.title}[/], file already exists."
+                        f"Resuming: skipping already downloaded {audiobook.title}, file already exists."
                         if options.resume and not options.skip_downloaded
-                        else f"Skipping [blue]{audiobook.title}[/], file already exists."
+                        else f"Skipping {audiobook.title}, file already exists."
                     )
                     logging.log(msg)
                     return
@@ -280,14 +280,14 @@ def download_audiobook(
                 probe_cache=probe_cache,
             ):
                 msg = (
-                    f"Resuming: skipping already downloaded [blue]{audiobook.title}[/], all files already exist."
+                    f"Resuming: skipping already downloaded {audiobook.title}, all files already exist."
                     if not options.skip_downloaded
-                    else f"Skipping [blue]{audiobook.title}[/], all files already exist."
+                    else f"Skipping {audiobook.title}, all files already exist."
                 )
                 logging.log(msg)
                 return
         elif os.path.isdir(output_dir):  # multiple files, skip_downloaded without resume
-            logging.log(f"Skipping [blue]{audiobook.title}[/], directory already exists.")
+            logging.log(f"Skipping {audiobook.title}, directory already exists.")
             return
     elif is_single_file and target_path:
         confirmed_target_overwrite = os.path.exists(target_path)
@@ -823,8 +823,8 @@ def _resolve_abs_sidecar_path(filepath: str, metadata_obj: AudiobookMetadata) ->
         except (OSError, ValueError):
             pass
     if shared_conflict:
-        logging.log(
-            f"[yellow]Warning:[/yellow] Shared output directory detected at '{parent_dir}'; "
+        logging.warning(
+            f"Warning: Shared output directory detected at '{parent_dir}'; "
             f"writing '{stem}.metadata.json' instead of overwriting 'metadata.json'. "
             "Use per-book folders (e.g. the 'Audiobookshelf' naming preset)."
         )
@@ -1305,7 +1305,7 @@ def download_files_with_progress(
             )
         with logging.progress() as progress:
             task = progress.add_task(
-                f"Downloading [blue]{audiobook.title}",
+                f"Downloading {audiobook.title}",
                 total = len(audiobook.files)
             )
             set_estimates_fn = getattr(progress, "set_file_size_estimates", None)
@@ -1560,8 +1560,8 @@ def download_file(
             update_progress(1.0)
             return filepath
         except FailedCombining as exc:
-            logging.log(
-                f"[yellow]Warning:[/yellow] Existing file '{os.path.basename(filepath)}' "
+            logging.warning(
+                f"Warning: Existing file '{os.path.basename(filepath)}' "
                 f"failed integrity check ({exc}); re-downloading."
             )
     if file.url_resolver is not None:
@@ -1725,7 +1725,7 @@ def download_file(
             if retryable_status and attempt + 1 < max_attempts:
                 delay = compute_retry_delay(attempt, headers=request.headers)
                 logging.log(
-                    f"[yellow]Retrying[/yellow] {os.path.basename(filepath)} "
+                    f"Retrying {os.path.basename(filepath)} "
                     f"(HTTP {request.status_code}, attempt {attempt + 2}/{max_attempts}, waiting {delay:.1f}s)"
                 )
                 logging.debug(
@@ -1736,7 +1736,7 @@ def download_file(
                 attempt += 1
                 continue
             if invalid_content_type or invalid_status_code:
-                # Failed-download bodies can be raw audio bytes: truncate + escape before logging
+                # Failed-download bodies can be raw audio bytes: truncate before logging
                 raw_content = getattr(request, "content", b"")
                 raw_slice = bytes(raw_content[:4096]) if isinstance(raw_content, (bytes, bytearray)) else b""
                 if is_cloudflare_challenge(request, body=raw_slice):
@@ -1751,13 +1751,12 @@ def download_file(
                     body_text = raw_body.decode("utf-8")
                 except UnicodeDecodeError:
                     body_text = repr(raw_body)
-                safe_body = logging.escape_markup(body_text)
                 raise DownloadError(
                     status_code=request.status_code,
                     content_type=content_type,
                     expected_status_code=file.expected_status_code,
                     expected_content_type=file.expected_content_type,
-                    body = safe_body,
+                    body = body_text,
                     url = file.url
                 )
 
@@ -1981,7 +1980,7 @@ def download_file(
             update_progress(-advanced)
             delay = compute_retry_delay(attempt)
             logging.log(
-                f"[yellow]Retrying[/yellow] {os.path.basename(filepath)} "
+                f"Retrying {os.path.basename(filepath)} "
                 f"(attempt {attempt + 2}/{max_attempts}, waiting {delay:.1f}s): {error}"
             )
             logging.debug(
@@ -2003,7 +2002,7 @@ def download_file(
                 raise
             delay = compute_retry_delay(attempt)
             logging.log(
-                f"[yellow]Retrying[/yellow] {os.path.basename(filepath)} "
+                f"Retrying {os.path.basename(filepath)} "
                 f"(attempt {attempt + 2}/{max_attempts}, waiting {delay:.1f}s): {error}"
             )
             logging.debug(
@@ -2109,7 +2108,7 @@ def confirm_overwrite_file(
             raise DownloadCancelled
         handler = interaction or logging.NonInteractiveInteractionHandler()
         answer = handler.confirm(
-            f"The file '[blue]{path}[/blue]' already exists. Do you want to override it?"
+            f"The file '{path}' already exists. Do you want to override it?"
         )
         if not answer:
             raise DownloadCancelled
@@ -2130,7 +2129,7 @@ def _confirm_overwrite_dir(
     else:
         handler = interaction or logging.NonInteractiveInteractionHandler()
         answer = handler.confirm(
-            f"The folder '[blue]{path}[/blue]' already exists. Do you want to override it?"
+            f"The folder '{path}' already exists. Do you want to override it?"
         )
     if not answer:
         raise DownloadCancelled

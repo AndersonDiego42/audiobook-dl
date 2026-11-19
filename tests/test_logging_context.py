@@ -91,23 +91,23 @@ def test_concurrent_run_downloads_isolate_logging_sinks_and_flags():
     assert logging.get_job_context() is None
 
 
-def test_job_context_isolates_ffmpeg_output_flag():
+def test_job_context_isolates_debug_and_quiet_flags():
     observed = {}
     barrier = threading.Barrier(2)
 
-    def worker(name: str, ffmpeg_flag: bool) -> None:
-        with logging.job_context(logging.JobContext(ffmpeg_output=ffmpeg_flag)):
+    def worker(name: str, debug_flag: bool, quiet_flag: bool) -> None:
+        with logging.job_context(logging.JobContext(debug=debug_flag, quiet=quiet_flag)):
             barrier.wait(timeout=2.0)
-            observed[name] = logging.is_ffmpeg_output()
+            observed[name] = (logging.is_debug_mode(), logging.is_quiet_mode())
 
-    t1 = threading.Thread(target=worker, args=("verbose", True))
-    t2 = threading.Thread(target=worker, args=("quiet", False))
+    t1 = threading.Thread(target=worker, args=("debug", True, False))
+    t2 = threading.Thread(target=worker, args=("quiet", False, True))
     t1.start()
     t2.start()
     t1.join(timeout=3.0)
     t2.join(timeout=3.0)
 
-    assert observed == {"verbose": True, "quiet": False}
+    assert observed == {"debug": (True, False), "quiet": (False, True)}
 
 
 def test_progress_adapter_tracks_bytes_and_speed():
@@ -208,16 +208,20 @@ def test_series_download_pauses_between_books(tmp_path):
         assert processed == ["T1", "T2"]
 
 
-def test_strip_and_escape_markup():
-    assert logging.strip_markup("[red]Error[/red]") == "Error"
-    assert logging.strip_markup("[underline]https://example.com[/]") == "https://example.com"
-    assert logging.strip_markup("[yellow]Warning:[/yellow] [Book 1] (2024)") == "Warning: [Book 1] (2024)"
-    assert logging.strip_markup(r"\[red]literal\[/red]") == "[red]literal[/red]"
-    assert logging.strip_markup("[bold cyan]Step 1[/bold cyan]") == "Step 1"
-    assert logging.strip_markup("plain text") == "plain text"
+def test_logging_warning_emits_to_sink_and_stderr(capsys):
+    assert not hasattr(logging, "strip_markup")
+    assert not hasattr(logging, "escape_markup")
 
-    escaped = logging.escape_markup("[red]Forbidden[/red]")
-    assert escaped == r"\[red]Forbidden\[/red]"
-    assert logging.strip_markup(escaped) == "[red]Forbidden[/red]"
-    assert logging.escape_markup("no brackets") == "no brackets"
+    sink = _CaptureSink()
+    with logging.job_context(logging.JobContext(quiet=True, sink=sink)):
+        logging.warning("Warning: existing file failed integrity check")
+
+    assert sink.logs == [("WARNING", "Warning: existing file failed integrity check")]
+
+    logging.warning("Warning: disk nearly full")
+    logging.warning("Plain warning message")
+    captured = capsys.readouterr()
+    assert "Warning: disk nearly full" in captured.err
+    assert "WARNING Warning:" not in captured.err
+    assert "WARNING Plain warning message" in captured.err
 

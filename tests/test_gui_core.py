@@ -115,16 +115,18 @@ def test_build_default_options_matches_schema_defaults():
 def test_logging_ui_sink_and_progress():
     sink = _RecordingSink()
     with logging.job_context(logging.JobContext(debug=True, quiet=False, sink=sink)):
-        logging.log("Downloading [blue]Example Book[/]")
-        logging.debug("Debug [bold]line[/]")
+        logging.log("Downloading Example Book")
+        logging.warning("Warning: Low disk space")
+        logging.debug("Debug line")
         with logging.progress([]) as progress:
-            task_id = progress.add_task("Downloading [blue]Example[/]", total=4)
+            task_id = progress.add_task("Downloading Example", total=4)
             progress.advance(task_id, 1.5)
             assert progress.tasks[task_id].remaining == pytest.approx(2.5)
             progress.advance(task_id, 2.5)
             assert progress.tasks[task_id].remaining == pytest.approx(0.0)
 
     assert ("INFO", "Downloading Example Book") in sink.logs
+    assert ("WARNING", "Warning: Low disk space") in sink.logs
     assert ("DEBUG", "Debug line") in sink.logs
     assert sink.starts == [("Downloading Example", 4.0)]
     assert sink.advances == [(1.5, 4.0), (4.0, 4.0)]
@@ -409,9 +411,9 @@ def test_gui_app_end_to_end_worker_and_prompts(tmp_path, monkeypatch):
 
         def fake_run_downloads(urls, options, config, interaction=None, cancel_event=None, pause_event=None, sink=None):
             with logging.job_context(logging.JobContext(sink=sink)):
-                logging.log("Downloading [blue]Test Book[/]")
+                logging.log("Downloading Test Book")
                 with logging.progress([]) as progress:
-                    task_id = progress.add_task("Downloading [blue]Test Book[/]", total=2)
+                    task_id = progress.add_task("Downloading Test Book", total=2)
                     progress.advance(task_id, 1)
                     progress.advance(task_id, 1)
                 assert interaction is not None
@@ -3591,11 +3593,13 @@ def test_gui_m2_sorting_collapsible_dependencies_log_batch_and_tokens(tmp_path):
         # 4. Log batch coalescing & level/search filtering
         for i in range(5):
             app.controller.event_queue.put(LogEvent(level="INFO", message=f"Info line {i}"))
+        app.controller.event_queue.put(LogEvent(level="WARNING", message="Warning: Watch out"))
         app.controller.event_queue.put(LogEvent(level="ERROR", message="Failure boom"))
         app.controller.event_queue.put(LogEvent(level="DEBUG", message="Verbose trace"))
         app._events.poll_queue()
         text_all = app.log_text.get("1.0", tk.END)
         assert "Info line 4" in text_all
+        assert "Warning: Watch out" in text_all
         assert "[ERROR] Failure boom" in text_all
         assert "[DEBUG] Verbose trace" in text_all
 
@@ -3603,6 +3607,7 @@ def test_gui_m2_sorting_collapsible_dependencies_log_batch_and_tokens(tmp_path):
         app.download_page.queue_panel._rerender_logs()
         text_err = app.log_text.get("1.0", tk.END)
         assert "[ERROR] Failure boom" in text_err
+        assert "Warning: Watch out" in text_err
         assert "Info line 4" not in text_err
     finally:
         app.controller.shutdown(is_running=False, is_previewing=False)

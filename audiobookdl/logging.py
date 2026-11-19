@@ -2,7 +2,6 @@ from collections import deque
 from contextlib import contextmanager
 import contextvars
 from dataclasses import dataclass
-import re
 from typing import Any, Protocol
 from collections.abc import Generator, Sequence
 from audiobookdl.utils import read_asset_file
@@ -58,7 +57,6 @@ class JobContext:
 
     debug: bool = False
     quiet: bool = False
-    ffmpeg_output: bool = False
     ffmpeg_dir: str | None = None
     sink: LogSink | None = None
     interaction: InteractionHandler | None = None
@@ -124,34 +122,10 @@ def is_quiet_mode() -> bool:
     return ctx.quiet if ctx is not None else False
 
 
-def is_ffmpeg_output() -> bool:
-    """Return whether verbose FFmpeg output is enabled in the active `JobContext`."""
-    ctx = _job_context.get()
-    return ctx.ffmpeg_output if ctx is not None else False
-
-
 def get_ui_sink() -> LogSink | None:
     """Return the active `LogSink` for the current `JobContext`, if any."""
     ctx = _job_context.get()
     return ctx.sink if ctx is not None else None
-
-
-_MARKUP_STRIP_RE = re.compile(r"\\(\[)|\[(?:/[^\n\[\]]*|[a-z#@][^\n\[\]]*)\]")
-_MARKUP_ESCAPE_RE = re.compile(r"(\\*)(\[)")
-
-
-def escape_markup(msg: str) -> str:
-    """Escape square-bracket markup tokens in `msg` before logging."""
-    if "[" not in msg:
-        return msg
-    return _MARKUP_ESCAPE_RE.sub(lambda m: f"{m.group(1) * 2}\\[", msg)
-
-
-def strip_markup(msg: str) -> str:
-    """Strip inline style markup tags into plain text for GUI and plain logs."""
-    if "[" not in msg:
-        return msg
-    return _MARKUP_STRIP_RE.sub(lambda m: m.group(1) or "", msg)
 
 
 _PROGRESS_EMIT_INTERVAL = 0.05  # 20 Hz max UI progress emission rate
@@ -167,7 +141,7 @@ def emit_item_progress(current: int, total: int, title: str = "") -> None:
         return
     handler = getattr(sink, "on_item_progress", None)
     if callable(handler):
-        handler(current, total, strip_markup(title))
+        handler(current, total, title)
 
 
 class _SinkTask:
@@ -213,7 +187,7 @@ class _SinkProgressAdapter:
             task = _SinkTask(float(total))
             self.tasks.append(task)
             task_id = len(self.tasks) - 1
-        self._sink.on_progress_start(strip_markup(description), float(total))
+        self._sink.on_progress_start(description, float(total))
         return task_id
 
     @staticmethod
@@ -388,7 +362,7 @@ def _emit_to_sink(level: str, msg: str) -> bool:
     sink = get_ui_sink()
     if sink is None:
         return False
-    sink.on_log(level, strip_markup(msg))
+    sink.on_log(level, msg)
     return True
 
 
@@ -407,7 +381,7 @@ def debug(msg: str) -> None:
         if _emit_to_sink("DEBUG", msg):
             return
         if sys.stderr is not None:
-            print(f"DEBUG {strip_markup(msg)}", file=sys.stderr)
+            print(f"DEBUG {msg}", file=sys.stderr)
 
 
 def log(msg: str):
@@ -417,7 +391,16 @@ def log(msg: str):
             return
         if sys.stderr is not None:
             prefix = "INFO " if is_debug_mode() else ""
-            print(f"{prefix}{strip_markup(msg)}", file=sys.stderr)
+            print(f"{prefix}{msg}", file=sys.stderr)
+
+
+def warning(msg: str) -> None:
+    """Emit warning message to the active UI sink or stderr."""
+    if _emit_to_sink("WARNING", msg):
+        return
+    if sys.stderr is not None:
+        text = msg if msg.lstrip().startswith(("Warning:", "WARNING")) else f"WARNING {msg}"
+        print(text, file=sys.stderr)
 
 
 def book_update(msg: str):
@@ -432,7 +415,7 @@ def error(msg: str):
     if _emit_to_sink("ERROR", msg):
         return
     if sys.stderr is not None:
-        print(strip_markup(msg), file=sys.stderr)
+        print(msg, file=sys.stderr)
 
 
 def print_error_file(name: str, **kwargs):

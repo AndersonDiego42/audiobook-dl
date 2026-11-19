@@ -128,7 +128,7 @@ def test_keyring_credential_store_and_plaintext_fallback(tmp_path, monkeypatch):
     monkeypatch.delenv(PLAINTEXT_OPT_IN_ENV, raising=False)
 
     logged = []
-    monkeypatch.setattr(logging, "log", logged.append)
+    monkeypatch.setattr(logging, "warning", logged.append)
 
     fallback = get_credential_store(str(cfg_path))
     assert isinstance(fallback, PlaintextFallbackCredentialStore)

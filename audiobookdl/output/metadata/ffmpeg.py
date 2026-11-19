@@ -104,7 +104,6 @@ def add_chapters_ffmpeg(
     faststart_args = ["-movflags", "+faststart"] if container_ext in utils.MP4_CONTAINERS else []
     tmp_chapter_file = f"{filepath}.chapters.tmp.txt"
     tmp_media_file = f"{stem}.tmp{ext or '.mp4'}"
-    capture = not logging.is_ffmpeg_output()
     try:
         with open(tmp_chapter_file, "w", encoding="utf-8", newline="\n") as f:
             f.write(create_tmp_chapter_file(filepath, chapters))
@@ -118,9 +117,19 @@ def add_chapters_ffmpeg(
              "-metadata:s:a:0", "title=",
              *faststart_args,
              tmp_media_file],
-            capture_output=capture,
             cancel_event=cancel_event,
         )
+        if logging.is_debug_mode():
+            raw_stderr = getattr(result, "stderr", None)
+            if raw_stderr:
+                text = (
+                    raw_stderr.decode("utf-8", "replace")
+                    if isinstance(raw_stderr, bytes)
+                    else str(raw_stderr)
+                )
+                cleaned = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+                if cleaned:
+                    logging.debug(cleaned)
         succeeded = (
             result.returncode == 0
             and os.path.exists(tmp_media_file)
@@ -140,9 +149,19 @@ def add_chapters_ffmpeg(
                  "-metadata:s:a:0", "title=",
                  *faststart_args,
                  tmp_media_file],
-                capture_output=capture,
                 cancel_event=cancel_event,
             )
+            if logging.is_debug_mode():
+                raw_fb_stderr = getattr(fallback_result, "stderr", None)
+                if raw_fb_stderr:
+                    fb_text = (
+                        raw_fb_stderr.decode("utf-8", "replace")
+                        if isinstance(raw_fb_stderr, bytes)
+                        else str(raw_fb_stderr)
+                    )
+                    fb_cleaned = fb_text.replace("\r\n", "\n").replace("\r", "\n").strip()
+                    if fb_cleaned:
+                        logging.debug(fb_cleaned)
             succeeded = (
                 fallback_result.returncode == 0
                 and os.path.exists(tmp_media_file)

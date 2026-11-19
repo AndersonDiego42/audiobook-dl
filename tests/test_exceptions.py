@@ -127,7 +127,8 @@ def test_audiobook_dl_exception_str_is_non_empty_plain_text(exc_cls, kwargs):
     exc = exc_cls(**kwargs)
     text = str(exc).strip()
     assert text != ""
-    assert "[red]" not in text
+    for tag in ("[red]", "[/red]", "[green]", "[/green]", "[underline]", "[/underline]", "[/]"):
+        assert tag not in text
 
     # Subclasses using base `**kwargs` accept `detail=...` cleanly for GUI dialogs.
     if exc_cls not in (AudiobookshelfError, exceptions.GenericAudiobookDLException, PsshParseError):

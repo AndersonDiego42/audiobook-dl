@@ -412,7 +412,7 @@ class AudiobooksdotcomSource(Source):
             )
             if audio_match is None:
                 logging.debug(
-                    f"Could not find audio URL. Page content from {part_url} was:\n{logging.escape_markup(page_text)}"
+                    f"Could not find audio URL. Page content from {part_url} was:\n{page_text}"
                 )
                 raise DataNotPresent
             audio_url = audio_match.group()

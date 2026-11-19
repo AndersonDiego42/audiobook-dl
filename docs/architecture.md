@@ -81,7 +81,7 @@ All runtime options shared across TOML loading/saving, pipeline option merging, 
 
 ### 2. Per-Job Context Isolation (`JobContext`)
 `Downloader` (and `run_downloads`) execute inside a `contextvars`-backed `logging.job_context(ctx)` ([`audiobookdl/logging.py`](../audiobookdl/logging.py)). Each `JobContext` encapsulates:
-- `debug`, `quiet`, and `ffmpeg_output` flags
+- `debug` and `quiet` flags
 - `ffmpeg_dir` (custom FFmpeg directory override without global mutation)
 - `sink` (`_EventLogSink` emitting structured `DownloadEvent`s or `GuiLogSink`)
 - `interaction` (`GuiInteractionHandler` prompt synchronization or `NonInteractiveInteractionHandler`)
