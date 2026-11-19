@@ -13,7 +13,11 @@ import requests
 from audiobookdl import logging
 from audiobookdl.exceptions import AudiobookDLException
 from audiobookdl.utils.audiobook import AudiobookMetadata
-from audiobookdl.utils.http import DEFAULT_HTTP_TIMEOUT, warn_if_insecure_token_url
+from audiobookdl.utils.http import (
+    DEFAULT_HTTP_TIMEOUT,
+    create_configured_http_session,
+    warn_if_insecure_token_url,
+)
 
 ABS_CREDENTIAL_KEY = "integration:audiobookshelf"
 _AUDIO_MEDIA_EXTENSIONS = frozenset({
@@ -190,6 +194,7 @@ class AudiobookshelfClient:
         api_token: str,
         *,
         session: requests.Session | None = None,
+        proxy: str | None = None,
         timeout: Any = DEFAULT_HTTP_TIMEOUT,
     ) -> None:
         self.base_url = _normalize_base_url(base_url)
@@ -199,8 +204,21 @@ class AudiobookshelfClient:
         if not self.api_token:
             raise AudiobookshelfError("Audiobookshelf API token is empty")
         warn_if_insecure_token_url(self.base_url, "Audiobookshelf")
-        self._owns_session = session is None
-        self.session = session if session is not None else requests.Session()
+        is_curl_cffi = (
+            session is not None
+            and (getattr(type(session), "__module__", "") or "").startswith("curl_cffi")
+        )
+        if session is None or is_curl_cffi:
+            effective_proxy = proxy
+            if effective_proxy is None and is_curl_cffi:
+                raw_proxies = getattr(session, "proxies", None)
+                if isinstance(raw_proxies, Mapping):
+                    effective_proxy = raw_proxies.get("https") or raw_proxies.get("http")
+            self._owns_session = True
+            self.session = create_configured_http_session(proxy=effective_proxy)
+        else:
+            self._owns_session = False
+            self.session = session
         self.timeout = timeout
 
     def close(self) -> None:
@@ -490,6 +508,8 @@ def sync_book_to_audiobookshelf(
     *,
     force_upload: bool = False,
     session: requests.Session | None = None,
+    proxy: str | None = None,
+    timeout: Any = DEFAULT_HTTP_TIMEOUT,
     skip_if_exists: bool = False,
 ) -> bool:
     """Upload and/or trigger a library scan on Audiobookshelf when configured.
@@ -513,7 +533,7 @@ def sync_book_to_audiobookshelf(
     if not (want_upload or auto_scan):
         return False
 
-    client = AudiobookshelfClient(url, token, session=session)
+    client = AudiobookshelfClient(url, token, session=session, proxy=proxy, timeout=timeout)
     try:
         if want_upload:
             logging.book_update("Uploading to Audiobookshelf")

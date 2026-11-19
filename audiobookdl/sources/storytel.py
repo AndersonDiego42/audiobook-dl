@@ -41,7 +41,7 @@ import re
 import os
 import uuid
 from audiobookdl.utils import read_asset_file
-from audiobookdl.utils.http import get_header_ci, is_cloudflare_challenge
+from audiobookdl.utils.http import get_header_ci, is_cloudflare_challenge, strip_auth_headers
 
 
 def _load_metadata_corrections() -> dict[str, dict[str, Any]]:
@@ -418,7 +418,7 @@ class StorytelSource(Source):
         source_data["_format_type"] = format_type
         self._update_metadata(consumableId, source_data, metadata, files)
         return Audiobook(
-            session=self._session,
+            session=self.create_unauthenticated_session(),
             files=files,
             metadata=metadata,
             cover=cover,
@@ -674,12 +674,13 @@ class StorytelSource(Source):
         format_type: str = "abook",
     ) -> list[AudiobookFile]:
         consumableId = book_info["consumableId"]
+        cdn_headers: dict[str, str | bytes] = dict(strip_auth_headers(self._session.headers))
         if format_type == "ebook":
             ebook_url = self.get_ebook_url(consumableId)
             return [
                 AudiobookFile(
                     url=ebook_url,
-                    headers=dict(self._session.headers),
+                    headers=cdn_headers,
                     ext=self._infer_ebook_extension(ebook_url),
                     expected_status_code=200,
                 )
@@ -688,7 +689,7 @@ class StorytelSource(Source):
         return [
             AudiobookFile(
                 url=audio_url,
-                headers=dict(self._session.headers),
+                headers=cdn_headers,
                 ext="mp3",
                 expected_status_code=200,
                 expected_content_type="audio/mpeg",

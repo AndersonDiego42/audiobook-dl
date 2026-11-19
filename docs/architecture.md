@@ -7,7 +7,7 @@
 ```mermaid
 flowchart TD
     subgraph Entrypoints["Entrypoints & Interfaces"]
-        ENTRY["audiobookdl/__main__.py / audiobookdl/gui/__main__.py"]
+        ENTRY["audiobookdl/__main__.py"]
         GUI["audiobookdl/gui/app.py (Tkinter Desktop GUI)"]
         PACK["audiobookdl/pack.py (Offline Repackager)"]
         SYNC["audiobookdl/sync.py (Bookshelf Auto-Sync)"]

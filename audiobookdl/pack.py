@@ -49,6 +49,7 @@ from audiobookdl.utils import (
 )
 from audiobookdl.utils.audiobook import AudiobookFile
 from audiobookdl.utils.concurrency import run_cancellable_pool
+from audiobookdl.utils.http import create_configured_http_session, resolve_http_timeout
 
 
 SUPPORTED_PACK_EXTENSIONS = frozenset(
@@ -888,7 +889,9 @@ def run_pack(
         options.output_format = "m4b"
 
     summary = PackSummary()
-    session = requests.Session()
+    resolved_proxy = getattr(options, "proxy", None) or getattr(resolved_config, "proxy", None)
+    resolved_timeout = resolve_http_timeout(options)
+    session = create_configured_http_session(options, proxy=resolved_proxy)
     try:
         with logging.job_context(ctx):
             groups = discover_pack_groups(paths, recursive=recursive)
@@ -950,7 +953,8 @@ def run_pack(
                             spec.audiobook.metadata,
                             resolved_config.audiobookshelf,
                             force_upload=bool(getattr(options, "upload_to_abs", False)),
-                            session=session,
+                            proxy=resolved_proxy,
+                            timeout=resolved_timeout,
                         ):
                             logging.log(f"Synced {spec.audiobook.title} to Audiobookshelf")
                     except Exception as exc:

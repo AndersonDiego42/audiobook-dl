@@ -180,7 +180,7 @@ def test_abs_config_persistence_and_client_upload_scan(tmp_path):
 
 def test_pipeline_process_audiobook_triggers_abs_sync(tmp_path, monkeypatch):
     monkeypatch.setattr("audiobookdl.pipeline.download", lambda *a, **kw: None)
-    fake_session = _FakeAbsSession()
+    fake_abs_session = _FakeAbsSession()
 
     class _Src:
         name = "librivox"
@@ -189,10 +189,21 @@ def test_pipeline_process_audiobook_triggers_abs_sync(tmp_path, monkeypatch):
         def on_download_complete(self, _b):
             pass
 
+    source_session = requests.Session()
+    source_session.headers.update(
+        {
+            "Authorization": "Bearer source-secret",
+            "X-Login-Token": "src-login",
+            "X-Profile-Token": "src-profile",
+            "Session-Key": "src-session-key",
+        }
+    )
+    source_session.cookies.set("sid", "source-cookie", domain="storytel.com")
+
     target_m4b = tmp_path / "MyBook.m4b"
     target_m4b.write_bytes(b"audio")
     book = Audiobook(
-        session=cast(requests.Session, fake_session),
+        session=source_session,
         metadata=AudiobookMetadata(title="MyBook", authors=["Alice"], scrape_url="https://librivox.org/mybook"),
         files=[AudiobookFile(url="https://example.com/1.mp3", ext="mp3")],
     )
@@ -214,9 +225,21 @@ def test_pipeline_process_audiobook_triggers_abs_sync(tmp_path, monkeypatch):
         output_format="m4b",
         database_directory=str(tmp_path),
     )
-    assert process_audiobook(cast(Source[Any], _Src()), book, opts, config=cfg) is True
-    assert any(c[1].endswith("/api/upload") for c in fake_session.calls)
-    assert any("/scan" in c[1] for c in fake_session.calls)
+    with patch(
+        "audiobookdl.integrations.audiobookshelf.create_configured_http_session",
+        return_value=fake_abs_session,
+    ):
+        assert process_audiobook(cast(Source[Any], _Src()), book, opts, config=cfg) is True
+
+    assert any(c[1].endswith("/api/upload") for c in fake_abs_session.calls)
+    assert any("/scan" in c[1] for c in fake_abs_session.calls)
+    for _method, _url, hdrs, _data, _names in fake_abs_session.calls:
+        lowered = {str(k).lower(): v for k, v in (hdrs or {}).items()}
+        assert lowered.get("authorization") == "Bearer tok"
+        assert "x-login-token" not in lowered
+        assert "x-profile-token" not in lowered
+        assert "session-key" not in lowered
+        assert "cookie" not in lowered
 
     # Missing config + force upload raises explicit error inside sync helper
     with pytest.raises(AudiobookshelfError):
@@ -449,5 +472,29 @@ def test_abs_upload_retries_transient_503_tracks_progress_skips_duplicate_and_we
 
     opf = build_opf_xml(meta, "cover.webp")
     assert 'media-type="image/webp"' in opf
+
+
+def test_audiobookshelf_client_replaces_curl_cffi_session():
+    class _FakeCurlSession:
+        __module__ = "curl_cffi.requests.session"
+
+        def __init__(self) -> None:
+            self.proxies = {"https": "http://127.0.0.1:8888", "http": "http://127.0.0.1:8888"}
+            self.headers = {"X-Login-Token": "leaked"}
+
+    fake_curl = _FakeCurlSession()
+    client = AudiobookshelfClient(
+        "https://abs.example.com",
+        "abs-tok",
+        session=cast(requests.Session, fake_curl),
+    )
+    try:
+        assert isinstance(client.session, requests.Session)
+        assert client.session is not fake_curl
+        assert client._owns_session is True
+        assert client.session.proxies.get("https") == "http://127.0.0.1:8888"
+        assert "X-Login-Token" not in client.session.headers
+    finally:
+        client.close()
 
 

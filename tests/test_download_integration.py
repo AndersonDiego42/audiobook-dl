@@ -486,8 +486,8 @@ def test_downloader_multipart_convert_output_m4b_integration(tmp_path):
         cfg_path = tmp_path / "audiobook-dl.toml"
         cfg_path.write_text("", encoding="utf-8")
         cfg = load_config(str(cfg_path))
+        target_url = f"{base}/mp/1"
         opts = build_default_options(
-            urls=[f"{base}/mp/1"],
             combine=True,
             output_format="m4b",
             audio_bitrate="96k",
@@ -496,8 +496,8 @@ def test_downloader_multipart_convert_output_m4b_integration(tmp_path):
             skip_downloaded=False,
         )
         src_inst = _MultiPartHttpSource(opts)
-        ab = src_inst.download(opts.urls[0])
-        summary = Downloader(cfg, opts).download(opts.urls, prefetched=(src_inst, ab))
+        ab = src_inst.download(target_url)
+        summary = Downloader(cfg, opts).download([target_url], prefetched=(src_inst, ab))
         assert summary.completed == 1
         out_m4b = out_dir / "Multipart Convert Book.m4b"
         assert out_m4b.is_file()

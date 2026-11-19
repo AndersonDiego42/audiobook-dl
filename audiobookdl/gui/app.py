@@ -664,9 +664,21 @@ class AudiobookDLApp:
                 pass
 
 
+class _WindowedArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser that never crashes when sys.stdout/sys.stderr are None (--windowed builds)."""
+
+    def _print_message(self, message: str, file: Any = None) -> None:
+        if not message:
+            return
+        target = sys.stderr if file is None else file
+        if target is None:
+            return
+        target.write(message)
+
+
 def parse_gui_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse startup arguments supported by the desktop GUI application."""
-    parser = argparse.ArgumentParser(prog="audiobook-dl")
+    parser = _WindowedArgumentParser(prog="audiobook-dl", exit_on_error=False)
     parser.add_argument(
         "--self-test",
         action="store_true",
@@ -679,7 +691,11 @@ def parse_gui_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Path to an audiobook-dl TOML configuration file",
     )
-    return parser.parse_args(list(argv) if argv is not None else None)
+    try:
+        parsed, _unknown = parser.parse_known_args(list(argv) if argv is not None else None)
+    except argparse.ArgumentError as exc:
+        parser.error(str(exc))
+    return parsed
 
 
 def run_self_test(check_gui: bool = True) -> None:

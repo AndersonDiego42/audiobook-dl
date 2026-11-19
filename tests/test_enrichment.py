@@ -444,12 +444,10 @@ def test_enrichment_providers_validation_and_options():
         enrich_metadata=True,
         enrich_providers="itunes,google",
         enrich_interactive=True,
-        no_enrich_cache=True,
     )
     assert opts.enrich_metadata is True
     assert opts.enrich_providers == "itunes,google"
     assert opts.enrich_interactive is True
-    assert opts.no_enrich_cache is True
 
 
 def test_enrichment_skips_incapable_providers_for_missing_fields():

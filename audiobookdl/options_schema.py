@@ -13,7 +13,6 @@ from audiobookdl.utils.http import DEFAULT_MAX_RETRIES
 
 MEDIA_TYPE_CHOICES: tuple[str, ...] = ("auto", "audiobook", "ebook", "video", "both")
 INTRO_CHAPTER_MODE_CHOICES: tuple[str, ...] = ("auto", "always", "off")
-OUTPUT_PRESET_CHOICES: tuple[str, ...] = ("default", "audiobookshelf", "plex", "kavita")
 GUI_OUTPUT_FORMATS: tuple[str, ...] = ("Original", "m4b", "mp3", "m4a", "mp4", "mkv", "flac", "opus")
 GUI_MEDIA_TYPE_OPTIONS: tuple[str, ...] = ("Auto", "Audiobook", "Ebook", "Video", "Both")
 GUI_INTRO_CHAPTER_MODES: tuple[str, ...] = (
@@ -63,48 +62,6 @@ def default_database_directory() -> str:
     from audiobookdl.config import config_dir
 
     return os.path.join(config_dir(), "db")
-
-
-def parse_series_selection(spec: str, total: int) -> list[int]:
-    """
-    Parse a 1-based comma/range selection string (e.g. `'1,3-5'`) into unique
-    ordered 0-based indices bounded by `[0, total)`.
-    """
-    if total < 0:
-        raise ValueError("total must be >= 0")
-    cleaned = spec.strip()
-    if not cleaned:
-        raise ValueError("Series item selection cannot be empty")
-    selected: list[int] = []
-    seen: set[int] = set()
-    for token in cleaned.split(","):
-        part = token.strip()
-        if not part:
-            raise ValueError(f"Empty token in selection '{spec}'")
-        if "-" in part:
-            bounds = part.split("-", 1)
-            if not bounds[0].strip().isdigit() or not bounds[1].strip().isdigit():
-                raise ValueError(f"Invalid range '{part}' in '{spec}'")
-            start_1 = int(bounds[0].strip())
-            end_1 = int(bounds[1].strip())
-            if start_1 < 1 or end_1 < start_1 or end_1 > total:
-                raise ValueError(f"Range '{part}' out of bounds for 1..{total}")
-            for one_based in range(start_1, end_1 + 1):
-                zero_based = one_based - 1
-                if zero_based not in seen:
-                    seen.add(zero_based)
-                    selected.append(zero_based)
-        else:
-            if not part.isdigit():
-                raise ValueError(f"Invalid index '{part}' in '{spec}'")
-            one_based = int(part)
-            if one_based < 1 or one_based > total:
-                raise ValueError(f"Index '{part}' out of bounds for 1..{total}")
-            zero_based = one_based - 1
-            if zero_based not in seen:
-                seen.add(zero_based)
-                selected.append(zero_based)
-    return selected
 
 
 def _validate_str(key: str, raw: Any) -> tuple[str | None, str | None]:
@@ -614,6 +571,7 @@ class GuiBinding:
     from_config: Callable[[Any], Any] | None = None
     to_option: Callable[[Any], Any] | None = None
     persisted_in_output_prefs: bool = False
+    tooltip: str | None = None
 
     def init_value(self, config_value: Any) -> Any:
         if self.from_config is not None:
@@ -662,11 +620,6 @@ class OptionSpec:
 
 OPTION_REGISTRY: tuple[OptionSpec, ...] = (
     OptionSpec(
-        name="urls",
-        default_factory=list,
-        help="Urls to download from",
-    ),
-    OptionSpec(
         name="cookie_file",
         default=None,
         help="Path to Netscape cookie file",
@@ -698,11 +651,6 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         merge_require_truthy=True,
     ),
     OptionSpec(
-        name="output_preset",
-        default=None,
-        help="Named output folder/filename template preset",
-    ),
-    OptionSpec(
         name="remove_chars",
         default="",
         help="List of characters that will be removed from output path",
@@ -719,6 +667,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
             from_config=_gui_init_raw_str,
             to_option=_gui_read_raw_str,
             persisted_in_output_prefs=True,
+            tooltip="Characters to strip from generated output folder and file names (e.g. :?*)",
         ),
     ),
     OptionSpec(
@@ -736,11 +685,6 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
             gui_default=False,
             persisted_in_output_prefs=True,
         ),
-    ),
-    OptionSpec(
-        name="quiet",
-        default=False,
-        help="Quiet mode",
     ),
     OptionSpec(
         name="cover",
@@ -893,12 +837,8 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
             var_type="bool",
             gui_default=False,
             from_config=_gui_init_bool_from_truthy,
+            tooltip="Record completed downloads in the SQLite archive ledger (downloads.db) and skip already-archived books when 'Skip downloaded' is enabled",
         ),
-    ),
-    OptionSpec(
-        name="no_download_archive",
-        default=False,
-        help="Disable reading and recording entries in the SQLite download archive (downloads.db)",
     ),
     OptionSpec(
         name="database_directory",
@@ -1083,11 +1023,6 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         ),
     ),
     OptionSpec(
-        name="series_items",
-        default=None,
-        help="1-based comma/range selection of series books to download (e.g. 1,3-5)",
-    ),
-    OptionSpec(
         name="max_workers",
         default=None,
         help="Maximum concurrent download/processing worker threads",
@@ -1163,6 +1098,11 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
             from_config=_gui_init_post_exec,
             to_option=_gui_read_optional_str,
             persisted_in_output_prefs=True,
+            tooltip=(
+                "Command to run after each completed audiobook (300s timeout; reads "
+                "AUDIOBOOK_DL_PATH/TITLE/AUTHOR/SOURCE/FORMAT env vars; prefix with "
+                "[argv, shell=False] or configure a TOML list to avoid shell expansion)"
+            ),
         ),
     ),
     OptionSpec(
@@ -1423,11 +1363,6 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         merge_require_truthy=True,
     ),
     OptionSpec(
-        name="service",
-        default=None,
-        help="Target service key",
-    ),
-    OptionSpec(
         name="enrich_metadata",
         default=False,
         help="Fill missing metadata, cover art, and chapters via Audnexus, iTunes, Google Books, and OpenLibrary",
@@ -1478,11 +1413,6 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
             persisted_in_output_prefs=True,
         ),
     ),
-    OptionSpec(
-        name="no_enrich_cache",
-        default=False,
-        help="Bypass reading cached enrichment responses and fetch fresh metadata",
-    ),
     # Config-only top-level keys (not part of DownloadOptions)
     OptionSpec(
         name="check_updates",
@@ -1528,14 +1458,11 @@ KNOWN_TOP_LEVEL_CONFIG_KEYS: frozenset[str] = frozenset(
 class DownloadOptions:
     """Typed runtime options shared across Desktop GUI, pipeline, and sources."""
 
-    urls: list[str] = field(default_factory=list)
     cookie_file: str | None = None
     combine: bool = False
     output_template: str = "{title}"
-    output_preset: str | None = None
     remove_chars: str = ""
     debug: bool = False
-    quiet: bool = False
     cover: bool = False
     no_chapters: bool = False
     split_chapters: bool = False
@@ -1548,7 +1475,6 @@ class DownloadOptions:
     skip_downloaded: bool = False
     skip_unavailable: bool = False
     download_archive: str | None = None
-    no_download_archive: bool = False
     database_directory: str = field(default_factory=default_database_directory)
     write_json_metadata: bool = False
     write_cover: bool = False
@@ -1561,7 +1487,6 @@ class DownloadOptions:
     audio_bitrate: str | None = None
     sample_rate: int | None = None
     overwrite: bool | None = None
-    series_items: str | None = None
     max_workers: int | None = None
     book_delay: float = 0.0
     limit_rate: str | None = None
@@ -1582,11 +1507,9 @@ class DownloadOptions:
     impersonate: str | None = None
     decryption_key: str | None = None
     locale: str | None = None
-    service: str | None = None
     enrich_metadata: bool = False
     enrich_providers: str | None = None
     enrich_interactive: bool = False
-    no_enrich_cache: bool = False
     _explicit_fields: frozenset[str] = field(
         default_factory=frozenset,
         init=False,
@@ -1610,8 +1533,6 @@ class SyncOptions:
     profile: str | None = None
     scan_only: bool = False
     dry_run: bool = False
-    watch: bool = False
-    interval_seconds: int = 3600
     output_template: str | None = None
     output_format: str | None = None
     archive_path: str | None = None

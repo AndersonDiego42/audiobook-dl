@@ -213,13 +213,13 @@ class PreviewCoordinator:
             return self._options.try_build_options(urls_override=[url], parent=self.dialog)
 
         def _search_enrichment(book: Audiobook, opts: DownloadOptions | None) -> Any:
-            resolved = opts if opts is not None else DownloadOptions(urls=[url])
+            resolved = opts if opts is not None else DownloadOptions()
             return self._controller.search_enrichment_for_audiobook(book, resolved)
 
         def _apply_enrichment(
             book: Audiobook, candidate: Any, opts: DownloadOptions | None
         ) -> Any:
-            resolved = opts if opts is not None else DownloadOptions(urls=[url])
+            resolved = opts if opts is not None else DownloadOptions()
             return self._controller.apply_enrichment_candidate(book, candidate, resolved)
 
         cached_series_opts: DownloadOptions | None = None

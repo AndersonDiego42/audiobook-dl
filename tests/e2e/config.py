@@ -80,5 +80,5 @@ class E2EConfig:
         if self.target_mode == "executable":
             if self.gui_executable is not None:
                 return [str(self.gui_executable), "--self-test"]
-            return ["audiobook-dl-gui", "--self-test"]
-        return [sys.executable, "-m", "audiobookdl.gui", "--self-test"]
+            return ["audiobook-dl", "--self-test"]
+        return [sys.executable, "-m", "audiobookdl", "--self-test"]

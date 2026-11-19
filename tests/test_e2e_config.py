@@ -16,7 +16,7 @@ def test_e2e_config_commands_respect_executable_mode(monkeypatch, tmp_path):
     monkeypatch.setenv("AUDIOBOOK_DL_E2E_TARGET", "executable")
     monkeypatch.delenv("AUDIOBOOK_DL_E2E_GUI_BIN", raising=False)
     cfg = E2EConfig.from_env()
-    assert cfg.gui_self_test_command() == ["audiobook-dl-gui", "--self-test"]
+    assert cfg.gui_self_test_command() == ["audiobook-dl", "--self-test"]
 
     gui_bin = tmp_path / "audiobook-dl.exe"
     monkeypatch.setenv("AUDIOBOOK_DL_E2E_GUI_BIN", str(gui_bin))
@@ -27,7 +27,7 @@ def test_e2e_config_commands_respect_executable_mode(monkeypatch, tmp_path):
 def test_e2e_config_commands_default_to_module_mode(monkeypatch):
     monkeypatch.delenv("AUDIOBOOK_DL_E2E_TARGET", raising=False)
     cfg = E2EConfig.from_env()
-    assert cfg.gui_self_test_command() == [sys.executable, "-m", "audiobookdl.gui", "--self-test"]
+    assert cfg.gui_self_test_command() == [sys.executable, "-m", "audiobookdl", "--self-test"]
 
 
 def test_gui_harness_skips_in_executable_mode(monkeypatch, tmp_path: Path):

@@ -582,7 +582,9 @@ def test_on_download_complete_writes_utf8_json(tmp_path):
 
 def test_download_ebook_only_book_in_auto_mode(tmp_path):
     src = _make_source(tmp_path)
+    src._session.headers["User-Agent"] = "Storytel/24.22"
     src._session.headers["authorization"] = "Bearer token-123"
+    src._session.cookies.set("sid", "secret-cookie", domain="storytel.com")
     details = _sample_book_details(
         "555",
         formats=[
@@ -618,7 +620,13 @@ def test_download_ebook_only_book_in_auto_mode(tmp_path):
     assert book.files[0].ext == "epub"
     assert book.files[0].expected_content_type is None
     assert book.files[0].url == "https://cdn.storytel.net/ebooks/sample.epub?sig=abc"
-    assert book.files[0].headers["authorization"] == "Bearer token-123"
+    lowered_file_headers = {k.lower(): v for k, v in book.files[0].headers.items()}
+    assert "authorization" not in lowered_file_headers
+    assert "cookie" not in lowered_file_headers
+    assert lowered_file_headers.get("user-agent") == "Storytel/24.22"
+    assert book.session is not src._session
+    assert "authorization" not in {k.lower() for k in book.session.headers}
+    assert book.session.cookies.get("sid") is None
     assert book.metadata.genres == ["Ebook", "Fiction"]
     assert book.metadata.narrators == []
     assert book.metadata.isbn == "9781234567897"
@@ -756,6 +764,41 @@ def test_storytel_download_counter_is_instance_attribute(tmp_path):
     src1._download_counter += 1
     assert src1._download_counter == 1
     assert src2._download_counter == 0
+
+
+def test_storytel_audio_files_strip_auth_headers_and_isolate_session(tmp_path):
+    src = _make_source(tmp_path)
+    src._session.headers.update(
+        {
+            "User-Agent": "Storytel/24.22",
+            "authorization": "Bearer secret-jwt",
+            "Cookie": "sid=secret",
+        }
+    )
+    src._session.cookies.set("sid", "secret", domain="storytel.com")
+    details = _sample_book_details("777")
+
+    def _fake_get(url, **_kwargs):
+        if "book-details/consumables/777" in url:
+            return _mock_resp(200, json_data=details)
+        if url.endswith("/assets/v2/consumables/777/abook"):
+            return _mock_resp(302, headers={"Location": "https://cdn.storytel.net/audio/777.mp3"})
+        if "playback-metadata/consumable/777" in url:
+            return _mock_resp(200, json_data={"formats": [{"type": "abook", "chapters": []}]})
+        if url == "https://covers.storytel.com/cover.jpg":
+            return _mock_resp(200, content=b"cover")
+        raise AssertionError(f"Unexpected GET {url}")
+
+    src._session.get = MagicMock(side_effect=_fake_get)
+    book = src.download_book_from_book_id("777")
+    assert isinstance(book, Audiobook)
+    assert book.session is not src._session
+    assert "authorization" not in {k.lower() for k in book.session.headers}
+    assert book.session.cookies.get("sid") is None
+    lowered = {k.lower(): v for k, v in book.files[0].headers.items()}
+    assert lowered.get("user-agent") == "Storytel/24.22"
+    assert "authorization" not in lowered
+    assert "cookie" not in lowered
 
 
 def test_storytel_library_and_search_urls_route_back_through_source(tmp_path):

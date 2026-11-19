@@ -4,9 +4,10 @@
 
 ## Config File Discovery
 
-1. **`AUDIOBOOK_DL_CONFIG` / `AUDIOBOOKDL_CONFIG`**: If set to a non-empty file path, overrides the default platform location.
-2. **Portable Mode**: On frozen builds (or when a `.portable` marker file or `audiobook-dl.toml` sits beside `audiobook-dl.exe`), configuration lives beside the executable and `db/` defaults to the same directory.
-3. **Platform Standard Directories**:
+1. **`-c` / `--config FILE`**: Explicit command-line configuration file path override.
+2. **`AUDIOBOOK_DL_CONFIG` / `AUDIOBOOKDL_CONFIG`**: If set to a non-empty file path, overrides the default platform location.
+3. **Portable Mode**: On frozen builds (or when a `.portable` marker file or `audiobook-dl.toml` sits beside `audiobook-dl.exe`), configuration lives beside the executable and `db/` defaults to the same directory.
+4. **Platform Standard Directories**:
    - **Windows**: `%LOCALAPPDATA%\jo1gi\audiobook-dl\audiobook-dl.toml`
    - **macOS**: `~/Library/Application Support/audiobook-dl/audiobook-dl.toml`
    - **Linux**: `$XDG_CONFIG_HOME/audiobook-dl/audiobook-dl.toml` (defaults to `~/.config/audiobook-dl/audiobook-dl.toml`)

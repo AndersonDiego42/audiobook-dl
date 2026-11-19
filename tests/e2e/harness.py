@@ -10,7 +10,7 @@ import subprocess
 import time
 import tkinter as tk
 from typing import Any
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 
 import pytest
 
@@ -103,19 +103,9 @@ class E2EWorkspace:
         self.config_path.write_text(content, encoding="utf-8")
         return self.config_path
 
-    def write_input_file(self, filename: str, urls: Sequence[str], *, bom: bool = False) -> Path:
-        """Create a URL batch file inside `work_dir`."""
-        path = self.work_dir / filename
-        payload = ("\n".join(urls) + "\n").encode("utf-8")
-        if bom:
-            payload = b"\xef\xbb\xbf" + payload
-        path.write_bytes(payload)
-        return path
-
     def build_env(
         self,
         *,
-        proxy_url: str | None = None,
         extra_env: dict[str, str] | None = None,
     ) -> tuple[dict[str, str], dict[str, str]]:
         """Return `(full_env, overrides_only)` isolated from host user state."""
@@ -143,11 +133,6 @@ class E2EWorkspace:
                 overrides["PYTHONUSERBASE"] = site.USER_BASE
         if self.config.ffmpeg_dir is not None:
             overrides["PATH"] = f"{self.config.ffmpeg_dir}{os.pathsep}{env.get('PATH', '')}"
-        if proxy_url:
-            overrides["HTTP_PROXY"] = proxy_url
-            overrides["http_proxy"] = proxy_url
-            overrides["NO_PROXY"] = "127.0.0.1,localhost"
-            overrides["no_proxy"] = "127.0.0.1,localhost"
         if extra_env:
             overrides.update(extra_env)
 
@@ -175,27 +160,20 @@ class GuiSelfTestRunner:
         config: E2EConfig,
         workspace: E2EWorkspace,
         diagnostics: E2EDiagnosticRecorder,
-        proxy_url: str | None = None,
     ) -> None:
         self.config = config
         self.workspace = workspace
         self.diagnostics = diagnostics
-        self.proxy_url = proxy_url
 
     def _exec(
         self,
         command: list[str],
         *,
-        use_proxy: bool = True,
         timeout: float | None = None,
         extra_env: dict[str, str] | None = None,
-        stdin_text: str | None = None,
     ) -> SubprocessResult:
         effective_timeout = timeout or self.config.timeout_seconds
-        env, overrides = self.workspace.build_env(
-            proxy_url=self.proxy_url if use_proxy else None,
-            extra_env=extra_env,
-        )
+        env, overrides = self.workspace.build_env(extra_env=extra_env)
         start = time.monotonic()
         timed_out = False
         try:
@@ -203,7 +181,6 @@ class GuiSelfTestRunner:
                 command,
                 cwd=str(self.workspace.work_dir),
                 env=env,
-                input=stdin_text,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -249,10 +226,9 @@ class GuiSelfTestRunner:
         )
 
     def run_gui_self_test(self, *, timeout: float | None = None) -> SubprocessResult:
-        """Invoke `audiobookdl.gui --self-test` in the isolated E2E workspace."""
+        """Invoke `audiobookdl --self-test` in the isolated E2E workspace."""
         return self._exec(
             self.config.gui_self_test_command(),
-            use_proxy=False,
             timeout=timeout,
         )
 

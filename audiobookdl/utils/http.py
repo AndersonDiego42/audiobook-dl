@@ -1,6 +1,6 @@
 import base64
 import binascii
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timezone
 import email.utils
 from http.cookiejar import Cookie, CookieJar
@@ -816,6 +816,38 @@ def redirect_of(
         if target_pattern and re.search(target_pattern, url):
             return url
     return url
+
+
+AUTH_HEADER_NAMES: frozenset[str] = frozenset(
+    {
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "cookie2",
+        "x-login-token",
+        "x-profile-token",
+        "token",
+        "session-key",
+        "x-api-key",
+        "x-auth-token",
+        "x-csrf-token",
+        "x-xsrf-token",
+    }
+)
+
+
+def strip_auth_headers(headers: Mapping[str, Any] | None) -> dict[str, str]:
+    """Copy `headers` while stripping authentication/session headers case-insensitively."""
+    if not headers:
+        return {}
+    cleaned: dict[str, str] = {}
+    for raw_key, raw_val in headers.items():
+        key = raw_key.decode("latin-1") if isinstance(raw_key, bytes) else str(raw_key)
+        if key.strip().lower() in AUTH_HEADER_NAMES:
+            continue
+        val = raw_val.decode("latin-1") if isinstance(raw_val, bytes) else str(raw_val)
+        cleaned[key] = val
+    return cleaned
 
 
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})

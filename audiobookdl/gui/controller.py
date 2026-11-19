@@ -2257,7 +2257,6 @@ class GuiController:
                 ffmpeg_dir = config.ffmpeg_dir.strip() or None if config.ffmpeg_dir else None
                 ctx = logging.JobContext(
                     debug=options.debug,
-                    quiet=options.quiet,
                     ffmpeg_dir=ffmpeg_dir,
                     sink=self.sink,
                     interaction=interaction,
@@ -3004,7 +3003,7 @@ class GuiController:
             proxy=getattr(options, "proxy", None),
             timeout=getattr(options, "timeout", None) or 10.0,
             database_directory=getattr(options, "database_directory", None),
-            use_cache=not bool(getattr(options, "no_enrich_cache", False)),
+            use_cache=True,
         )
 
     def apply_enrichment_candidate(
@@ -3015,7 +3014,7 @@ class GuiController:
     ) -> tuple[list[str], bool, bool]:
         """Apply `candidate` onto `audiobook` using controller session and cache."""
         db_dir = getattr(options, "database_directory", None)
-        use_cache = not bool(getattr(options, "no_enrich_cache", False))
+        use_cache = True
         include_chapters = not bool(getattr(options, "no_chapters", False))
         override_chapters = bool(getattr(options, "override_chapters", False))
         if db_dir:

@@ -259,10 +259,24 @@ def test_schema_driven_merge_and_preset_precedence(tmp_path):
         expected = spec.merge_cast(raw_val) if spec.merge_cast else raw_val
         assert getattr(opts, spec.name) == expected
 
-    preset_opts = build_default_options(output_preset="plex", combine=False)
-    apply_runtime_options(preset_opts, cfg)
-    assert preset_opts.combine is False
-    assert preset_opts.output_template != "{title} - cfg"
+    override_opts = build_default_options(output_template="{author}/{title}", combine=False)
+    apply_runtime_options(override_opts, cfg)
+    assert override_opts.combine is False
+    assert override_opts.output_template == "{author}/{title}"
+
+
+def test_gui_tooltip_overrides_for_cli_jargon_options():
+    from audiobookdl.gui.options_panel import _option_help
+
+    for name in ("post_exec", "download_archive", "remove_chars"):
+        spec = OPTIONS_BY_NAME[name]
+        assert spec.gui is not None
+        assert spec.gui.tooltip
+        gui_tip = _option_help(name)
+        assert gui_tip == spec.gui.tooltip
+        assert gui_tip != spec.get_help()
+
+    assert _option_help("output_format") == OPTIONS_BY_NAME["output_format"].get_help()
 
 
 def test_gui_option_bindings_converters():

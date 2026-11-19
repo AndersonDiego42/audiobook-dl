@@ -104,6 +104,26 @@ def test_gui_launcher_parses_gui_args_and_launches_self_test():
         mock_self_test.assert_called_once_with(check_gui=True)
 
 
+def test_parse_gui_args_handles_windowed_none_streams_and_unknown_flags(monkeypatch):
+    import pytest
+    from audiobookdl.gui.app import parse_gui_args
+
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", None)
+
+    parsed_unknown = parse_gui_args(["-psn_0_12345", "--unknown-flag"])
+    assert parsed_unknown.self_test is False
+    assert parsed_unknown.config_location is None
+
+    with pytest.raises(SystemExit) as help_exc:
+        parse_gui_args(["--help"])
+    assert help_exc.value.code == 0
+
+    with pytest.raises(SystemExit) as err_exc:
+        parse_gui_args(["--config"])
+    assert err_exc.value.code == 2
+
+
 def test_build_exe_onedir_builds_single_gui_executable(tmp_path, monkeypatch):
     build_exe = _load_build_exe()
     dist_dir = tmp_path / "dist"

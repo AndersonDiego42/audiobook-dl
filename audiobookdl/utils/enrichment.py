@@ -31,7 +31,11 @@ from audiobookdl.utils.enrichment_cache import (
     default_enrichment_cache_path,
     make_cache_key,
 )
-from audiobookdl.utils.http import DEFAULT_USER_AGENT, warn_if_insecure_token_url
+from audiobookdl.utils.http import (
+    DEFAULT_USER_AGENT,
+    create_configured_http_session,
+    warn_if_insecure_token_url,
+)
 
 
 DEFAULT_PROVIDERS: tuple[str, ...] = ("audnexus", "itunes", "google", "openlibrary")
@@ -1120,7 +1124,11 @@ def test_custom_metadata_provider(
     if api_key and api_key.strip():
         warn_if_insecure_token_url(base_url, "custom metadata provider")
         headers["Authorization"] = api_key.strip()
-    session_cm = nullcontext(session) if session is not None else requests.Session()
+    session_cm: Any = (
+        nullcontext(session)
+        if session is not None
+        else create_configured_http_session(proxy=proxy)
+    )
     with session_cm as sess:
         resp = sess.get(
             f"{base_url}/search",
@@ -1480,7 +1488,11 @@ def apply_candidate_to_audiobook(
         and (bool(candidate.chapters) or (candidate.provider == "audnexus" and bool(candidate.asin)))
     )
     if need_cover or need_chapters:
-        session_cm = nullcontext(session) if session is not None else requests.Session()
+        session_cm: Any = (
+            nullcontext(session)
+            if session is not None
+            else create_configured_http_session(proxy=proxy)
+        )
         with session_cm as sess:
             if need_cover and candidate.cover_url:
                 cover = _download_cover(sess, candidate.cover_url, proxy=proxy, timeout=timeout)
@@ -1538,7 +1550,7 @@ def search_enrichment_candidates(
     with cache_cm as cache:
         if session is None and len(provider_list) > 1:
             def _query_worker(prov: str) -> list[EnrichmentCandidate]:
-                with requests.Session() as worker_sess:
+                with create_configured_http_session(proxy=proxy) as worker_sess:
                     return _query_provider(
                         prov,
                         metadata,
@@ -1557,7 +1569,11 @@ def search_enrichment_candidates(
                 for future in futures:
                     collected.extend(future.result())
         else:
-            session_cm = nullcontext(session) if session is not None else requests.Session()
+            session_cm: Any = (
+                nullcontext(session)
+                if session is not None
+                else create_configured_http_session(proxy=proxy)
+            )
             with session_cm as sess:
                 for provider in provider_list:
                     collected.extend(
@@ -1622,7 +1638,11 @@ def enrich_audiobook_metadata(
         if database_directory
         else nullcontext(None)
     )
-    session_cm = nullcontext(session) if session is not None else requests.Session()
+    session_cm: Any = (
+        nullcontext(session)
+        if session is not None
+        else create_configured_http_session(proxy=proxy)
+    )
     chapters_overridden = False
 
     with cache_cm as cache, session_cm as sess:

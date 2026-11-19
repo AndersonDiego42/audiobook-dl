@@ -222,7 +222,6 @@ def test_gui_app_smoke_and_state_transitions(tmp_path):
         app.combine_var.set(True)
 
         opts = app.build_options()
-        assert opts.urls == ["https://example.com/book1"]
         assert opts.output_format == "m4b"
         assert opts.combine is True
         assert opts.output_template == os.path.join(str(tmp_path), "{title}")

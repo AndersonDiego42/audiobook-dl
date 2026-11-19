@@ -37,7 +37,7 @@ class YourCloudLibrarySource(Source):
         book_info = self.download_book_info(account_id, fulfillment_id)
         playlist = self.download_playlist(fulfillment_id, license_id)
         return Audiobook(
-            session=self._session,
+            session=self.create_unauthenticated_session(),
             files=self.get_files(playlist),
             metadata=self.get_metadata(book_info, url=url),
             cover=self.download_cover(book_info),

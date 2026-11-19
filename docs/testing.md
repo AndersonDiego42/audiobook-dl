@@ -73,7 +73,7 @@ flowchart LR
 
 | Variable | Default | Description |
 |---|---|---|
-| `AUDIOBOOK_DL_E2E_TARGET` | `module` | `module` runs `python -m audiobookdl.gui --self-test`; `executable` targets built binaries |
+| `AUDIOBOOK_DL_E2E_TARGET` | `module` | `module` runs `python -m audiobookdl --self-test`; `executable` targets built binaries |
 | `AUDIOBOOK_DL_E2E_GUI_BIN` | _(unset)_ | Path to GUI executable for `--self-test` when `AUDIOBOOK_DL_E2E_TARGET=executable` |
 | `AUDIOBOOK_DL_E2E_FFMPEG_DIR` | _(unset)_ | Optional explicit directory containing `ffmpeg` and `ffprobe` |
 | `AUDIOBOOK_DL_E2E_TIMEOUT` | `30.0` | Timeout in seconds for subprocesses and GUI state polling |

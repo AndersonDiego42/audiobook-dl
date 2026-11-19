@@ -412,3 +412,49 @@ def test_nextory_parallel_playlists_and_hls_key_deduplication(tmp_path):
         "https://cdn.nextory.com/p2/key.bin",
     ]
 
+
+def test_nextory_strips_auth_headers_from_cdn_files_and_uses_unauthenticated_session(tmp_path):
+    src = _make_source(tmp_path)
+    src._session.headers.update(
+        {
+            "X-Application-Id": "200",
+            "X-Country-Code": "SE",
+            "token": "secret-login-token",
+            "X-Login-Token": "secret-login-token",
+            "X-Profile-Token": "secret-profile-token",
+            "Authorization": "Bearer secret-auth",
+        }
+    )
+    src._session.cookies.set("session", "secret-cookie", domain="nextory.com")
+
+    product = _book_entry(333, title="CDN Safe Book")
+    audio_data = {"files": [{"uri": "https://cdn.nextory.com/333/master.m3u8", "start_at": 0}]}
+    playlist = b"#EXTM3U\n#EXTINF:5.0,\nseg0.ts\n#EXT-X-ENDLIST\n"
+
+    def fake_get(url, **_kwargs):
+        if url.endswith("/library/v1/products/333"):
+            return _json_resp(product)
+        if url.endswith("/packages/audio"):
+            return _json_resp(audio_data)
+        if url.endswith("master.m3u8"):
+            return MagicMock(status_code=200, content=playlist)
+        if url.endswith("333.jpg"):
+            return MagicMock(status_code=200, content=b"cover-bytes")
+        raise AssertionError(f"Unexpected GET {url}")
+
+    src._session.get = MagicMock(side_effect=fake_get)
+    book = src.download_from_id(333)
+
+    assert book.session is not src._session
+    assert book.session.cookies.get("session") is None
+    assert not any(
+        k.lower() in {"token", "x-login-token", "x-profile-token", "authorization"}
+        for k in book.session.headers
+    )
+    assert len(book.files) == 1
+    lowered = {k.lower(): v for k, v in book.files[0].headers.items()}
+    assert lowered.get("x-application-id") == "200"
+    assert lowered.get("x-country-code") == "SE"
+    for forbidden in ("token", "x-login-token", "x-profile-token", "authorization", "cookie"):
+        assert forbidden not in lowered
+

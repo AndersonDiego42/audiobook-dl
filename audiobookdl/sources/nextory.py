@@ -10,6 +10,7 @@ from audiobookdl.exceptions import (
     UserNotAuthorized,
 )
 from audiobookdl.utils.concurrency import run_cancellable_pool
+from audiobookdl.utils.http import strip_auth_headers
 
 import calendar
 from datetime import date, datetime
@@ -189,7 +190,7 @@ class NextorySource(Source):
             logging.debug(f"nextory audio_data without 'files': {audio_data!r}")
             raise BookHasNoAudiobook
         return Audiobook(
-            session=self._session,
+            session=self.create_unauthenticated_session(),
             files=self.get_files(audio_data),
             metadata=self.get_metadata(book_info),
             cover=self.get_cover(book_info),
@@ -324,10 +325,7 @@ class NextorySource(Source):
         return []
 
     def get_files(self, audio_data) -> list[AudiobookFile]:
-        session_headers: dict[str, str] = {
-            str(k): v.decode("latin-1") if isinstance(v, bytes) else str(v)
-            for k, v in self._session.headers.items()
-        }
+        session_headers = strip_auth_headers(self._session.headers)
         raw_files = audio_data["files"]
         if len(raw_files) <= 1:
             files: list[AudiobookFile] = []

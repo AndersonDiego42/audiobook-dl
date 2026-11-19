@@ -121,7 +121,7 @@ def test_downloader_events_isolation_and_selective_workflow(monkeypatch):
     assert logging.get_ui_sink() is None
 
     config = Config(sources={}, output_template=None, database_directory=None, skip_downloaded=None)
-    options = build_default_options(debug=True, quiet=False)
+    options = build_default_options(debug=True)
     interaction = _RecordingInteraction(answers={"Username": "alice", "Password": "secret"})
 
     downloader = Downloader(
@@ -305,7 +305,7 @@ def test_apply_runtime_options_toml_fallback_and_explicit_override(tmp_path):
         proxy="http://127.0.0.1:9000",
         timeout=30.0,
     )
-    omitted_opts = build_default_options(urls=["https://example.com/book"])
+    omitted_opts = build_default_options()
     apply_runtime_options(omitted_opts, cfg)
     assert omitted_opts.output_template == "{author}/{title}"
     assert omitted_opts.database_directory == str(tmp_path / "custom_db")
@@ -324,7 +324,6 @@ def test_apply_runtime_options_toml_fallback_and_explicit_override(tmp_path):
         combine=False,
         skip_downloaded=False,
         overwrite=False,
-        urls=["https://example.com/book"],
     )
     apply_runtime_options(explicit_opts, cfg)
     assert explicit_opts.output_template == "{title}"
@@ -379,24 +378,6 @@ def test_series_summary_tracks_partial_failures(monkeypatch):
     assert full_summary.books_failed == 1
     assert len(full_summary.book_errors) == 1
     assert "broken third book" in full_summary.book_errors[0][1]
-
-
-def test_apply_runtime_options_resolves_output_preset_unless_explicit_output():
-    from audiobookdl.output.output import OUTPUT_TEMPLATE_PRESETS
-    from audiobookdl.pipeline import apply_runtime_options
-
-    cfg = Config(sources={}, output_template="{author} - {title}", database_directory=None, skip_downloaded=None)
-    preset_opts = build_default_options(output_preset="audiobookshelf", urls=["https://example.com"])
-    apply_runtime_options(preset_opts, cfg)
-    assert preset_opts.output_template == OUTPUT_TEMPLATE_PRESETS["audiobookshelf"]
-
-    override_opts = build_default_options(
-        output_preset="audiobookshelf",
-        output_template="{title}",
-        urls=["https://example.com"],
-    )
-    apply_runtime_options(override_opts, cfg)
-    assert override_opts.output_template == "{title}"
 
 
 def test_download_archive_records_and_skips_repeat_downloads(tmp_path, monkeypatch):
@@ -689,7 +670,7 @@ def test_apply_runtime_options_media_type_precedence():
     apply_runtime_options(opts_default, cfg)
     assert opts_default.media_type == "ebook"
 
-    opts_explicit = build_default_options(media_type="both", urls=["https://example.com/book"])
+    opts_explicit = build_default_options(media_type="both")
     apply_runtime_options(opts_explicit, cfg)
     assert opts_explicit.media_type == "both"
 
@@ -784,7 +765,7 @@ def test_download_result_series_handles_book_has_no_ebook_and_dual_format_series
     assert summary.books_failed == 0
 
 
-def test_enrichment_and_updater_close_auto_sessions_and_process_reuses_source_session(tmp_path, monkeypatch):
+def test_enrichment_and_updater_close_auto_sessions_and_process_isolates_source_session(tmp_path, monkeypatch):
     from unittest.mock import MagicMock, patch
     from audiobookdl import AudiobookFile
     from audiobookdl.utils.enrichment import EnrichmentResult, enrich_audiobook_metadata
@@ -793,6 +774,10 @@ def test_enrichment_and_updater_close_auto_sessions_and_process_reuses_source_se
     closed_count = 0
 
     class _FakeAutoSession:
+        def __init__(self):
+            self.headers = {}
+            self.proxies = {}
+
         def __enter__(self):
             return self
 
@@ -800,26 +785,50 @@ def test_enrichment_and_updater_close_auto_sessions_and_process_reuses_source_se
             nonlocal closed_count
             closed_count += 1
 
+        def mount(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            nonlocal closed_count
+            closed_count += 1
+
         def get(self, *_args, **_kwargs):
             return MagicMock(status_code=200, json=lambda: {"tag_name": "v9.9.9", "html_url": "https://x"})
 
-    monkeypatch.setattr("audiobookdl.utils.updater.requests.Session", _FakeAutoSession)
-    info = check_for_updates(current_version="0.1.0", respect_opt_out=False)
+    with monkeypatch.context() as mp:
+        mp.setattr("audiobookdl.utils.updater.requests.Session", _FakeAutoSession)
+        info = check_for_updates(current_version="0.1.0", respect_opt_out=False)
     assert info is not None and info.has_update is True
     assert closed_count == 1
 
-    enriched_sessions = []
+    enriched_snapshots: list[tuple[Any, dict[str, str], dict[str, str]]] = []
 
     def fake_enrich(audiobook, **kwargs):
-        enriched_sessions.append(kwargs.get("session"))
+        sess = kwargs.get("session")
+        enriched_snapshots.append(
+            (
+                sess,
+                dict(getattr(sess, "headers", {})),
+                dict(getattr(sess, "cookies", {})),
+            )
+        )
         return EnrichmentResult(updated=True, providers_used=["openlibrary"])
 
-    fake_session = MagicMock()
+    source_session = requests.Session()
+    source_session.headers.update(
+        {
+            "Authorization": "Bearer secret-source-jwt",
+            "X-Login-Token": "secret-login",
+            "X-Profile-Token": "secret-profile",
+            "Session-Key": "secret-session-key",
+        }
+    )
+    source_session.cookies.set("sid", "secret-cookie", domain="storytel.com")
     src = MagicMock()
     src.name = "storytel"
-    src._session = fake_session
+    src._session = source_session
     book = Audiobook(
-        session=fake_session,
+        session=source_session,
         metadata=AudiobookMetadata(title="Enrich Book"),
         files=[AudiobookFile(url="https://example.com/a.mp3", ext="mp3")],
     )
@@ -834,9 +843,19 @@ def test_enrichment_and_updater_close_auto_sessions_and_process_reuses_source_se
         from audiobookdl.pipeline import process_audiobook
 
         process_audiobook(src, book, opts)
-    assert enriched_sessions == [fake_session]
 
-    monkeypatch.setattr("audiobookdl.utils.enrichment.requests.Session", _FakeAutoSession)
+    assert len(enriched_snapshots) == 1
+    used_sess, used_headers, used_cookies = enriched_snapshots[0]
+    assert used_sess is not source_session
+    assert isinstance(used_sess, requests.Session)
+    lowered_headers = {k.lower(): v for k, v in used_headers.items()}
+    assert "authorization" not in lowered_headers
+    assert "x-login-token" not in lowered_headers
+    assert "x-profile-token" not in lowered_headers
+    assert "session-key" not in lowered_headers
+    assert used_cookies == {}
+
+    monkeypatch.setattr("audiobookdl.utils.http.requests.Session", _FakeAutoSession)
     enrich_audiobook_metadata(
         Audiobook(session=None, metadata=AudiobookMetadata(title="Fallback Close"), files=[]),
         providers=("openlibrary",),
@@ -894,7 +913,7 @@ def test_authenticate_isolates_profiles_and_persists_login_cookies(tmp_path):
     assert default_src.cached_cookie_path().endswith("session_cookies.txt")
 
 
-def test_no_download_archive_bypasses_reading_and_writing_downloads_db(tmp_path):
+def test_explicit_none_download_archive_bypasses_reading_and_writing_downloads_db(tmp_path):
     from unittest.mock import MagicMock, patch
     from audiobookdl import AudiobookFile
     from audiobookdl.pipeline import process_audiobook
@@ -914,7 +933,7 @@ def test_no_download_archive_bypasses_reading_and_writing_downloads_db(tmp_path)
         output_template=str(tmp_path / "{title}"),
         database_directory=str(db_dir),
         skip_downloaded=True,
-        no_download_archive=True,
+        download_archive=None,
     )
     src = MagicMock()
     src.name = "storytel"
@@ -926,9 +945,9 @@ def test_no_download_archive_bypasses_reading_and_writing_downloads_db(tmp_path)
     )
 
     with patch("audiobookdl.pipeline.download") as mock_dl:
-        # Must NOT skip pre-recorded entry when no_download_archive=True
+        # Must NOT skip pre-recorded entry when download_archive=None is explicitly passed
         assert process_audiobook(src, book, opts) is True
-        # Must NOT insert new entry into downloads.db when no_download_archive=True
+        # Must NOT insert new entry into downloads.db when download_archive=None is explicitly passed
         assert process_audiobook(src, new_book, opts) is True
     assert mock_dl.call_count == 2
     assert len(DownloadArchive(str(archive_path)).list_entries()) == 1

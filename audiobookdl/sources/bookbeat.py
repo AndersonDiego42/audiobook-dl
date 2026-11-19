@@ -3,6 +3,7 @@ from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Co
 from audiobookdl.exceptions import BookHasNoAudiobook, BookHasNoEbook, MissingBookAccess, RequestError, UserNotAuthorized
 from audiobookdl.options_schema import DownloadOptions
 from audiobookdl.utils.audiobook import parse_language, parse_release_date
+from audiobookdl.utils.http import strip_auth_headers
 
 import base64
 import re
@@ -104,9 +105,10 @@ class BookBeatSource(Source):
         if not href:
             raise MissingBookAccess
         ext = "pdf" if ".pdf" in href.lower() else "epub"
+        cdn_headers: dict[str, str | bytes] = dict(strip_auth_headers(self._session.headers))
         return Audiobook(
-            session=self._session,
-            files=[AudiobookFile(url=href, headers=dict(self._session.headers), ext=ext)],
+            session=self.create_unauthenticated_session(),
+            files=[AudiobookFile(url=href, headers=cdn_headers, ext=ext)],
             metadata=self.get_metadata(book_info, url=url, is_ebook=True),
             cover=self.get_cover(book_info),
             chapters=[],
@@ -123,7 +125,7 @@ class BookBeatSource(Source):
 
         if mode == "audiobook":
             return Audiobook(
-                session=self._session,
+                session=self.create_unauthenticated_session(),
                 files=self.get_files(book_info),
                 metadata=self.get_metadata(book_info, url=url),
                 cover=self.get_cover(book_info),
@@ -144,7 +146,7 @@ class BookBeatSource(Source):
             if audio_entry is not None:
                 items.append(
                     Audiobook(
-                        session=self._session,
+                        session=self.create_unauthenticated_session(),
                         files=self.get_files(book_info),
                         metadata=self.get_metadata(book_info, url=url),
                         cover=self.get_cover(book_info),
@@ -162,7 +164,7 @@ class BookBeatSource(Source):
         # Default "auto": prefer audiobook when present, fall back to ebook
         if audio_entry is not None:
             return Audiobook(
-                session=self._session,
+                session=self.create_unauthenticated_session(),
                 files=self.get_files(book_info),
                 metadata=self.get_metadata(book_info, url=url),
                 cover=self.get_cover(book_info),
@@ -201,10 +203,11 @@ class BookBeatSource(Source):
     def get_files(self, book_info: dict) -> list[AudiobookFile]:
         lic = self._get_license(book_info)
         if "_links" in lic:
+            cdn_headers: dict[str, str | bytes] = dict(strip_auth_headers(self._session.headers))
             return [
                 AudiobookFile(
                     url=lic["_links"]["download"]["href"],
-                    headers=dict(self._session.headers),
+                    headers=cdn_headers,
                     ext="mp4",
                 )
             ]

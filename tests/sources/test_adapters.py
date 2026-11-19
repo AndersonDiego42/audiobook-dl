@@ -1524,3 +1524,82 @@ def test_everand_yourcloudlibrary_and_nextory_hardening(tmp_path):
     nx._configured_locale = "de_DE"
     assert nx._resolve_locale("https://www.nextory.com/book/1") == "de_DE"
 
+
+def test_bookbeat_yourcloudlibrary_librofm_isolate_cdn_sessions_and_headers(tmp_path):
+    from audiobookdl.sources.librofm import LibrofmSource
+
+    # 1. BookBeat (audiobook + ebook) strips Authorization while keeping client headers & unauth session
+    bb = BookBeatSource(_opts(tmp_path))
+    bb._session.headers.update(
+        {
+            "accept": "application/hal+json",
+            "bb-client": "BookBeatApp",
+            "bb-device": "dev-1",
+            "authorization": "Bearer bb-secret-jwt",
+        }
+    )
+    bb._session.cookies.set("bb_sid", "bb-cookie", domain="bookbeat.com")
+    bb_meta = {"title": "BB Safe", "cover": "https://cdn.bookbeat.com/cover.jpg", "editions": []}
+    bb._session.get = MagicMock(
+        side_effect=[
+            _json_resp(bb_meta),
+            _json_resp(
+                {
+                    "_embedded": {
+                        "downloads": [
+                            {"format": "audioBook", "_links": {"license": {"href": "https://api.bookbeat.com/lic/1"}}},
+                            {"format": "eBook", "_links": {"license": {"href": "https://api.bookbeat.com/elic/1"}}},
+                        ]
+                    }
+                }
+            ),
+            _json_resp({"_links": {"download": {"href": "https://cdn.bookbeat.com/1.mp4"}}, "tracks": [{"start": 0}]}),
+            MagicMock(status_code=200, content=b"cover"),
+        ]
+    )
+    bb_book = bb.download("https://www.bookbeat.com/book/1")
+    assert isinstance(bb_book, Audiobook)
+    assert bb_book.session is not bb._session
+    assert "authorization" not in {k.lower() for k in bb_book.session.headers}
+    assert bb_book.session.cookies.get("bb_sid") is None
+    bb_hdrs = {k.lower(): v for k, v in bb_book.files[0].headers.items()}
+    assert bb_hdrs.get("bb-client") == "BookBeatApp"
+    assert bb_hdrs.get("bb-device") == "dev-1"
+    assert "authorization" not in bb_hdrs
+
+    # 2. YourCloudLibrary isolates Audiobook.session from Session-Key and cookies
+    ycl = YourCloudLibrarySource(_opts(tmp_path))
+    ycl._session.cookies.set("ycl_sid", "ycl-cookie", domain="yourcloudlibrary.com")
+    listen_html = (
+        b'"accountId":"acc1","fulfillmentId":"ful1","licenseId":"lic1","session_key":"sk-secret"'
+    )
+    ycl._session.get = MagicMock(
+        side_effect=[
+            MagicMock(status_code=200, content=listen_html),
+            _json_resp({"audiobook": {"title": "YCL Safe", "authors": ["A"], "narrators": ["N"], "chapters": []}}),
+        ]
+    )
+    ycl._session.post = MagicMock(
+        return_value=_json_resp({"playlist": [{"url": "https://cdn.findawayworld.com/p1.mp3"}]})
+    )
+    ycl_book = ycl.download("https://audio.yourcloudlibrary.com/listen/bk1")
+    assert ycl_book.session is not ycl._session
+    assert "session-key" not in {k.lower() for k in ycl_book.session.headers}
+    assert ycl_book.session.cookies.get("ycl_sid") is None
+
+    # 3. Libro.fm isolates Audiobook.session from OAuth bearer token
+    lf = LibrofmSource(_opts(tmp_path))
+    lf._access_token = "libro-oauth-secret"
+    lf._session.headers["Authorization"] = "Bearer libro-oauth-secret"
+    lf._session.cookies.set("lf_sid", "lf-cookie", domain="libro.fm")
+    lf.get_json = MagicMock(  # type: ignore[method-assign]
+        side_effect=[
+            {"audiobooks": []},
+            {"m4b_url": "https://cdn.libro.fm/book.m4b", "title": "Libro Safe"},
+        ]
+    )
+    lf_book = lf.download("https://libro.fm/audiobooks/9780593152393")
+    assert lf_book.session is not lf._session
+    assert "authorization" not in {k.lower() for k in lf_book.session.headers}
+    assert lf_book.session.cookies.get("lf_sid") is None
+

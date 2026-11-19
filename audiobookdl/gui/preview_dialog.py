@@ -924,9 +924,10 @@ class PreviewDialog(ModalDialog):
         self._set_enrichment_busy(True, "Searching providers...")
 
         search_fn = self._on_search_enrichment or (
-            lambda book, _opts: search_enrichment_candidates(
+            lambda book, opts: search_enrichment_candidates(
                 book.metadata,
-                session=getattr(self._source, "_session", None),
+                proxy=getattr(opts, "proxy", None),
+                timeout=getattr(opts, "timeout", None) or 10.0,
             )
         )
         search_snapshot = _clone_audiobook_for_enrichment(audiobook)
@@ -994,10 +995,11 @@ class PreviewDialog(ModalDialog):
         self._set_enrichment_busy(True, "Applying match...")
 
         apply_fn = self._on_apply_enrichment or (
-            lambda book, cand, _opts: apply_candidate_to_audiobook(
+            lambda book, cand, opts: apply_candidate_to_audiobook(
                 book,
                 cand,
-                session=getattr(self._source, "_session", None),
+                proxy=getattr(opts, "proxy", None),
+                timeout=getattr(opts, "timeout", None) or 10.0,
             )
         )
         apply_snapshot = _clone_audiobook_for_enrichment(audiobook)

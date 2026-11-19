@@ -26,7 +26,11 @@ OptionWidget = ttk.Entry | ttk.Checkbutton | ttk.Combobox | ttk.Spinbox
 
 def _option_help(name: str) -> str:
     spec = OPTIONS_BY_NAME.get(name)
-    return spec.get_help() if spec is not None else ""
+    if spec is None:
+        return ""
+    if spec.gui is not None and spec.gui.tooltip:
+        return spec.gui.tooltip
+    return spec.get_help()
 
 
 class OptionsPanel(ttk.LabelFrame):

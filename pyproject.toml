@@ -59,7 +59,6 @@ build = [
 
 [project.gui-scripts]
 audiobook-dl = "audiobookdl.gui:main"
-audiobook-dl-gui = "audiobookdl.gui:main"
 
 [tool.setuptools.dynamic]
 version = {attr = "audiobookdl.__version__"}

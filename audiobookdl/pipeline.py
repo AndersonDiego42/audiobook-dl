@@ -29,7 +29,6 @@ from .options_schema import (
     MERGEABLE_OPTION_SPECS,
     DownloadOptions,
     build_default_options,
-    parse_series_selection,
 )
 from .exceptions import (
     AudiobookDLException,
@@ -75,7 +74,7 @@ from .output.download import download
 from .sources import find_compatible_source, find_source_by_name
 from .sources.source import CatalogBook, Source, bind_pooled_session
 from .utils import subprocess_kwargs
-from .utils.http import create_configured_http_session
+from .utils.http import create_configured_http_session, resolve_http_timeout
 from .utils.archive import DownloadArchive, default_archive_path, make_book_key
 from .utils.audiobook import (
     Audiobook,
@@ -297,15 +296,8 @@ def apply_runtime_options(
 ) -> logging.JobContext:
     """Merge config defaults into `options` and build an isolated `JobContext`."""
     explicit: frozenset[str] = getattr(options, "_explicit_fields", frozenset())
-    preset_requested = "output_template" not in explicit and bool(getattr(options, "output_preset", None))
-    if preset_requested:
-        preset_tpl = output.OUTPUT_TEMPLATE_PRESETS.get(options.output_preset or "")
-        if preset_tpl:
-            options.output_template = preset_tpl
 
     for spec in MERGEABLE_OPTION_SPECS:
-        if spec.name == "output_template" and preset_requested:
-            continue
         if spec.name in explicit:
             continue
         cfg_key = spec.config_key or spec.name
@@ -329,7 +321,6 @@ def apply_runtime_options(
     ffmpeg_dir = config.ffmpeg_dir.strip() or None if config.ffmpeg_dir else None
     return logging.JobContext(
         debug=options.debug,
-        quiet=options.quiet,
         ffmpeg_dir=ffmpeg_dir,
     )
 
@@ -836,18 +827,6 @@ def download_result(
 ) -> None:
     """Download a resolved `Audiobook` or `Series` `Result`."""
     handler = interaction or logging.NonInteractiveInteractionHandler()
-    if (
-        isinstance(result, Series)
-        and selected_indices is None
-        and getattr(options, "series_items", None)
-    ):
-        try:
-            selected_indices = parse_series_selection(
-                options.series_items or "",
-                len(result.books),
-            )
-        except ValueError as exc:
-            raise GenericAudiobookDLException(str(exc)) from exc
 
     logging.log("")  # Empty line
     if isinstance(result, Audiobook):
@@ -1462,20 +1441,24 @@ def enrich_audiobook_with_options(
                 )
             selector = _select
 
-    result = enrich_audiobook_metadata(
-        audiobook,
-        providers=providers,
-        custom_providers=custom_providers,
-        session=getattr(source, "_session", None),
-        proxy=getattr(options, "proxy", None),
-        timeout=getattr(options, "timeout", None) or 10.0,
-        database_directory=getattr(options, "database_directory", None),
-        use_cache=not bool(getattr(options, "no_enrich_cache", False)),
-        interactive=interactive,
-        selector=selector,
-        include_chapters=not bool(getattr(options, "no_chapters", False)),
-        override_chapters=bool(getattr(options, "override_chapters", False)),
+    resolved_proxy = getattr(options, "proxy", None) or (
+        resolved_cfg.proxy if resolved_cfg is not None else None
     )
+    with create_configured_http_session(options, proxy=resolved_proxy) as enrich_session:
+        result = enrich_audiobook_metadata(
+            audiobook,
+            providers=providers,
+            custom_providers=custom_providers,
+            session=enrich_session,
+            proxy=resolved_proxy,
+            timeout=getattr(options, "timeout", None) or 10.0,
+            database_directory=getattr(options, "database_directory", None),
+            use_cache=True,
+            interactive=interactive,
+            selector=selector,
+            include_chapters=not bool(getattr(options, "no_chapters", False)),
+            override_chapters=bool(getattr(options, "override_chapters", False)),
+        )
     if result.updated:
         details = list(result.fields_updated)
         if result.cover_updated:
@@ -1535,8 +1518,9 @@ def process_audiobook(
         else (audiobook.metadata.source or "unknown")
     )
     book_key = make_book_key(source_name, audiobook)
-    use_archive = not bool(getattr(options, "no_download_archive", False))
-    explicit_archive = getattr(options, "download_archive", None) if use_archive else None
+    explicit_fields: frozenset[str] = getattr(options, "_explicit_fields", frozenset())
+    explicit_archive = getattr(options, "download_archive", None)
+    use_archive = not ("download_archive" in explicit_fields and not explicit_archive)
     ledger_path = (
         explicit_archive
         or (
@@ -1640,12 +1624,17 @@ def process_audiobook(
         try:
             from audiobookdl.integrations.audiobookshelf import sync_book_to_audiobookshelf
 
+            resolved_proxy = getattr(options, "proxy", None) or (
+                config.proxy if config is not None else None
+            )
+            resolved_timeout = resolve_http_timeout(options)
             if sync_book_to_audiobookshelf(
                 resolved_output,
                 audiobook.metadata,
                 abs_cfg,
                 force_upload=force_abs,
-                session=getattr(audiobook, "session", None),
+                proxy=resolved_proxy,
+                timeout=resolved_timeout,
             ):
                 logging.log(f"Synced {audiobook.title} to Audiobookshelf")
         except Exception as exc:

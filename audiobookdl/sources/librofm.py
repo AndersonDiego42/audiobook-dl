@@ -260,7 +260,7 @@ class LibrofmSource(Source):
             cover = self.fetch_cover_safe(cover_url, default_ext=default_ext)
 
         return Audiobook(
-            session=self._session,
+            session=self.create_unauthenticated_session(),
             metadata=meta,
             files=files,
             chapters=chapters,

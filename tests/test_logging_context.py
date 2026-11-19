@@ -57,8 +57,8 @@ def test_concurrent_run_downloads_isolate_logging_sinks_and_flags():
             )
 
     cfg = Config(sources={}, output_template=None, database_directory=None, skip_downloaded=None)
-    opts_a = build_default_options(debug=True, quiet=False)
-    opts_b = build_default_options(debug=False, quiet=True)
+    opts_a = build_default_options(debug=True)
+    opts_b = build_default_options(debug=False)
 
     results = {}
 
@@ -76,16 +76,22 @@ def test_concurrent_run_downloads_isolate_logging_sinks_and_flags():
     assert results["a"].completed == 1
     assert results["b"].completed == 1
 
-    # Job A had debug=True and quiet=False: receives INFO + DEBUG (including worker threads)
+    # Job A had debug=True: receives INFO + DEBUG (including worker threads)
     a_messages = [msg for _lvl, msg in sink_a.logs]
     assert any("start https://a.example/1" in m for m in a_messages)
+    assert any("dbg https://a.example/1" in m for m in a_messages)
     assert any("worker-0 https://a.example/1" in m for m in a_messages)
     assert not any("b.example" in m for m in a_messages)
     assert sink_a.starts == ["task https://a.example/1"]
     assert sink_a.finished == 1
 
-    # Job B had debug=False and quiet=True: receives no INFO/DEBUG logs and no Job A leaks
-    assert sink_b.logs == []
+    # Job B had debug=False: receives INFO only, no DEBUG logs, and no Job A leaks
+    b_levels = {lvl for lvl, _msg in sink_b.logs}
+    b_messages = [msg for _lvl, msg in sink_b.logs]
+    assert b_levels == {"INFO"}
+    assert any("start https://b.example/2" in m for m in b_messages)
+    assert not any("dbg https://b.example/2" in m for m in b_messages)
+    assert not any("a.example" in m for m in b_messages)
     assert sink_b.starts == ["task https://b.example/2"]
     assert sink_b.finished == 1
     assert logging.get_job_context() is None

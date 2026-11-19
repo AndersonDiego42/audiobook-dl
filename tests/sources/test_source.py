@@ -756,6 +756,25 @@ def test_source_handles_cdn_522_retries_cloudflare_challenge_and_redirected_hls(
         source.get_stream_files("https://cdn.example.com/bad.m3u8")
 
 
+def test_strip_auth_headers_removes_tokens_case_insensitively():
+    from audiobookdl.utils.http import strip_auth_headers
+
+    raw = {
+        "Authorization": "Bearer secret",
+        "x-login-token": "login-tok",
+        "X-Profile-Token": b"prof-tok",
+        "TOKEN": "tok",
+        "Session-Key": "sk",
+        "Cookie": "a=b",
+        "X-Api-Key": "key",
+        "User-Agent": "CustomUA/1.0",
+        b"X-Client": b"App",
+    }
+    cleaned = strip_auth_headers(raw)
+    assert cleaned == {"User-Agent": "CustomUA/1.0", "X-Client": "App"}
+    assert strip_auth_headers(None) == {}
+
+
 
 
 

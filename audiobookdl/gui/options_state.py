@@ -550,7 +550,6 @@ class OptionsCoordinator:
         )
 
         return build_default_options(
-            urls=urls,
             output_template=output_template,
             download_archive=download_archive,
             config_location=effective_config_location,

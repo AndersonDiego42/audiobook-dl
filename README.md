@@ -72,8 +72,6 @@ Launch the Tkinter desktop application:
 ```shell
 audiobook-dl
 # or
-audiobook-dl-gui
-# or
 python -m audiobookdl
 ```
 

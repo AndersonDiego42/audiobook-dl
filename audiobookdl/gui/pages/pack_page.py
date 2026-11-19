@@ -903,7 +903,7 @@ class PackPage(ttk.Frame):
         if base is None:
             return None
         fmt = self.format_var.get().strip().lower() or "m4b"
-        cloned = dataclasses.replace(base, urls=[], output_format=fmt)
+        cloned = dataclasses.replace(base, output_format=fmt)
         cloned._explicit_fields = frozenset(base._explicit_fields | {"output_format"})
         return cloned
 

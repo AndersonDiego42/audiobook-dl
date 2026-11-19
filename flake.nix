@@ -51,7 +51,6 @@
               pycountry
               pycryptodome
               requests
-              rich
               tkinter
               urllib3
               python-dateutil
@@ -79,7 +78,6 @@
               mutagen
               openpyxl
               requests
-              rich
               lxml
               cssselect
               pillow

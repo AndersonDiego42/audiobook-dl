@@ -29,9 +29,8 @@ Ensure `ffmpeg` and `ffprobe` are available on `PATH` for media merging, chapter
 
 ```shell
 python -m audiobookdl
-# or via installed entry points:
+# or via installed entry point:
 audiobook-dl
-audiobook-dl-gui
 ```
 
 ## Verification Checks
