@@ -118,7 +118,7 @@ def test_logging_ui_sink_and_progress():
         logging.log("Downloading Example Book")
         logging.warning("Warning: Low disk space")
         logging.debug("Debug line")
-        with logging.progress([]) as progress:
+        with logging.progress() as progress:
             task_id = progress.add_task("Downloading Example", total=4)
             progress.advance(task_id, 1.5)
             assert progress.tasks[task_id].remaining == pytest.approx(2.5)
@@ -412,7 +412,7 @@ def test_gui_app_end_to_end_worker_and_prompts(tmp_path, monkeypatch):
         def fake_run_downloads(urls, options, config, interaction=None, cancel_event=None, pause_event=None, sink=None):
             with logging.job_context(logging.JobContext(sink=sink)):
                 logging.log("Downloading Test Book")
-                with logging.progress([]) as progress:
+                with logging.progress() as progress:
                     task_id = progress.add_task("Downloading Test Book", total=2)
                     progress.advance(task_id, 1)
                     progress.advance(task_id, 1)
@@ -449,7 +449,7 @@ def test_sink_progress_adapter_throttles_by_delta_time_and_completion(monkeypatc
 
     sink = _RecordingSink()
     with logging.job_context(logging.JobContext(sink=sink)):
-        with logging.progress([]) as progress:
+        with logging.progress() as progress:
             task_id = progress.add_task("Downloading", total=1000.0)
             # Four tiny advances (0.1% each = 0.4% total, 0s elapsed) -> throttled
             for _ in range(4):
@@ -627,7 +627,7 @@ def test_gui_add_to_queue_while_running_and_batch_progress(tmp_path, monkeypatch
                     logging.emit_item_progress(1, 1, "Book One")
                 else:
                     logging.emit_item_progress(2, 5, "Series Book Two")
-                with logging.progress([]) as progress:
+                with logging.progress() as progress:
                     task_id = progress.add_task(f"Downloading {url}", total=2.0)
                     progress.advance(task_id, 2.0)
             return DownloadSummary(completed=1, failed=0, cancelled=False)
@@ -733,7 +733,7 @@ def test_sink_progress_adapter_emits_speed_and_eta_metrics(monkeypatch):
 
     sink = _MetricsSink()
     with logging.job_context(logging.JobContext(sink=sink)):
-        with logging.progress([]) as progress:
+        with logging.progress() as progress:
             task_id = progress.add_task("Downloading", total=4.0)
             clock[0] += 1.0
             progress.record_bytes(task_id, 1024 * 1024)

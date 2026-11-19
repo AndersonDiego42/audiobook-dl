@@ -608,23 +608,23 @@ class Downloader:
                         reason = _describe_unavailable_reason(e)
                         logging.log(f"Skipped {url} ({reason})")
                         if logging.is_debug_mode():
-                            logging.print_traceback()
+                            logging.log_traceback()
                         continue
                     summary.failed += 1
                     summary.books_failed += 1
                     detail = str(e).strip() or e.error_description
                     summary.book_errors.append((url, detail))
-                    e.print()
+                    logging.error(detail)
                     if logging.is_debug_mode():
-                        logging.print_traceback()
+                        logging.log_traceback()
                 except AudiobookDLException as e:
                     summary.failed += 1
                     summary.books_failed += 1
                     detail = str(e).strip() or e.error_description
                     summary.book_errors.append((url, detail))
-                    e.print()
+                    logging.error(detail)
                     if logging.is_debug_mode():
-                        logging.print_traceback()
+                        logging.log_traceback()
         return summary
 
 
@@ -927,7 +927,7 @@ def download_result(
                 errors.append((str(book), detail))
                 logging.log(f"Skipped {book} ({detail})")
                 if logging.is_debug_mode():
-                    logging.print_traceback()
+                    logging.log_traceback()
                 continue
         if summary is not None:
             summary.books_completed += done_count
@@ -987,14 +987,12 @@ def process_url(
 
 def get_cookie_path(options: DownloadOptions, config: SourceConfig | None) -> str | None:
     """
-    Find path to cookie file from `options.cookie_file`, source config, or `./cookies.txt`.
+    Find path to cookie file from `options.cookie_file` or source config.
     """
     if options.cookie_file is not None and os.path.exists(options.cookie_file):
         return options.cookie_file
     if config is not None and config.cookie_file is not None and os.path.exists(config.cookie_file):
         return config.cookie_file
-    if os.path.exists("./cookies.txt"):
-        return "./cookies.txt"
     return None
 
 

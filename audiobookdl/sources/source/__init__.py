@@ -533,7 +533,9 @@ class Source(Generic[T]):
             return ssl_context
         except AttributeError as error: # AttributeError: module 'urllib3.util' has no attribute 'create_urllib3_context'
             raise GenericAudiobookDLException(
-                "Please update urllib3 to version >= 2 using the command 'pip install -U urllib3'"
+                "This version of audiobook-dl requires urllib3 >= 2.0 "
+                "(missing urllib3.util.create_urllib3_context). "
+                "Please update your audiobook-dl installation or Python environment."
             ) from error
 
     def create_session(self, options: DownloadOptions | None = None) -> requests.Session:

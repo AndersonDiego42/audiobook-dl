@@ -94,14 +94,10 @@ def test_error_template_inventory_covers_all_18_assets():
 
 
 @pytest.mark.parametrize(("exc_cls", "kwargs"), _SUBCLASS_CASES, ids=lambda v: v.__name__ if isinstance(v, type) else "kwargs")
-def test_audiobook_dl_exception_print_renders_cleanly(exc_cls, kwargs):
-    sink = _RecordingSink()
+def test_audiobook_dl_exception_has_no_legacy_print_and_renders_str(exc_cls, kwargs):
+    assert not hasattr(exc_cls, "print")
     exc = exc_cls(**kwargs)
-    with logging.job_context(logging.JobContext(sink=sink)):
-        exc.print()
-
-    assert len(sink.messages) >= 1
-    rendered = "\n".join(msg for _lvl, msg in sink.messages)
+    rendered = str(exc)
     assert rendered.strip() != ""
     if exc_cls is exceptions.NoSourceFound:
         assert "Librivox" in rendered
@@ -114,12 +110,13 @@ def test_audiobook_dl_exception_print_renders_cleanly(exc_cls, kwargs):
 def test_non_subclass_error_templates_render_cleanly():
     sink = _RecordingSink()
     with logging.job_context(logging.JobContext(sink=sink)):
-        exceptions.DataNotPresent(error_description="nextory_want_to_read").print()
-        logging.print_error_file("chapters_add", filetype="m4b")
+        want_to_read = str(exceptions.DataNotPresent(error_description="nextory_want_to_read"))
+        logging.log_error_file("chapters_add", filetype="m4b")
 
-    assert len(sink.messages) == 2
-    assert "Nextory" in sink.messages[0][1]
-    assert "m4b" in sink.messages[1][1]
+    assert "Nextory" in want_to_read
+    assert len(sink.messages) == 1
+    assert sink.messages[0][0] == "ERROR"
+    assert "m4b" in sink.messages[0][1]
 
 
 @pytest.mark.parametrize(("exc_cls", "kwargs"), _SUBCLASS_CASES, ids=lambda v: v.__name__ if isinstance(v, type) else "kwargs")

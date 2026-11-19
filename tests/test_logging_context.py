@@ -45,7 +45,7 @@ def test_concurrent_run_downloads_isolate_logging_sinks_and_flags():
         barrier.wait(timeout=2.0)
         logging.log(f"start {url}")
         logging.debug(f"dbg {url}")
-        with logging.progress([]) as prog:
+        with logging.progress() as prog:
             task = prog.add_task(f"task {url}", total=2.0)
             run_cancellable_pool(
                 lambda idx: (
@@ -111,7 +111,7 @@ def test_job_context_isolates_debug_and_quiet_flags():
 
 
 def test_progress_adapter_tracks_bytes_and_speed():
-    with logging.progress([]) as prog:
+    with logging.progress() as prog:
         task = prog.add_task("Downloading", total=2.0)
         assert prog.get_byte_metrics(task) is None
         prog.record_bytes(task, 2048)
@@ -208,20 +208,41 @@ def test_series_download_pauses_between_books(tmp_path):
         assert processed == ["T1", "T2"]
 
 
-def test_logging_warning_emits_to_sink_and_stderr(capsys):
+def test_logging_warning_emits_to_sink_and_stdlib_logger(caplog):
+    import logging as stdlib_logging
+
     assert not hasattr(logging, "strip_markup")
     assert not hasattr(logging, "escape_markup")
+    assert not hasattr(logging, "print_error_file")
+    assert not hasattr(logging, "print_traceback")
 
     sink = _CaptureSink()
     with logging.job_context(logging.JobContext(quiet=True, sink=sink)):
         logging.warning("Warning: existing file failed integrity check")
+        logging.book_update("Adding metadata")
+        try:
+            raise ValueError("boom")
+        except ValueError:
+            logging.log_traceback()
 
-    assert sink.logs == [("WARNING", "Warning: existing file failed integrity check")]
+    assert ("WARNING", "Warning: existing file failed integrity check") in sink.logs
+    assert any(lvl == "ERROR" and "ValueError: boom" in msg for lvl, msg in sink.logs)
 
-    logging.warning("Warning: disk nearly full")
-    logging.warning("Plain warning message")
-    captured = capsys.readouterr()
-    assert "Warning: disk nearly full" in captured.err
-    assert "WARNING Warning:" not in captured.err
-    assert "WARNING Plain warning message" in captured.err
+    with logging.job_context(logging.JobContext(quiet=False, sink=sink)):
+        logging.book_update("Adding metadata")
+    assert ("INFO", "Adding metadata") in sink.logs
+
+    with caplog.at_level(stdlib_logging.WARNING, logger="audiobookdl"):
+        logging.warning("Warning: disk nearly full")
+        logging.warning("Plain warning message")
+        try:
+            raise RuntimeError("headless boom")
+        except RuntimeError:
+            logging.log_traceback()
+
+    warning_msgs = [r.message for r in caplog.records if r.levelno == stdlib_logging.WARNING]
+    error_msgs = [r.message for r in caplog.records if r.levelno == stdlib_logging.ERROR]
+    assert "Warning: disk nearly full" in warning_msgs
+    assert "Plain warning message" in warning_msgs
+    assert any("RuntimeError: headless boom" in msg for msg in error_msgs)
 

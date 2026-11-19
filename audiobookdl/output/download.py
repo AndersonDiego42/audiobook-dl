@@ -1702,7 +1702,8 @@ def download_file(
                     raise CloudflareBlocked(
                         detail=(
                             f"HTTP {request.status_code} Cloudflare challenge from {file.url}. "
-                            "Try --impersonate chrome or fresh browser cookies."
+                            "Try setting Impersonate (e.g. chrome) in Options -> Network & Performance "
+                            "or importing fresh browser cookies on the Accounts page."
                         )
                     )
 
@@ -1743,7 +1744,8 @@ def download_file(
                     raise CloudflareBlocked(
                         detail=(
                             f"HTTP {request.status_code} Cloudflare challenge from {file.url}. "
-                            "Try --impersonate chrome or fresh browser cookies."
+                            "Try setting Impersonate (e.g. chrome) in Options -> Network & Performance "
+                            "or importing fresh browser cookies on the Accounts page."
                         )
                     )
                 raw_body = raw_slice[:512]

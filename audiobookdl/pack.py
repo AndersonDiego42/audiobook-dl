@@ -962,16 +962,17 @@ def run_pack(
                     break
                 except AudiobookDLException as exc:
                     summary.books_failed += 1
-                    summary.book_errors.append((source_root, exc.error_description))
-                    exc.print()
+                    detail = str(exc).strip() or exc.error_description
+                    summary.book_errors.append((source_root, detail))
+                    logging.error(detail)
                     if logging.is_debug_mode():
-                        logging.print_traceback()
+                        logging.log_traceback()
                 except Exception as exc:
                     summary.books_failed += 1
                     summary.book_errors.append((source_root, str(exc)))
                     logging.error(f"Failed packing '{source_root}': {exc}")
                     if logging.is_debug_mode():
-                        logging.print_traceback()
+                        logging.log_traceback()
     finally:
         session.close()
 

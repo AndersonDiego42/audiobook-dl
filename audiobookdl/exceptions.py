@@ -1,8 +1,9 @@
-from .logging import error, print_error_file
+from typing import Any
+
 from .utils import read_asset_file
 
 
-class _SafeFormatDict(dict):
+class _SafeFormatDict(dict[str, Any]):
     def __missing__(self, _key: str) -> str:
         return ""
 
@@ -10,12 +11,15 @@ class _SafeFormatDict(dict):
 class AudiobookDLException(Exception):
     error_description = "unknown"
 
-    def __init__(self, error_description = None, message: str | None = None, **kwargs) -> None:
+    def __init__(self, error_description=None, message: str | None = None, **kwargs) -> None:
         if message:
             super().__init__(message)
         if error_description:
             self.error_description = error_description
         self.data = kwargs
+
+    def _template_data(self) -> dict[str, Any]:
+        return dict(self.data)
 
     def __str__(self) -> str:
         base = super().__str__().strip()
@@ -25,7 +29,7 @@ class AudiobookDLException(Exception):
             else:
                 try:
                     template = read_asset_file(f"assets/errors/{self.error_description}.txt")
-                    rendered = template.format_map(_SafeFormatDict(self.data))
+                    rendered = template.format_map(_SafeFormatDict(self._template_data()))
                     base = rendered.strip()
                 except Exception:
                     base = self.error_description.replace("_", " ").capitalize()
@@ -33,12 +37,6 @@ class AudiobookDLException(Exception):
         if detail and detail not in base:
             base = f"{base}\n\nDetails: {detail}" if base else detail
         return base
-
-    def print(self) -> None:
-        print_error_file(self.error_description, **self.data)
-        detail = str(self.data.get("detail") or "").strip()
-        if detail:
-            error(detail)
 
 class DataNotPresent(AudiobookDLException):
     error_description = "data_not_present"
@@ -55,11 +53,15 @@ class NoFilesFound(AudiobookDLException):
 class NoSourceFound(AudiobookDLException):
     error_description = "no_source_found"
 
-    def print(self):
-        import audiobookdl.sources as sources
+    def _template_data(self) -> dict[str, Any]:
+        data = dict(self.data)
+        if "sources" not in data:
+            import audiobookdl.sources as sources
 
-        source_name_list = "\n".join([f" • {name}" for name in sources.get_source_names()])
-        print_error_file(self.error_description, sources=source_name_list, **self.data)
+            data["sources"] = "\n".join(
+                f" • {name}" for name in sources.get_source_names()
+            )
+        return data
 
 class RequestError(AudiobookDLException):
     error_description = "request_error"
@@ -101,7 +103,3 @@ class DownloadError(AudiobookDLException):
 
 class DownloadCancelled(AudiobookDLException):
     error_description: str = "cancelled"
-
-    def print(self) -> None:
-        from .logging import log
-        log("Download cancelled")

@@ -84,5 +84,5 @@ def add_chapters(
             logging.debug("Could not add chapters")
         else:
             filetype = os.path.splitext(filepath)[1][1:]
-            logging.print_error_file("chapters_add", filetype=filetype)
+            logging.log_error_file("chapters_add", filetype=filetype)
         return False

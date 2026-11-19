@@ -19,7 +19,7 @@ sequenceDiagram
     Caller->>DL: download(urls) inside JobContext
     DL->>Src: find_compatible_source(url) (or resolve_redirect_url)
     alt requires_authentication
-        DL->>Auth: Check cookie_file, ./cookies.txt, or cached session_cookies
+        DL->>Auth: Check cookie_file or cached session_cookies
         Auth-->>Src: Load Netscape jar or authenticate via _login()
         Src->>Auth: save_cookie_file() (0600 permissions)
     end

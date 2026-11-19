@@ -460,7 +460,7 @@ def test_oreilly_video_mode_and_format_preserve_video_stream(tmp_path):
     assert resolve_audiobook_output_format(res_video, "m4b") == "mp4"
     assert resolve_audiobook_output_format(res_video, "mkv") == "mkv"
 
-    # `-f mp4` with `media_type="auto"` on a video course also preserves video stream
+    # `output_format="mp4"` with `media_type="auto"` on a video course also preserves video stream
     opts_mp4 = _opts(tmp_path, media_type="auto")
     opts_mp4.output_format = "mp4"
     src_auto_mp4 = OReillySource(opts_mp4)

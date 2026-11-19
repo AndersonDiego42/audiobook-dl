@@ -107,7 +107,7 @@ def test_downloader_events_isolation_and_selective_workflow(monkeypatch):
 
     def fake_process_audiobook(_src, ab: Audiobook, _opts, **_kw) -> None:
         downloaded_titles.append(ab.title)
-        with logging.progress([]) as prog:
+        with logging.progress() as prog:
             task = prog.add_task(f"Downloading {ab.title}", total=100.0)
             prog.record_bytes(task, 2048)
             prog.advance(task, 50.0)
@@ -1589,7 +1589,30 @@ def test_series_skips_inaccessible_and_missing_books(monkeypatch):
     assert summary.failed == 0
 
 
+def test_get_cookie_path_ignores_cwd_cookies_txt(tmp_path, monkeypatch):
+    from audiobookdl.config import SourceConfig
+    from audiobookdl.pipeline import get_cookie_path
 
+    cwd_cookie = tmp_path / "cookies.txt"
+    cwd_cookie.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
 
+    opts = build_default_options()
+    assert get_cookie_path(opts, None) is None
 
+    cfg_cookie = tmp_path / "explicit.txt"
+    cfg_cookie.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    src_cfg = SourceConfig(
+        username=None,
+        password=None,
+        cookie_file=str(cfg_cookie),
+        library=None,
+        locale=None,
+    )
+    assert get_cookie_path(opts, src_cfg) == str(cfg_cookie)
+
+    opt_cookie = tmp_path / "opt.txt"
+    opt_cookie.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    opts_with_file = build_default_options(cookie_file=str(opt_cookie))
+    assert get_cookie_path(opts_with_file, src_cfg) == str(opt_cookie)
 

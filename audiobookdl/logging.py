@@ -5,10 +5,17 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 from collections.abc import Generator, Sequence
 from audiobookdl.utils import read_asset_file
-import sys
+import logging as stdlib_logging
 import threading
 import time
 import traceback
+
+_STDLIB_LOGGER = stdlib_logging.getLogger("audiobookdl")
+
+
+class _SafeFormatDict(dict[str, Any]):
+    def __missing__(self, _key: str) -> str:
+        return ""
 
 
 class LogSink(Protocol):
@@ -376,51 +383,43 @@ def mask_secret(value: str | None) -> str:
 
 
 def debug(msg: str) -> None:
-    """Emit debug message to the active UI sink or stderr."""
+    """Emit debug message to the active UI sink or stdlib logger."""
     if is_debug_mode():
         if _emit_to_sink("DEBUG", msg):
             return
-        if sys.stderr is not None:
-            print(f"DEBUG {msg}", file=sys.stderr)
+        _STDLIB_LOGGER.debug(msg)
 
 
-def log(msg: str):
-    """Emit informational message to the active UI sink or stderr."""
+def log(msg: str) -> None:
+    """Emit informational message to the active UI sink or stdlib logger."""
     if not is_quiet_mode():
         if _emit_to_sink("INFO", msg):
             return
-        if sys.stderr is not None:
-            prefix = "INFO " if is_debug_mode() else ""
-            print(f"{prefix}{msg}", file=sys.stderr)
+        _STDLIB_LOGGER.info(msg)
 
 
 def warning(msg: str) -> None:
-    """Emit warning message to the active UI sink or stderr."""
+    """Emit warning message to the active UI sink or stdlib logger."""
     if _emit_to_sink("WARNING", msg):
         return
-    if sys.stderr is not None:
-        text = msg if msg.lstrip().startswith(("Warning:", "WARNING")) else f"WARNING {msg}"
-        print(text, file=sys.stderr)
+    _STDLIB_LOGGER.warning(msg)
 
 
-def book_update(msg: str):
-    """Display indented msg in log"""
-    if is_debug_mode():
-        log(msg)
-    else:
-        log(f"  {msg}")
+def book_update(msg: str) -> None:
+    """Emit a book status update message."""
+    log(msg)
 
 
-def error(msg: str):
+def error(msg: str) -> None:
+    """Emit error message to the active UI sink or stdlib logger."""
     if _emit_to_sink("ERROR", msg):
         return
-    if sys.stderr is not None:
-        print(msg, file=sys.stderr)
+    _STDLIB_LOGGER.error(msg)
 
 
-def print_error_file(name: str, **kwargs):
-    """Print predefined error message"""
-    msg = read_asset_file(f"assets/errors/{name}.txt").format(**kwargs)
+def log_error_file(name: str, **kwargs: Any) -> None:
+    """Log predefined error template message."""
+    msg = read_asset_file(f"assets/errors/{name}.txt").format_map(_SafeFormatDict(kwargs))
     msg = msg.strip()
     error(msg)
 
@@ -494,17 +493,20 @@ class _HeadlessProgressAdapter:
             return total, speed_bps
 
 
-def progress(_progress_format: Sequence[Any] = ()) -> Any:
+def progress() -> Any:
     sink = get_ui_sink()
     if sink is not None:
         return _SinkProgressAdapter(sink)
     return _HeadlessProgressAdapter()
 
 
-def print_traceback() -> None:
-    """Print traceback"""
+def log_traceback() -> None:
+    """Emit the current exception traceback to the active UI sink or stdlib logger."""
+    tb = traceback.format_exc().strip()
+    if not tb or tb == "NoneType: None":
+        return
     sink = get_ui_sink()
     if sink is not None:
-        sink.on_log("ERROR", traceback.format_exc().strip())
+        sink.on_log("ERROR", tb)
         return
-    traceback.print_exc()
+    _STDLIB_LOGGER.error(tb)

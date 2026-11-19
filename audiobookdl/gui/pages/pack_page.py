@@ -1018,7 +1018,7 @@ class PackPage(ttk.Frame):
             except DownloadCancelled:
                 cancelled = True
             except AudiobookDLException as exc:
-                err = exc.error_description
+                err = str(exc).strip() or exc.error_description
             except Exception as exc:
                 err = str(exc)
             finally:

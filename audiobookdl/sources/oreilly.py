@@ -763,7 +763,7 @@ class OReillySource(Source[str]):
                 return items[0]
             return Series(title=items[0].metadata.title, books=items)
 
-        # Default "auto": audiobooks & video courses extract audio (or video when `-f mp4`/`mkv`), books assemble EPUB.
+        # Default "auto": audiobooks & video courses extract audio (or video when output_format is "mp4"/"mkv"), books assemble EPUB.
         if is_audio_kind:
             return self._build_stream_audiobook(urn, info, url=url, video=wants_video_by_format)
         return self._build_ebook_audiobook(urn, info, url=url)

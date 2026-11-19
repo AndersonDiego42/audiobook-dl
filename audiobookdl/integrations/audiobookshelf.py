@@ -517,7 +517,7 @@ def sync_book_to_audiobookshelf(
     try:
         if want_upload:
             logging.book_update("Uploading to Audiobookshelf")
-            with logging.progress([]) as prog:
+            with logging.progress() as prog:
                 task_id: int | None = None
                 reported = 0
 

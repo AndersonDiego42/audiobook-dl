@@ -103,7 +103,8 @@ def request(
             raise exceptions.CloudflareBlocked(
                 detail=(
                     f"HTTP {resp.status_code} Cloudflare challenge from {_safe_url_label(url)}. "
-                    "Try --impersonate chrome or fresh browser cookies."
+                    "Try setting Impersonate (e.g. chrome) in Options -> Network & Performance "
+                    "or importing fresh browser cookies on the Accounts page."
                 )
             )
 
@@ -141,7 +142,8 @@ def _raise_for_failed_response(url: str, resp: requests.Response) -> None:
         raise exceptions.CloudflareBlocked(
             detail=(
                 f"HTTP {resp.status_code} Cloudflare challenge from {_safe_url_label(url)}. "
-                "Try --impersonate chrome or fresh browser cookies."
+                "Try setting Impersonate (e.g. chrome) in Options -> Network & Performance "
+                "or importing fresh browser cookies on the Accounts page."
             )
         )
     logging.debug(f"Failed to download data from: {url}\nResponse:\n{resp.content!r}")
@@ -431,7 +433,8 @@ def _load_m3u8_playlist(
             raise exceptions.CloudflareBlocked(
                 detail=(
                     f"Cloudflare challenge returned instead of HLS playlist from {_safe_url_label(resolved_url)}. "
-                    "Try --impersonate chrome or fresh browser cookies."
+                    "Try setting Impersonate (e.g. chrome) in Options -> Network & Performance "
+                    "or importing fresh browser cookies on the Accounts page."
                 )
             )
         raise exceptions.RequestError(

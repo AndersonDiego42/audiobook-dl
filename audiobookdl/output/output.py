@@ -814,7 +814,7 @@ def detect_silence_chapters(
     command.append("-")
 
     if show_progress and expected > 0:
-        with logging.progress([]) as prog:
+        with logging.progress() as prog:
             task_id = prog.add_task("Detecting silence chapters", total=expected)
             reported = 0.0
 
@@ -1098,7 +1098,7 @@ def combine_audiofiles(
                     )
 
                 if show_progress:
-                    with logging.progress([]) as remux_prog:
+                    with logging.progress() as remux_prog:
                         remux_task = remux_prog.add_task(
                             f"{verb} (0/{total_parts})",
                             total=float(total_parts),
@@ -1255,7 +1255,7 @@ def combine_audiofiles(
             command += ["-progress", "pipe:1", "-nostats"]
         command.append(output_path)
         if show_progress and expected > 0:
-            with logging.progress([]) as mux_prog:
+            with logging.progress() as mux_prog:
                 mux_task = mux_prog.add_task(f"Combining to .{output_extension}", total=expected)
                 reported = 0.0
 
@@ -1414,7 +1414,7 @@ def convert_single_file(
 
     try:
         if show_progress and info.duration > 0:
-            with logging.progress([]) as conv_prog:
+            with logging.progress() as conv_prog:
                 conv_task = conv_prog.add_task(
                     f"Converting {os.path.basename(old_path)}",
                     total=info.duration,
@@ -1743,7 +1743,7 @@ def split_audio_by_chapters(
     effective_cancel: Any = _CancelMonitor()
     logging.book_update(f"Splitting into {len(tasks)} chapters")
     try:
-        with logging.progress([]) as split_prog:
+        with logging.progress() as split_prog:
             task_bar = split_prog.add_task(f"Splitting ({len(tasks)} chapters)", total=len(tasks))
 
             def _run_task(item: tuple[int, float, float | None, str, str]) -> str:
@@ -1845,7 +1845,7 @@ def merge_segment_groups_into_chapters(
     logging.book_update(f"Merging {total} chapters")
     try:
         with tempfile.TemporaryDirectory() as tmp_root:
-            with logging.progress([]) as merge_prog:
+            with logging.progress() as merge_prog:
                 merge_task = merge_prog.add_task(f"Merging ({total} chapters)", total=total)
 
                 def _merge_one(item: tuple[int, tuple[tuple[str, list[str]], tuple[int, str]]]) -> str:
