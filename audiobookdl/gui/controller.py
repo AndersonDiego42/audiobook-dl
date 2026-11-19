@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, replace
 import json
 import os
 import queue
+import sqlite3
 import threading
 from typing import Any
 import uuid
@@ -37,6 +38,7 @@ from audiobookdl.utils.archive import (
     DownloadArchive,
     default_archive_path,
     make_book_key,
+    resolve_archive_path,
     resolve_database_directory,
 )
 from audiobookdl.utils.fs import atomic_write_text
@@ -94,7 +96,7 @@ from audiobookdl.pipeline import (
     verify_service_auth,
 )
 from audiobookdl.sources.source import Source
-from audiobookdl.utils.audiobook import Audiobook, Chapter, Result
+from audiobookdl.utils.audiobook import Audiobook, Chapter, Result, Series
 from audiobookdl.utils.http import create_configured_http_session, resolve_http_timeout
 from audiobookdl.utils.enrichment import (
     EnrichmentCandidate,
@@ -611,7 +613,20 @@ class GuiController:
         self._active_bg_tasks = 0
         self._bg_done_cond = threading.Condition(self._bg_lock)
         self._bg_executor: ThreadPoolExecutor | None = None
+        self._db_lock = threading.Lock()
+        self._db_executor: ThreadPoolExecutor | None = None
         self._activity_callback: Callable[[], None] | None = None
+
+    @property
+    def db_executor(self) -> ThreadPoolExecutor:
+        """Return the shared single-worker serialized SQLite executor."""
+        with self._db_lock:
+            if self._db_executor is None:
+                self._db_executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="abdl-db",
+                )
+            return self._db_executor
 
     def set_activity_callback(self, callback: Callable[[], None] | None) -> None:
         """Register a main-thread wakeup callback invoked when background tasks start."""
@@ -1798,13 +1813,22 @@ class GuiController:
                     out.append(dict(rec))
         return out
 
-    def clear_completed_records(self, ordered_ids: Sequence[str]) -> list[str]:
+    def clear_completed_records(
+        self,
+        ordered_ids: Sequence[str],
+        *,
+        statuses: Sequence[str] | None = None,
+    ) -> list[str]:
+        target_statuses = (
+            set(statuses)
+            if statuses is not None
+            else {"Completed", "Failed", "Cancelled", "Interrupted"}
+        )
         with self.queue_lock:
             removable = [
                 iid
                 for iid in ordered_ids
-                if self.queue_records.get(iid, {}).get("status")
-                in ("Completed", "Failed", "Cancelled", "Interrupted")
+                if self.queue_records.get(iid, {}).get("status") in target_statuses
             ]
             for iid in removable:
                 self.queue_records.pop(iid, None)
@@ -2212,7 +2236,13 @@ class GuiController:
         if interaction is not None:
             interaction.release_all()
 
-    def start_preview(self, url: str, options: DownloadOptions) -> int:
+    def start_preview(
+        self,
+        url: str,
+        options: DownloadOptions,
+        *,
+        check_duplicate: bool = False,
+    ) -> int:
         """Fetch metadata and resolved `Result` for `url` on a background thread."""
         with self._preview_lock:
             self.preview_request_id += 1
@@ -2250,8 +2280,66 @@ class GuiController:
                     if callable(close_fn):
                         close_fn()
                     raise DownloadCancelled()
+
+                duplicate_warning: str | None = None
+                existing_series_indices: frozenset[int] | None = None
+                if isinstance(result, Audiobook) and check_duplicate:
+                    archive_path = resolve_archive_path(config)
+                    dup = self.find_cross_source_duplicate(
+                        result.metadata,
+                        source_name=source.name,
+                        archive_path=archive_path,
+                    )
+                    if dup is not None:
+                        dup_where = dup.get("output_path") or dup.get("title") or ""
+                        duplicate_warning = (
+                            f"Duplicate Alert: Already in library from {dup['source']}"
+                            + (f" ({dup_where})" if dup_where else "")
+                        )
+                elif isinstance(result, Series):
+                    from audiobookdl.gui.coordinators import series_book_exists
+
+                    dir_stems_cache: dict[str, set[str]] = {}
+                    archive_titles_cache: set[str] | None = None
+                    if options.download_archive and os.path.exists(options.download_archive):
+                        try:
+                            with DownloadArchive(options.download_archive, persistent=True) as archive:
+                                archive_titles_cache = {
+                                    e.title.strip().casefold()
+                                    for e in archive.list_entries(limit=5000, include_hidden=True)
+                                    if e.status == "downloaded" and e.title and e.title.strip()
+                                }
+                        except sqlite3.Error:
+                            archive_titles_cache = None
+                    existing_series_indices = frozenset(
+                        idx
+                        for idx, book in enumerate(result.books)
+                        if series_book_exists(
+                            book,
+                            options=options,
+                            dir_stems_cache=dir_stems_cache,
+                            archive_titles_cache=archive_titles_cache,
+                            series_title=result.title,
+                        )
+                    )
+
+                with self._preview_lock:
+                    stale = self.preview_cancel_event.is_set() or request_id != self.preview_request_id
+                if stale:
+                    close_fn = getattr(source, "close", None)
+                    if callable(close_fn):
+                        close_fn()
+                    raise DownloadCancelled()
+
                 self.event_queue.put(
-                    PreviewDoneEvent(url=url, prepared=(source, result), error=None)
+                    PreviewDoneEvent(
+                        url=url,
+                        prepared=(source, result),
+                        error=None,
+                        duplicate_checked=check_duplicate,
+                        duplicate_warning=duplicate_warning,
+                        existing_series_indices=existing_series_indices,
+                    )
                 )
             except Exception as exc:
                 with self._preview_lock:
@@ -3068,6 +3156,11 @@ class GuiController:
         self._activity_callback = None
         if bg_exec is not None:
             bg_exec.shutdown(wait=False, cancel_futures=True)
+        with self._db_lock:
+            db_exec = self._db_executor
+            self._db_executor = None
+        if db_exec is not None:
+            db_exec.shutdown(wait=False, cancel_futures=True)
         with self._sessions_lock:
             sessions = list(self._thread_sessions)
             self._thread_sessions.clear()

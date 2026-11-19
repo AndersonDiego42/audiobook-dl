@@ -35,7 +35,7 @@ class SyncCoordinator:
         status_var: tk.StringVar,
         is_running_provider: Callable[[], bool],
         is_previewing_provider: Callable[[], bool],
-        is_in_tray_provider: Callable[[], bool] | None = None,
+        is_in_tray_provider: Callable[[], bool] | None=None,
         schedule_poll_soon: Callable[[], None],
         append_log: Callable[[str], None],
         register_enqueued_batch: Callable[..., None],
@@ -66,7 +66,9 @@ class SyncCoordinator:
     def archive_ledger_path(self) -> str:
         return resolve_archive_path(self._controller.config_snapshot())
 
-    def set_syncing_state(self, syncing: bool) -> None:
+    def set_syncing_state(
+        self, syncing: bool, *, status_text: str | None=None
+    ) -> None:
         self.is_syncing = syncing
         dl_page = self._shell.get_page("download")
         if dl_page is not None:
@@ -75,6 +77,9 @@ class SyncCoordinator:
                 is_previewing=self._is_previewing_provider(),
                 is_syncing=syncing,
             )
+        lib_page = self._shell.get_page("library")
+        if lib_page is not None:
+            lib_page.sync_tab.set_syncing_state(syncing, status_text=status_text)
         self._shell.set_footer_running_state(
             running=self._is_running_provider(),
             paused=self._controller.is_paused(),
@@ -103,7 +108,7 @@ class SyncCoordinator:
         targets: Sequence[tuple[str, str]],
         mode: str,
         *,
-        unattended: bool = False,
+        unattended: bool=False,
     ) -> None:
         normalized = str(mode or "").strip().lower()
         if normalized not in VALID_AUTO_SYNC_MODES:
@@ -162,7 +167,7 @@ class SyncCoordinator:
         self,
         targets: Sequence[tuple[str, str]],
         *,
-        unattended: bool = False,
+        unattended: bool=False,
     ) -> None:
         if self._is_running_provider():
             self._status_var.set("Wait for active downloads before syncing libraries")
@@ -197,10 +202,10 @@ class SyncCoordinator:
     def sync_libraries(
         self,
         *,
-        services: Sequence[str] = (),
-        scan_only: bool = False,
-        dry_run: bool = False,
-        unattended: bool = False,
+        services: Sequence[str]=(),
+        scan_only: bool=False,
+        dry_run: bool=False,
+        unattended: bool=False,
     ) -> None:
         """Run one library synchronization cycle in the background."""
         if self._is_running_provider():
@@ -234,12 +239,18 @@ class SyncCoordinator:
         )
         self._controller.start_library_sync(sync_opts)
 
+    def _update_sync_tab_status(self, status_text: str) -> None:
+        lib_page = self._shell.get_page("library")
+        if lib_page is not None:
+            lib_page.sync_tab.set_syncing_state(False, status_text=status_text)
+
     def handle_sync_done(self, cycle: Any, exc: Exception | None) -> None:
         self.set_syncing_state(False)
         unattended = self._last_sync_unattended or self._is_window_hidden()
         self._last_sync_unattended = False
         if exc is not None:
             self._status_var.set("Library sync failed")
+            self._update_sync_tab_status(f"Last sync: Failed ({exc})")
             self._append_log(f"[ERROR] Library sync failed: {exc}")
             if unattended:
                 send_os_notification_async("Library Sync Failed", str(exc))
@@ -248,9 +259,11 @@ class SyncCoordinator:
             return
         if cycle is None:
             self._status_var.set("Library sync finished")
+            self._update_sync_tab_status("Last sync: Finished")
             return
         if getattr(cycle, "cancelled", False):
             self._status_var.set("Library sync cancelled")
+            self._update_sync_tab_status("Last sync: Cancelled")
             self._append_log("--- Library sync cancelled ---")
             return
         msg = (
@@ -258,6 +271,7 @@ class SyncCoordinator:
             f"downloaded {cycle.downloaded}, skipped {cycle.skipped}, failed {cycle.failed}"
         )
         self._status_var.set(f"Sync complete: {msg}")
+        self._update_sync_tab_status(f"Last sync: {msg}")
         self._append_log(f"--- Library sync finished: {msg} ---")
         for err in getattr(cycle, "errors", ()):
             self._append_log(f"[WARN] {err}")
@@ -287,6 +301,7 @@ class SyncCoordinator:
         self._last_sync_unattended = False
         if exc is not None:
             self._status_var.set("Library sync failed")
+            self._update_sync_tab_status(f"Last sync: Failed ({exc})")
             self._append_log(f"[ERROR] Library sync failed: {exc}")
             if unattended:
                 send_os_notification_async("Library Sync Failed", str(exc))
@@ -295,6 +310,7 @@ class SyncCoordinator:
             return
         if stats.get("cancelled"):
             self._status_var.set("Library sync cancelled")
+            self._update_sync_tab_status("Last sync: Cancelled")
             self._append_log("--- Library sync cancelled ---")
             return
         for err in stats.get("errors") or ():
@@ -306,6 +322,9 @@ class SyncCoordinator:
         if total_urls == 0:
             discovered = stats.get("discovered", 0)
             self._status_var.set(f"Sync complete: {discovered} discovered, 0 pending")
+            self._update_sync_tab_status(
+                f"Last sync: {discovered} discovered, 0 pending"
+            )
             self._append_log(
                 f"--- Library sync finished: {discovered} discovered, 0 pending ---"
             )
@@ -342,6 +361,7 @@ class SyncCoordinator:
             append_status=f"Queued +{len(queued_jobs)} synced book(s) (total {new_total})",
             append_log_msg=f"--- Added {len(queued_jobs)} synced book(s) to queue (total {new_total}) ---",
         )
+        self._update_sync_tab_status(f"Last sync: Queued {len(queued_jobs)} book(s)")
         if unattended and queued_jobs:
             send_os_notification_async(
                 "Library Sync Queued Books",

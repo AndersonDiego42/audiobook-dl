@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import tkinter as tk
@@ -16,6 +17,7 @@ from audiobookdl.config import (
     save_audiobookshelf_config,
 )
 from audiobookdl.gui.ffmpeg_assistant import FFmpegAssistant
+from audiobookdl.gui.window_manager import open_path_in_os
 from audiobookdl.gui.theme import (
     LIGHT_PALETTE,
     THEME_LABELS,
@@ -30,6 +32,7 @@ from audiobookdl.gui.widgets import (
     ScrollableFrame,
     ScrolledTreeview,
     TreeColumnSpec,
+    bind_adaptive_wraplength,
     tree_item_values,
 )
 from audiobookdl.integrations.audiobookshelf import AudiobookshelfClient
@@ -202,8 +205,8 @@ class SettingsPage(ttk.Frame):
         self.rowconfigure(1, weight=1)
 
         header = ttk.Frame(self)
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        ttk.Label(header, text="Settings", font=make_bold_font(self, 13)).grid(
+        header.grid(row=0, column=0, sticky="ew", pady=(0, scale_px(self, 8)))
+        ttk.Label(header, text="Settings", font=make_bold_font(self, 4)).grid(
             row=0, column=0, sticky="w"
         )
         ttk.Label(
@@ -334,9 +337,15 @@ class SettingsPage(ttk.Frame):
         )
 
         ttk.Label(abs_frame, text="API Token:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(abs_frame, textvariable=self._token_var, width=42, show="*").grid(
-            row=1, column=1, columnspan=2, sticky="ew", pady=4
-        )
+        self._show_token_var = tk.BooleanVar(value=False)
+        self._token_entry = ttk.Entry(abs_frame, textvariable=self._token_var, width=42, show="*")
+        self._token_entry.grid(row=1, column=1, sticky="ew", pady=4, padx=(0, 6))
+        ttk.Checkbutton(
+            abs_frame,
+            text="Show",
+            variable=self._show_token_var,
+            command=self._toggle_token_visibility,
+        ).grid(row=1, column=2, sticky="e", pady=4)
 
         ttk.Label(abs_frame, text="Library ID:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
         self._lib_combo = ttk.Combobox(abs_frame, textvariable=self._library_var, width=28)
@@ -395,7 +404,13 @@ class SettingsPage(ttk.Frame):
         )
         self._custom_scrolled.grid(row=1, column=0, sticky="ew")
         self._custom_tree = self._custom_scrolled.tree
+        self._custom_tree.bind(
+            "<<TreeviewSelect>>", lambda _e: self._sync_custom_provider_buttons(), add="+"
+        )
         self._custom_tree.bind("<Double-1>", lambda _e: self._edit_custom_provider())
+        self._custom_tree.bind("<Delete>", lambda _e: self._remove_custom_provider())
+        self._custom_tree.bind("<Return>", lambda _e: self._edit_custom_provider())
+        self._custom_tree.bind("<F2>", lambda _e: self._edit_custom_provider())
 
         self._custom_status_var = tk.StringVar(value="")
         self._custom_loading_bar = ttk.Progressbar(providers_frame, mode="indeterminate")
@@ -407,19 +422,28 @@ class SettingsPage(ttk.Frame):
         ttk.Button(custom_btns, text="Add...", command=self._add_custom_provider).pack(
             side=tk.LEFT, padx=(0, 6)
         )
-        ttk.Button(custom_btns, text="Edit...", command=self._edit_custom_provider).pack(
-            side=tk.LEFT, padx=(0, 6)
+        self._custom_edit_btn = ttk.Button(
+            custom_btns, text="Edit...", command=self._edit_custom_provider, state="disabled"
         )
-        ttk.Button(custom_btns, text="Toggle Enabled", command=self._toggle_custom_provider).pack(
-            side=tk.LEFT, padx=(0, 6)
+        self._custom_edit_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self._custom_toggle_btn = ttk.Button(
+            custom_btns,
+            text="Toggle Enabled",
+            command=self._toggle_custom_provider,
+            state="disabled",
         )
+        self._custom_toggle_btn.pack(side=tk.LEFT, padx=(0, 6))
         self._custom_test_btn = ttk.Button(
-            custom_btns, text="Test Connection", command=self._test_custom_provider
+            custom_btns,
+            text="Test Connection",
+            command=self._test_custom_provider,
+            state="disabled",
         )
         self._custom_test_btn.pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(custom_btns, text="Remove", command=self._remove_custom_provider).pack(
-            side=tk.LEFT
+        self._custom_remove_btn = ttk.Button(
+            custom_btns, text="Remove", command=self._remove_custom_provider, state="disabled"
         )
+        self._custom_remove_btn.pack(side=tk.LEFT)
 
         ttk.Label(providers_frame, textvariable=self._custom_status_var, style="Muted.TLabel").grid(
             row=4, column=0, sticky="w", pady=(6, 0)
@@ -431,12 +455,16 @@ class SettingsPage(ttk.Frame):
         cfg_frame.columnconfigure(0, weight=1)
 
         resolved_cfg = config_location or get_config_location(None)
-        ttk.Label(
+        self._resolved_cfg_path = resolved_cfg
+        self._cfg_file_label = ttk.Label(
             cfg_frame,
             text=f"Config file: {resolved_cfg}",
             style="Muted.TLabel",
             wraplength=scale_px(self, 560),
-        ).grid(row=0, column=0, sticky="w", pady=(0, 6))
+            justify="left",
+        )
+        self._cfg_file_label.grid(row=0, column=0, sticky="w", pady=(0, scale_px(self, 6)))
+        bind_adaptive_wraplength(cfg_frame, self._cfg_file_label, margin_dp=24, min_dp=280)
 
         updates_var = check_updates_var if check_updates_var is not None else tk.BooleanVar(value=True)
         chk_kwargs: dict[str, object] = {
@@ -454,18 +482,55 @@ class SettingsPage(ttk.Frame):
             text="Reload Config",
             command=lambda: self._reload_config_and_reset_abs(on_reload_config),
         ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            cfg_btns,
+            text="Open Config Folder",
+            command=self._open_config_folder,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            cfg_btns,
+            text="Copy Path",
+            command=self._copy_config_path,
+        ).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(cfg_btns, text="Check for Updates...", command=on_check_updates).pack(
             side=tk.LEFT, padx=(0, 10)
         )
         ttk.Label(cfg_btns, text=f"v{__version__}", style="Muted.TLabel").pack(side=tk.LEFT)
         self._refresh_custom_providers()
         self._scroll.guard_scroll_inputs()
+        self.apply_theme(self._palette)
 
     def apply_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
         self._custom_tree.tag_configure("ok", foreground=palette.success)
         self._custom_tree.tag_configure("err", foreground=palette.error)
         self._scroll.apply_theme(palette)
+
+    def _toggle_token_visibility(self) -> None:
+        self._token_entry.configure(show="" if self._show_token_var.get() else "*")
+
+    def _open_config_folder(self) -> None:
+        target = self._resolved_cfg_path
+        if os.path.isfile(target):
+            open_path_in_os(self.winfo_toplevel(), target, reveal_in_folder=True)
+        else:
+            parent_dir = os.path.dirname(os.path.abspath(target)) or "."
+            open_path_in_os(self.winfo_toplevel(), parent_dir, reveal_in_folder=False)
+
+    def _copy_config_path(self) -> None:
+        self.clipboard_clear()
+        self.clipboard_append(self._resolved_cfg_path)
+        self._status_var.set("Copied config file path to clipboard.")
+
+    def _sync_custom_provider_buttons(self) -> None:
+        has_sel = bool(self._custom_tree.selection())
+        state = "normal" if has_sel else "disabled"
+        self._custom_edit_btn.configure(state=state)
+        self._custom_toggle_btn.configure(state=state)
+        self._custom_test_btn.configure(
+            state="normal" if (has_sel and not self._testing_custom_provider) else "disabled"
+        )
+        self._custom_remove_btn.configure(state=state)
 
     def _mark_abs_dirty(self) -> None:
         if not self._loading_abs:
@@ -546,6 +611,7 @@ class SettingsPage(ttk.Frame):
                 )
             else:
                 self._custom_status_var.set("No custom metadata providers configured.")
+        self._sync_custom_provider_buttons()
 
     def _selected_custom_provider(self) -> CustomMetadataProviderConfig | None:
         sel = self._custom_tree.selection()
@@ -725,6 +791,9 @@ class SettingsPage(ttk.Frame):
         if not url or not token:
             self._status_var.set("Server URL and API Token are required.")
             return
+        if not url.lower().startswith(("http://", "https://")):
+            self._status_var.set("Server URL must start with http:// or https://.")
+            return
         self._test_btn.configure(state="disabled")
         self._loading_bar.grid()
         self._loading_bar.start(12)
@@ -783,6 +852,14 @@ class SettingsPage(ttk.Frame):
     def _save(self) -> None:
         url = self._url_var.get().strip().rstrip("/")
         token = self._token_var.get().strip()
+        if url and not url.lower().startswith(("http://", "https://")):
+            self._status_var.set("Server URL must start with http:// or https://.")
+            messagebox.showwarning(
+                "Invalid URL",
+                "Audiobookshelf Server URL must start with http:// or https://.",
+                parent=self.winfo_toplevel(),
+            )
+            return
         lib_id = self._resolve_library_id_value()
         auto_upload = bool(self._auto_upload_var.get())
         auto_scan = bool(self._auto_scan_var.get())

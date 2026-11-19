@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from tkinter import ttk
 
@@ -50,22 +51,27 @@ class LibraryPage(ttk.Frame):
         on_save_schedule: Callable[[bool, int, str, list[tuple[str, str]]], None] | None = None,
         on_manage_account: Callable[[str, str], object] | None = None,
         on_manage_accounts: Callable[[], object] | None = None,
+        on_cancel_sync: Callable[[], None] | None = None,
         on_tab_changed: Callable[[str], None] | None = None,
         palette_provider: Callable[[], ThemePalette],
+        db_executor: ThreadPoolExecutor | None = None,
+        on_library_saved: Callable[[int, int], None] | None = None,
     ) -> None:
         super().__init__(parent, padding=scale_px(parent, 12))
         self._archive_path_provider = archive_path_provider
         self._palette_provider = palette_provider
         self._on_tab_changed = on_tab_changed
+        self._on_library_saved = on_library_saved
         self._suppress_tab_event = False
         self._tab_events_armed = False
+        self._dirty_tabs: set[str] = {"archive", "catalog", "sync"}
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
 
         header = ttk.Frame(self)
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        header.grid(row=0, column=0, sticky="ew", pady=(0, scale_px(self, 8)))
         header.columnconfigure(0, weight=1)
-        ttk.Label(header, text="Library", font=make_bold_font(self, 13)).grid(
+        ttk.Label(header, text="Library", font=make_bold_font(self, 4)).grid(
             row=0, column=0, sticky="w"
         )
         ttk.Label(
@@ -76,6 +82,7 @@ class LibraryPage(ttk.Frame):
 
         self.notebook = ttk.Notebook(self)
         self.notebook.grid(row=1, column=0, sticky="nsew")
+        self.notebook.enable_traversal()
 
         palette = palette_provider()
         self.archive_tab = ArchiveTab(
@@ -86,7 +93,15 @@ class LibraryPage(ttk.Frame):
             on_pack_paths=on_pack_paths,
             on_upload_abs=on_upload_abs,
             palette=palette,
+            db_executor=db_executor,
+            defer_initial_refresh=True,
         )
+
+        def _handle_library_saved(inserted: int, updated: int) -> None:
+            self._dirty_tabs.add("archive")
+            if self._on_library_saved is not None:
+                self._on_library_saved(inserted, updated)
+
         self.catalog_tab = CatalogTab(
             self.notebook,
             services,
@@ -104,6 +119,8 @@ class LibraryPage(ttk.Frame):
             config_provider=config_provider,
             selected_profile=selected_profile_provider(),
             palette=palette,
+            db_executor=db_executor,
+            on_library_saved=_handle_library_saved,
         )
         self.sync_tab = SyncTab(
             self.notebook,
@@ -117,6 +134,8 @@ class LibraryPage(ttk.Frame):
             on_auto_sync_changed=on_auto_sync_changed,
             on_save_schedule=on_save_schedule,
             on_manage_accounts=on_manage_accounts,
+            on_cancel_sync=on_cancel_sync,
+            defer_initial_refresh=True,
         )
 
         self.notebook.add(self.archive_tab, text="Archive Ledger")
@@ -146,25 +165,39 @@ class LibraryPage(ttk.Frame):
                 self.notebook.select(tab)  # type: ignore[no-untyped-call]
             finally:
                 self._suppress_tab_event = False
+            if self._tab_events_armed and tab_key in self._dirty_tabs:
+                self._refresh_tab(tab_key)
+
+    def _refresh_tab(self, tab_key: str) -> None:
+        self._dirty_tabs.discard(tab_key)
+        if tab_key == "archive":
+            latest_path = self._archive_path_provider()
+            if latest_path != self.archive_tab._archive_path:
+                self.archive_tab.set_archive_path(latest_path)
+            else:
+                self.archive_tab.refresh()
+        elif tab_key == "catalog":
+            self.catalog_tab.sync_buttons()
+            self.catalog_tab.refresh_statuses()
+        elif tab_key == "sync":
+            self.sync_tab.refresh_targets()
 
     def _handle_notebook_tab_changed(self, _event: tk.Event | None = None) -> None:
         if self._suppress_tab_event or not self._tab_events_armed:
             return
+        active_tab = self.current_sub_tab()
+        if active_tab in self._dirty_tabs:
+            self._refresh_tab(active_tab)
         if self._on_tab_changed is not None:
-            self._on_tab_changed(self.current_sub_tab())
+            self._on_tab_changed(active_tab)
 
     def on_show(self) -> None:
-        """Refresh archive, catalog statuses, and sync targets whenever Library is opened."""
+        """Mark all sub-tabs dirty and refresh only the currently visible sub-tab."""
         self._tab_events_armed = True
-        latest_path = self._archive_path_provider()
-        if latest_path != self.archive_tab._archive_path:
-            self.archive_tab.set_archive_path(latest_path)
-        else:
-            self.archive_tab.refresh()
-        self.catalog_tab.sync_buttons()
-        self.catalog_tab.refresh_statuses()
-        self.sync_tab.refresh_targets()
+        self._dirty_tabs.update(("archive", "catalog", "sync"))
+        self._refresh_tab(self.current_sub_tab())
 
     def apply_theme(self, palette: ThemePalette) -> None:
         self.archive_tab.apply_theme(palette)
         self.catalog_tab.apply_theme(palette)
+        self.sync_tab.apply_theme(palette)

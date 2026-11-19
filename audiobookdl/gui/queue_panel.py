@@ -41,6 +41,7 @@ from audiobookdl.gui.widgets import (
     ModalDialog,
     ResponsiveMode,
     ScrolledTreeview,
+    Tooltip,
     TreeColumnSpec,
     resolve_responsive_mode,
 )
@@ -398,24 +399,24 @@ class JobInspectorDialog(ModalDialog):
             ("Output Path:", str(record.get("output_path") or "--")),
         ]
         for row_idx, (label, val) in enumerate(fields):
-            ttk.Label(body, text=label, font=make_bold_font(self, 9)).grid(
-                row=row_idx, column=0, sticky="nw", padx=(0, 8), pady=2
+            ttk.Label(body, text=label, font=make_bold_font(self, 0)).grid(
+                row=row_idx, column=0, sticky="nw", padx=(0, scale_px(self, 8)), pady=scale_px(self, 2)
             )
             ttk.Label(body, text=val, wraplength=scale_px(self, 420), justify="left").grid(
-                row=row_idx, column=1, sticky="w", pady=2
+                row=row_idx, column=1, sticky="w", pady=scale_px(self, 2)
             )
-        ttk.Label(body, text="Profile / Options:", font=make_bold_font(self, 9)).grid(
-            row=6, column=0, sticky="nw", padx=(0, 8), pady=2
+        ttk.Label(body, text="Profile / Options:", font=make_bold_font(self, 0)).grid(
+            row=6, column=0, sticky="nw", padx=(0, scale_px(self, 8)), pady=scale_px(self, 2)
         )
         ttk.Label(
             body,
             textvariable=self._overrides_var,
             wraplength=scale_px(self, 420),
             justify="left",
-        ).grid(row=6, column=1, sticky="w", pady=2)
+        ).grid(row=6, column=1, sticky="w", pady=scale_px(self, 2))
 
-        ttk.Label(body, text="Detail / Error:", font=make_bold_font(self, 9)).grid(
-            row=7, column=0, sticky="nw", padx=(0, 8), pady=(6, 2)
+        ttk.Label(body, text="Detail / Error:", font=make_bold_font(self, 0)).grid(
+            row=7, column=0, sticky="nw", padx=(0, scale_px(self, 8)), pady=(scale_px(self, 6), scale_px(self, 2))
         )
         detail_box = ScrolledText(body, height=6, width=52, wrap="word")
         detail_box.grid(row=7, column=1, sticky="nsew", pady=(6, 2))
@@ -431,6 +432,9 @@ class JobInspectorDialog(ModalDialog):
             ttk.Button(btns, text="Copy Path", command=self._copy_path).pack(
                 side=tk.LEFT, padx=(0, 6)
             )
+        ttk.Button(btns, text="Copy All Info", command=self._copy_all_info).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
         can_edit = (
             on_save_options is not None
             and record.get("job_kind", "download") in ("download", "pack")
@@ -495,6 +499,20 @@ class JobInspectorDialog(ModalDialog):
             self.clipboard_clear()
             self.clipboard_append(path)
 
+    def _copy_all_info(self) -> None:
+        lines = [
+            f"Job ID: {self._record.get('job_id') or '-'}",
+            f"Service: {self._record.get('service') or '-'}",
+            f"Status: {self._record.get('status') or '-'}",
+            f"URL / Source: {self._record.get('url') or '-'}",
+            f"Title / Name: {self._record.get('title') or '-'}",
+            f"Output Path: {self._record.get('output_path') or '-'}",
+            f"Profile / Options: {self._overrides_var.get()}",
+            f"Detail / Error: {self._record.get('detail') or '(none)'}",
+        ]
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(lines))
+
 
 class ActivityQueuePanel(ttk.LabelFrame):
     """LabelFrame managing action buttons, progress/metrics display, activity log, and queue table."""
@@ -536,7 +554,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
         on_concurrency_changed: Callable[[int], None] | None = None,
         palette: ThemePalette | None = None,
     ) -> None:
-        super().__init__(master, text="Activity", padding=(10, 6))
+        super().__init__(master, text="Activity", padding=(scale_px(master, 10), scale_px(master, 6)))
         self._window = root
         self._controller = controller
         self._palette = palette or LIGHT_PALETTE
@@ -648,6 +666,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
 
         self.activity_notebook = ttk.Notebook(self)
         self.activity_notebook.grid(row=3, column=0, sticky="nsew")
+        self.activity_notebook.enable_traversal()
 
         log_tab = ttk.Frame(self.activity_notebook)
         log_tab.columnconfigure(0, weight=1)
@@ -685,6 +704,21 @@ class ActivityQueuePanel(ttk.LabelFrame):
         except tk.TclError:
             pass
         self.log_text.grid(row=1, column=0, sticky="nsew")
+
+        def _focus_log_search(_e: tk.Event) -> str:
+            self._log_search_entry.focus_set()
+            self._log_search_entry.selection_range(0, tk.END)
+            return "break"
+
+        def _clear_log_search(_e: tk.Event) -> str | None:
+            if self.log_search_var.get():
+                self.log_search_var.set("")
+                return "break"
+            return None
+
+        self.log_text.bind("<Control-f>", _focus_log_search, add="+")
+        self.log_text.bind("<Control-F>", _focus_log_search, add="+")
+        self._log_search_entry.bind("<Escape>", _clear_log_search, add="+")
         self.activity_notebook.add(log_tab, text="Activity Log")
 
         queue_tab = ttk.Frame(self.activity_notebook, padding=4)
@@ -747,14 +781,15 @@ class ActivityQueuePanel(ttk.LabelFrame):
         ttk.Label(queue_filter_bar, text="Search:").pack(side=tk.LEFT, padx=(0, 4))
         q_search_entry = ttk.Entry(queue_filter_bar, textvariable=self.queue_search_var, width=24)
         q_search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._queue_search_entry = q_search_entry
         self.queue_search_var.trace_add("write", lambda *_args: self._schedule_queue_filter())
 
         queue_columns = (
-            TreeColumnSpec("service", "Service", width=90, stretch=False),
-            TreeColumnSpec("profile", "Profile", width=78, stretch=False),
-            TreeColumnSpec("url", "URL / Title", width=210, stretch=True),
-            TreeColumnSpec("status", "Status", width=90, stretch=False),
-            TreeColumnSpec("detail", "Detail", width=160, stretch=True),
+            TreeColumnSpec("service", "Service", width=76, stretch=False),
+            TreeColumnSpec("profile", "Profile", width=64, stretch=False),
+            TreeColumnSpec("url", "URL / Title", width=150, stretch=True),
+            TreeColumnSpec("status", "Status", width=74, stretch=False),
+            TreeColumnSpec("detail", "Detail", width=120, stretch=True),
         )
         self._scrolled_queue = ScrolledTreeview(
             queue_tab, queue_columns, selectmode="extended", height=3, enable_sorting=False
@@ -762,6 +797,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
         self._scrolled_queue.grid(row=2, column=0, sticky="nsew")
         self.queue_tree = self._scrolled_queue.tree
         self._build_queue_context_menu()
+        self.queue_tree.bind("<<TreeviewSelect>>", lambda _e: self._sync_queue_toolbar_buttons(), add="+")
         self.queue_tree.bind("<Double-1>", self._on_queue_double_click)
         self.queue_tree.bind("<Delete>", lambda _e: self.remove_selected_item())
         self.queue_tree.bind("<ButtonPress-1>", self._on_queue_drag_start, add="+")
@@ -770,6 +806,19 @@ class ActivityQueuePanel(ttk.LabelFrame):
         self.queue_tree.bind("<Button-3>", self._show_queue_context_menu)
         if sys.platform == "darwin":
             self.queue_tree.bind("<Button-2>", self._show_queue_context_menu)
+        self._bind_queue_shortcuts()
+        self._tooltips = [
+            Tooltip(
+                self.queue_concurrency_spin,
+                "Maximum number of downloads running concurrently (1-4)",
+                palette_provider=lambda: self._palette,
+            ),
+            Tooltip(
+                self._queue_search_entry,
+                "Filter queued and historical jobs by URL, title, service, or profile (Ctrl+F)",
+                palette_provider=lambda: self._palette,
+            ),
+        ]
         self.activity_notebook.add(queue_tab, text="Queue & History")
         self._refresh_queue_empty_and_badge()
 
@@ -906,6 +955,90 @@ class ActivityQueuePanel(ttk.LabelFrame):
         self._conc_frame.grid(row=1, column=2, columnspan=2, padx=(0, 8), pady=(4, 0), sticky="e")
         self.queue_clear_btn.grid(row=1, column=4, padx=0, pady=(4, 0), sticky="e")
 
+    def _bind_queue_shortcuts(self) -> None:
+        def _select_all(_e: tk.Event) -> str:
+            visible = self.queue_tree.get_children()
+            if visible:
+                self.queue_tree.selection_set(visible)
+                self.queue_tree.focus(visible[0])
+            return "break"
+
+        def _focus_q_search(_e: tk.Event) -> str:
+            self._queue_search_entry.focus_set()
+            self._queue_search_entry.selection_range(0, tk.END)
+            return "break"
+
+        def _clear_q_search(_e: tk.Event) -> str | None:
+            if self.queue_search_var.get():
+                self.queue_search_var.set("")
+                return "break"
+            return None
+
+        def _on_return(_e: tk.Event) -> str:
+            self._show_selected_details()
+            return "break"
+
+        def _on_f2(_e: tk.Event) -> str:
+            self._edit_selected_job_options()
+            return "break"
+
+        def _on_alt_up(_e: tk.Event) -> str:
+            self.move_selected_item(-1)
+            return "break"
+
+        def _on_alt_down(_e: tk.Event) -> str:
+            self.move_selected_item(1)
+            return "break"
+
+        def _on_space(_e: tk.Event) -> str:
+            self.toggle_pause()
+            return "break"
+
+        self.queue_tree.bind("<Control-a>", _select_all, add="+")
+        self.queue_tree.bind("<Control-A>", _select_all, add="+")
+        self.queue_tree.bind("<Control-f>", _focus_q_search, add="+")
+        self.queue_tree.bind("<Control-F>", _focus_q_search, add="+")
+        self.queue_tree.bind("<Return>", _on_return, add="+")
+        self.queue_tree.bind("<F2>", _on_f2, add="+")
+        self.queue_tree.bind("<Alt-Up>", _on_alt_up, add="+")
+        self.queue_tree.bind("<Alt-Down>", _on_alt_down, add="+")
+        self.queue_tree.bind("<space>", _on_space, add="+")
+        self._queue_search_entry.bind("<Escape>", _clear_q_search, add="+")
+        for seq in ("<Shift-F10>", "<Menu>"):
+            try:
+                self.queue_tree.bind(seq, self._show_queue_context_menu_from_key, add="+")
+            except tk.TclError:
+                pass
+
+    def _sync_queue_toolbar_buttons(self) -> None:
+        records = self._selected_records()
+        single = records[0] if len(records) == 1 else None
+        can_remove = any(rec.get("status") != "Running" for rec in records)
+        can_move = bool(single is not None and single.get("status") == "Queued")
+        can_open = bool(
+            single is not None
+            and self._on_open_path is not None
+            and self._resolve_record_path(single, reveal_in_folder=False)
+        )
+        has_failed = False
+        has_clearable = False
+        for iid in self._queue_order:
+            rec = self._controller.get_queue_record(iid)
+            st = str((rec or {}).get("status") or "")
+            if st in ("Failed", "Cancelled", "Interrupted"):
+                has_failed = True
+                has_clearable = True
+            elif st == "Completed":
+                has_clearable = True
+            if has_failed and has_clearable:
+                break
+        self.queue_remove_btn.configure(state="normal" if can_remove else "disabled")
+        self.queue_up_btn.configure(state="normal" if can_move else "disabled")
+        self.queue_down_btn.configure(state="normal" if can_move else "disabled")
+        self.queue_open_btn.configure(state="normal" if can_open else "disabled")
+        self.queue_retry_btn.configure(state="normal" if has_failed else "disabled")
+        self.queue_clear_btn.configure(state="normal" if has_clearable else "disabled")
+
     def _build_queue_context_menu(self) -> None:
         menu = tk.Menu(self.queue_tree, tearoff=0)
         menu.add_command(
@@ -932,6 +1065,16 @@ class ActivityQueuePanel(ttk.LabelFrame):
         menu.add_command(label="Move Down", command=lambda: self.move_selected_item(1))
         menu.add_command(label="Move to Bottom", command=lambda: self.move_selected_to_edge(to_top=False))
         menu.add_command(label="Remove Selected", command=self.remove_selected_item)
+        menu.add_command(
+            label="Clear Completed Only",
+            command=lambda: self.clear_completed_history(statuses=("Completed",)),
+        )
+        menu.add_command(
+            label="Clear Failed & Cancelled",
+            command=lambda: self.clear_completed_history(
+                statuses=("Failed", "Cancelled", "Interrupted")
+            ),
+        )
         menu.add_command(label="Clear Completed & Failed", command=self.clear_completed_history)
         menu.add_separator()
         menu.add_command(label="Export Queue...", command=self.export_queue_dialog)
@@ -1004,9 +1147,9 @@ class ActivityQueuePanel(ttk.LabelFrame):
         self.log_text.tag_configure("error", foreground=palette.error)
         self.log_text.tag_configure("warn", foreground=palette.warning)
         self.log_text.tag_configure("debug", foreground=palette.fg_muted)
-        self.log_text.tag_configure("section", foreground=palette.accent)
+        self.log_text.tag_configure("section", foreground=palette.accent_text)
         self.log_text.tag_configure("info", foreground=palette.text_fg)
-        self.queue_tree.tag_configure("running", foreground=palette.accent)
+        self.queue_tree.tag_configure("running", foreground=palette.accent_text)
         self.queue_tree.tag_configure("completed", foreground=palette.success)
         self.queue_tree.tag_configure("failed", foreground=palette.error)
         self.queue_tree.tag_configure("paused", foreground=palette.warning)
@@ -1584,6 +1727,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
             pass
         if self._on_queue_summary_changed is not None:
             self._on_queue_summary_changed(active, failed)
+        self._sync_queue_toolbar_buttons()
 
     def restore_saved_queue_history(self) -> None:
         """Restore unresolved queue items persisted across GUI restarts."""
@@ -1657,6 +1801,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
                 job_id,
                 values=self.format_queue_row_values(rec),
             )
+        self._sync_queue_toolbar_buttons()
 
     def _selected_records(self) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -1869,12 +2014,30 @@ class ActivityQueuePanel(ttk.LabelFrame):
                 return
         self._show_selected_details()
 
+    def _show_queue_context_menu_from_key(self, _event: tk.Event | None = None) -> str:
+        sel = self.queue_tree.selection()
+        focus_iid = self.queue_tree.focus() or (sel[0] if sel else "")
+        try:
+            bbox = self.queue_tree.bbox(focus_iid) if focus_iid else None
+            if bbox and len(bbox) == 4:
+                x_root = self.queue_tree.winfo_rootx() + bbox[0] + 16
+                y_root = self.queue_tree.winfo_rooty() + bbox[1] + bbox[3]
+            else:
+                x_root = self.queue_tree.winfo_rootx() + 16
+                y_root = self.queue_tree.winfo_rooty() + 16
+        except tk.TclError:
+            return "break"
+        return self._popup_queue_context_menu_at(x_root, y_root)
+
     def _show_queue_context_menu(self, event: tk.Event) -> str:
         row_iid = self.queue_tree.identify_row(event.y)
         if row_iid:
             if row_iid not in self.queue_tree.selection():
                 self.queue_tree.selection_set(row_iid)
             self.queue_tree.focus(row_iid)
+        return self._popup_queue_context_menu_at(event.x_root, event.y_root)
+
+    def _popup_queue_context_menu_at(self, x_root: int, y_root: int) -> str:
 
         records = self._selected_records()
         single = records[0] if len(records) == 1 else None
@@ -1910,11 +2073,17 @@ class ActivityQueuePanel(ttk.LabelFrame):
         can_copy_detail = bool(single is not None and str(single.get("detail") or "").strip())
         can_move = bool(single is not None and single.get("status") == "Queued")
         can_remove = any(rec.get("status") != "Running" for rec in records)
-        has_clearable = any(
+        has_completed_only = any(
             (rec := self._controller.get_queue_record(iid)) is not None
-            and rec.get("status") in ("Completed", "Failed", "Cancelled", "Interrupted")
+            and rec.get("status") == "Completed"
             for iid in self._queue_order
         )
+        has_failed_only = any(
+            (rec := self._controller.get_queue_record(iid)) is not None
+            and rec.get("status") in ("Failed", "Cancelled", "Interrupted")
+            for iid in self._queue_order
+        )
+        has_clearable = has_completed_only or has_failed_only
 
         can_edit_job = (
             single is not None
@@ -1946,10 +2115,16 @@ class ActivityQueuePanel(ttk.LabelFrame):
         menu.entryconfigure("Move Down", state="normal" if can_move else "disabled")
         menu.entryconfigure("Move to Bottom", state="normal" if can_move else "disabled")
         menu.entryconfigure("Remove Selected", state="normal" if can_remove else "disabled")
+        menu.entryconfigure(
+            "Clear Completed Only", state="normal" if has_completed_only else "disabled"
+        )
+        menu.entryconfigure(
+            "Clear Failed & Cancelled", state="normal" if has_failed_only else "disabled"
+        )
         menu.entryconfigure("Clear Completed & Failed", state="normal" if has_clearable else "disabled")
 
         try:
-            menu.tk_popup(event.x_root, event.y_root)
+            menu.tk_popup(x_root, y_root)
         finally:
             menu.grab_release()
         return "break"
@@ -2028,6 +2203,12 @@ class ActivityQueuePanel(ttk.LabelFrame):
             tags = [t for t in self.queue_tree.item(hover_iid, "tags") if t != "drag_target"]
             self.queue_tree.item(hover_iid, tags=tuple(tags))
 
+    def _is_queued_row(self, iid: str | None) -> bool:
+        if not iid:
+            return False
+        rec = self._controller.get_queue_record(iid)
+        return rec is not None and rec.get("status") == "Queued"
+
     def _on_queue_drag_start(self, event: tk.Event) -> None:
         self._clear_drag_hover()
         if self._scrolled_queue._sort_col is not None:
@@ -2039,25 +2220,40 @@ class ActivityQueuePanel(ttk.LabelFrame):
             self._drag_start_y = None
             return
         row_iid = self.queue_tree.identify_row(event.y)
-        self._drag_job_id = row_iid or None
-        self._drag_start_y = event.y if row_iid else None
-
-    def _on_queue_drag_motion(self, event: tk.Event) -> None:
-        if not self._drag_job_id or self._drag_start_y is None:
+        if not self._is_queued_row(row_iid):
+            self._drag_job_id = None
+            self._drag_start_y = None
             return
+        self._drag_job_id = row_iid
+        self._drag_start_y = event.y
+
+    def _on_queue_drag_motion(self, event: tk.Event) -> str | None:
+        if not self._drag_job_id or self._drag_start_y is None:
+            return None
+        if not self._is_queued_row(self._drag_job_id):
+            self._drag_job_id = None
+            self._drag_start_y = None
+            self._clear_drag_hover()
+            return None
         if abs(event.y - self._drag_start_y) < scale_px(self, 6):
             self._clear_drag_hover()
-            return
+            return None
         target = self.queue_tree.identify_row(event.y)
         if target == self._drag_hover_iid:
-            return
+            return "break"
         self._clear_drag_hover()
-        if target and target != self._drag_job_id and self.queue_tree.exists(target):
+        if (
+            target
+            and target != self._drag_job_id
+            and self.queue_tree.exists(target)
+            and self._is_queued_row(target)
+        ):
             tags = list(self.queue_tree.item(target, "tags"))
             if "drag_target" not in tags:
                 tags.append("drag_target")
                 self.queue_tree.item(target, tags=tuple(tags))
             self._drag_hover_iid = target
+        return "break"
 
     def _on_queue_drag_drop(self, event: tk.Event) -> None:
         src = self._drag_job_id
@@ -2070,14 +2266,49 @@ class ActivityQueuePanel(ttk.LabelFrame):
         if abs(event.y - start_y) < scale_px(self, 6):
             return
         target = self.queue_tree.identify_row(event.y)
-        if not target or target == src:
+        if (
+            not target
+            or target == src
+            or not self._is_queued_row(src)
+            or not self._is_queued_row(target)
+        ):
             return
         new_order = self._controller.move_pending_job_to_target(src, target)
         if new_order is not None:
             self._sync_pending_order_in_tree(new_order)
 
-    def clear_completed_history(self) -> None:
-        for iid in self._controller.clear_completed_records(list(self._queue_order)):
+    def clear_completed_history(self, *, statuses: Sequence[str] | None = None) -> None:
+        target_statuses = (
+            set(statuses)
+            if statuses is not None
+            else {"Completed", "Failed", "Cancelled", "Interrupted"}
+        )
+        matching_failed = [
+            iid
+            for iid in self._queue_order
+            if (rec := self._controller.get_queue_record(iid)) is not None
+            and rec.get("status") in target_statuses
+            and rec.get("status") in ("Failed", "Cancelled", "Interrupted")
+        ]
+        if matching_failed:
+            matching_total = sum(
+                1
+                for iid in self._queue_order
+                if (rec := self._controller.get_queue_record(iid)) is not None
+                and rec.get("status") in target_statuses
+            )
+            if not messagebox.askyesno(
+                "Clear Queue History",
+                (
+                    f"Remove {matching_total} finished/failed job(s) from the queue history "
+                    f"(including {len(matching_failed)} failed or cancelled)?"
+                ),
+                parent=self._window,
+            ):
+                return
+        for iid in self._controller.clear_completed_records(
+            list(self._queue_order), statuses=tuple(target_statuses)
+        ):
             if self.queue_tree.exists(iid):
                 self.queue_tree.delete(iid)
             self._detached_iids.discard(iid)

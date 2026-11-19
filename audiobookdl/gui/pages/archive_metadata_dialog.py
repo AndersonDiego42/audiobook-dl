@@ -89,8 +89,13 @@ class _ArchiveMetadataDialog(ModalDialog):
         ttk.Entry(body, textvariable=self._output_path_var).grid(
             row=row_idx, column=1, sticky="ew", pady=3
         )
-        ttk.Button(body, text="Browse...", command=self._browse_output_path).grid(
-            row=row_idx, column=2, padx=(6, 0), pady=3
+        path_btns = ttk.Frame(body)
+        path_btns.grid(row=row_idx, column=2, padx=(6, 0), pady=3)
+        ttk.Button(path_btns, text="Browse...", command=self._browse_output_path).pack(
+            side=tk.LEFT
+        )
+        ttk.Button(path_btns, text="Folder...", command=self._browse_output_folder).pack(
+            side=tk.LEFT, padx=(4, 0)
         )
         row_idx += 1
 
@@ -108,6 +113,22 @@ class _ArchiveMetadataDialog(ModalDialog):
         chosen = filedialog.askopenfilename(
             parent=self,
             title="Relink Audiobook File",
+            initialdir=initial_dir,
+        )
+        if chosen:
+            self._output_path_var.set(chosen)
+
+    def _browse_output_folder(self) -> None:
+        current = self._output_path_var.get().strip()
+        if current and os.path.isdir(current):
+            initial_dir = current
+        elif current and os.path.dirname(current):
+            initial_dir = os.path.dirname(current)
+        else:
+            initial_dir = os.getcwd()
+        chosen = filedialog.askdirectory(
+            parent=self,
+            title="Relink Audiobook Folder",
             initialdir=initial_dir,
         )
         if chosen:

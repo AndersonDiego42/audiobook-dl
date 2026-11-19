@@ -4,29 +4,28 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import os
+import sqlite3
 from tkinter import ttk
 from typing import TYPE_CHECKING, Any
 
 from audiobookdl.config import DEFAULT_PROFILE, list_source_profiles, normalize_profile_name
 from audiobookdl.gui.formatting import default_output_dir
-from audiobookdl.gui.pages import (
-    AccountsPage,
-    CatalogTab,
-    DownloadPage,
-    LibraryPage,
-    PackPage,
-    SettingsPage,
-)
 from audiobookdl.gui.window_manager import open_path_in_os
 from audiobookdl.sources import ServiceInfo
-from audiobookdl.utils.archive import DownloadArchive
 
 if TYPE_CHECKING:
     from audiobookdl.gui.app import AudiobookDLApp
+    from audiobookdl.gui.pages.accounts_page import AccountsPage
+    from audiobookdl.gui.pages.catalog_tab import CatalogTab
+    from audiobookdl.gui.pages.download_page import DownloadPage
+    from audiobookdl.gui.pages.library_page import LibraryPage
+    from audiobookdl.gui.pages.pack_page import PackPage
+    from audiobookdl.gui.pages.settings_page import SettingsPage
 
 
 def create_download_page(app: AudiobookDLApp, parent: ttk.Frame) -> DownloadPage:
     """Build and wire the lazy `DownloadPage`."""
+    from audiobookdl.gui.pages.download_page import DownloadPage
 
     def _open_path(path: str, reveal: bool = False) -> None:
         open_path_in_os(app.root, path, reveal_in_folder=reveal)
@@ -110,6 +109,8 @@ def create_download_page(app: AudiobookDLApp, parent: ttk.Frame) -> DownloadPage
 
 def create_library_page(app: AudiobookDLApp, parent: ttk.Frame) -> LibraryPage:
     """Build and wire the lazy `LibraryPage`."""
+    from audiobookdl.gui.pages.library_page import LibraryPage
+    from audiobookdl.utils.archive import DownloadArchive
 
     def _on_queue_urls(urls_to_add: list[str]) -> None:
         added = app._urls.append_urls_to_input(urls_to_add)
@@ -153,20 +154,24 @@ def create_library_page(app: AudiobookDLApp, parent: ttk.Frame) -> LibraryPage:
 
     def _on_save_to_library(svc_key: str, prof: str, books: Sequence[Any]) -> tuple[int, int]:
         with DownloadArchive(app._sync.archive_ledger_path()) as archive:
-            inserted, updated = archive.upsert_catalog_items(
+            return archive.upsert_catalog_items(
                 svc_key,
                 list(books),
                 profile=normalize_profile_name(prof),
             )
+
+    def _on_library_saved(inserted: int, updated: int) -> None:
         app.status_var.set(f"Library DB: +{inserted} new, {updated} refreshed")
-        return inserted, updated
 
     def _status_resolver(svc_key: str, books: Sequence[Any]) -> list[str]:
         archive_path = app._sync.archive_ledger_path()
         if not os.path.exists(archive_path):
             return [""] * len(books)
-        with DownloadArchive(archive_path, persistent=True) as archive:
-            return archive.lookup_catalog_statuses(svc_key, list(books))
+        try:
+            with DownloadArchive(archive_path, persistent=True) as archive:
+                return archive.lookup_catalog_statuses(svc_key, list(books))
+        except sqlite3.Error:
+            return [""] * len(books)
 
     def _on_download_urls(urls_to_download: list[str], svc_key: str, prof: str) -> None:
         norm_prof = normalize_profile_name(prof)
@@ -218,16 +223,21 @@ def create_library_page(app: AudiobookDLApp, parent: ttk.Frame) -> LibraryPage:
         auto_sync_targets=app._automation.auto_sync_targets or None,
         on_run_sync=_on_run_sync,
         on_auto_sync_changed=app._automation.configure_auto_sync_timer,
+        on_cancel_sync=app.cancel_download,
         on_save_schedule=app._sync.save_sync_schedule,
         on_manage_account=lambda sk, prof: app.open_accounts(sk or None, prof),
         on_manage_accounts=lambda: app.open_accounts(),
         on_tab_changed=app.shell.sync_sub_tab,
         palette_provider=lambda: app._window.palette,
+        db_executor=app.controller.db_executor,
+        on_library_saved=_on_library_saved,
     )
 
 
 def create_pack_page(app: AudiobookDLApp, parent: ttk.Frame) -> PackPage:
     """Build and wire the lazy `PackPage`."""
+    from audiobookdl.gui.pages.pack_page import PackPage
+
     return PackPage(
         parent,
         app.controller,
@@ -241,6 +251,8 @@ def create_pack_page(app: AudiobookDLApp, parent: ttk.Frame) -> PackPage:
 
 def create_accounts_page(app: AudiobookDLApp, parent: ttk.Frame) -> AccountsPage:
     """Build and wire the lazy `AccountsPage`."""
+    from audiobookdl.gui.pages.accounts_page import AccountsPage
+
     return AccountsPage(
         parent,
         app.controller,
@@ -257,6 +269,8 @@ def create_accounts_page(app: AudiobookDLApp, parent: ttk.Frame) -> AccountsPage
 
 def create_settings_page(app: AudiobookDLApp, parent: ttk.Frame) -> SettingsPage:
     """Build and wire the lazy `SettingsPage`."""
+    from audiobookdl.gui.pages.settings_page import SettingsPage
+
     config_loc = app.controller.config_location
 
     def _on_abs_saved(_updated: Any) -> None:

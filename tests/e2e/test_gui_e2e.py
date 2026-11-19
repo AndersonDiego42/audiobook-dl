@@ -247,8 +247,16 @@ def test_gui_library_catalog_archive_and_export_end_to_end(
     # ArchiveTab export after saving catalog selection into downloads.db
     cat._tree.selection_set("book-0")
     cat.save_to_library()
+    gui_harness.pump_until(
+        lambda: "Saved to Library DB:" in cat._status_var.get(),
+        description="CatalogTab save_to_library completion",
+    )
     arch_tab = app.open_library_tab("archive").archive_tab
     arch_tab.refresh()
+    gui_harness.pump_until(
+        lambda: len(arch_tab._tree.get_children()) >= 1,
+        description="ArchiveTab async refresh",
+    )
     assert len(arch_tab._tree.get_children()) >= 1
     export_json = e2e_workspace.work_dir / "lib_export.json"
     from audiobookdl.utils.export import export_library_entries

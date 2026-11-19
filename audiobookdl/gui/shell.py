@@ -122,12 +122,13 @@ class SidebarShell(ttk.Frame):
             padding=(scale_px(self, 12), scale_px(self, 12), scale_px(self, 12), scale_px(self, 8)),
         )
         brand.grid(row=0, column=0, sticky="ew")
-        ttk.Label(
+        self._brand_title_label = ttk.Label(
             brand,
             text="audiobook-dl",
             style="Sidebar.TLabel",
-            font=make_bold_font(self, 12),
-        ).pack(anchor="w")
+            font=make_bold_font(self, 3),
+        )
+        self._brand_title_label.pack(anchor="w")
         sub = f"v{__version__}" + ("  [Portable]" if is_portable_mode() else "")
         ttk.Label(brand, text=sub, style="SidebarMuted.TLabel").pack(anchor="w")
 
@@ -186,12 +187,13 @@ class SidebarShell(ttk.Frame):
         footer.grid(row=4, column=0, sticky="ew")
         footer.columnconfigure(0, weight=1)
 
-        ttk.Label(
+        self._active_job_label = ttk.Label(
             footer,
             textvariable=active_job_var,
             style="Sidebar.TLabel",
             wraplength=sidebar_w - scale_px(self, 22),
-        ).grid(row=0, column=0, sticky="w", pady=(0, 4))
+        )
+        self._active_job_label.grid(row=0, column=0, sticky="w", pady=(0, scale_px(self, 4)))
 
         self.footer_progressbar = ttk.Progressbar(
             footer,
@@ -199,14 +201,15 @@ class SidebarShell(ttk.Frame):
             maximum=100,
             variable=progress_var,
         )
-        self.footer_progressbar.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        self.footer_progressbar.grid(row=1, column=0, sticky="ew", pady=(0, scale_px(self, 4)))
 
-        ttk.Label(
+        self._status_label = ttk.Label(
             footer,
             textvariable=status_var,
             style="SidebarMuted.TLabel",
             wraplength=sidebar_w - scale_px(self, 22),
-        ).grid(row=2, column=0, sticky="w", pady=(0, 6))
+        )
+        self._status_label.grid(row=2, column=0, sticky="w", pady=(0, scale_px(self, 6)))
 
         footer_btns = ttk.Frame(footer, style="Sidebar.TFrame")
         footer_btns.grid(row=3, column=0, sticky="ew")
@@ -259,7 +262,7 @@ class SidebarShell(ttk.Frame):
         self.breadcrumb_label = ttk.Label(
             self._nav_header,
             textvariable=self.breadcrumb_var,
-            font=make_bold_font(self, 10),
+            font=make_bold_font(self, 1),
         )
         self.breadcrumb_label.grid(row=0, column=2, sticky="w")
 
@@ -321,7 +324,7 @@ class SidebarShell(ttk.Frame):
         """Return page IDs that have already been instantiated."""
         return tuple(self._pages.keys())
 
-    def ensure_page(self, page_id: str) -> Any:
+    def ensure_page(self, page_id: str, *, apply_theme_on_create: bool = True) -> Any:
         """Return the page for `page_id`, building it without changing the active view if needed."""
         if page_id not in self._factories:
             raise KeyError(f"Unknown page id: {page_id!r}")
@@ -329,7 +332,8 @@ class SidebarShell(ttk.Frame):
         if page is None:
             page = self._factories[page_id](self.page_host)
             self._pages[page_id] = page
-            apply_theme_to_widget_tree(page, self._palette_provider())
+            if apply_theme_on_create:
+                apply_theme_to_widget_tree(page, self._palette_provider())
         return page
 
     def _invoke_context_action(self) -> None:
@@ -422,6 +426,7 @@ class SidebarShell(ttk.Frame):
         target: str | NavRoute,
         *,
         record_history: bool = True,
+        apply_theme_on_create: bool = True,
     ) -> Any:
         """Switch to `target` (`page_id` or `page_id:sub_tab`), lazily building it and updating history."""
         route = NavRoute.parse(target)
@@ -433,7 +438,7 @@ class SidebarShell(ttk.Frame):
         if prev_page_id and prev_page_id in self._pages and prev_page_id != route.page_id:
             self._pages[prev_page_id].grid_remove()
 
-        page = self.ensure_page(route.page_id)
+        page = self.ensure_page(route.page_id, apply_theme_on_create=apply_theme_on_create)
         if prev_page_id != route.page_id:
             page.grid(row=0, column=0, sticky="nsew")
             self._breadcrumb_detail = ""
@@ -485,17 +490,30 @@ class SidebarShell(ttk.Frame):
         badge = self._badge_labels.get("download")
         if badge is None:
             return
-        parts: list[str] = []
-        if active_count > 0:
-            parts.append(f"{active_count} queued")
-        if failed_count > 0:
-            parts.append(f"{failed_count} failed")
-        if parts:
-            badge.configure(text=", ".join(parts))
+        if active_count > 0 and failed_count > 0:
+            badge_text = f"{active_count}q, {failed_count} err"
+        elif active_count > 0:
+            badge_text = f"{active_count} queued"
+        elif failed_count > 0:
+            badge_text = f"{failed_count} failed"
+        else:
+            badge_text = ""
+        if badge_text:
+            badge.configure(text=badge_text)
             badge.grid()
         else:
             badge.configure(text="")
             badge.grid_remove()
+
+    def update_dpi_scaling(self) -> None:
+        """Recompute DPI-dependent sidebar width, wraplengths, and fonts after a monitor DPI change."""
+        sidebar_w = scale_px(self, self.SIDEBAR_WIDTH_DP)
+        self.sidebar.configure(width=sidebar_w)
+        wrap_w = max(scale_px(self, 120), sidebar_w - scale_px(self, 22))
+        self._active_job_label.configure(wraplength=wrap_w)
+        self._status_label.configure(wraplength=wrap_w)
+        self._brand_title_label.configure(font=make_bold_font(self, 3))
+        self.breadcrumb_label.configure(font=make_bold_font(self, 1))
 
     def set_footer_running_state(
         self,

@@ -1,13 +1,15 @@
 """Main Tkinter desktop window coordinator and launcher entry point for audiobook-dl."""
 
+from __future__ import annotations
+
 import argparse
+from collections.abc import Sequence
 import os
 import sys
 import tempfile
 import tkinter as tk
 from tkinter import messagebox, ttk
-from typing import Any
-from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any
 
 from audiobookdl import __version__
 from audiobookdl.config import (
@@ -31,7 +33,6 @@ from audiobookdl.gui.page_factories import (
     create_pack_page,
     create_settings_page,
 )
-from audiobookdl.gui.pages import AccountsPage, DownloadPage, LibraryPage, PackPage
 from audiobookdl.gui.preview_coordinator import PreviewCoordinator
 from audiobookdl.gui.queue_panel import ActivityQueuePanel
 from audiobookdl.gui.run_coordinator import RunCoordinator
@@ -46,6 +47,12 @@ from audiobookdl.gui.window_manager import WindowManager, build_menu_bar
 from audiobookdl.options_schema import DownloadOptions
 from audiobookdl.sources import ServiceInfo, get_available_services
 from audiobookdl.utils import read_asset_file
+
+if TYPE_CHECKING:
+    from audiobookdl.gui.pages.accounts_page import AccountsPage
+    from audiobookdl.gui.pages.download_page import DownloadPage
+    from audiobookdl.gui.pages.library_page import LibraryPage
+    from audiobookdl.gui.pages.pack_page import PackPage
 
 
 class AudiobookDLApp:
@@ -155,6 +162,7 @@ class AudiobookDLApp:
             on_exit=self._on_tray_exit,
             on_theme_applied=self._on_theme_applied,
             on_tray_started=lambda: self._events.schedule_poll_soon(250),
+            on_dpi_changed=self._on_dpi_changed,
         )
 
         cfg_gui = self._controller.config.gui
@@ -343,7 +351,6 @@ class AudiobookDLApp:
         )
         self._urls.install_root_drop()
         self._options.wire_preview_traces()
-        apply_theme_to_widget_tree(self.root, self._window.palette)
 
         self._auth.load_service_into_form()
         self._ffmpeg_assistant.update_status()
@@ -361,7 +368,8 @@ class AudiobookDLApp:
             initial_route = NavRoute("library")
         else:
             initial_route = saved_route
-        self.navigate(initial_route, record_history=False)
+        self.shell.navigate(initial_route, record_history=False, apply_theme_on_create=False)
+        apply_theme_to_widget_tree(self.root, self._window.palette)
         if initial_route.page_id != "download":
             self._events.refresh_saved_queue_badge()
 
@@ -489,9 +497,12 @@ class AudiobookDLApp:
         """Check for newer releases."""
         self._events.check_updates_interactive()
 
-    def _on_theme_applied(self, palette: ThemePalette) -> None:
-        self.shell.apply_theme(palette)
+    def _on_theme_applied(self, _palette: ThemePalette) -> None:
         self._ffmpeg_assistant.update_status()
+
+    def _on_dpi_changed(self) -> None:
+        if hasattr(self, "shell"):
+            self.shell.update_dpi_scaling()
 
     def _open_accounts_from_download(self) -> None:
         svc = self._auth.selected_service()

@@ -35,6 +35,9 @@ class ThemePalette:
     border: str
     accent: str
     accent_fg: str
+    accent_hover: str
+    accent_pressed: str
+    accent_text: str
     success: str
     warning: str
     error: str
@@ -42,6 +45,8 @@ class ThemePalette:
     text_fg: str
     select_bg: str
     select_fg: str
+    select_hover: str
+    select_pressed: str
     menu_bg: str
     menu_fg: str
 
@@ -56,16 +61,21 @@ LIGHT_PALETTE = ThemePalette(
     fg_secondary="#333333",
     fg_muted="#555555",
     fg_disabled="#888888",
-    border="#c6c6c6",
+    border="#767676",
     accent="#0078d4",
     accent_fg="#ffffff",
+    accent_hover="#106ebe",
+    accent_pressed="#005a9e",
+    accent_text="#005a9e",
     success="#1f6f3d",
-    warning="#9a6700",
+    warning="#805300",
     error="#b42318",
     text_bg="#ffffff",
     text_fg="#1f1f1f",
     select_bg="#0078d4",
     select_fg="#ffffff",
+    select_hover="#106ebe",
+    select_pressed="#005a9e",
     menu_bg="#f0f0f0",
     menu_fg="#1f1f1f",
 )
@@ -80,9 +90,12 @@ DARK_PALETTE = ThemePalette(
     fg_secondary="#cccccc",
     fg_muted="#9d9d9d",
     fg_disabled="#6e6e6e",
-    border="#3e3e42",
-    accent="#3b82f6",
+    border="#717178",
+    accent="#2563eb",
     accent_fg="#ffffff",
+    accent_hover="#1d4ed8",
+    accent_pressed="#1e40af",
+    accent_text="#60a5fa",
     success="#4ade80",
     warning="#facc15",
     error="#f87171",
@@ -90,6 +103,8 @@ DARK_PALETTE = ThemePalette(
     text_fg="#e8e8e8",
     select_bg="#264f78",
     select_fg="#ffffff",
+    select_hover="#2f6296",
+    select_pressed="#1d3d5e",
     menu_bg="#252526",
     menu_fg="#e8e8e8",
 )
@@ -227,11 +242,14 @@ def _apply_windows_titlebar_theme(window: tk.Misc, *, is_dark: bool) -> None:
     if windll is None:
         return
     try:
-        hwnd = windll.user32.GetParent(window.winfo_id())
+        user32 = windll.user32
+        wid = int(window.winfo_id())
+        hwnd = int(user32.GetAncestor(wid, 2))  # GA_ROOT = 2
         if not hwnd:
-            hwnd = window.winfo_id()
+            hwnd = int(user32.GetParent(wid)) or wid
         value = ctypes.c_int(1 if is_dark else 0)
         dwmapi = windll.dwmapi
+        applied = False
         # DWMWA_USE_IMMUTABLE_DARK_MODE is 20 on Windows 11 / 20H1+, 19 on older Win10 builds
         for attr in (20, 19):
             res = dwmapi.DwmSetWindowAttribute(
@@ -241,7 +259,28 @@ def _apply_windows_titlebar_theme(window: tk.Misc, *, is_dark: bool) -> None:
                 ctypes.sizeof(value),
             )
             if res == 0:
+                applied = True
                 break
+        if applied:
+            # SWP_NOSIZE (0x1) | SWP_NOMOVE (0x2) | SWP_NOZORDER (0x4) | SWP_NOACTIVATE (0x10) | SWP_FRAMECHANGED (0x20)
+            user32.SetWindowPos(ctypes.c_void_p(hwnd), 0, 0, 0, 0, 0, 0x0037)
+        if not window.winfo_ismapped() and not getattr(window, "_dwm_map_hooked", False):
+            win_any: Any = window
+            win_any._dwm_map_hooked = True
+
+            def _on_first_map(ev: tk.Event) -> None:
+                if getattr(ev, "widget", None) is not window:
+                    return
+                try:
+                    if not window.winfo_exists() or not window.winfo_ismapped():
+                        return
+                except tk.TclError:
+                    return
+                pal = getattr(win_any, "_palette", None)
+                dark_now = (pal.mode == "dark") if pal is not None else is_dark
+                _apply_windows_titlebar_theme(window, is_dark=dark_now)
+
+            window.bind("<Map>", _on_first_map, add="+")
     except Exception:
         pass
 
@@ -254,8 +293,24 @@ def default_font_family(widget: tk.Misc | None = None) -> str:
         return "TkDefaultFont"
 
 
-def make_bold_font(widget: tk.Misc | None, size: int) -> tuple[str, int, str]:
-    """Return a portable `(family, size, 'bold')` font tuple based on `TkDefaultFont`."""
+def default_font_size(widget: tk.Misc | None = None) -> int:
+    """Return the positive point size of `TkDefaultFont` (defaulting to 9pt)."""
+    try:
+        raw = int(tkfont.nametofont("TkDefaultFont", root=widget).cget("size"))
+        if raw != 0:
+            return abs(raw)
+    except (tk.TclError, ValueError, TypeError):
+        pass
+    return 9
+
+
+def make_bold_font(widget: tk.Misc | None, delta: int = 0) -> tuple[str, int, str]:
+    """Return a portable `(family, point_size, 'bold')` font tuple scaled relative to `TkDefaultFont`.
+
+    Accepts either a relative point delta (`0`, `1`, `3`, `4`) or a legacy 9pt-baseline point size (`9`, `10`, `12`, `13`).
+    """
+    effective_delta = (delta - 9) if delta >= 8 else delta
+    size = max(8, default_font_size(widget) + effective_delta)
     return (default_font_family(widget), size, "bold")
 
 
@@ -267,26 +322,43 @@ def _configure_semantic_labels(style: ttk.Style, palette: ThemePalette) -> None:
     style.configure("Error.TLabel", foreground=palette.error)
 
 
-def _configure_accent_button(style: ttk.Style, palette: ThemePalette) -> None:
+def _configure_accent_button(
+    style: ttk.Style,
+    palette: ThemePalette,
+    root: tk.Misc | None = None,
+) -> None:
     style.configure(
         "Accent.TButton",
         background=palette.accent,
-        foreground=palette.select_fg,
+        foreground=palette.accent_fg,
         bordercolor=palette.accent,
-        padding=(8, 3),
+        padding=(scale_px(root, 8), scale_px(root, 3)),
     )
     style.map(
         "Accent.TButton",
         background=[
             ("disabled", palette.bg),
-            ("pressed", palette.accent),
-            ("active", palette.accent),
+            ("pressed", palette.accent_pressed),
+            ("active", palette.accent_hover),
         ],
-        foreground=[("disabled", palette.fg_disabled)],
+        bordercolor=[
+            ("disabled", palette.border),
+            ("pressed", palette.accent_pressed),
+            ("active", palette.accent_hover),
+        ],
+        foreground=[
+            ("disabled", palette.fg_disabled),
+            ("pressed", palette.accent_fg),
+            ("active", palette.accent_fg),
+        ],
     )
 
 
-def _configure_clam_palette(style: ttk.Style, palette: ThemePalette) -> None:
+def _configure_clam_palette(
+    style: ttk.Style,
+    palette: ThemePalette,
+    root: tk.Misc | None = None,
+) -> None:
     style.configure(
         ".",
         background=palette.bg,
@@ -300,6 +372,24 @@ def _configure_clam_palette(style: ttk.Style, palette: ThemePalette) -> None:
         selectforeground=palette.select_fg,
     )
     style.configure("TFrame", background=palette.bg)
+    style.configure("EmptyOverlay.TFrame", background=palette.surface)
+    style.configure(
+        "EmptyOverlay.TLabel",
+        background=palette.surface,
+        foreground=palette.fg_muted,
+    )
+    style.configure("TPanedwindow", background=palette.bg)
+    style.configure(
+        "Sash",
+        sashthickness=scale_px(root, 6),
+        gripcount=0,
+        background=palette.border,
+        bordercolor=palette.border,
+        lightcolor=palette.border,
+        darkcolor=palette.border,
+    )
+    style.configure("TSeparator", background=palette.border)
+    style.configure("TSizegrip", background=palette.bg)
     style.configure("TLabelframe", background=palette.bg, bordercolor=palette.border)
     style.configure("TLabelframe.Label", background=palette.bg, foreground=palette.fg)
     style.configure("TLabel", background=palette.bg, foreground=palette.fg)
@@ -313,13 +403,14 @@ def _configure_clam_palette(style: ttk.Style, palette: ThemePalette) -> None:
     ):
         style.configure(label_style, background=palette.bg)
 
+    btn_pad = (scale_px(root, 8), scale_px(root, 3))
     style.configure(
         "TButton",
         background=palette.surface_alt,
         foreground=palette.fg,
         bordercolor=palette.border,
         width=0,
-        padding=(8, 3),
+        padding=btn_pad,
     )
     style.map(
         "TButton",
@@ -330,7 +421,25 @@ def _configure_clam_palette(style: ttk.Style, palette: ThemePalette) -> None:
         ],
         foreground=[("disabled", palette.fg_disabled)],
     )
-    _configure_accent_button(style, palette)
+    style.configure(
+        "TMenubutton",
+        background=palette.surface_alt,
+        foreground=palette.fg,
+        bordercolor=palette.border,
+        arrowcolor=palette.fg,
+        padding=btn_pad,
+    )
+    style.map(
+        "TMenubutton",
+        background=[
+            ("disabled", palette.bg),
+            ("pressed", palette.surface_hover),
+            ("active", palette.surface_hover),
+        ],
+        foreground=[("disabled", palette.fg_disabled)],
+        arrowcolor=[("disabled", palette.fg_disabled)],
+    )
+    _configure_accent_button(style, palette, root=root)
 
     style.configure("Sidebar.TFrame", background=palette.surface)
     style.configure("Sidebar.TLabel", background=palette.surface, foreground=palette.fg)
@@ -339,15 +448,16 @@ def _configure_clam_palette(style: ttk.Style, palette: ThemePalette) -> None:
         "SidebarBadge.TLabel",
         background=palette.surface_alt,
         foreground=palette.fg_secondary,
-        padding=(6, 1),
+        padding=(scale_px(root, 5), scale_px(root, 1)),
     )
+    nav_pad = (scale_px(root, 10), scale_px(root, 7))
     style.configure(
         "SidebarNav.TButton",
         background=palette.surface,
         foreground=palette.fg,
         bordercolor=palette.surface,
         anchor="w",
-        padding=(10, 7),
+        padding=nav_pad,
         relief="flat",
     )
     style.map(
@@ -364,14 +474,18 @@ def _configure_clam_palette(style: ttk.Style, palette: ThemePalette) -> None:
         foreground=palette.select_fg,
         bordercolor=palette.select_bg,
         anchor="w",
-        padding=(10, 7),
+        padding=nav_pad,
         relief="flat",
     )
     style.map(
         "SidebarNavActive.TButton",
         background=[
-            ("pressed", palette.select_bg),
-            ("active", palette.select_bg),
+            ("pressed", palette.select_pressed),
+            ("active", palette.select_hover),
+        ],
+        bordercolor=[
+            ("pressed", palette.select_pressed),
+            ("active", palette.select_hover),
         ],
         foreground=[("disabled", palette.fg_disabled)],
     )
@@ -387,7 +501,7 @@ def _configure_clam_palette(style: ttk.Style, palette: ThemePalette) -> None:
         background=palette.surface_alt,
         foreground=palette.fg_secondary,
         bordercolor=palette.border,
-        padding=(8, 2),
+        padding=(scale_px(root, 8), scale_px(root, 2)),
     )
     style.map(
         "Chip.TButton",
@@ -401,6 +515,7 @@ def _configure_clam_palette(style: ttk.Style, palette: ThemePalette) -> None:
         foreground=[("disabled", palette.fg_disabled)],
         indicatorcolor=[
             ("selected", palette.accent),
+            ("!selected", palette.surface),
             ("disabled", palette.border),
         ],
     )
@@ -409,6 +524,11 @@ def _configure_clam_palette(style: ttk.Style, palette: ThemePalette) -> None:
         "TRadiobutton",
         background=[("active", palette.bg)],
         foreground=[("disabled", palette.fg_disabled)],
+        indicatorcolor=[
+            ("selected", palette.accent),
+            ("!selected", palette.surface),
+            ("disabled", palette.border),
+        ],
     )
 
     style.configure(
@@ -462,7 +582,7 @@ def _configure_clam_palette(style: ttk.Style, palette: ThemePalette) -> None:
         background=palette.surface_alt,
         foreground=palette.fg_muted,
         bordercolor=palette.border,
-        padding=(10, 4),
+        padding=(scale_px(root, 10), scale_px(root, 4)),
     )
     style.map(
         "TNotebook.Tab",
@@ -528,13 +648,46 @@ def _configure_menu(menu: tk.Menu, palette: ThemePalette) -> None:
         pass
 
 
+def _configure_combobox_popdown(combobox: ttk.Combobox, palette: ThemePalette) -> None:
+    try:
+        popdown = str(combobox.tk.call("ttk::combobox::PopdownWindow", str(combobox)))
+        if not popdown:
+            return
+        listbox_path = f"{popdown}.f.l"
+        combobox.tk.call(
+            listbox_path,
+            "configure",
+            "-background",
+            palette.surface,
+            "-foreground",
+            palette.fg,
+            "-selectbackground",
+            palette.select_bg,
+            "-selectforeground",
+            palette.select_fg,
+            "-highlightbackground",
+            palette.border,
+            "-highlightcolor",
+            palette.accent,
+        )
+    except tk.TclError:
+        pass
+
+
 def apply_theme_to_widget_tree(widget: tk.Misc, palette: ThemePalette) -> None:
-    """Recursively apply `palette` colors to non-ttk Tk widgets (`Toplevel`, `Text`, `Canvas`, `Menu`)."""
+    """Recursively apply `palette` colors to non-ttk Tk widgets, combobox popdowns, and nested `Toplevel`s."""
     if isinstance(widget, (tk.Tk, tk.Toplevel)):
+        if hasattr(widget, "_palette"):
+            win_any: Any = widget
+            win_any._palette = palette
         try:
             widget.configure(background=palette.bg)
         except tk.TclError:
             pass
+        if isinstance(widget, tk.Toplevel):
+            _apply_windows_titlebar_theme(widget, is_dark=(palette.mode == "dark"))
+    elif isinstance(widget, ttk.Combobox):
+        _configure_combobox_popdown(widget, palette)
     elif isinstance(widget, tk.Text):
         try:
             widget.configure(
@@ -567,6 +720,28 @@ def apply_theme_to_widget_tree(widget: tk.Misc, palette: ThemePalette) -> None:
             widget.configure(background=palette.bg)
         except tk.TclError:
             pass
+    elif not isinstance(widget, ttk.Widget):
+        if isinstance(widget, tk.Frame):
+            try:
+                widget.configure(background=palette.bg)
+            except tk.TclError:
+                pass
+        elif isinstance(widget, tk.Label):
+            try:
+                widget.configure(background=palette.bg, foreground=palette.fg)
+            except tk.TclError:
+                pass
+        elif isinstance(widget, tk.Button):
+            try:
+                widget.configure(
+                    background=palette.surface_alt,
+                    foreground=palette.fg,
+                    activebackground=palette.surface_hover,
+                    activeforeground=palette.fg,
+                    disabledforeground=palette.fg_disabled,
+                )
+            except tk.TclError:
+                pass
 
     apply_hook = getattr(widget, "apply_theme", None)
     if callable(apply_hook) and not isinstance(widget, (tk.Tk, tk.Toplevel)):
@@ -581,20 +756,22 @@ def apply_theme_to_widget_tree(widget: tk.Misc, palette: ThemePalette) -> None:
 
 def apply_theme_to_window(window: tk.Toplevel, palette: ThemePalette) -> None:
     """Apply `palette` to a `Toplevel` dialog, its classic Tk children, and Windows title bar."""
-    if hasattr(window, "_palette"):
-        win_any: Any = window
-        win_any._palette = palette
     apply_theme_to_widget_tree(window, palette)
-    _apply_windows_titlebar_theme(window, is_dark=(palette.mode == "dark"))
 
 
-def apply_theme(root: tk.Misc, style: ttk.Style, theme_mode: str | None) -> ThemePalette:
-    """Apply `theme_mode` (`'system'`, `'light'`, `'dark'`) to `style`, `root`, and all child widgets."""
+def apply_theme(
+    root: tk.Misc,
+    style: ttk.Style,
+    theme_mode: str | None,
+    *,
+    walk_tree: bool = True,
+) -> ThemePalette:
+    """Apply `theme_mode` (`'system'`, `'light'`, and `'dark'`) to `style`, `root`, and child widgets."""
     palette = resolve_palette(theme_mode)
     available = style.theme_names()
     if "clam" in available:
         style.theme_use("clam")
-    _configure_clam_palette(style, palette)
+    _configure_clam_palette(style, palette, root=root)
 
     configure_hidpi_scaling(root, style)
 
@@ -606,6 +783,7 @@ def apply_theme(root: tk.Misc, style: ttk.Style, theme_mode: str | None) -> Them
     except tk.TclError:
         pass
 
-    apply_theme_to_widget_tree(root, palette)
+    if walk_tree:
+        apply_theme_to_widget_tree(root, palette)
     _apply_windows_titlebar_theme(root, is_dark=(palette.mode == "dark"))
     return palette

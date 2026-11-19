@@ -237,15 +237,9 @@ def normalize_source_key(raw_key: str) -> str:
     if lowered in _STATIC_SOURCE_ALIASES:
         return _STATIC_SOURCE_ALIASES[lowered]
     try:
-        from audiobookdl.sources import get_source_classes
+        from audiobookdl.sources import normalize_descriptor_source_key
 
-        for cls in get_source_classes():
-            if not cls.names:
-                continue
-            canonical = cls.names[0].lower()
-            for alias in cls.names:
-                if alias.lower() == lowered:
-                    return canonical
+        return normalize_descriptor_source_key(lowered)
     except Exception:
         pass
     return lowered

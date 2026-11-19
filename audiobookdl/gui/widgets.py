@@ -7,10 +7,12 @@ import re
 import sys
 import threading
 import tkinter as tk
-from tkinter import ttk
+from tkinter import simpledialog, ttk
 from typing import Any, Literal
 from collections.abc import Callable, Sequence
 import weakref
+
+_STDLIB_ASKSTRING = simpledialog.askstring
 
 from audiobookdl.gui.formatting import (
     clamp_rect_to_monitor,
@@ -25,10 +27,8 @@ from audiobookdl.gui.theme import (
     scale_px,
 )
 
-
 _SORT_CHUNK_RE = re.compile(r"(\d+)")
 _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
-
 
 TreeAnchor = Literal["nw", "n", "ne", "w", "center", "e", "sw", "s", "se"]
 ResponsiveMode = Literal["wide", "compact"]
@@ -46,6 +46,47 @@ def resolve_responsive_mode(
     if current == "wide":
         return "compact" if width < exit_wide_px else "wide"
     return "wide" if width >= enter_wide_px else "compact"
+
+
+def update_label_wraplength(
+    label: ttk.Label,
+    target_px: int,
+    *,
+    min_px: int = 160,
+    max_px: int | None = None,
+) -> None:
+    """Update a label's `wraplength` only when changed by >= 4 px to prevent Tk `<Configure>` loops."""
+    resolved = max(min_px, int(target_px))
+    if max_px is not None:
+        resolved = min(resolved, max(min_px, int(max_px)))
+    prev = getattr(label, "_last_wraplength_px", None)
+    if prev == resolved or (prev is not None and abs(resolved - prev) < 4):
+        return
+    label_any: Any = label
+    label_any._last_wraplength_px = resolved
+    label.configure(wraplength=resolved)
+
+
+def bind_adaptive_wraplength(
+    container: tk.Misc,
+    label: ttk.Label,
+    *,
+    margin_dp: int=28,
+    min_dp: int=180,
+) -> None:
+    """Bind `<Configure>` on `container` to keep `label` `wraplength` fitted without layout loops."""
+
+    def _on_cfg(event: tk.Event) -> None:
+        w = int(getattr(event, "width", 0) or 0)
+        if w <= 1:
+            return
+        update_label_wraplength(
+            label,
+            w - scale_px(container, margin_dp),
+            min_px=scale_px(container, min_dp),
+        )
+
+    container.bind("<Configure>", _on_cfg, add="+")
 
 
 @dataclass(frozen=True)
@@ -137,11 +178,11 @@ def populate_grouped_tree(
     get_values: typing.Callable[[_TreeItemT], tuple[str, ...]],
     get_group_key: typing.Callable[[_TreeItemT], str],
     format_group_values: typing.Callable[[str, int], tuple[str, ...]],
-    should_group: typing.Callable[[_TreeItemT, int], bool] | None = None,
-    group_prefix: str = "group:",
-    open_groups: bool = True,
-    get_tags: typing.Callable[[_TreeItemT], tuple[str, ...]] | None = None,
-    get_image: typing.Callable[[_TreeItemT], Any] | None = None,
+    should_group: typing.Callable[[_TreeItemT, int], bool] | None=None,
+    group_prefix: str="group:",
+    open_groups: bool=True,
+    get_tags: typing.Callable[[_TreeItemT], tuple[str, ...]] | None=None,
+    get_image: typing.Callable[[_TreeItemT], Any] | None=None,
 ) -> int:
     """Populate `tree` flat or grouped under collapsible parent rows.
 
@@ -216,14 +257,15 @@ class ScrolledTreeview(ttk.Frame):
         parent: tk.Misc,
         columns: Sequence[TreeColumnSpec],
         *,
-        selectmode: str = "browse",
-        height: int | None = None,
-        show_tree: bool = False,
-        tree_heading: str = "",
-        tree_width: int = 28,
-        tree_minwidth: int = 22,
-        tree_style: str | None = None,
-        enable_sorting: bool = True,
+        selectmode: str="browse",
+        height: int | None=None,
+        show_tree: bool=False,
+        tree_heading: str="",
+        tree_width: int=28,
+        tree_minwidth: int=22,
+        tree_style: str | None=None,
+        enable_sorting: bool=True,
+        on_sort_column: Callable[[str, bool], None] | None=None,
     ) -> None:
         super().__init__(parent)
         self.columnconfigure(0, weight=1)
@@ -235,6 +277,7 @@ class ScrolledTreeview(ttk.Frame):
         self._sort_col: str | None = None
         self._sort_desc = False
         self._enable_sorting = enable_sorting
+        self._on_sort_column = on_sort_column
 
         tree_kwargs: dict[str, Any] = {
             "columns": tuple(spec.key for spec in columns),
@@ -258,7 +301,7 @@ class ScrolledTreeview(ttk.Frame):
         for spec in columns:
             if enable_sorting and spec.sortable:
 
-                def _sort_cb(k: str = spec.key) -> None:
+                def _sort_cb(k: str=spec.key) -> None:
                     self.sort_by_column(k)
 
                 self.tree.heading(
@@ -315,7 +358,7 @@ class ScrolledTreeview(ttk.Frame):
         step = -1 if delta > 0 else 1
         return self._xscroll_units(step * 2)
 
-    def set_tree_column_width(self, width: int, *, minwidth: int | None = None) -> None:
+    def set_tree_column_width(self, width: int, *, minwidth: int | None=None) -> None:
         """Update the `#0` tree column width (and optional `minwidth`) in logical pixels."""
         kwargs: dict[str, Any] = {"width": scale_px(self, width)}
         if minwidth is not None:
@@ -325,10 +368,10 @@ class ScrolledTreeview(ttk.Frame):
     def set_empty_state(
         self,
         visible: bool,
-        message: str = "",
+        message: str="",
         *,
-        action_text: str = "",
-        action_command: Callable[[], None] | None = None,
+        action_text: str="",
+        action_command: Callable[[], None] | None=None,
     ) -> None:
         """Show or hide a centered empty-state message and optional CTA button over the table."""
         if not visible:
@@ -336,14 +379,18 @@ class ScrolledTreeview(ttk.Frame):
                 self._empty_overlay.place_forget()
             return
         if self._empty_overlay is None:
-            self._empty_overlay = ttk.Frame(self.tree, padding=scale_px(self, 12))
+            self._empty_overlay = ttk.Frame(
+                self.tree,
+                padding=scale_px(self, 12),
+                style="EmptyOverlay.TFrame",
+            )
             self._empty_label = ttk.Label(
                 self._empty_overlay,
                 text="",
-                style="Muted.TLabel",
+                style="EmptyOverlay.TLabel",
                 justify="center",
             )
-            self._empty_label.pack(pady=(0, 6))
+            self._empty_label.pack(pady=(0, scale_px(self, 6)))
             self._empty_btn = ttk.Button(
                 self._empty_overlay,
                 text="",
@@ -364,8 +411,18 @@ class ScrolledTreeview(ttk.Frame):
         if self._empty_cmd is not None:
             self._empty_cmd()
 
-    def sort_by_column(self, col_key: str, *, descending: bool | None = None) -> None:
-        """Sort rows by `col_key`, preserving parent group hierarchy when present."""
+    def set_sort_indicator(self, col_key: str | None, descending: bool = False) -> None:
+        """Update stored sort column/direction and column heading arrow indicators."""
+        self._sort_col = col_key
+        self._sort_desc = descending
+        for s in self._columns:
+            suffix = ""
+            if col_key is not None and s.key == col_key:
+                suffix = " \u25bc" if descending else " \u25b2"
+            self.tree.heading(s.key, text=f"{s.heading}{suffix}")
+
+    def sort_by_column(self, col_key: str, *, descending: bool | None=None) -> None:
+        """Sort rows by `col_key`, delegating to `on_sort_column` when configured."""
         if not self._enable_sorting:
             return
         spec = self._col_specs.get(col_key)
@@ -374,14 +431,10 @@ class ScrolledTreeview(ttk.Frame):
             return
         if descending is None:
             descending = not self._sort_desc if self._sort_col == col_key else False
-        self._sort_col = col_key
-        self._sort_desc = descending
-
-        for s in self._columns:
-            suffix = ""
-            if s.key == col_key:
-                suffix = " \u25bc" if descending else " \u25b2"
-            self.tree.heading(s.key, text=f"{s.heading}{suffix}")
+        self.set_sort_indicator(col_key, descending)
+        if self._on_sort_column is not None:
+            self._on_sort_column(col_key, descending)
+            return
 
         def _sort_children(parent_iid: str) -> None:
             children = list(self.tree.get_children(parent_iid))
@@ -442,9 +495,9 @@ class ScrollableFrame(ttk.Frame):
         self,
         parent: tk.Misc,
         *,
-        style: ttk.Style | None = None,
-        content_padding: tuple[int, int] = (12, 8),
-        inner_scrollables: Callable[[], Sequence[tk.Widget]] | None = None,
+        style: ttk.Style | None=None,
+        content_padding: tuple[int, int]=(12, 8),
+        inner_scrollables: Callable[[], Sequence[tk.Widget]] | None=None,
     ) -> None:
         super().__init__(parent)
         self.columnconfigure(0, weight=1)
@@ -455,6 +508,8 @@ class ScrollableFrame(ttk.Frame):
         self._last_canvas_size: tuple[int, int] | None = None
         self._last_content_req_size: tuple[int, int] | None = None
         self._guarded_inputs: weakref.WeakSet[tk.Misc] = weakref.WeakSet()
+        self._scroll_inputs_guarded = False
+        self._wheel_delta_remainder: float = 0.0
 
         canvas_bg = style.lookup("TFrame", "background") if style is not None else ""
         canvas_kwargs: dict[str, Any] = {"highlightthickness": 0, "borderwidth": 0}
@@ -466,7 +521,11 @@ class ScrollableFrame(ttk.Frame):
         self.vscroll = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=self.vscroll.set)
 
-        self.content_frame = ttk.Frame(self.canvas, padding=content_padding)
+        scaled_padding = (
+            scale_px(self, content_padding[0]),
+            scale_px(self, content_padding[1]),
+        )
+        self.content_frame = ttk.Frame(self.canvas, padding=scaled_padding)
         self.window_id = self.canvas.create_window((0, 0), window=self.content_frame, anchor="nw")
 
         self.content_frame.bind("<Configure>", self._on_content_configure)
@@ -527,8 +586,14 @@ class ScrollableFrame(ttk.Frame):
         self.on_mousewheel(event)
         return "break"
 
-    def guard_scroll_inputs(self) -> None:
+    def invalidate_scroll_inputs(self) -> None:
+        """Mark descendant input wheel guards stale so the next guard pass scans new widgets."""
+        self._scroll_inputs_guarded = False
+
+    def guard_scroll_inputs(self, *, force: bool=False) -> None:
         """Bind wheel pass-through on descendant `Combobox` and `Spinbox` widgets so scrolling won't mutate values."""
+        if self._scroll_inputs_guarded and not force:
+            return
         stack: list[tk.Misc] = [self.content_frame]
         while stack:
             node = stack.pop()
@@ -544,13 +609,14 @@ class ScrollableFrame(ttk.Frame):
                             child.bind(seq, self._on_guarded_input_wheel, add="+")
                 else:
                     stack.append(child)
+        self._scroll_inputs_guarded = True
 
     def apply_theme(self, palette: ThemePalette) -> None:
         """Update the underlying canvas background to match the active theme."""
         if palette.bg:
             self.canvas.configure(background=palette.bg)
 
-    def sync_layout(self, event: Any | None = None) -> None:
+    def sync_layout(self, event: Any | None=None) -> None:
         """Synchronize embedded content dimensions and scrollbar visibility with canvas size."""
         if event is not None:
             canvas_w = event.width
@@ -579,8 +645,9 @@ class ScrollableFrame(ttk.Frame):
             self.vscroll_visible = False
             self.canvas.yview_moveto(0.0)
 
-    def _on_content_configure(self, _event: tk.Event | None = None) -> None:
-        self.guard_scroll_inputs()
+    def _on_content_configure(self, _event: tk.Event | None=None) -> None:
+        if not self._scroll_inputs_guarded:
+            self.guard_scroll_inputs()
         req_size = (
             self.content_frame.winfo_reqwidth(),
             self.content_frame.winfo_reqheight(),
@@ -623,10 +690,11 @@ class ScrollableFrame(ttk.Frame):
         first, last = self.canvas.yview()
         view_top = first * content_h
         view_bottom = last * content_h
+        margin = scale_px(self, 8)
         if widget_top < view_top:
-            self.canvas.yview_moveto(max(0.0, (widget_top - 8) / content_h))
+            self.canvas.yview_moveto(max(0.0, (widget_top - margin) / content_h))
         elif widget_bottom > view_bottom:
-            self.canvas.yview_moveto(min(1.0, (widget_bottom + 8 - canvas_h) / content_h))
+            self.canvas.yview_moveto(min(1.0, (widget_bottom + margin - canvas_h) / content_h))
 
     @staticmethod
     def _matches_inner_scrollable(widget: tk.Misc, scrollable: tk.Misc) -> bool:
@@ -664,6 +732,12 @@ class ScrollableFrame(ttk.Frame):
                 return
             if "popdown" in str(widget):
                 return
+            if isinstance(widget, (ttk.Combobox, ttk.Spinbox)):
+                try:
+                    if self._is_combobox_popdown_open(widget) or widget.focus_get() is widget:
+                        return
+                except tk.TclError:
+                    return
             if self._inner_scrollables is not None:
                 for scrollable in self._inner_scrollables():
                     if self._matches_inner_scrollable(widget, scrollable):
@@ -678,10 +752,21 @@ class ScrollableFrame(ttk.Frame):
         if first <= 0.0 and last >= 1.0:
             return
         if delta:
-            step = -1 if delta > 0 else 1
-            if sys.platform != "darwin" and abs(delta) >= 120:
-                step = int(-delta / 120)
-            self.canvas.yview_scroll(step, "units")
+            if sys.platform == "darwin":
+                step = -1 if delta > 0 else 1
+                self.canvas.yview_scroll(step, "units")
+            else:
+                increment = -float(delta) / 120.0
+                if (
+                    self._wheel_delta_remainder != 0.0
+                    and (self._wheel_delta_remainder > 0) != (increment > 0)
+                ):
+                    self._wheel_delta_remainder = 0.0
+                self._wheel_delta_remainder += increment
+                steps = int(self._wheel_delta_remainder)
+                if steps != 0:
+                    self._wheel_delta_remainder -= steps
+                    self.canvas.yview_scroll(steps, "units")
         elif event_num == 4:
             self.canvas.yview_scroll(-1, "units")
         elif event_num == 5:
@@ -725,8 +810,16 @@ def attach_url_context_menu(
     menu.add_command(label="Clear", command=on_clear)
 
     def _show_menu(event: tk.Event) -> str:
+        x_root = getattr(event, "x_root", 0)
+        y_root = getattr(event, "y_root", 0)
+        if not x_root and not y_root:
+            try:
+                x_root = text_widget.winfo_rootx() + scale_px(text_widget, 12)
+                y_root = text_widget.winfo_rooty() + scale_px(text_widget, 12)
+            except tk.TclError:
+                return "break"
         try:
-            menu.tk_popup(event.x_root, event.y_root)
+            menu.tk_popup(x_root, y_root)
         finally:
             menu.grab_release()
         return "break"
@@ -734,6 +827,11 @@ def attach_url_context_menu(
     text_widget.bind("<Button-3>", _show_menu)
     if sys.platform == "darwin":
         text_widget.bind("<Button-2>", _show_menu)
+    for seq in ("<Shift-F10>", "<Menu>"):
+        try:
+            text_widget.bind(seq, _show_menu)
+        except tk.TclError:
+            pass
     return menu
 
 
@@ -745,9 +843,9 @@ class MainThreadCallbackQueue:
     def __init__(
         self,
         widget: tk.Misc,
-        interval_ms: int = 30,
+        interval_ms: int=30,
         *,
-        max_batch: int = MAX_BATCH,
+        max_batch: int=MAX_BATCH,
     ) -> None:
         self._widget = widget
         self._interval_ms = max(10, interval_ms)
@@ -787,7 +885,7 @@ class MainThreadCallbackQueue:
         with self._lock:
             return self._destroyed
 
-    def _ensure_polling(self, delay_ms: int | None = None) -> None:
+    def _ensure_polling(self, delay_ms: int | None=None) -> None:
         with self._lock:
             if self._destroyed or self._after_id is not None:
                 return
@@ -898,8 +996,8 @@ class Tooltip:
         widget: tk.Misc,
         text: str,
         *,
-        delay_ms: int = 400,
-        palette_provider: Callable[[], ThemePalette] | None = None,
+        delay_ms: int=400,
+        palette_provider: Callable[[], ThemePalette] | None=None,
     ) -> None:
         self._widget = widget
         self._text = text
@@ -913,9 +1011,12 @@ class Tooltip:
         widget.bind("<ButtonPress>", self._cancel_and_hide, add="+")
         widget.bind("<FocusIn>", self._schedule_focus, add="+")
         widget.bind("<FocusOut>", self._cancel_and_hide, add="+")
+        widget.bind("<Escape>", self._cancel_and_hide, add="+")
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            widget.bind(seq, self._cancel_and_hide, add="+")
         widget.bind("<Destroy>", self._on_destroy, add="+")
 
-    def _schedule(self, _event: tk.Event | None = None) -> None:
+    def _schedule(self, _event: tk.Event | None=None) -> None:
         self._cancel_timer()
         if not self._text:
             return
@@ -925,7 +1026,7 @@ class Tooltip:
         except tk.TclError:
             self._after_id = None
 
-    def _schedule_focus(self, _event: tk.Event | None = None) -> None:
+    def _schedule_focus(self, _event: tk.Event | None=None) -> None:
         # Show briefly delayed on keyboard focus navigation only if mapped
         try:
             if self._widget.winfo_ismapped():
@@ -941,7 +1042,7 @@ class Tooltip:
                 pass
             self._after_id = None
 
-    def _cancel_and_hide(self, _event: tk.Event | None = None) -> None:
+    def _cancel_and_hide(self, _event: tk.Event | None=None) -> None:
         self._cancel_timer()
         self.hide()
 
@@ -982,6 +1083,20 @@ class Tooltip:
             foreground=palette.fg,
         )
         label.pack()
+        tip.update_idletasks()
+        tip_w = max(1, tip.winfo_reqwidth())
+        tip_h = max(1, tip.winfo_reqheight())
+        monitors = get_monitor_work_areas(self._widget)
+        _, _, cx, cy = clamp_rect_to_monitor(
+            tip_w,
+            tip_h,
+            x,
+            y,
+            monitors,
+            min_width=1,
+            min_height=1,
+        )
+        tip.wm_geometry(f"+{cx}+{cy}")
         self._tip_window = tip
 
     def hide(self) -> None:
@@ -998,7 +1113,7 @@ def attach_tooltip(
     widget: tk.Misc,
     text: str,
     *,
-    palette_provider: Callable[[], ThemePalette] | None = None,
+    palette_provider: Callable[[], ThemePalette] | None=None,
 ) -> Tooltip | None:
     """Attach a `Tooltip` to `widget` if `text` is non-empty."""
     cleaned = text.strip()
@@ -1015,8 +1130,8 @@ class CollapsibleSection(ttk.Frame):
         parent: tk.Misc,
         title: str,
         *,
-        collapsed: bool = False,
-        on_toggle: Callable[[bool], None] | None = None,
+        collapsed: bool=False,
+        on_toggle: Callable[[bool], None] | None=None,
     ) -> None:
         super().__init__(parent)
         self.columnconfigure(0, weight=1)
@@ -1054,7 +1169,7 @@ class CollapsibleSection(ttk.Frame):
     def set_summary(self, summary: str) -> None:
         self.summary_var.set(summary)
 
-    def toggle(self, collapsed: bool | None = None) -> bool:
+    def toggle(self, collapsed: bool | None=None) -> bool:
         target = (not self._collapsed) if collapsed is None else bool(collapsed)
         if target != self._collapsed:
             self._collapsed = target
@@ -1082,10 +1197,10 @@ class ModalDialog(tk.Toplevel):
         parent: tk.Misc,
         title: str,
         *,
-        palette: ThemePalette | None = None,
-        default_size: tuple[int, int] | None = None,
-        min_size: tuple[int, int] | None = None,
-        resizable: tuple[bool, bool] = (True, True),
+        palette: ThemePalette | None=None,
+        default_size: tuple[int, int] | None=None,
+        min_size: tuple[int, int] | None=None,
+        resizable: tuple[bool, bool]=(True, True),
     ) -> None:
         super().__init__(parent)
         self._palette = palette or LIGHT_PALETTE
@@ -1138,7 +1253,7 @@ class ModalDialog(tk.Toplevel):
             cur = stack.pop()
             if isinstance(cur, ttk.Combobox):
 
-                def _on_cb_esc(_ev: tk.Event, cb: ttk.Combobox = cur) -> str | None:
+                def _on_cb_esc(_ev: tk.Event, cb: ttk.Combobox=cur) -> str | None:
                     try:
                         pd = str(self.tk.call("ttk::combobox::PopdownWindow", str(cb)))
                         if bool(int(self.tk.call("winfo", "ismapped", pd))):
@@ -1154,13 +1269,13 @@ class ModalDialog(tk.Toplevel):
             except tk.TclError:
                 pass
 
-    def _on_escape(self, _event: tk.Event | None = None) -> str:
+    def _on_escape(self, _event: tk.Event | None=None) -> str:
         if self._is_combobox_popdown_active():
             return "break"
         self.destroy()
         return "break"
 
-    def _on_modal_map(self, _event: tk.Event | None = None) -> None:
+    def _on_modal_map(self, _event: tk.Event | None=None) -> None:
         if not self._finalized:
             return
         try:
@@ -1172,8 +1287,8 @@ class ModalDialog(tk.Toplevel):
     def finalize_modal(
         self,
         *,
-        initial_focus: tk.Misc | None = None,
-        monitors: Sequence[tuple[int, int, int, int]] | None = None,
+        initial_focus: tk.Misc | None=None,
+        monitors: Sequence[tuple[int, int, int, int]] | None=None,
     ) -> None:
         """Apply theme, size and center on owner clamped to monitor work area, show, grab, and focus."""
         self._finalized = True
@@ -1256,3 +1371,114 @@ class ModalDialog(tk.Toplevel):
                     opener.focus_set()
             except tk.TclError:
                 pass
+
+
+class TextInputDialog(ModalDialog):
+    """Theme-aware modal text input dialog replacing unthemed `simpledialog.askstring`."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        title: str,
+        prompt: str,
+        *,
+        initialvalue: str="",
+        show: str | None=None,
+        palette: ThemePalette | None=None,
+    ) -> None:
+        resolved = palette or getattr(parent.winfo_toplevel(), "_palette", None) or LIGHT_PALETTE
+        super().__init__(
+            parent,
+            title,
+            palette=resolved,
+            default_size=(380, 148),
+            min_size=(320, 136),
+            resizable=(True, False),
+        )
+        self.result: str | None = None
+        self._value_var = tk.StringVar(master=self, value=initialvalue)
+
+        pad_x = scale_px(self, 14)
+        pad_y = scale_px(self, 12)
+        body = ttk.Frame(self, padding=(pad_x, pad_y))
+        body.pack(fill=tk.BOTH, expand=True)
+        body.columnconfigure(0, weight=1)
+
+        self.prompt_label = ttk.Label(
+            body,
+            text=prompt,
+            wraplength=scale_px(self, 340),
+            justify="left",
+        )
+        self.prompt_label.grid(row=0, column=0, sticky="ew", pady=(0, scale_px(self, 6)))
+        bind_adaptive_wraplength(body, self.prompt_label, margin_dp=28, min_dp=220)
+
+        entry_kwargs: dict[str, Any] = {"textvariable": self._value_var}
+        if show:
+            entry_kwargs["show"] = show
+        self.entry = ttk.Entry(body, **entry_kwargs)
+        self.entry.grid(row=1, column=0, sticky="ew", pady=(0, scale_px(self, 12)))
+        self.entry.bind("<Return>", self._on_ok)
+        self.entry.bind("<KP_Enter>", self._on_ok)
+        if initialvalue:
+            self.entry.selection_range(0, tk.END)
+            self.entry.icursor(tk.END)
+
+        btn_row = ttk.Frame(body)
+        btn_row.grid(row=2, column=0, sticky="e")
+        self.cancel_btn = ttk.Button(btn_row, text="Cancel", command=self._on_cancel)
+        self.cancel_btn.pack(side=tk.RIGHT)
+        self.ok_btn = ttk.Button(
+            btn_row,
+            text="OK",
+            style="Accent.TButton",
+            command=self._on_ok,
+        )
+        self.ok_btn.pack(side=tk.RIGHT, padx=(0, scale_px(self, 6)))
+
+        self.finalize_modal(initial_focus=self.entry)
+
+    def _on_ok(self, _event: tk.Event | None=None) -> str:
+        self.result = self._value_var.get()
+        self.destroy()
+        return "break"
+
+    def _on_cancel(self, _event: tk.Event | None=None) -> str:
+        self.result = None
+        self.destroy()
+        return "break"
+
+
+def ask_text_input(
+    parent: tk.Misc,
+    title: str,
+    prompt: str,
+    *,
+    initialvalue: str="",
+    show: str | None=None,
+    palette: ThemePalette | None=None,
+    askstring_override: Callable[..., Any] | None=None,
+) -> str | None:
+    """Open a themed `TextInputDialog` (or delegate to a monkeypatched `simpledialog.askstring` in tests)."""
+    hook = askstring_override if askstring_override is not None else simpledialog.askstring
+    if hook is not _STDLIB_ASKSTRING or simpledialog.askstring is not _STDLIB_ASKSTRING:
+        active_hook = (
+            hook if hook is not _STDLIB_ASKSTRING else simpledialog.askstring
+        )
+        kwargs: dict[str, Any] = {"parent": parent}
+        if initialvalue:
+            kwargs["initialvalue"] = initialvalue
+        if show is not None:
+            kwargs["show"] = show
+        res = active_hook(title, prompt, **kwargs)
+        return str(res) if res is not None else None
+    dialog = TextInputDialog(
+        parent,
+        title,
+        prompt,
+        initialvalue=initialvalue,
+        show=show,
+        palette=palette,
+    )
+    parent.wait_window(dialog)
+    return dialog.result

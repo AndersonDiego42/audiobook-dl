@@ -17,7 +17,8 @@ from audiobookdl.config import (
 )
 from audiobookdl.gui.controller import GuiController
 from audiobookdl.gui.cookie_dialog import CookieImportDialog
-from audiobookdl.gui.theme import ThemePalette
+from audiobookdl.gui.theme import ThemePalette, scale_px
+from audiobookdl.gui.widgets import ResponsiveMode, Tooltip, ask_text_input, resolve_responsive_mode
 from audiobookdl.sources import ServiceInfo, detect_service_key, resolve_service_label
 
 
@@ -45,7 +46,7 @@ class ServiceAuthCoordinator:
         build_verify_options: Callable[[], DownloadOptions | None],
         is_running_provider: Callable[[], bool],
         on_log: Callable[[str], None],
-        on_credentials_changed: Callable[[], None] | None = None,
+        on_credentials_changed: Callable[[], None] | None=None,
     ) -> None:
         self._window = root
         self._controller = controller
@@ -116,7 +117,7 @@ class ServiceAuthCoordinator:
             self._prompting_discard = False
 
     def _notify_credentials_changed(
-        self, service_key: str | None = None, profile: str | None = None
+        self, service_key: str | None=None, profile: str | None=None
     ) -> None:
         if self._on_credentials_changed is None:
             return
@@ -174,7 +175,7 @@ class ServiceAuthCoordinator:
     def service_label_for_url(self, url: str) -> str:
         return resolve_service_label(url, self._services_by_key)
 
-    def select_service_profile(self, service_key: str, profile: str = DEFAULT_PROFILE) -> None:
+    def select_service_profile(self, service_key: str, profile: str=DEFAULT_PROFILE) -> None:
         svc = self._services_by_key.get(service_key)
         if svc is not None:
             self.service_label_var.set(svc.label)
@@ -182,7 +183,7 @@ class ServiceAuthCoordinator:
         self.load_service_into_form()
         self.update_field_states()
 
-    def select_service_smart(self, service_key: str | None = None) -> None:
+    def select_service_smart(self, service_key: str | None=None) -> None:
         """Select a service and resolve its effective profile automatically."""
         svc = self._services_by_key.get(service_key) if service_key else self.selected_service()
         if svc is None:
@@ -315,9 +316,9 @@ class ServiceAuthCoordinator:
 
     def show_cookie_import_dialog(
         self,
-        svc_key_override: str | None = None,
+        svc_key_override: str | None=None,
         *,
-        profile_override: str | None = None,
+        profile_override: str | None=None,
     ) -> None:
         """Open or raise the interactive browser-cookie importer dialog."""
         self._cookie_import_profile = (
@@ -371,7 +372,7 @@ class ServiceAuthCoordinator:
         self._status_var.set(f"Imported {count} cookies to {os.path.basename(cookie_path)}")
         self._on_log(f"Imported {count} browser cookie(s) to {cookie_path}")
 
-    def save_current_credentials(self, quiet: bool = False) -> None:
+    def save_current_credentials(self, quiet: bool=False) -> None:
         """Persist the selected service's login, password, library, locale, OAuth client, and cookie path."""
         service = self.selected_service()
         if service is None or not service.auth_methods:
@@ -422,6 +423,16 @@ class ServiceAuthCoordinator:
         if service is None:
             return
         active_profile = normalize_profile_name(self.profile_var.get())
+        profile_suffix = f" ({active_profile})" if active_profile != DEFAULT_PROFILE else ""
+        if not messagebox.askyesno(
+            "Forget Credentials",
+            (
+                "Remove saved credentials, OAuth tokens, and cached session cookies "
+                f"for {service.label}{profile_suffix}?"
+            ),
+            parent=self._window,
+        ):
+            return
         self._controller.delete_source_profile(service.key, profile=active_profile)
         self.username_var.set("")
         self.password_var.set("")
@@ -438,17 +449,19 @@ class ServiceAuthCoordinator:
         self._status_var.set(f"Removed saved login for {service.label}{profile_suffix}")
         self._on_log(f"Removed saved login settings for {service.label}{profile_suffix}.")
 
-    def create_new_profile(self, profile_name: str | None = None) -> bool:
+    def create_new_profile(self, profile_name: str | None=None) -> bool:
         """Create/select a new named profile for the currently selected service."""
         service = self.selected_service()
         if service is None or not service.auth_methods:
             return False
         raw_name = profile_name
         if raw_name is None:
-            raw_name = simpledialog.askstring(
+            raw_name = ask_text_input(
+                self._window,
                 "New Profile",
                 f"Enter profile name for {service.label}:",
-                parent=self._window,
+                palette=self._palette_provider(),
+                askstring_override=simpledialog.askstring,
             )
         if raw_name is None or not raw_name.strip():
             return False
@@ -465,7 +478,7 @@ class ServiceAuthCoordinator:
             )
         return True
 
-    def rename_current_profile(self, new_name: str | None = None) -> bool:
+    def rename_current_profile(self, new_name: str | None=None) -> bool:
         """Rename the active profile for the selected service."""
         service = self.selected_service()
         if service is None or not service.auth_methods:
@@ -473,11 +486,13 @@ class ServiceAuthCoordinator:
         old_profile = normalize_profile_name(self.profile_var.get())
         raw_new = new_name
         if raw_new is None:
-            raw_new = simpledialog.askstring(
+            raw_new = ask_text_input(
+                self._window,
                 "Rename Profile",
                 f"Rename profile '{old_profile}' for {service.label} to:",
                 initialvalue=old_profile,
-                parent=self._window,
+                palette=self._palette_provider(),
+                askstring_override=simpledialog.askstring,
             )
         if raw_new is None or not raw_new.strip():
             return False
@@ -773,18 +788,26 @@ class ServiceAuthCoordinator:
 class ServiceAuthPanel(ttk.LabelFrame):
     """LabelFrame managing service/profile selection, login fields, and browser cookie import."""
 
+    _SERVICE_ROW_WIDE_ENTER_DP = 620
+    _SERVICE_ROW_WIDE_EXIT_DP = 590
+
     def __init__(
         self,
         master: tk.Misc,
         coordinator: ServiceAuthCoordinator,
     ) -> None:
-        super().__init__(master, text="Service & Authentication", padding=(10, 6))
+        super().__init__(
+            master,
+            text="Service & Authentication",
+            padding=(scale_px(master, 10), scale_px(master, 6)),
+        )
         self._coord = coordinator
         self._window = coordinator._window
         self._controller = coordinator._controller
         self._services = coordinator._services
         self._services_by_label = coordinator._services_by_label
         self._services_by_key = coordinator._services_by_key
+        self._service_row_mode: ResponsiveMode = "wide"
 
         self._status_var = coordinator._status_var
         self.service_label_var = coordinator.service_label_var
@@ -828,6 +851,7 @@ class ServiceAuthPanel(ttk.LabelFrame):
         service_row = ttk.Frame(self)
         service_row.grid(row=0, column=1, columnspan=4, sticky="ew", pady=(0, 4))
         service_row.columnconfigure(5, weight=1)
+        self._service_row = service_row
 
         self.service_combo = ttk.Combobox(
             service_row,
@@ -867,12 +891,14 @@ class ServiceAuthPanel(ttk.LabelFrame):
         )
         self.rename_profile_btn.grid(row=0, column=4, sticky="w", padx=(0, 8))
 
-        ttk.Label(service_row, textvariable=self.service_hint_var, style="Muted.TLabel").grid(
-            row=0, column=5, sticky="w"
+        self._service_hint_label = ttk.Label(
+            service_row, textvariable=self.service_hint_var, style="Muted.TLabel"
         )
-        ttk.Label(service_row, textvariable=self.saved_badge_var, style="Success.TLabel").grid(
-            row=0, column=6, sticky="e", padx=(8, 0)
+        self._saved_badge_label = ttk.Label(
+            service_row, textvariable=self.saved_badge_var, style="Success.TLabel"
         )
+        self._apply_service_row_layout("wide")
+        service_row.bind("<Configure>", self._on_service_row_configure, add="+")
 
         ttk.Label(self, text="Cookies File:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
         self.cookie_entry = ttk.Entry(self, textvariable=self.cookie_file_var)
@@ -963,16 +989,81 @@ class ServiceAuthPanel(ttk.LabelFrame):
         )
         self.test_auth_btn.pack(side=tk.RIGHT, padx=(0, 4))
 
+        pal = self._coord._palette_provider
+        self._tooltips = [
+            Tooltip(
+                self.profile_combo,
+                "Switch between named account profiles for this service",
+                palette_provider=pal,
+            ),
+            Tooltip(
+                self.cookie_entry,
+                "Path to a Netscape/Mozilla cookies.txt file exported or imported from your browser",
+                palette_provider=pal,
+            ),
+            Tooltip(
+                self.lib_entry,
+                "Library or card identifier required by services such as OverDrive/Libby or Hoopla",
+                palette_provider=pal,
+            ),
+            Tooltip(
+                self.locale_entry,
+                "Storefront region or locale code (e.g. us, uk, de) for regional catalogs",
+                palette_provider=pal,
+            ),
+            Tooltip(
+                self.oauth_client_entry,
+                "Optional custom OAuth 2.0 client ID for services supporting interactive OAuth login",
+                palette_provider=pal,
+            ),
+        ]
+
+    def _on_service_row_configure(self, event: tk.Event) -> None:
+        w = int(getattr(event, "width", 0) or self._service_row.winfo_width())
+        self.sync_responsive_layout(w)
+
+    def sync_responsive_layout(self, width: int | None=None) -> None:
+        """Reflow service hint and saved badge onto a second row in narrow viewports."""
+        w = int(width if width is not None else self._service_row.winfo_width())
+        mode = resolve_responsive_mode(
+            self._service_row_mode,
+            w,
+            scale_px(self, self._SERVICE_ROW_WIDE_ENTER_DP),
+            scale_px(self, self._SERVICE_ROW_WIDE_EXIT_DP),
+        )
+        if mode != self._service_row_mode:
+            self._apply_service_row_layout(mode)
+
+    def _apply_service_row_layout(self, mode: ResponsiveMode) -> None:
+        self._service_row_mode = mode
+        if mode == "wide":
+            self._service_hint_label.grid(row=0, column=5, columnspan=1, sticky="w", pady=0)
+            self._saved_badge_label.grid(
+                row=0, column=6, columnspan=1, sticky="e", padx=(scale_px(self, 8), 0), pady=0
+            )
+        else:
+            self._service_hint_label.grid(
+                row=1, column=0, columnspan=4, sticky="w", pady=(scale_px(self, 3), 0)
+            )
+            self._saved_badge_label.grid(
+                row=1,
+                column=4,
+                columnspan=3,
+                sticky="e",
+                padx=(scale_px(self, 8), 0),
+                pady=(scale_px(self, 3), 0),
+            )
+
     def selected_service(self) -> ServiceInfo | None:
         return self._coord.selected_service()
 
     def service_label_for_url(self, url: str) -> str:
         return self._coord.service_label_for_url(url)
 
-    def on_service_selected(self, _event: tk.Event | None = None) -> None:
+    def on_service_selected(self, _event: tk.Event | None=None) -> None:
         self._coord.select_service_smart()
 
-    def on_profile_changed(self, _event: tk.Event | None = None) -> None:
+    def on_profile_changed(self, _event: tk.Event | None=None) -> None:
         self._coord.handle_profile_changed()
 
     def on_urls_changed(self, urls: Sequence[str]) -> None:
@@ -1086,13 +1177,13 @@ class ServiceAuthPanel(ttk.LabelFrame):
         if chosen:
             self.cookie_file_var.set(chosen)
 
-    def show_cookie_import_dialog(self, svc_key_override: str | None = None) -> None:
+    def show_cookie_import_dialog(self, svc_key_override: str | None=None) -> None:
         self._coord.show_cookie_import_dialog(svc_key_override=svc_key_override)
 
     def on_cookies_imported(self, service_key: str, cookie_path: str, count: int) -> None:
         self._coord.on_cookies_imported(service_key, cookie_path, count)
 
-    def save_current_credentials(self, quiet: bool = False) -> None:
+    def save_current_credentials(self, quiet: bool=False) -> None:
         self._coord.save_current_credentials(quiet=quiet)
 
     def forget_current_credentials(self) -> None:

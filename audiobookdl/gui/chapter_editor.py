@@ -12,7 +12,14 @@ from collections.abc import Callable, Sequence
 
 from audiobookdl.gui.formatting import format_duration, format_timestamp_ms, parse_timestamp_ms
 from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, scale_px
-from audiobookdl.gui.widgets import ModalDialog, ScrolledTreeview, TreeColumnSpec
+from audiobookdl.gui.widgets import (
+    ModalDialog,
+    ResponsiveMode,
+    ScrolledTreeview,
+    Tooltip,
+    TreeColumnSpec,
+    resolve_responsive_mode,
+)
 from audiobookdl.utils import find_executable, subprocess_kwargs
 from audiobookdl.utils.audiobook import Chapter
 
@@ -151,12 +158,22 @@ class _ChapterEditDialog(ModalDialog):
 
         self._title_var = tk.StringVar(value=chapter.title)
         self._start_var = tk.StringVar(value=format_timestamp_ms(chapter.start))
+        self._start_label_var = tk.StringVar(
+            value=(
+                "Start (HH:MM:SS.mmm):"
+                if chapter.start >= 3_600_000 or self._start_var.get().count(":") >= 2
+                else "Start (MM:SS.mmm):"
+            )
+        )
+        self._start_var.trace_add("write", self._sync_start_label)
 
         ttk.Label(body, text="Title:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
         title_entry = ttk.Entry(body, textvariable=self._title_var, width=36)
         title_entry.grid(row=0, column=1, sticky="ew", pady=4)
 
-        ttk.Label(body, text="Start (MM:SS.mmm):").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Label(body, textvariable=self._start_label_var).grid(
+            row=1, column=0, sticky="w", padx=(0, 8), pady=4
+        )
         start_entry = ttk.Entry(body, textvariable=self._start_var, width=18)
         start_entry.grid(row=1, column=1, sticky="w", pady=4)
 
@@ -167,6 +184,18 @@ class _ChapterEditDialog(ModalDialog):
 
         self.bind("<Return>", lambda _e: self._save())
         self.finalize_modal(initial_focus=title_entry)
+
+    def _sync_start_label(self, *_args: object) -> None:
+        raw = self._start_var.get()
+        use_hours = raw.count(":") >= 2
+        if not use_hours:
+            try:
+                use_hours = parse_timestamp_ms(raw) >= 3_600_000
+            except ValueError:
+                pass
+        self._start_label_var.set(
+            "Start (HH:MM:SS.mmm):" if use_hours else "Start (MM:SS.mmm):"
+        )
 
     def _save(self) -> None:
         title = self._title_var.get().strip()
@@ -309,6 +338,10 @@ def resolve_audition_target(
 class ChapterEditorFrame(ttk.Frame):
     """Interactive chapter table allowing add, rename, timestamp edit/shift, delete, merge, and import/export."""
 
+    _UNPROBED = object()
+    _TOOLBAR_WIDE_ENTER_DP = 620
+    _TOOLBAR_WIDE_EXIT_DP = 580
+
     _COLUMNS = (
         TreeColumnSpec("num", "#", width=42, stretch=False, anchor="e", sort_kind="number"),
         TreeColumnSpec("start", "Start", width=95, stretch=False, anchor="e"),
@@ -332,38 +365,46 @@ class ChapterEditorFrame(ttk.Frame):
         self._audition_tracks: list[tuple[str, int]] = []
         self._audition_proc: subprocess.Popen[bytes] | None = None
         self._audition_poll_id: str | None = None
+        self._cached_ffplay_path: str | None | object = self._UNPROBED
         self._total_duration_ms: int | None = None
         self._source_label = ""
         self._info_var = tk.StringVar(value="No chapters")
+        self._toolbar_mode: ResponsiveMode = "wide"
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
 
         toolbar = ttk.Frame(self)
-        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        ttk.Button(toolbar, text="Add...", command=self.add_chapter).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(toolbar, text="Edit...", command=self.edit_selected).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(toolbar, text="Delete", command=self.delete_selected).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(toolbar, text="Merge Next", command=self.merge_with_next).pack(
-            side=tk.LEFT, padx=(0, 4)
+        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, scale_px(self, 6)))
+        self._toolbar = toolbar
+        self._add_btn = ttk.Button(toolbar, text="Add...", command=self.add_chapter)
+        self._edit_btn = ttk.Button(toolbar, text="Edit...", command=self.edit_selected)
+        self._delete_btn = ttk.Button(toolbar, text="Delete", command=self.delete_selected)
+        self._merge_btn = ttk.Button(toolbar, text="Merge Next", command=self.merge_with_next)
+        self._shift_btn = ttk.Button(toolbar, text="Shift...", command=self.shift_chapters)
+        self._import_btn = ttk.Button(
+            toolbar, text="Import .cue/.json...", command=self.import_from_file
         )
-        ttk.Button(toolbar, text="Shift...", command=self.shift_chapters).pack(
-            side=tk.LEFT, padx=(0, 4)
-        )
-        ttk.Button(toolbar, text="Import .cue/.json...", command=self.import_from_file).pack(
-            side=tk.LEFT, padx=(0, 4)
-        )
-        ttk.Button(toolbar, text="Export...", command=self.export_to_file).pack(
-            side=tk.LEFT, padx=(0, 4)
-        )
+        self._export_btn = ttk.Button(toolbar, text="Export...", command=self.export_to_file)
         self._audition_btn = ttk.Button(
             toolbar,
             text="Audition 5s",
             command=self.toggle_audition,
             state="disabled",
         )
-        self._audition_btn.pack(side=tk.LEFT)
-        ttk.Label(toolbar, textvariable=self._info_var, style="Muted.TLabel").pack(side=tk.RIGHT)
+        self._toolbar_btns = (
+            self._add_btn,
+            self._edit_btn,
+            self._delete_btn,
+            self._merge_btn,
+            self._shift_btn,
+            self._import_btn,
+            self._export_btn,
+            self._audition_btn,
+        )
+        self._info_label = ttk.Label(toolbar, textvariable=self._info_var, style="Muted.TLabel")
+        self._apply_toolbar_layout("wide")
+        toolbar.bind("<Configure>", self._on_toolbar_configure, add="+")
 
         self._scrolled = ScrolledTreeview(
             self,
@@ -374,12 +415,106 @@ class ChapterEditorFrame(ttk.Frame):
         )
         self._scrolled.grid(row=1, column=0, sticky="nsew")
         self.tree = self._scrolled.tree
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self._sync_toolbar_button_states(), add="+")
         self.tree.bind("<Double-1>", lambda _e: self.edit_selected())
+
+        def _on_select_all(_e: tk.Event) -> str:
+            children = self.tree.get_children()
+            if children:
+                self.tree.selection_set(children)
+                self.tree.focus(children[0])
+            return "break"
+
+        def _on_delete(_e: tk.Event) -> str:
+            self.delete_selected()
+            return "break"
+
+        def _on_edit(_e: tk.Event) -> str:
+            self.edit_selected()
+            return "break"
+
+        def _on_space(_e: tk.Event) -> str:
+            self.toggle_audition()
+            return "break"
+
+        self.tree.bind("<Control-a>", _on_select_all, add="+")
+        self.tree.bind("<Control-A>", _on_select_all, add="+")
+        self.tree.bind("<Delete>", _on_delete, add="+")
+        self.tree.bind("<Return>", _on_edit, add="+")
+        self.tree.bind("<F2>", _on_edit, add="+")
+        self.tree.bind("<space>", _on_space, add="+")
+        self._tooltips = [
+            Tooltip(
+                self._merge_btn,
+                "Merge the selected chapter into the following chapter",
+                palette_provider=lambda: self._palette,
+            ),
+            Tooltip(
+                self._shift_btn,
+                "Offset or stretch chapter start timestamps by a fixed amount or factor",
+                palette_provider=lambda: self._palette,
+            ),
+            Tooltip(
+                self._import_btn,
+                "Load chapters from an external .cue or .json sidecar file",
+                palette_provider=lambda: self._palette,
+            ),
+            Tooltip(
+                self._export_btn,
+                "Save current chapters as a .cue or .json file",
+                palette_provider=lambda: self._palette,
+            ),
+            Tooltip(
+                self._audition_btn,
+                "Play a 5-second audio preview from the selected chapter start using ffplay (Space)",
+                palette_provider=lambda: self._palette,
+            ),
+        ]
+        self._sync_toolbar_button_states()
         self.bind("<Destroy>", self._on_destroy, add="+")
 
     def apply_theme(self, palette: ThemePalette) -> None:
         """Update the stored palette used when opening chapter edit dialogs."""
         self._palette = palette
+
+    def _on_toolbar_configure(self, event: tk.Event) -> None:
+        w = int(getattr(event, "width", 0) or self._toolbar.winfo_width())
+        self.sync_responsive_toolbars(w)
+
+    def sync_responsive_toolbars(self, width: int | None = None) -> None:
+        """Reflow chapter editor buttons into 2 rows when narrow."""
+        w = int(width if width is not None else self._toolbar.winfo_width())
+        if w <= 1:
+            return
+        mode = resolve_responsive_mode(
+            self._toolbar_mode,
+            w,
+            scale_px(self, self._TOOLBAR_WIDE_ENTER_DP),
+            scale_px(self, self._TOOLBAR_WIDE_EXIT_DP),
+        )
+        if mode != self._toolbar_mode:
+            self._apply_toolbar_layout(mode)
+
+    def _apply_toolbar_layout(self, mode: ResponsiveMode) -> None:
+        self._toolbar_mode = mode
+        for col in range(10):
+            self._toolbar.columnconfigure(col, weight=0)
+        p4 = scale_px(self, 4)
+        btns = self._toolbar_btns
+        if mode == "wide":
+            for idx, btn in enumerate(btns):
+                btn.grid(row=0, column=idx, sticky="w", padx=(0, p4), pady=0)
+            self._toolbar.columnconfigure(len(btns), weight=1)
+            self._info_label.grid(row=0, column=len(btns) + 1, columnspan=1, sticky="e", pady=0)
+            return
+        row0 = btns[:5]
+        row1 = btns[5:]
+        for idx, btn in enumerate(row0):
+            btn.grid(row=0, column=idx, sticky="w", padx=(0, p4), pady=0)
+        for idx, btn in enumerate(row1):
+            btn.grid(row=1, column=idx, sticky="w", padx=(0, p4), pady=(p4, 0))
+        self._toolbar.columnconfigure(5, weight=1)
+        self._info_label.grid(row=1, column=3, columnspan=3, sticky="e", pady=(p4, 0))
 
     def set_chapters(
         self,
@@ -407,6 +542,29 @@ class ChapterEditorFrame(ttk.Frame):
         self._source_label = source_label
         self._render()
 
+    def _get_ffplay_path(self) -> str | None:
+        if self._cached_ffplay_path is self._UNPROBED:
+            self._cached_ffplay_path = find_executable("ffplay")
+        return self._cached_ffplay_path if isinstance(self._cached_ffplay_path, str) else None
+
+    def _sync_toolbar_button_states(self) -> None:
+        sel = sorted(
+            {
+                int(iid)
+                for iid in self.tree.selection()
+                if iid.isdigit() and 0 <= int(iid) < len(self._chapters)
+            }
+        )
+        has_sel = bool(sel)
+        single_sel = len(sel) == 1
+        has_chapters = bool(self._chapters)
+        can_merge = single_sel and (sel[0] + 1) < len(self._chapters)
+        self._edit_btn.configure(state="normal" if single_sel else "disabled")
+        self._delete_btn.configure(state="normal" if has_sel else "disabled")
+        self._merge_btn.configure(state="normal" if can_merge else "disabled")
+        self._shift_btn.configure(state="normal" if has_chapters else "disabled")
+        self._export_btn.configure(state="normal" if has_chapters else "disabled")
+
     def _update_audition_button_state(self) -> None:
         if self._audition_proc is not None and self._audition_proc.poll() is None:
             self._audition_btn.configure(text="Stop Audition", state="normal")
@@ -414,7 +572,7 @@ class ChapterEditorFrame(ttk.Frame):
         can_play = bool(
             self._chapters
             and self._audition_tracks
-            and find_executable("ffplay") is not None
+            and self._get_ffplay_path() is not None
         )
         self._audition_btn.configure(
             text="Audition 5s",
@@ -465,7 +623,7 @@ class ChapterEditorFrame(ttk.Frame):
                 parent=self,
             )
             return False
-        ffplay_bin = find_executable("ffplay")
+        ffplay_bin = self._get_ffplay_path()
         if ffplay_bin is None:
             messagebox.showwarning(
                 "ffplay Not Found",
@@ -536,6 +694,13 @@ class ChapterEditorFrame(ttk.Frame):
             self._on_change(self.get_chapters())
 
     def _render(self) -> None:
+        try:
+            yview_top = float(self.tree.yview()[0])
+        except (tk.TclError, IndexError, TypeError, ValueError):
+            yview_top = 0.0
+        prev_selection = list(self.tree.selection())
+        prev_focus = self.tree.focus()
+
         existing = self.tree.get_children()
         if existing:
             self.tree.delete(*existing)
@@ -558,12 +723,23 @@ class ChapterEditorFrame(ttk.Frame):
                 iid=str(idx),
                 values=(idx + 1, format_timestamp_ms(ch.start), dur_str, ch.title, row_src),
             )
+        valid_sel = [iid for iid in prev_selection if self.tree.exists(iid)]
+        if valid_sel:
+            self.tree.selection_set(valid_sel)
+        if prev_focus and self.tree.exists(prev_focus):
+            self.tree.focus(prev_focus)
+        if yview_top > 0.0 and total > 0:
+            try:
+                self.tree.yview_moveto(yview_top)
+            except tk.TclError:
+                pass
         src_suffix = f" ({self._source_label})" if self._source_label else ""
         self._info_var.set(f"{total} chapter{'s' if total != 1 else ''}{src_suffix}")
         self._scrolled.set_empty_state(
             total == 0,
             "No chapters detected. Import a .cue or .json file to add chapters.",
         )
+        self._sync_toolbar_button_states()
         self._update_audition_button_state()
 
     def add_chapter(self) -> None:
@@ -690,6 +866,16 @@ class ChapterEditorFrame(ttk.Frame):
         if not loaded:
             messagebox.showinfo("No Chapters", "No chapters were found in the selected file.", parent=self)
             return
+        if self._chapters:
+            if not messagebox.askyesno(
+                "Replace Chapters",
+                (
+                    f"Replace {len(self._chapters)} existing chapter(s) with "
+                    f"{len(loaded)} imported chapter(s)?"
+                ),
+                parent=self,
+            ):
+                return
         self._chapters = loaded
         ext_src = os.path.splitext(path)[1].lower() or "File"
         self._chapter_sources = [ext_src] * len(loaded)

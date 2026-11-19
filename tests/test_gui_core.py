@@ -280,7 +280,7 @@ def test_save_and_load_source_credentials_round_trip(tmp_path):
 
 
 @pytest.mark.gui
-def test_gui_service_dropdown_saves_and_restores_credentials(tmp_path):
+def test_gui_service_dropdown_saves_and_restores_credentials(tmp_path, monkeypatch):
     try:
         root = tk.Tk()
     except tk.TclError as exc:
@@ -328,6 +328,7 @@ def test_gui_service_dropdown_saves_and_restores_credentials(tmp_path):
         assert app2.username_var.get() == "alice@example.com"
         assert app2.password_var.get() == "hunter2!"
 
+        monkeypatch.setattr("audiobookdl.gui.auth_panel.messagebox.askyesno", lambda *_a, **_kw: True)
         app2._auth.forget_current_credentials()
         assert app2.username_var.get() == ""
         assert app2.password_var.get() == ""
@@ -1257,6 +1258,7 @@ def test_gui_queue_move_remove_retry_and_clear(tmp_path, monkeypatch):
         app._runs.retry_failed_queue_items()
         assert retried["urls"] == ["https://librivox.org/book-b"]
 
+        monkeypatch.setattr("audiobookdl.gui.queue_panel.messagebox.askyesno", lambda *_a, **_kw: True)
         app.download_page.queue_panel.clear_completed_history()
         assert list(app.queue_tree.get_children()) == []
     finally:
@@ -1408,7 +1410,10 @@ def test_gui_archive_ledger_dialog_filters_and_populates(tmp_path):
 
         lib_page = app.open_library_tab("archive")
         tab = lib_page.archive_tab
-        root.update_idletasks()
+        deadline = time.monotonic() + 2.0
+        while len(tab._tree.get_children()) != 2 and time.monotonic() < deadline:
+            root.update()
+            time.sleep(0.01)
         assert len(tab._tree.get_children()) == 2
         assert tab._ledger is not None
         initial_ledger = tab._ledger
@@ -1417,12 +1422,10 @@ def test_gui_archive_ledger_dialog_filters_and_populates(tmp_path):
         root.update_idletasks()
         assert len(tab._tree.get_children()) == 2
         # Wait past 180ms debounce window and pump Tk events
-        import time
-
-        deadline = time.monotonic() + 1.0
+        deadline = time.monotonic() + 2.0
         while len(tab._tree.get_children()) != 1 and time.monotonic() < deadline:
             root.update()
-            time.sleep(0.04)
+            time.sleep(0.02)
         assert len(tab._tree.get_children()) == 1
         # Same persistent DownloadArchive connection was reused across refreshes
         assert tab._ledger is initial_ledger
@@ -1952,6 +1955,10 @@ def test_preview_dialog_inline_metadata_and_cover_editing(tmp_path, monkeypatch)
         assert dialog._narrators_var.get() == "First Narrator"
         assert dialog._series_var.get() == "Original Series"
         assert dialog._series_order_var.get() == "1"
+        deadline = time.monotonic() + 2.0
+        while dialog._cover_photo is None and time.monotonic() < deadline:
+            root.update()
+            time.sleep(0.01)
         assert dialog._cover_photo is not None
 
         warnings: list[tuple[str, str]] = []
@@ -1986,6 +1993,10 @@ def test_preview_dialog_inline_metadata_and_cover_editing(tmp_path, monkeypatch)
         dialog._choose_cover_file()
         assert dialog._pending_cover is not None
         assert dialog._pending_cover.extension == "jpg"
+        deadline = time.monotonic() + 2.0
+        while dialog._cover_photo is None and time.monotonic() < deadline:
+            root.update()
+            time.sleep(0.01)
         assert dialog._cover_photo is not None
         assert str(dialog._clear_cover_btn.cget("state")) == "normal"  # type: ignore[union-attr]
 
@@ -3327,6 +3338,10 @@ def test_gui_catalog_browser_status_badges_hide_downloaded_and_one_click_downloa
             ),
         ]
         tab.populate_items(books)
+        deadline = time.monotonic() + 2.0
+        while tab._tree.item("book-0", "values")[3] != "Downloaded" and time.monotonic() < deadline:
+            root.update()
+            time.sleep(0.01)
 
         v0 = tab._tree.item("book-0", "values")
         v1 = tab._tree.item("book-1", "values")
@@ -3349,6 +3364,10 @@ def test_gui_catalog_browser_status_badges_hide_downloaded_and_one_click_downloa
         # Save to Library DB immediately refreshes book-2 status badge to Pending
         tab._tree.selection_set(("book-2",))
         tab.save_to_library()
+        deadline = time.monotonic() + 2.0
+        while tab._tree.item("book-2", "values")[3] != "Pending" and time.monotonic() < deadline:
+            root.update()
+            time.sleep(0.01)
         v2_saved = tab._tree.item("book-2", "values")
         assert isinstance(v2_saved, (tuple, list))
         assert v2_saved[3] == "Pending"
@@ -3819,6 +3838,10 @@ def test_gui_m3_queue_inspector_reorder_filter_sync_accounts_and_archive(tmp_pat
             on_upload_abs=lambda entry: uploaded_entries.append(entry),
         )
         assert root.grab_current() is None
+        deadline = time.monotonic() + 2.0
+        while not ltab._tree.get_children() and time.monotonic() < deadline:
+            root.update()
+            time.sleep(0.01)
         first_row = ltab._tree.get_children()[0]
         ltab._tree.selection_set(first_row)
         ltab._on_entry_selected()
@@ -3917,6 +3940,10 @@ def test_gui_sidebar_lazy_pages_refresh_on_visit_and_keyboard_nav(tmp_path, monk
             arch.record("librivox", "b1", title="Fresh Book", author="Author")
         lib2 = app.navigate("library")
         assert lib2 is lib1
+        deadline = time.monotonic() + 2.0
+        while len(lib2.archive_tab._tree.get_children()) != 1 and time.monotonic() < deadline:
+            root.update()
+            time.sleep(0.01)
         assert len(lib2.archive_tab._tree.get_children()) == 1
 
         acct1 = app.navigate("accounts")
@@ -4128,8 +4155,12 @@ def test_gui_sidebar_badge_footer_and_ffmpeg_banner(tmp_path):
 
         # Download nav badge reflects active + failed counts
         badge = app.shell._badge_labels["download"]
+        app.shell.set_download_badge(2, 0)
+        assert badge.cget("text") == "2 queued"
+        app.shell.set_download_badge(0, 1)
+        assert badge.cget("text") == "1 failed"
         app.shell.set_download_badge(2, 1)
-        assert badge.cget("text") == "2 queued, 1 failed"
+        assert badge.cget("text") == "2q, 1 err"
         assert badge.winfo_manager() == "grid"
         app.shell.set_download_badge(0, 0)
         assert badge.winfo_manager() == ""
@@ -4647,7 +4678,7 @@ def test_gui_06_persists_sync_schedule_clipboard_monitor_and_check_updates(tmp_p
     )
     app = AudiobookDLApp(root, config_location=str(cfg_path))
     try:
-        lib_page = app.navigate("library")
+        lib_page = app.open_library_tab("sync")
         sync_tab = lib_page.sync_tab
         sync_tab.auto_sync_var.set(True)
         sync_tab.interval_var.set("15")
@@ -4680,7 +4711,7 @@ def test_gui_06_persists_sync_schedule_clipboard_monitor_and_check_updates(tmp_p
         assert app2._automation.auto_sync_targets == [("everand", "work")]
         assert app2._automation.auto_sync_after_id is not None
 
-        lib_page2 = app2.navigate("library")
+        lib_page2 = app2.open_library_tab("sync")
         sync_tab2 = lib_page2.sync_tab
         assert sync_tab2.auto_sync_var.get() is True
         assert sync_tab2.interval_var.get() == "15"
@@ -4727,6 +4758,10 @@ def test_gui_07_archive_tab_async_selection_and_verify_missing(tmp_path):
 
     tab = ArchiveTab(root, str(archive_path))
     try:
+        deadline = time.monotonic() + 2.0
+        while not tab._tree.exists(str(id_missing)) and time.monotonic() < deadline:
+            root.update()
+            time.sleep(0.01)
         # Rapidly switch selection from missing -> existing; stale token ensures existing wins
         tab._tree.selection_set(str(id_missing))
         tab._on_entry_selected()
@@ -5185,18 +5220,28 @@ def test_gui_17_archive_tab_pagination_and_edit_metadata(tmp_path, monkeypatch):
     monkeypatch.setattr(ArchiveTab, "_PAGE_SIZE", 2)
     tab = ArchiveTab(root, str(archive_path))
     try:
+        def _pump_until(pred) -> None:
+            dl = time.monotonic() + 2.0
+            while not pred() and time.monotonic() < dl:
+                root.update()
+                time.sleep(0.01)
+
+        _pump_until(lambda: "of 5 items" in tab._status_var.get())
         tab._group_var.set(False)
         tab._refresh()
+        _pump_until(lambda: len(tab._tree.get_children()) == 2 and "Showing 1-2 of 5 items" in tab._status_var.get())
         assert "Showing 1-2 of 5 items" in tab._status_var.get()
         assert len(tab._tree.get_children()) == 2
         assert str(tab._prev_page_btn.cget("state")) == "disabled"
         assert str(tab._next_page_btn.cget("state")) == "normal"
 
         tab._next_page()
+        _pump_until(lambda: "Showing 3-4 of 5 items" in tab._status_var.get())
         assert "Showing 3-4 of 5 items" in tab._status_var.get()
         assert str(tab._prev_page_btn.cget("state")) == "normal"
 
         tab._load_all_entries()
+        _pump_until(lambda: "Showing 5 items" in tab._status_var.get())
         assert "Showing 5 items" in tab._status_var.get()
         assert len(tab._tree.get_children()) == 5
 
@@ -5224,6 +5269,7 @@ def test_gui_17_archive_tab_pagination_and_edit_metadata(tmp_path, monkeypatch):
         )
         monkeypatch.setattr(tab, "wait_window", lambda _dlg: None)
         tab._edit_selected_metadata()
+        _pump_until(lambda: tab._entries_by_id.get(int(first_iid)) is not None and tab._entries_by_id[int(first_iid)].title == "Renamed Entry")
         assert tab._entries_by_id[int(first_iid)].title == "Renamed Entry"
         assert tab._entries_by_id[int(first_iid)].status == "pending"
         assert tab._entries_by_id[int(first_iid)].tags == ("reviewed",)
@@ -5887,6 +5933,10 @@ def test_gui_event_driven_idle_poll_wakes_on_bg_task_and_debounces_archive_selec
 
         tab._format_size = spy_format_size  # type: ignore[method-assign]
         try:
+            deadline = time.monotonic() + 2.0
+            while not tab._tree.exists(str(id_a)) and time.monotonic() < deadline:
+                root2.update()
+                time.sleep(0.01)
             tab._tree.selection_set(str(id_a))
             tab._on_entry_selected()
             tab._tree.selection_set(str(id_b))
@@ -8149,6 +8199,1230 @@ def test_aud015_cross_page_validation_state_and_helpers(tmp_path):
                 root.destroy()
         except tk.TclError:
             pass
+
+
+@pytest.mark.gui
+def test_aud020_lazy_library_subtabs_hidden_details_and_async_preview_checks(tmp_path, monkeypatch):
+    import sqlite3
+    from audiobookdl.gui.pages.archive_tab import ArchiveTab
+    from audiobookdl.utils.archive import DownloadArchive
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    archive_path = tmp_path / "downloads.db"
+    book_dir = tmp_path / "HiddenDetailBook"
+    book_dir.mkdir()
+    (book_dir / "part1.mp3").write_bytes(b"z" * 1024)
+    cfg_path.write_text(
+        f'download_archive = "{str(archive_path).replace(os.sep, "/")}"\n'
+        '[sources.storytel]\nusername = "alice"\n',
+        encoding="utf-8",
+    )
+    with DownloadArchive(str(archive_path), persistent=True) as arch:
+        eid = arch.record(
+            "librivox",
+            "https://librivox.org/hidden-detail",
+            title="Hidden Detail Book",
+            author="Author",
+            output_path=str(book_dir),
+            status="downloaded",
+        )
+
+    app = AudiobookDLApp(root, config_location=str(cfg_path))
+    try:
+        # 1. LibraryPage on_show() refreshes only active sub-tab; hidden sub-tabs refresh on tab change
+        lib_page = app.navigate("library")
+        sync_calls: list[int] = []
+        orig_refresh_targets = lib_page.sync_tab.refresh_targets
+
+        def _spy_sync_refresh() -> None:
+            sync_calls.append(1)
+            orig_refresh_targets()
+
+        monkeypatch.setattr(lib_page.sync_tab, "refresh_targets", _spy_sync_refresh)
+        assert lib_page.sync_tab._target_vars == []
+        lib_page.on_show()
+        assert sync_calls == []
+        assert "sync" in lib_page._dirty_tabs
+
+        lib_page.notebook.select(lib_page.sync_tab)
+        lib_page._handle_notebook_tab_changed()
+        assert len(sync_calls) == 1
+        assert "sync" not in lib_page._dirty_tabs
+        assert lib_page.sync_tab._target_vars != []
+
+        # 2. ArchiveTab skips size/cover worker when _details_visible is False, then loads on show
+        atab = lib_page.archive_tab
+        deadline = time.monotonic() + 2.0
+        while not atab._tree.exists(str(eid)) and time.monotonic() < deadline:
+            root.update()
+            time.sleep(0.01)
+
+        size_calls: list[str] = []
+        orig_format_size = atab._format_size
+        monkeypatch.setattr(
+            atab,
+            "_format_size",
+            lambda p, *, is_cancelled=None: (size_calls.append(p), orig_format_size(p, is_cancelled=is_cancelled))[1],
+        )
+        atab._toggle_details_pane()
+        assert atab._details_visible is False
+        atab._tree.selection_set(str(eid))
+        atab._on_entry_selected()
+        for _ in range(15):
+            root.update()
+            time.sleep(0.01)
+        assert size_calls == []
+
+        atab._toggle_details_pane()
+        assert atab._details_visible is True
+        deadline = time.monotonic() + 2.0
+        while not size_calls and time.monotonic() < deadline:
+            root.update()
+            time.sleep(0.01)
+        assert size_calls == [str(book_dir)]
+
+        # 3. ArchiveTab guards sqlite3.Error cleanly on DB worker
+        broken_tab = ArchiveTab(root, str(archive_path), defer_initial_refresh=True)
+        monkeypatch.setattr(
+            broken_tab,
+            "_query_page_sync",
+            lambda *_a: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")),
+        )
+        broken_tab._refresh()
+        deadline = time.monotonic() + 2.0
+        while "Database error:" not in broken_tab._status_var.get() and time.monotonic() < deadline:
+            root.update()
+            time.sleep(0.01)
+        assert "database is locked" in broken_tab._status_var.get()
+        broken_tab.destroy()
+
+        # 4. PreviewCoordinator uses precomputed duplicate_warning & existing_series_indices off-thread
+        monkeypatch.setattr(
+            app.controller,
+            "find_cross_source_duplicate",
+            lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("Main thread DB lookup must be skipped")),
+        )
+        src = SimpleNamespace(name="librivox", close=lambda: None)
+        ab = Audiobook(
+            session=MagicMock(),
+            metadata=AudiobookMetadata(title="Dup Check"),
+            files=[AudiobookFile(url="https://librivox.org/1.mp3", ext="mp3")],
+        )
+        dlg_ab = app._preview.show_preview_dialog(
+            "https://librivox.org/1",
+            src,  # type: ignore[arg-type]
+            ab,
+            duplicate_checked=True,
+            duplicate_warning="Duplicate Alert: precomputed",
+        )
+        assert dlg_ab._duplicate_warning == "Duplicate Alert: precomputed"
+        dlg_ab.destroy()
+
+        monkeypatch.setattr(
+            "audiobookdl.gui.preview_coordinator.series_book_exists",
+            lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("Main thread series scan must be skipped")),
+        )
+        series = Series(
+            title="S",
+            books=[BookId(id="1", title="Book One"), BookId(id="2", title="Book Two")],
+        )
+        dlg_s = app._preview.show_preview_dialog(
+            "https://librivox.org/series",
+            src,  # type: ignore[arg-type]
+            series,
+            duplicate_checked=True,
+            existing_series_indices=frozenset({1}),
+        )
+        assert dlg_s._item_labels[0].endswith("Book One")
+        assert dlg_s._item_labels[1].endswith("[Exists]")
+        dlg_s.destroy()
+    finally:
+        app._on_close(force=True)
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
+
+@pytest.mark.gui
+def test_aud021_startup_lazy_imports_single_theme_walk_trace_suppression_and_render_opts(tmp_path, monkeypatch):
+    import subprocess
+    from audiobookdl.gui.chapter_editor import ChapterEditorFrame
+    from audiobookdl.gui.preview_dialog import PreviewDialog
+
+    # 1. Fresh-process check: starting on download does not import unvisited pages or all 18 sources
+    probe_code = (
+        "import sys, tkinter as tk\n"
+        "from audiobookdl.gui.app import AudiobookDLApp\n"
+        "try:\n"
+        "    root = tk.Tk()\n"
+        "except tk.TclError:\n"
+        "    print('SKIP_NO_TK')\n"
+        "    raise SystemExit(0)\n"
+        "root.withdraw()\n"
+        f"app = AudiobookDLApp(root, config_location={repr(str(tmp_path / 'lazy.toml'))})\n"
+        "try:\n"
+        "    bad = [m for m in ('audiobookdl.gui.pages.library_page', 'audiobookdl.gui.pages.pack_page', "
+        "'audiobookdl.gui.pages.accounts_page', 'audiobookdl.gui.pages.settings_page', "
+        "'audiobookdl.sources.youtubemusic', 'audiobookdl.sources.ereolen', 'yt_dlp') if m in sys.modules]\n"
+        "    print('BAD=' + ','.join(bad))\n"
+        "    assert not bad, f'Eager imports found: {bad}'\n"
+        "finally:\n"
+        "    app._on_close(force=True)\n"
+        "    try:\n"
+        "        if root.winfo_exists():\n"
+        "            root.destroy()\n"
+        "    except tk.TclError:\n"
+        "        pass\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", probe_code],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+
+    # 2. Startup performs a single root apply_theme_to_widget_tree walk
+    root_theme_walks: list[tk.Misc] = []
+    import audiobookdl.gui.app as app_mod
+
+    orig_apply_tree = app_mod.apply_theme_to_widget_tree
+
+    def _spy_apply_tree(widget, palette):
+        if widget is root:
+            root_theme_walks.append(widget)
+        return orig_apply_tree(widget, palette)
+
+    monkeypatch.setattr(app_mod, "apply_theme_to_widget_tree", _spy_apply_tree)
+    app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+    try:
+        assert len(root_theme_walks) == 1
+
+        # 3. OptionsCoordinator.reload_config() suppresses trace storms
+        tpl_calls: list[int] = []
+        sum_calls: list[int] = []
+        orig_tpl = app._options.update_template_preview
+        orig_sum = app._options.update_download_summaries
+        monkeypatch.setattr(app._options, "update_template_preview", lambda: (tpl_calls.append(1), orig_tpl())[1])
+        monkeypatch.setattr(
+            app._options,
+            "update_download_summaries",
+            lambda page=None: (sum_calls.append(1), orig_sum(page))[1],
+        )
+        app._options.reload_config()
+        assert len(tpl_calls) == 1
+        assert len(sum_calls) == 1
+
+        # 4. ScrollableFrame skips redundant guard_scroll_inputs BFS on resize <Configure>
+        dl = app.download_page
+        guard_scans: list[int] = []
+        orig_winfo_children = dl.top_scroll.content_frame.winfo_children
+        monkeypatch.setattr(
+            dl.top_scroll.content_frame,
+            "winfo_children",
+            lambda: (guard_scans.append(1), orig_winfo_children())[1],
+        )
+        dl.top_scroll._on_content_configure()
+        assert guard_scans == []
+
+        # 5. PreviewDialog updates readonly labels in-place via StringVar and single-row toggles
+        ab = Audiobook(
+            session=MagicMock(),
+            metadata=AudiobookMetadata(title="Inplace Meta"),
+            files=[AudiobookFile(url="https://example.com/1.m4b", ext="m4b")],
+            chapters=[Chapter(start=0, title="Ch 1")],
+        )
+        src = SimpleNamespace(name="Dummy", close=lambda: None)
+        pdlg = PreviewDialog(
+            root,
+            "https://example.com/1",
+            src,  # type: ignore[arg-type]
+            ab,
+            is_running=False,
+            skip_downloaded=False,
+            series_book_exists=lambda _b: False,
+            on_confirm=lambda *_a: None,
+        )
+        assert pdlg._readonly_frame is not None
+        initial_children = list(pdlg._readonly_frame.winfo_children())
+        pdlg._on_chapters_edited(ab, [Chapter(start=0, title="Ch 1"), Chapter(start=1000, title="Ch 2")])
+        assert list(pdlg._readonly_frame.winfo_children()) == initial_children
+        assert pdlg._readonly_value_vars["Chapters"].get() == "2 chapters"
+        pdlg.destroy()
+
+        series = Series(title="S", books=[BookId(id="1", title="A"), BookId(id="2", title="B"), BookId(id="3", title="C")])
+        sdlg = PreviewDialog(
+            root,
+            "https://example.com/s",
+            src,  # type: ignore[arg-type]
+            series,
+            is_running=False,
+            skip_downloaded=False,
+            series_book_exists=lambda _b: False,
+            on_confirm=lambda *_a: None,
+        )
+        assert sdlg._tree is not None
+        set_calls: list[str] = []
+        orig_set = sdlg._tree.set
+        monkeypatch.setattr(
+            sdlg._tree,
+            "set",
+            lambda item, col=None, val=None: (set_calls.append(str(item)), orig_set(item, col, val))[1],
+        )
+        sdlg._check_vars[1].set(False)
+        sdlg._toggle_series_item(1, False)
+        assert set_calls == ["1"]
+        sdlg.destroy()
+
+        # 6. ChapterEditorFrame caches ffplay lookup across edits & preserves yview
+        probe_calls: list[str] = []
+        monkeypatch.setattr(
+            "audiobookdl.gui.chapter_editor.find_executable",
+            lambda name: (probe_calls.append(name), None)[1],
+        )
+        editor = ChapterEditorFrame(root)
+        editor.set_chapters(
+            [Chapter(start=i * 1000, title=f"Ch {i}") for i in range(30)],
+            audition_tracks=[(str(tmp_path / "a.mp3"), 30000)],
+        )
+        editor.apply_chapter_shift(mode="offset", value=1.0)
+        editor.apply_chapter_shift(mode="offset", value=1.0)
+        assert probe_calls == ["ffplay"]
+        editor.destroy()
+
+        # 7. AutomationCoordinator.poll_clipboard() skips parse_url_text when clipboard unchanged
+        parse_calls: list[str] = []
+        monkeypatch.setattr(
+            "audiobookdl.gui.coordinators.parse_url_text",
+            lambda raw: (parse_calls.append(raw), [])[1],
+        )
+        monkeypatch.setattr(root, "clipboard_get", lambda: "unchanged plain text")
+        app.clipboard_monitor_var.set(True)
+        app._automation.apply_clipboard_monitor(quiet=True, persist=False)
+        app._automation.poll_clipboard()
+        app._automation.poll_clipboard()
+        assert parse_calls == []
+    finally:
+        app._on_close(force=True)
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
+
+def _wcag_relative_luminance(hex_color: str) -> float:
+    cleaned = hex_color.lstrip("#")
+    r, g, b = (int(cleaned[i : i + 2], 16) / 255.0 for i in (0, 2, 4))
+
+    def _chan(c: float) -> float:
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+    return 0.2126 * _chan(r) + 0.7152 * _chan(g) + 0.0722 * _chan(b)
+
+
+def _wcag_contrast_ratio(fg_hex: str, bg_hex: str) -> float:
+    l1 = _wcag_relative_luminance(fg_hex)
+    l2 = _wcag_relative_luminance(bg_hex)
+    lighter, darker = (l1, l2) if l1 >= l2 else (l2, l1)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+@pytest.mark.gui
+def test_aud022_wcag_contrast_ratios_and_interactive_button_states():
+    from tkinter import ttk
+    from audiobookdl.gui.theme import DARK_PALETTE, LIGHT_PALETTE, apply_theme
+
+    # 1. Verify WCAG 2.1 AA contrast ratios (>= 4.5:1 normal text, >= 3.0:1 borders)
+    for pal in (LIGHT_PALETTE, DARK_PALETTE):
+        assert _wcag_contrast_ratio(pal.fg, pal.bg) >= 4.5
+        assert _wcag_contrast_ratio(pal.fg, pal.surface) >= 4.5
+        assert _wcag_contrast_ratio(pal.fg_muted, pal.bg) >= 4.5
+        assert _wcag_contrast_ratio(pal.fg_muted, pal.surface) >= 4.5
+        assert _wcag_contrast_ratio(pal.warning, pal.bg) >= 4.5
+        assert _wcag_contrast_ratio(pal.warning, pal.surface) >= 4.5
+        assert _wcag_contrast_ratio(pal.error, pal.bg) >= 4.5
+        assert _wcag_contrast_ratio(pal.success, pal.bg) >= 4.5
+        assert _wcag_contrast_ratio(pal.accent_fg, pal.accent) >= 4.5
+        assert _wcag_contrast_ratio(pal.accent_fg, pal.accent_hover) >= 4.5
+        assert _wcag_contrast_ratio(pal.accent_fg, pal.accent_pressed) >= 4.5
+        assert _wcag_contrast_ratio(pal.accent_text, pal.surface) >= 4.5
+        assert _wcag_contrast_ratio(pal.select_fg, pal.select_bg) >= 4.5
+        assert _wcag_contrast_ratio(pal.select_fg, pal.select_hover) >= 4.5
+        assert _wcag_contrast_ratio(pal.select_fg, pal.select_pressed) >= 4.5
+        assert _wcag_contrast_ratio(pal.border, pal.bg) >= 3.0
+        assert _wcag_contrast_ratio(pal.border, pal.surface) >= 3.0
+
+    # 2. Verify Accent.TButton and SidebarNavActive.TButton interactive state mappings
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        style = ttk.Style(root)
+        for mode, pal in (("light", LIGHT_PALETTE), ("dark", DARK_PALETTE)):
+            apply_theme(root, style, mode)
+            accent_bg_map = dict(style.map("Accent.TButton", "background"))
+            accent_fg_map = dict(style.map("Accent.TButton", "foreground"))
+            assert accent_bg_map.get("active") == pal.accent_hover
+            assert accent_bg_map.get("pressed") == pal.accent_pressed
+            assert accent_bg_map.get("active") != pal.accent
+            assert accent_bg_map.get("pressed") != accent_bg_map.get("active")
+            assert accent_fg_map.get("active") == pal.accent_fg
+            assert accent_fg_map.get("pressed") == pal.accent_fg
+
+            nav_bg_map = dict(style.map("SidebarNavActive.TButton", "background"))
+            assert nav_bg_map.get("active") == pal.select_hover
+            assert nav_bg_map.get("pressed") == pal.select_pressed
+            assert nav_bg_map.get("active") != pal.select_bg
+    finally:
+        root.destroy()
+
+
+@pytest.mark.gui
+def test_aud023_live_theme_switching_classic_surfaces_and_text_input_dialog(tmp_path):
+    from tkinter import ttk
+    from audiobookdl.gui.theme import (
+        DARK_PALETTE,
+        LIGHT_PALETTE,
+        apply_theme,
+        apply_theme_to_widget_tree,
+    )
+    from audiobookdl.gui.widgets import (
+        ScrolledTreeview,
+        TextInputDialog,
+        TreeColumnSpec,
+    )
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        style = ttk.Style(root)
+        apply_theme(root, style, "light")
+
+        # 1. ScrolledTreeview empty overlay matches Treeview surface instead of root bg
+        st = ScrolledTreeview(root, (TreeColumnSpec("col", "Col", width=100),))
+        st.set_empty_state(True, "Empty table")
+        assert st._empty_overlay is not None
+        assert st._empty_label is not None
+        assert str(st._empty_overlay.cget("style")) == "EmptyOverlay.TFrame"
+        assert str(st._empty_label.cget("style")) == "EmptyOverlay.TLabel"
+        assert style.lookup("EmptyOverlay.TFrame", "background") == LIGHT_PALETTE.surface
+        apply_theme(root, style, "dark")
+        assert style.lookup("EmptyOverlay.TFrame", "background") == DARK_PALETTE.surface
+        assert style.lookup("EmptyOverlay.TLabel", "background") == DARK_PALETTE.surface
+
+        # 2. Live Combobox popdown listbox and nested Toplevels re-theme on apply_theme_to_widget_tree
+        combo = ttk.Combobox(root, values=("Alpha", "Beta"))
+        combo.pack()
+        popdown = root.tk.call("ttk::combobox::PopdownWindow", str(combo))
+        listbox_path = f"{popdown}.f.l"
+
+        parent_top = tk.Toplevel(root)
+        parent_top.withdraw()
+        nested_top = tk.Toplevel(parent_top)
+        nested_top.withdraw()
+        nested_top._palette = LIGHT_PALETTE  # type: ignore[attr-defined]
+        classic_frame = tk.Frame(nested_top)
+        classic_label = tk.Label(classic_frame, text="Classic")
+
+        apply_theme_to_widget_tree(root, DARK_PALETTE)
+        assert root.tk.call(listbox_path, "cget", "-background") == DARK_PALETTE.surface
+        assert root.tk.call(listbox_path, "cget", "-foreground") == DARK_PALETTE.fg
+        assert getattr(nested_top, "_palette", None) == DARK_PALETTE
+        assert str(classic_frame.cget("background")) == DARK_PALETTE.bg
+        assert str(classic_label.cget("foreground")) == DARK_PALETTE.fg
+
+        apply_theme_to_widget_tree(root, LIGHT_PALETTE)
+        assert root.tk.call(listbox_path, "cget", "-background") == LIGHT_PALETTE.surface
+        assert getattr(nested_top, "_palette", None) == LIGHT_PALETTE
+
+        # 3. TextInputDialog confirm/cancel and theming
+        dlg_ok = TextInputDialog(
+            root,
+            "New Profile",
+            "Enter profile name:",
+            initialvalue="work",
+            palette=DARK_PALETTE,
+        )
+        assert dlg_ok._palette == DARK_PALETTE
+        dlg_ok._value_var.set("personal")
+        dlg_ok._on_ok()
+        assert dlg_ok.result == "personal"
+
+        dlg_cancel = TextInputDialog(
+            root,
+            "Rename Profile",
+            "Rename to:",
+            initialvalue="work",
+            palette=LIGHT_PALETTE,
+        )
+        dlg_cancel._on_cancel()
+        assert dlg_cancel.result is None
+
+        nested_top.destroy()
+        parent_top.destroy()
+    finally:
+        root.destroy()
+
+
+@pytest.mark.gui
+def test_aud024_responsive_overflow_toolbar_reflow_and_scrollbars(tmp_path):
+    from tkinter import ttk
+    from audiobookdl.gui.chapter_editor import ChapterEditorFrame
+    from audiobookdl.gui.preview_dialog import _EnrichmentPickerDialog
+    from audiobookdl.gui.theme import scale_px
+    from audiobookdl.gui.widgets import ScrollableFrame
+    from audiobookdl.utils.enrichment import EnrichmentCandidate
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+    try:
+        dl = app.download_page
+        dl.options_section.toggle(False)
+        dl.naming_section.toggle(False)
+        root.update_idletasks()
+
+        # 1. OptionsPanel compact natural width <= 500 dp and urls_text has vertical scrollbar
+        assert dl.options_panel.winfo_reqwidth() <= scale_px(root, 500)
+        assert dl.top_scroll.content_frame.winfo_reqwidth() <= scale_px(root, 650)
+        assert isinstance(dl.urls_scroll, ttk.Scrollbar)
+        assert str(dl.urls_text.cget("yscrollcommand")) != ""
+
+        # 2. Library tabs: ArchiveTab, CatalogTab, SyncTab scrollbars and responsive toolbars
+        lib_page = app.open_library_tab("archive")
+        arch = lib_page.archive_tab
+        assert isinstance(arch._details_scroll, ScrollableFrame)
+        arch.sync_responsive_toolbars(scale_px(root, 480))
+        assert arch._top_bar_mode == "compact"
+        assert arch._btn_bar_mode == "compact"
+        assert int(arch._group_cb.grid_info()["row"]) == 1
+        assert int(arch._action_buttons[-1].grid_info()["row"]) == 1
+        arch.sync_responsive_toolbars(scale_px(root, 860))
+        assert arch._top_bar_mode == "wide"
+        assert arch._btn_bar_mode == "wide"
+
+        cat = lib_page.catalog_tab
+        assert isinstance(cat._details_scroll, ScrollableFrame)
+        cat.sync_responsive_toolbars(scale_px(root, 500))
+        assert cat._top_bar_mode == "compact"
+        assert cat._filter_bar_mode == "compact"
+        assert int(cat._query_entry.grid_info()["row"]) == 1
+        assert int(cat._group_cb.grid_info()["row"]) == 1
+        cat.sync_responsive_toolbars(scale_px(root, 860))
+        assert cat._top_bar_mode == "wide"
+        assert cat._filter_bar_mode == "wide"
+
+        sync_tab = lib_page.sync_tab
+        assert isinstance(sync_tab._accounts_scroll, ScrollableFrame)
+
+        # 3. AccountsPage and ServiceAuthPanel responsive reflow
+        acct_page = app.open_accounts()
+        acct_page.sync_responsive_toolbars(scale_px(root, 500))
+        assert acct_page._btn_bar_mode == "compact"
+        assert int(acct_page._refresh_btn.grid_info()["row"]) == 1
+        acct_page.sync_responsive_toolbars(scale_px(root, 820))
+        assert acct_page._btn_bar_mode == "wide"
+
+        acct_page.auth_panel.sync_responsive_layout(scale_px(root, 480))
+        assert acct_page.auth_panel._service_row_mode == "compact"
+        assert int(acct_page.auth_panel._service_hint_label.grid_info()["row"]) == 1
+        acct_page.auth_panel.sync_responsive_layout(scale_px(root, 720))
+        assert acct_page.auth_panel._service_row_mode == "wide"
+
+        # 4. PackPage listbox scrollbar & responsive options row, plus ChapterEditorFrame toolbar
+        pack_page = app.navigate("pack")
+        assert isinstance(pack_page._paths_scroll, ttk.Scrollbar)
+        assert str(pack_page._paths_listbox.cget("yscrollcommand")) != ""
+        pack_page.sync_responsive_toolbars(scale_px(root, 480))
+        assert pack_page._opts_row_mode == "compact"
+        assert int(pack_page._delete_source_cb.grid_info()["row"]) == 1
+        pack_page.sync_responsive_toolbars(scale_px(root, 760))
+        assert pack_page._opts_row_mode == "wide"
+
+        ch_ed = ChapterEditorFrame(root)
+        ch_ed.sync_responsive_toolbars(scale_px(root, 460))
+        assert ch_ed._toolbar_mode == "compact"
+        assert int(ch_ed._audition_btn.grid_info()["row"]) == 1
+        ch_ed.sync_responsive_toolbars(scale_px(root, 760))
+        assert ch_ed._toolbar_mode == "wide"
+        ch_ed.destroy()
+
+        # 5. _EnrichmentPickerDialog diff_text scrollbar
+        cand = EnrichmentCandidate(
+            provider="audnexus",
+            score=0.95,
+            title="Dune",
+            authors=["Frank Herbert"],
+            narrators=["Scott Brick"],
+        )
+        picker = _EnrichmentPickerDialog(root, [cand])
+        assert isinstance(picker._diff_scroll, ttk.Scrollbar)
+        assert str(picker._diff_text.cget("yscrollcommand")) != ""
+        picker.destroy()
+
+        # 6. Sidebar download badge stays compact when both active & failed counts > 0
+        app.shell.set_download_badge(12, 3)
+        badge_lbl = app.shell._badge_labels["download"]
+        assert badge_lbl.cget("text") == "12q, 3 err"
+    finally:
+        app._on_close(force=True)
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
+
+@pytest.mark.gui
+def test_aud025_hidpi_relative_font_scaling_per_monitor_dpi_and_work_areas(tmp_path, monkeypatch):
+    from tkinter import font as tkfont
+    from audiobookdl.gui import formatting, window_manager
+    from audiobookdl.gui.theme import default_font_size, make_bold_font
+
+    # 1. Linux xrandr multi-monitor parsing & negative-coordinate virtual root fallback
+    sample_xrandr = (
+        "Screen 0: minimum 8 x 8, current 3840 x 1080, maximum 32767 x 32767\n"
+        "DP-1 connected primary 1920x1080+0+0 (normal left inverted right x axis y axis) 510mm x 290mm\n"
+        "HDMI-1 connected 1920x1080-1920+0 (normal left inverted right x axis y axis) 510mm x 290mm\n"
+    )
+    monitors = formatting._parse_xrandr_monitors(sample_xrandr)
+    assert monitors == [(0, 0, 1920, 1080), (-1920, 0, 0, 1080)]
+    clamped = formatting.clamp_geometry_to_monitors("900x600+-1500+100", monitors)
+    assert clamped == "900x600+-1500+100"
+
+    with monkeypatch.context() as mp:
+        mp.setattr(formatting.sys, "platform", "darwin")
+        fake_widget = SimpleNamespace(
+            winfo_screenwidth=lambda: 1920,
+            winfo_screenheight=lambda: 1080,
+            winfo_vrootx=lambda: -1920,
+            winfo_vrooty=lambda: 0,
+            winfo_vrootwidth=lambda: 3840,
+            winfo_vrootheight=lambda: 1080,
+        )
+        fallback_areas = formatting.get_monitor_work_areas(fake_widget)  # type: ignore[arg-type]
+        assert (-1920, 0, 1920, 1080) in fallback_areas
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    app = AudiobookDLApp(root, config_location=str(tmp_path / "audiobook-dl.toml"))
+    try:
+        # 2. Relative make_bold_font scales with user TkDefaultFont size
+        default_font = tkfont.nametofont("TkDefaultFont", root=root)
+        orig_size = int(default_font.cget("size"))
+        try:
+            default_font.configure(size=14)
+            assert default_font_size(root) == 14
+            assert make_bold_font(root, 0)[1] == 14
+            assert make_bold_font(root, 1)[1] == 15
+            assert make_bold_font(root, 3)[1] == 17
+            assert make_bold_font(root, 4)[1] == 18
+            # Legacy point size arguments (9..13) also map relatively
+            assert make_bold_font(root, 9)[1] == 14
+            assert make_bold_font(root, 13)[1] == 18
+        finally:
+            default_font.configure(size=orig_size)
+
+        # 3. Per-monitor live DPI change on <Configure> rescales minsize and sidebar width
+        dpi_scale_holder = {"scale": app._window._last_dpi_scale}
+        monkeypatch.setattr(window_manager, "get_dpi_scale", lambda _w: dpi_scale_holder["scale"])
+        monkeypatch.setattr(
+            "audiobookdl.gui.theme.get_dpi_scale",
+            lambda _w: dpi_scale_holder["scale"],
+        )
+        dpi_scale_holder["scale"] = 1.75
+        app._window.on_root_configure(SimpleNamespace(widget=root))  # type: ignore[arg-type]
+        assert app._window._last_dpi_scale == 1.75
+        assert int(app.shell.sidebar.cget("width")) == round(app.shell.SIDEBAR_WIDTH_DP * 1.75)
+    finally:
+        app._on_close(force=True)
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
+
+@pytest.mark.gui
+def test_aud026_keyboard_shortcuts_tooltips_and_mousewheel_ergonomics(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from tkinter import ttk
+    import requests
+    from audiobookdl.gui import widgets, window_manager
+    from audiobookdl.gui.preview_dialog import PreviewDialog
+    from audiobookdl.utils.audiobook import Audiobook, AudiobookMetadata, Series
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+
+    try:
+        # 1. Global shortcuts: Windows/Linux Ctrl+, case-insensitivity, "break", Text focus guard
+        events: list[str] = []
+        monkeypatch.setattr(window_manager.sys, "platform", "win32")
+        theme_var = tk.StringVar(value="system")
+        window_manager.build_menu_bar(
+            root,
+            theme_var=theme_var,
+            on_browse_url_file=lambda: events.append("open"),
+            on_open_output_folder=lambda: events.append("folder"),
+            on_reload_config=lambda: events.append("reload"),
+            on_exit=lambda: events.append("exit"),
+            on_go_back=lambda: events.append("back"),
+            on_go_forward=lambda: events.append("forward"),
+            on_set_theme=lambda m: events.append(f"theme:{m}"),
+            on_navigate=lambda p: events.append(f"nav:{p}"),
+            on_open_library_tab=lambda t: events.append(f"lib:{t}"),
+            on_check_updates=lambda: events.append("updates"),
+            on_show_about=lambda: events.append("about"),
+            on_preview_metadata=lambda: events.append("preview"),
+            on_start_download=lambda: events.append("start"),
+        )
+        assert root.bind("<Control-o>")
+        assert root.bind("<Control-O>")
+        assert root.bind("<Control-q>")
+        assert root.bind("<Control-Q>")
+        assert root.bind("<F5>")
+
+        # Dispatch shortcut via dummy button vs Text focus guard
+        btn = ttk.Button(root, text="Dummy")
+        btn.pack()
+        root.update_idletasks()
+        monkeypatch.setattr(root, "focus_get", lambda: btn)
+        assert root.tk.call("eval", f"return [bind {root} <Control-o>]") != ""
+        txt = tk.Text(root)
+        txt.pack()
+        monkeypatch.setattr(root, "focus_get", lambda: txt)
+        # macOS Command shortcuts
+        monkeypatch.setattr(window_manager.sys, "platform", "darwin")
+        root2 = tk.Toplevel(root)
+        root2.withdraw()
+        window_manager.build_menu_bar(
+            root2,  # type: ignore[arg-type]
+            theme_var=theme_var,
+            on_browse_url_file=lambda: events.append("mac-open"),
+            on_open_output_folder=lambda: None,
+            on_reload_config=lambda: None,
+            on_exit=lambda: None,
+            on_go_back=lambda: None,
+            on_go_forward=lambda: None,
+            on_set_theme=lambda _m: None,
+            on_navigate=lambda _p: None,
+            on_open_library_tab=lambda _t: None,
+            on_check_updates=lambda: None,
+            on_show_about=lambda: None,
+            on_preview_metadata=lambda: None,
+            on_start_download=lambda: None,
+        )
+        assert root2.bind("<Command-o>")
+        assert root2.bind("<Command-O>")
+        assert root2.bind("<Command-Key-1>")
+        root2.destroy()
+
+        # 2. Tooltip clamping to monitor work area + Escape/MouseWheel dismissal
+        monkeypatch.setattr(
+            widgets,
+            "get_monitor_work_areas",
+            lambda _w: [(0, 0, 800, 600)],
+        )
+        edge_btn = ttk.Button(root, text="Edge")
+        edge_btn.place(x=780, y=580)
+        root.update_idletasks()
+        monkeypatch.setattr(edge_btn, "winfo_ismapped", lambda: True)
+        monkeypatch.setattr(edge_btn, "winfo_rootx", lambda: 790)
+        monkeypatch.setattr(edge_btn, "winfo_rooty", lambda: 590)
+        tip = widgets.Tooltip(edge_btn, "Helpful explanation")
+        tip.show()
+        assert tip._tip_window is not None
+        tip._tip_window.update_idletasks()
+        geom = tip._tip_window.wm_geometry()
+        pos_part = geom.split("+", 1)[1]
+        cx_str, cy_str = pos_part.split("+")
+        assert int(cx_str) + tip._tip_window.winfo_reqwidth() <= 800
+        assert int(cy_str) + tip._tip_window.winfo_reqheight() <= 600
+        assert tip._tip_window.winfo_reqwidth() < 200
+        tip._cancel_and_hide(None)
+        assert tip._tip_window is None
+        assert edge_btn.bind("<Escape>")
+        assert edge_btn.bind("<MouseWheel>")
+
+        # 3. ScrollableFrame: fractional delta accumulation + focused Combobox/Spinbox guard
+        sf = widgets.ScrollableFrame(root)
+        sf.pack(fill=tk.BOTH, expand=True)
+        for i in range(40):
+            ttk.Label(sf.content_frame, text=f"Row {i}").pack()
+        combo = ttk.Combobox(sf.content_frame, values=("A", "B", "C"), state="readonly")
+        combo.pack()
+        sf.update_idletasks()
+        scroll_calls: list[tuple[int, str]] = []
+        monkeypatch.setattr(sf.canvas, "yview", lambda: (0.0, 0.5))
+        monkeypatch.setattr(sf.canvas, "yview_scroll", lambda s, w: scroll_calls.append((int(s), str(w))))
+        monkeypatch.setattr(sf, "winfo_ismapped", lambda: True)
+        monkeypatch.setattr(widgets.sys, "platform", "win32")
+
+        # 4 fractional wheel ticks of -30 = 1 unit on the 4th tick
+        for _ in range(3):
+            sf.on_mousewheel(SimpleNamespace(widget=sf.content_frame, delta=-30, num=None))  # type: ignore[arg-type]
+        assert scroll_calls == []
+        sf.on_mousewheel(SimpleNamespace(widget=sf.content_frame, delta=-30, num=None))  # type: ignore[arg-type]
+        assert scroll_calls == [(1, "units")]
+
+        # Focused Combobox should NOT scroll outer ScrollableFrame
+        scroll_calls.clear()
+        monkeypatch.setattr(combo, "focus_get", lambda: combo)
+        sf.on_mousewheel(SimpleNamespace(widget=combo, delta=-120, num=None))  # type: ignore[arg-type]
+        assert scroll_calls == []
+
+        # 4. PreviewDialog Series filter Escape clears filter without closing, empty overlay shown
+        fake_src = SimpleNamespace(name="librivox", title="Librivox", meta={})
+        sess = requests.Session()
+        series_obj = Series(
+            title="Test Series",
+            books=[
+                Audiobook(
+                    session=sess,
+                    metadata=AudiobookMetadata(title="First Book", authors=["Alice"]),
+                    files=[],
+                    chapters=[],
+                ),
+                Audiobook(
+                    session=sess,
+                    metadata=AudiobookMetadata(title="Second Book", authors=["Bob"]),
+                    files=[],
+                    chapters=[],
+                ),
+            ],
+        )
+        dlg = PreviewDialog(
+            root,
+            "https://librivox.org/series",
+            fake_src,  # type: ignore[arg-type]
+            series_obj,
+            is_running=False,
+            skip_downloaded=False,
+            series_book_exists=lambda _b: False,
+            on_confirm=lambda *_a: None,
+        )
+        assert dlg._scrolled_tree is not None
+        dlg._filter_var.set("NoMatchHere")
+        dlg._apply_filter()
+        assert len(dlg._tree.get_children()) == 0
+        assert dlg._on_escape(None) == "break"
+        assert dlg.winfo_exists()
+        assert dlg._filter_var.get() == ""
+        assert len(dlg._tree.get_children()) == 2
+        dlg.destroy()
+
+        # 5. Full app notebook traversal + shortcut parity checks
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "cfg.toml"))
+        assert root.bind("<Control-Tab>") or root.bind("<Control-Key-Tab>")
+        assert app.download_page.queue_panel.queue_tree.bind("<Shift-F10>")
+        assert app.download_page.queue_panel.queue_tree.bind("<Alt-Up>")
+        assert app.download_page.account_chip_btn.bind("<Shift-F10>")
+        lib_page = app.navigate("library")
+        assert lib_page.archive_tab._tree.bind("<Shift-F10>")
+        assert lib_page.catalog_tab._tree.bind("<Return>")
+        app._on_close(force=True)
+    finally:
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
+
+@pytest.mark.gui
+def test_aud027_confirmations_selection_states_empty_overlays_and_sqlite_sort(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from audiobookdl.gui.chapter_editor import ChapterEditorFrame, _ChapterEditDialog
+    from audiobookdl.gui.cookie_dialog import CookieImportDialog
+    from audiobookdl.gui.pages.archive_metadata_dialog import _ArchiveMetadataDialog
+    from audiobookdl.gui.pages.drm_inspect_dialog import DrmInspectDialog
+    from audiobookdl.gui.pages.sync_tab import SyncTab
+    from audiobookdl.gui.theme import LIGHT_PALETTE
+    from audiobookdl.sources import get_available_services
+    from audiobookdl.utils.archive import DownloadArchive
+    from audiobookdl.utils.audiobook import Chapter
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+
+    try:
+        # 1. SQLite sorting in DownloadArchive & ArchiveTab
+        db_path = str(tmp_path / "archive.sqlite")
+        with DownloadArchive(db_path) as ledger:
+            ledger.record(
+                "librivox",
+                "k1",
+                url="https://example.com/1",
+                title="Zebra Book",
+                author="Bob",
+                output_path=str(tmp_path / "z.m4b"),
+                audio_format="m4b",
+                status="downloaded",
+            )
+            ledger.record(
+                "audible",
+                "k2",
+                url="https://example.com/2",
+                title="Alpha Book",
+                author="Alice",
+                output_path=str(tmp_path / "a.m4b"),
+                audio_format="m4b",
+                status="pending",
+            )
+            asc_titles = [e.title for e in ledger.list_entries(sort_by="title", descending=False)]
+            desc_titles = [e.title for e in ledger.list_entries(sort_by="title", descending=True)]
+            assert asc_titles == ["Alpha Book", "Zebra Book"]
+            assert desc_titles == ["Zebra Book", "Alpha Book"]
+
+        # 2. _ArchiveMetadataDialog Folder... browse button
+        with DownloadArchive(db_path) as ledger:
+            entry = ledger.list_entries(limit=1)[0]
+        meta_dlg = _ArchiveMetadataDialog(root, entry, palette=LIGHT_PALETTE)
+        monkeypatch.setattr(
+            "audiobookdl.gui.pages.archive_metadata_dialog.filedialog.askdirectory",
+            lambda **_kw: str(tmp_path / "folder_book"),
+        )
+        meta_dlg._browse_output_folder()
+        assert meta_dlg._output_path_var.get() == str(tmp_path / "folder_book")
+        meta_dlg.destroy()
+
+        # 3. _ChapterEditDialog dynamic HH:MM:SS.mmm label + ChapterEditorFrame button states & import confirm
+        ch_dlg = _ChapterEditDialog(
+            root, Chapter(start=3_665_000, title="Ch 1"), palette=LIGHT_PALETTE
+        )
+        assert "HH:MM:SS.mmm" in ch_dlg._start_label_var.get()
+        ch_dlg._start_var.set("01:00.000")
+        assert "MM:SS.mmm" in ch_dlg._start_label_var.get()
+        ch_dlg.destroy()
+
+        ed = ChapterEditorFrame(root)
+        assert str(ed._edit_btn.cget("state")) == "disabled"
+        assert str(ed._delete_btn.cget("state")) == "disabled"
+        assert str(ed._merge_btn.cget("state")) == "disabled"
+        assert str(ed._shift_btn.cget("state")) == "disabled"
+        assert str(ed._export_btn.cget("state")) == "disabled"
+        ed.set_chapters([Chapter(0, "One"), Chapter(10_000, "Two")])
+        assert str(ed._shift_btn.cget("state")) == "normal"
+        assert str(ed._export_btn.cget("state")) == "normal"
+        ed.tree.selection_set("0")
+        ed._sync_toolbar_button_states()
+        assert str(ed._edit_btn.cget("state")) == "normal"
+        assert str(ed._merge_btn.cget("state")) == "normal"
+
+        cue_file = tmp_path / "ch.json"
+        cue_file.write_text('[{"start_ms": 0, "title": "Imported"}]', encoding="utf-8")
+        monkeypatch.setattr(
+            "audiobookdl.gui.chapter_editor.filedialog.askopenfilename",
+            lambda **_kw: str(cue_file),
+        )
+        monkeypatch.setattr("audiobookdl.gui.chapter_editor.messagebox.askyesno", lambda *_a, **_kw: False)
+        ed.import_from_file()
+        assert len(ed.get_chapters()) == 2
+        monkeypatch.setattr("audiobookdl.gui.chapter_editor.messagebox.askyesno", lambda *_a, **_kw: True)
+        ed.import_from_file()
+        assert [c.title for c in ed.get_chapters()] == ["Imported"]
+
+        # 4. CookieImportDialog empty states
+        svcs = get_available_services()
+        cookie_dlg = CookieImportDialog(
+            root,
+            svcs,
+            initial_service_key="overdrive",
+            on_apply=lambda *_a: None,
+            extractor=lambda _b, _d: SimpleNamespace(cookies=[], domains=["overdrive.com"]),  # type: ignore[arg-type]
+        )
+        assert cookie_dlg._preview._empty_label.winfo_manager() != ""
+        cookie_dlg.destroy()
+
+        # 5. DrmInspectDialog loading bar visibility
+        drm_dlg = DrmInspectDialog(root)
+        drm_dlg._set_loading_state("test.m4b")
+        assert drm_dlg.loading_bar.winfo_manager() != ""
+        drm_dlg._set_error_state("bad")
+        assert drm_dlg.loading_bar.winfo_manager() == ""
+        drm_dlg.destroy()
+
+        # 6. SyncTab controls + interval limit 1440
+        sync_tab = SyncTab(
+            root,
+            lambda: SimpleNamespace(sources={"librivox": {}}),
+            [s for s in svcs if s.supports_library][:2],
+            on_run_sync=lambda _t, _m: None,
+            on_cancel_sync=lambda: None,
+        )
+        sync_tab.deselect_all_targets()
+        assert sync_tab.selected_targets() == []
+        sync_tab.select_all_targets()
+        assert len(sync_tab.selected_targets()) >= 1
+        sync_tab.set_syncing_state(True)
+        assert str(sync_tab._cancel_btn.cget("state")) == "normal"
+        assert str(sync_tab._sync_now_btn.cget("state")) == "disabled"
+        sync_tab.set_syncing_state(False, status_text="Last sync: Ok")
+        assert str(sync_tab._sync_now_btn.cget("state")) == "normal"
+        assert sync_tab._last_sync_var.get() == "Last sync: Ok"
+        warnings: list[str] = []
+        monkeypatch.setattr(
+            "audiobookdl.gui.pages.sync_tab.messagebox.showwarning",
+            lambda _t, msg, **_kw: warnings.append(msg),
+        )
+        sync_tab.interval_var.set("2000")
+        assert sync_tab._read_schedule() is None
+        assert warnings and "1440" in warnings[-1]
+
+        # 7. Full App pages: PackPage, SettingsPage, AccountsPage, ArchiveTab, QueuePanel, Auth, Catalog
+        app = AudiobookDLApp(root, config_location=str(tmp_path / "app.toml"))
+        qp = app.download_page.queue_panel
+        assert str(qp.queue_remove_btn.cget("state")) == "disabled"
+        assert str(qp.queue_clear_btn.cget("state")) == "disabled"
+
+        # Add one completed and one failed job; verify Clear Completed Only vs Clear Failed confirmation
+        app.controller.queue_records["j_ok"] = {
+            "job_id": "j_ok",
+            "status": "Completed",
+            "service": "Librivox",
+            "url": "https://librivox.org/1",
+            "profile": "default",
+            "detail": "Done",
+        }
+        app.controller.queue_records["j_fail"] = {
+            "job_id": "j_fail",
+            "status": "Failed",
+            "service": "Librivox",
+            "url": "https://librivox.org/2",
+            "profile": "default",
+            "detail": "Err",
+        }
+        qp._queue_order.extend(["j_ok", "j_fail"])
+        for jid in ("j_ok", "j_fail"):
+            rec = app.controller.queue_records[jid]
+            qp.queue_tree.insert("", tk.END, iid=jid, values=qp.format_queue_row_values(rec))
+        qp._refresh_queue_empty_and_badge()
+        assert str(qp.queue_clear_btn.cget("state")) == "normal"
+        assert str(qp.queue_retry_btn.cget("state")) == "normal"
+
+        # Clear Completed Only leaves j_fail without prompting
+        asked: list[str] = []
+        monkeypatch.setattr(
+            "audiobookdl.gui.queue_panel.messagebox.askyesno",
+            lambda _t, msg, **_kw: (asked.append(msg), False)[1],
+        )
+        qp.clear_completed_history(statuses=("Completed",))
+        assert asked == []
+        assert "j_fail" in qp._queue_order and "j_ok" not in qp._queue_order
+        # Clearing failed with user declining leaves j_fail
+        qp.clear_completed_history(statuses=("Failed", "Cancelled", "Interrupted"))
+        assert len(asked) == 1
+        assert "j_fail" in qp._queue_order
+
+        # Drag-reorder restricted to Queued rows
+        assert qp._is_queued_row("j_fail") is False
+        qp._on_queue_drag_start(SimpleNamespace(x=10, y=5))  # type: ignore[arg-type]
+        assert qp._drag_job_id is None
+
+        # PackPage cover validation, button states, multi-line Description, output path refresh
+        pack = app.navigate("pack")
+        assert str(pack._remove_path_btn.cget("state")) == "disabled"
+        assert str(pack._clear_paths_btn.cget("state")) == "disabled"
+        assert str(pack._edit_book_btn.cget("state")) == "disabled"
+        pack.description_var.set("Line 1\nLine 2")
+        assert pack._desc_text.get("1.0", "end-1c") == "Line 1\nLine 2"
+        pack.cover_path_var.set(str(tmp_path / "missing_cover.jpg"))
+        with pytest.raises(ValueError, match="Cover image file not found"):
+            pack._build_overrides()
+
+        # SettingsPage Show token toggle, URL validation, custom provider buttons, Copy Path
+        settings = app.navigate("settings")
+        assert str(settings._token_entry.cget("show")) == "*"
+        settings._show_token_var.set(True)
+        settings._toggle_token_visibility()
+        assert str(settings._token_entry.cget("show")) == ""
+        settings._url_var.set("ftp://bad-scheme")
+        settings._token_var.set("tok123")
+        settings._test_connection()
+        assert "http://" in settings._status_var.get()
+        assert str(settings._custom_edit_btn.cget("state")) == "disabled"
+        settings._copy_config_path()
+        assert root.clipboard_get() == settings._resolved_cfg_path
+
+        # AccountsPage selection button states
+        acct = app.navigate("accounts")
+        acct._tree.selection_set(())
+        acct._sync_selection_buttons()
+        assert str(acct._rename_profile_btn.cget("state")) == "disabled"
+        assert str(acct._delete_profile_btn.cget("state")) == "disabled"
+
+        # CatalogTab & ArchiveTab selection button states
+        lib_page = app.navigate("library")
+        cat = lib_page.catalog_tab
+        assert cat._download_btn is not None
+        assert str(cat._download_btn.cget("state")) == "disabled"
+        assert str(cat._add_selected_btn.cget("state")) == "disabled"
+        arc = lib_page.archive_tab
+        assert str(arc._remove_btn.cget("state")) == "disabled"
+        assert str(arc._edit_meta_btn.cget("state")) == "disabled"
+
+        app._on_close(force=True)
+    finally:
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
+
+def test_aud028_desktop_os_integration_dnd_notifications_and_window_manager(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import ctypes
+    from audiobookdl.gui import dnd, notifications, window_manager
+
+    # 1. notifications.py: 5s NotifyIcon fallback, session AUMID cache, _MEIPASS skip, Linux -i icon
+    notifications._REGISTERED_AUMIDS.clear()
+    monkeypatch.setattr(notifications.sys, "platform", "win32")
+    monkeypatch.setattr(
+        notifications,
+        "_resolve_windows_powershell",
+        lambda: ("C:/pwsh.exe", False),
+    )
+    monkeypatch.setattr(notifications, "ensure_windows_aumid_registered", lambda **_kw: True)
+    recorded_runs: list[tuple[list[str], float]] = []
+    monkeypatch.setattr(
+        notifications.subprocess,
+        "run",
+        lambda cmd, **kw: recorded_runs.append((list(cmd), float(kw["timeout"]))) or SimpleNamespace(returncode=0),
+    )
+    assert notifications._send_windows_toast("T", "M", app_name="audiobook-dl", timeout=2.0) is True
+    assert "Start-Sleep -Milliseconds 5000" in recorded_runs[0][0][-1]
+    assert recorded_runs[0][1] >= 8.0
+
+    # _MEIPASS exclusion for bundled icon
+    mei_dir = tmp_path / "_MEI12345"
+    mei_icon = mei_dir / "icon.ico"
+    mei_dir.mkdir()
+    mei_icon.write_bytes(b"ico")
+    monkeypatch.setattr(notifications.sys, "_MEIPASS", str(mei_dir), raising=False)
+    assert notifications._resolve_bundled_icon_path(str(mei_icon)) is None
+
+    # Linux notify-send -i icon
+    monkeypatch.setattr(notifications.sys, "_MEIPASS", None, raising=False)
+    monkeypatch.setattr(notifications.shutil, "which", lambda name: "/usr/bin/notify-send" if name == "notify-send" else None)
+    linux_cmds: list[list[str]] = []
+    monkeypatch.setattr(
+        notifications.subprocess,
+        "run",
+        lambda cmd, **_kw: linux_cmds.append(list(cmd)) or SimpleNamespace(returncode=0),
+    )
+    assert notifications._send_linux_notification("Done", "Book", app_name="audiobook-dl", timeout=3.0) is True
+    assert "-i" in linux_cmds[0]
+
+    # 2. window_manager.py: Explorer /select,<normpath> single token + AboutDialog owner clipboard
+    popens: list[list[str]] = []
+    target_file = tmp_path / "My Author" / "Book Title.m4b"
+    target_file.parent.mkdir()
+    target_file.write_bytes(b"data")
+    monkeypatch.setattr(window_manager.sys, "platform", "win32")
+    monkeypatch.setattr(window_manager.subprocess, "Popen", lambda argv: popens.append(list(argv)))
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+    root.withdraw()
+    try:
+        window_manager.open_path_in_os(root, str(target_file), reveal_in_folder=True)
+        assert len(popens) == 1
+        assert popens[0][0] == "explorer"
+        assert len(popens[0]) == 2
+        assert popens[0][1].startswith("/select,")
+        assert str(target_file) in popens[0][1]
+
+        about = window_manager.AboutDialog(root, services_count=12)
+        about._copy_info()
+        assert about._copy_btn.cget("text") == "Copied!"
+        about.destroy()
+        assert "Supported services: 12" in root.clipboard_get()
+
+        # Window icon fallback sets _icon_photo via iconphoto
+        wm_root = AudiobookDLApp(root, config_location=str(tmp_path / "wm.toml"))
+        wm_root._window.apply_window_icon()
+        assert getattr(wm_root._window, "_icon_photo", None) is not None
+
+        # 3. dnd.py: SetWindowSubclass + ChangeWindowMessageFilterEx
+        fake_calls: list[str] = []
+
+        class _FakeFn:
+            def __init__(self, name: str, ret: int = 1) -> None:
+                self.name = name
+                self.ret = ret
+                self.argtypes: Any = None
+                self.restype: Any = None
+
+            def __call__(self, *_a: Any) -> int:
+                fake_calls.append(self.name)
+                return self.ret
+
+        fake_user32 = SimpleNamespace(
+            GetAncestor=_FakeFn("GetAncestor", 100),
+            IsWindow=_FakeFn("IsWindow", 1),
+            ChangeWindowMessageFilterEx=_FakeFn("ChangeWindowMessageFilterEx", 1),
+        )
+        fake_shell32 = SimpleNamespace(
+            DragAcceptFiles=_FakeFn("DragAcceptFiles", 0),
+            DragQueryFileW=_FakeFn("DragQueryFileW", 0),
+            DragFinish=_FakeFn("DragFinish", 0),
+        )
+        fake_comctl32 = SimpleNamespace(
+            SetWindowSubclass=_FakeFn("SetWindowSubclass", 1),
+            DefSubclassProc=_FakeFn("DefSubclassProc", 0),
+            RemoveWindowSubclass=_FakeFn("RemoveWindowSubclass", 1),
+        )
+        fake_windll = SimpleNamespace(user32=fake_user32, shell32=fake_shell32, comctl32=fake_comctl32)
+        monkeypatch.setattr(dnd.sys, "platform", "win32")
+        monkeypatch.setattr(ctypes, "windll", fake_windll, raising=False)
+        cleanup = dnd.install_windows_file_drop(root, lambda _paths: None)
+        assert "SetWindowSubclass" in fake_calls
+        assert fake_calls.count("ChangeWindowMessageFilterEx") == 3
+        assert getattr(root, "_win_drop_installed_ok", False) is True
+        cleanup()
+        assert "RemoveWindowSubclass" in fake_calls
+        wm_root._on_close(force=True)
+    finally:
+        try:
+            if root.winfo_exists():
+                root.destroy()
+        except tk.TclError:
+            pass
+
 
 
 

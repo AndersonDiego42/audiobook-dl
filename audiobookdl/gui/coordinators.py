@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import hashlib
 import os
 import re
 import tkinter as tk
@@ -189,7 +190,7 @@ class AutomationCoordinator:
         self._sync_libraries = sync_libraries
 
         self.clipboard_after_id: str | None = None
-        self.last_seen_clipboard: str = ""
+        self._last_clipboard_sig: tuple[int, bytes] | None = None
         self.auto_sync_after_id: str | None = None
         self.auto_sync_enabled: bool = False
         self.auto_sync_minutes: int = 60
@@ -218,14 +219,23 @@ class AutomationCoordinator:
                 pass
             self.clipboard_after_id = None
 
+    @staticmethod
+    def _clipboard_signature(raw: str) -> tuple[int, bytes]:
+        digest = hashlib.blake2b(
+            raw.encode("utf-8", errors="surrogatepass"),
+            digest_size=16,
+        ).digest()
+        return (len(raw), digest)
+
     def apply_clipboard_monitor(self, *, quiet: bool, persist: bool) -> None:
         self.cancel_clipboard()
         enabled = bool(self._is_clipboard_enabled())
         if enabled:
             try:
-                self.last_seen_clipboard = str(self._root.clipboard_get() or "")
+                raw = str(self._root.clipboard_get() or "")
             except tk.TclError:
-                self.last_seen_clipboard = ""
+                raw = ""
+            self._last_clipboard_sig = self._clipboard_signature(raw) if raw else None
             if not quiet:
                 self._set_status("Clipboard URL monitor enabled")
             self.clipboard_after_id = self._root.after(1200, self.poll_clipboard)
@@ -247,16 +257,19 @@ class AutomationCoordinator:
             raw = str(self._root.clipboard_get() or "")
         except tk.TclError:
             raw = ""
-        if raw and raw != self.last_seen_clipboard:
-            self.last_seen_clipboard = raw
-            candidates = [
-                u for u in parse_url_text(raw)
-                if u.lower().startswith(("http://", "https://")) and detect_service_key(u)
-            ]
-            if candidates:
-                added = self._append_urls(candidates)
-                if added:
-                    self._set_status(f"Captured {len(added)} URL(s) from clipboard")
+        if raw:
+            sig = self._clipboard_signature(raw)
+            if sig != self._last_clipboard_sig:
+                self._last_clipboard_sig = sig
+                if len(raw) <= 262144 and ("http://" in raw.lower() or "https://" in raw.lower()):
+                    candidates = [
+                        u for u in parse_url_text(raw)
+                        if u.lower().startswith(("http://", "https://")) and detect_service_key(u)
+                    ]
+                    if candidates:
+                        added = self._append_urls(candidates)
+                        if added:
+                            self._set_status(f"Captured {len(added)} URL(s) from clipboard")
         try:
             if self._root.winfo_exists() and self._is_clipboard_enabled():
                 self.clipboard_after_id = self._root.after(1200, self.poll_clipboard)
@@ -361,8 +374,11 @@ class UrlInputCoordinator:
                     return
             except tk.TclError:
                 return
-            self._win_drop_installed = True
             install_windows_file_drop(self._root, self.on_dropped_paths)
+            self._win_drop_installed = bool(
+                getattr(self._root, "_win_drop_installed_ok", False)
+                or getattr(self._root, "_win_drop_callback", None)
+            )
 
         if self._root.winfo_ismapped():
             _ensure_win_drop()

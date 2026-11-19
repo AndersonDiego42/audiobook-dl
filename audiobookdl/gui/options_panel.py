@@ -8,8 +8,8 @@ from collections.abc import Callable
 
 from audiobookdl.gui.formatting import MEDIA_TYPE_OPTIONS, OUTPUT_FORMATS, OVERWRITE_OPTIONS
 from audiobookdl.gui.pages.drm_inspect_dialog import DrmInspectDialog
-from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette
-from audiobookdl.gui.widgets import attach_tooltip
+from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, scale_px
+from audiobookdl.gui.widgets import attach_tooltip, update_label_wraplength
 from audiobookdl.options_schema import GUI_INTRO_CHAPTER_MODES, OPTIONS_BY_NAME
 from audiobookdl.utils import (
     AUDIO_BITRATE_PRESETS,
@@ -41,7 +41,11 @@ class OptionsPanel(ttk.LabelFrame):
         on_format_selected: Callable[[tk.Event | None], None],
         palette_provider: Callable[[], ThemePalette] | None = None,
     ) -> None:
-        super().__init__(master, text="Options", padding=(8, 4))
+        super().__init__(
+            master,
+            text="Options",
+            padding=(scale_px(master, 8), scale_px(master, 4)),
+        )
         self._vars = vars_owner
         self._on_m4b_toggled = on_m4b_toggled
         self._on_format_selected = on_format_selected
@@ -54,14 +58,44 @@ class OptionsPanel(ttk.LabelFrame):
         self._wire_dependencies()
         self.sync_dependency_states()
         self._validate_inline_fields()
+        self.bind("<Configure>", self._on_options_configure, add="+")
+
+    def _on_options_configure(self, event: tk.Event) -> None:
+        w = int(getattr(event, "width", 0) or self.winfo_width())
+        if w <= 1:
+            return
+        wrap_full = w - scale_px(self, 36)
+        wrap_half = w - scale_px(self, 240)
+        min_full = scale_px(self, 280)
+        min_half = scale_px(self, 180)
+        max_full = scale_px(self, 420)
+        max_half = scale_px(self, 240)
+        update_label_wraplength(
+            self._enrich_providers_hint_label, wrap_full, min_px=min_full, max_px=max_full
+        )
+        update_label_wraplength(
+            self._remove_chars_hint_label, wrap_half, min_px=min_half, max_px=max_half
+        )
+        update_label_wraplength(
+            self._network_defaults_label, wrap_full, min_px=min_full, max_px=max_full
+        )
+        update_label_wraplength(
+            self._validation_label, wrap_full, min_px=min_full, max_px=max_full
+        )
 
     def _build_widgets(self) -> None:
         self.columnconfigure(0, weight=1)
+        p4 = scale_px(self, 4)
+        p6 = scale_px(self, 6)
+        p8 = scale_px(self, 8)
+        p10 = scale_px(self, 10)
 
         self.options_notebook = ttk.Notebook(self)
         self.options_notebook.grid(row=0, column=0, sticky="ew")
+        self.options_notebook.enable_traversal()
 
-        general_tab = ttk.Frame(self.options_notebook, padding=(8, 6))
+        general_tab = ttk.Frame(self.options_notebook, padding=(p8, p6))
+        general_tab.columnconfigure(2, weight=1)
         self.options_notebook.add(general_tab, text="General")
 
         cb_m4b = ttk.Checkbutton(
@@ -70,18 +104,7 @@ class OptionsPanel(ttk.LabelFrame):
             variable=self._vars.m4b_var,
             command=self._on_m4b_toggled,
         )
-        cb_m4b.grid(row=0, column=0, columnspan=2, sticky="w", padx=(0, 12))
-
-        ttk.Label(general_tab, text="Format:").grid(row=0, column=2, sticky="w", padx=(0, 4))
-        format_combo = ttk.Combobox(
-            general_tab,
-            textvariable=self._vars.output_format_var,
-            values=OUTPUT_FORMATS,
-            state="readonly",
-            width=10,
-        )
-        format_combo.grid(row=0, column=3, sticky="w", padx=(0, 12))
-        format_combo.bind("<<ComboboxSelected>>", self._on_format_selected)
+        cb_m4b.grid(row=0, column=0, sticky="w", padx=(0, p10))
 
         cb_combine = ttk.Checkbutton(
             general_tab,
@@ -89,333 +112,342 @@ class OptionsPanel(ttk.LabelFrame):
             variable=self._vars.combine_var,
             command=self._on_combine_clicked,
         )
-        cb_combine.grid(row=0, column=4, sticky="w", padx=(0, 12))
+        cb_combine.grid(row=0, column=1, sticky="w", padx=(0, p10))
 
         cb_skip = ttk.Checkbutton(
             general_tab, text="Skip downloaded", variable=self._vars.skip_downloaded_var
         )
-        cb_skip.grid(row=0, column=5, sticky="w")
+        cb_skip.grid(row=0, column=2, sticky="w")
 
         cb_resume = ttk.Checkbutton(general_tab, text="Resume partial", variable=self._vars.resume_var)
-        cb_resume.grid(row=1, column=0, columnspan=2, sticky="w", padx=(0, 12), pady=(4, 0))
-
-        ttk.Label(general_tab, text="Overwrite:").grid(
-            row=1, column=2, sticky="w", padx=(0, 4), pady=(4, 0)
-        )
-        overwrite_combo = ttk.Combobox(
-            general_tab,
-            textvariable=self._vars.overwrite_var,
-            values=OVERWRITE_OPTIONS,
-            state="readonly",
-            width=12,
-        )
-        overwrite_combo.grid(row=1, column=3, sticky="w", padx=(0, 12), pady=(4, 0))
+        cb_resume.grid(row=1, column=0, sticky="w", padx=(0, p10), pady=(p4, 0))
 
         cb_archive = ttk.Checkbutton(
             general_tab,
             text="Use archive ledger",
             variable=self._vars.download_archive_var,
         )
-        cb_archive.grid(row=1, column=4, sticky="w", padx=(0, 12), pady=(4, 0))
+        cb_archive.grid(row=1, column=1, sticky="w", padx=(0, p10), pady=(p4, 0))
 
         cb_cover_only = ttk.Checkbutton(
             general_tab,
             text="Cover only",
             variable=self._vars.cover_only_var,
         )
-        cb_cover_only.grid(row=1, column=5, sticky="w", pady=(4, 0))
-
-        ttk.Label(general_tab, text="Media:").grid(row=2, column=0, sticky="w", padx=(0, 4), pady=(4, 0))
-        media_combo = ttk.Combobox(
-            general_tab,
-            textvariable=self._vars.media_type_var,
-            values=MEDIA_TYPE_OPTIONS,
-            state="readonly",
-            width=10,
-        )
-        media_combo.grid(row=2, column=1, sticky="w", padx=(0, 12), pady=(4, 0))
-        media_combo.bind("<<ComboboxSelected>>", self._on_media_selected)
-
-        ttk.Label(general_tab, text="Bitrate:").grid(
-            row=2, column=2, sticky="w", padx=(0, 4), pady=(4, 0)
-        )
-        bitrate_values = list(AUDIO_BITRATE_PRESETS)
-        if self._vars.audio_bitrate_var.get() not in bitrate_values:
-            bitrate_values.append(self._vars.audio_bitrate_var.get())
-        bitrate_combo = ttk.Combobox(
-            general_tab,
-            textvariable=self._vars.audio_bitrate_var,
-            values=bitrate_values,
-            state="normal",
-            width=10,
-        )
-        bitrate_combo.grid(row=2, column=3, sticky="w", padx=(0, 12), pady=(4, 0))
-
-        ttk.Label(general_tab, text="Sample rate:").grid(
-            row=2, column=4, sticky="w", padx=(0, 4), pady=(4, 0)
-        )
-        sample_rate_values = list(AUDIO_SAMPLE_RATE_PRESETS)
-        if self._vars.sample_rate_var.get() not in sample_rate_values:
-            sample_rate_values.append(self._vars.sample_rate_var.get())
-        sample_rate_combo = ttk.Combobox(
-            general_tab,
-            textvariable=self._vars.sample_rate_var,
-            values=sample_rate_values,
-            state="normal",
-            width=10,
-        )
-        sample_rate_combo.grid(row=2, column=5, sticky="w", pady=(4, 0))
+        cb_cover_only.grid(row=1, column=2, sticky="w", pady=(p4, 0))
 
         self.notify_cb = ttk.Checkbutton(
             general_tab,
             text="Notify on finish",
             variable=self._vars.notify_on_complete_var,
         )
-        self.notify_cb.grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
-
-        cb_enrich = ttk.Checkbutton(
-            general_tab,
-            text="Enrich metadata",
-            variable=self._vars.enrich_metadata_var,
-        )
-        cb_enrich.grid(row=3, column=2, sticky="w", padx=(0, 12), pady=(4, 0))
-
-        cb_enrich_interactive = ttk.Checkbutton(
-            general_tab,
-            text="Interactive enrich",
-            variable=self._vars.enrich_interactive_var,
-        )
-        cb_enrich_interactive.grid(row=3, column=3, sticky="w", padx=(0, 12), pady=(4, 0))
+        self.notify_cb.grid(row=2, column=0, sticky="w", padx=(0, p10), pady=(p4, 0))
 
         cb_skip_unavailable = ttk.Checkbutton(
             general_tab,
             text="Skip unavailable",
             variable=self._vars.skip_unavailable_var,
         )
-        cb_skip_unavailable.grid(row=3, column=4, sticky="w", padx=(0, 12), pady=(4, 0))
+        cb_skip_unavailable.grid(row=2, column=1, sticky="w", padx=(0, p10), pady=(p4, 0))
 
         cb_debug = ttk.Checkbutton(general_tab, text="Debug logs", variable=self._vars.debug_var)
-        cb_debug.grid(row=3, column=5, sticky="w", pady=(4, 0))
+        cb_debug.grid(row=2, column=2, sticky="w", pady=(p4, 0))
 
-        enrich_row = ttk.Frame(general_tab)
-        enrich_row.grid(row=4, column=0, columnspan=6, sticky="ew", pady=(4, 0))
-        ttk.Label(enrich_row, text="Enrich providers:").pack(side=tk.LEFT, padx=(0, 6))
+        cb_enrich = ttk.Checkbutton(
+            general_tab,
+            text="Enrich metadata",
+            variable=self._vars.enrich_metadata_var,
+        )
+        cb_enrich.grid(row=3, column=0, sticky="w", padx=(0, p10), pady=(p4, 0))
+
+        cb_enrich_interactive = ttk.Checkbutton(
+            general_tab,
+            text="Interactive enrich",
+            variable=self._vars.enrich_interactive_var,
+        )
+        cb_enrich_interactive.grid(row=3, column=1, columnspan=2, sticky="w", pady=(p4, 0))
+
+        fmt_row = ttk.Frame(general_tab)
+        fmt_row.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(p4, 0))
+        ttk.Label(fmt_row, text="Format:").pack(side=tk.LEFT, padx=(0, p4))
+        format_combo = ttk.Combobox(
+            fmt_row,
+            textvariable=self._vars.output_format_var,
+            values=OUTPUT_FORMATS,
+            state="readonly",
+            width=8,
+        )
+        format_combo.pack(side=tk.LEFT, padx=(0, p8))
+        format_combo.bind("<<ComboboxSelected>>", self._on_format_selected)
+
+        ttk.Label(fmt_row, text="Overwrite:").pack(side=tk.LEFT, padx=(0, p4))
+        overwrite_combo = ttk.Combobox(
+            fmt_row,
+            textvariable=self._vars.overwrite_var,
+            values=OVERWRITE_OPTIONS,
+            state="readonly",
+            width=10,
+        )
+        overwrite_combo.pack(side=tk.LEFT, padx=(0, p8))
+
+        ttk.Label(fmt_row, text="Media:").pack(side=tk.LEFT, padx=(0, p4))
+        media_combo = ttk.Combobox(
+            fmt_row,
+            textvariable=self._vars.media_type_var,
+            values=MEDIA_TYPE_OPTIONS,
+            state="readonly",
+            width=8,
+        )
+        media_combo.pack(side=tk.LEFT)
+        media_combo.bind("<<ComboboxSelected>>", self._on_media_selected)
+
+        audio_gen_row = ttk.Frame(general_tab)
+        audio_gen_row.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(p4, 0))
+        ttk.Label(audio_gen_row, text="Bitrate:").pack(side=tk.LEFT, padx=(0, p4))
+        bitrate_values = list(AUDIO_BITRATE_PRESETS)
+        if self._vars.audio_bitrate_var.get() not in bitrate_values:
+            bitrate_values.append(self._vars.audio_bitrate_var.get())
+        bitrate_combo = ttk.Combobox(
+            audio_gen_row,
+            textvariable=self._vars.audio_bitrate_var,
+            values=bitrate_values,
+            state="normal",
+            width=7,
+        )
+        bitrate_combo.pack(side=tk.LEFT, padx=(0, p8))
+
+        ttk.Label(audio_gen_row, text="Sample rate:").pack(side=tk.LEFT, padx=(0, p4))
+        sample_rate_values = list(AUDIO_SAMPLE_RATE_PRESETS)
+        if self._vars.sample_rate_var.get() not in sample_rate_values:
+            sample_rate_values.append(self._vars.sample_rate_var.get())
+        sample_rate_combo = ttk.Combobox(
+            audio_gen_row,
+            textvariable=self._vars.sample_rate_var,
+            values=sample_rate_values,
+            state="normal",
+            width=7,
+        )
+        sample_rate_combo.pack(side=tk.LEFT, padx=(0, p8))
+
+        ttk.Label(audio_gen_row, text="Providers:").pack(side=tk.LEFT, padx=(0, p4))
         enrich_providers_entry = ttk.Entry(
-            enrich_row,
+            audio_gen_row,
             textvariable=self._vars.enrich_providers_var,
-            width=26,
+            width=12,
         )
-        enrich_providers_entry.pack(side=tk.LEFT, padx=(0, 8))
+        enrich_providers_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
         self._enrich_providers_hint_var = tk.StringVar(
-            value="audnexus, itunes, google, openlibrary"
+            value="Providers: audnexus, itunes, google, openlibrary"
         )
-        ttk.Label(
-            enrich_row,
+        self._enrich_providers_hint_label = ttk.Label(
+            general_tab,
             textvariable=self._enrich_providers_hint_var,
             style="Muted.TLabel",
-        ).pack(side=tk.LEFT)
+            wraplength=scale_px(self, 380),
+            justify="left",
+        )
+        self._enrich_providers_hint_label.grid(
+            row=6, column=0, columnspan=3, sticky="w", pady=(scale_px(self, 2), 0)
+        )
 
-        sidecars_tab = ttk.Frame(self.options_notebook, padding=(8, 6))
-        sidecars_tab.columnconfigure(3, weight=1)
+        sidecars_tab = ttk.Frame(self.options_notebook, padding=(p8, p6))
+        sidecars_tab.columnconfigure(2, weight=1)
         self.options_notebook.add(sidecars_tab, text="Chapters & Sidecars")
 
-        chapters_top_row = ttk.Frame(sidecars_tab)
-        chapters_top_row.grid(row=0, column=0, columnspan=4, sticky="ew")
-
         cb_no_chapters = ttk.Checkbutton(
-            chapters_top_row, text="No chapters", variable=self._vars.no_chapters_var
+            sidecars_tab, text="No chapters", variable=self._vars.no_chapters_var
         )
-        cb_no_chapters.pack(side=tk.LEFT, padx=(0, 14))
+        cb_no_chapters.grid(row=0, column=0, sticky="w", padx=(0, p10))
 
         cb_split_chapters = ttk.Checkbutton(
-            chapters_top_row,
+            sidecars_tab,
             text="Split chapters",
             variable=self._vars.split_chapters_var,
             command=self._on_split_chapters_clicked,
         )
-        cb_split_chapters.pack(side=tk.LEFT, padx=(0, 14))
+        cb_split_chapters.grid(row=0, column=1, sticky="w", padx=(0, p10))
 
         cb_silence_chapters = ttk.Checkbutton(
-            chapters_top_row,
+            sidecars_tab,
             text="Silence chapters",
             variable=self._vars.chapters_from_silence_var,
         )
-        cb_silence_chapters.pack(side=tk.LEFT, padx=(0, 14))
+        cb_silence_chapters.grid(row=0, column=2, sticky="w")
 
         cb_override_chapters = ttk.Checkbutton(
-            chapters_top_row,
+            sidecars_tab,
             text="Override chapters",
             variable=self._vars.override_chapters_var,
         )
-        cb_override_chapters.pack(side=tk.LEFT, padx=(0, 14))
-
-        offset_box = ttk.Frame(chapters_top_row)
-        offset_box.pack(side=tk.LEFT)
-        ttk.Label(offset_box, text="Offset (ms):").pack(side=tk.LEFT, padx=(0, 4))
-        chapter_offset_entry = ttk.Entry(
-            offset_box, textvariable=self._vars.chapter_offset_ms_var, width=7
-        )
-        chapter_offset_entry.pack(side=tk.LEFT)
+        cb_override_chapters.grid(row=1, column=0, sticky="w", padx=(0, p10), pady=(p4, 0))
 
         cb_json = ttk.Checkbutton(
-            sidecars_tab, text="Write JSON metadata", variable=self._vars.write_json_var
+            sidecars_tab, text="Write JSON", variable=self._vars.write_json_var
         )
-        cb_json.grid(row=1, column=0, sticky="w", padx=(0, 14), pady=(4, 0))
+        cb_json.grid(row=1, column=1, sticky="w", padx=(0, p10), pady=(p4, 0))
 
         cb_opf = ttk.Checkbutton(sidecars_tab, text="Write OPF", variable=self._vars.write_opf_var)
-        cb_opf.grid(row=1, column=1, sticky="w", padx=(0, 14), pady=(4, 0))
+        cb_opf.grid(row=1, column=2, sticky="w", pady=(p4, 0))
 
         cb_cue = ttk.Checkbutton(sidecars_tab, text="Write CUE", variable=self._vars.write_cue_var)
-        cb_cue.grid(row=1, column=2, sticky="w", padx=(0, 14), pady=(4, 0))
+        cb_cue.grid(row=2, column=0, sticky="w", padx=(0, p10), pady=(p4, 0))
 
         cb_write_cover = ttk.Checkbutton(
             sidecars_tab, text="Write cover", variable=self._vars.write_cover_var
         )
-        cb_write_cover.grid(row=1, column=3, sticky="w", pady=(4, 0))
-
-        cb_abs_meta = ttk.Checkbutton(
-            sidecars_tab, text="Write ABS metadata.json", variable=self._vars.write_abs_metadata_var
-        )
-        cb_abs_meta.grid(row=2, column=0, sticky="w", padx=(0, 14), pady=(4, 0))
-
-        cb_upload_abs = ttk.Checkbutton(
-            sidecars_tab, text="Upload to ABS", variable=self._vars.upload_to_abs_var
-        )
-        cb_upload_abs.grid(row=2, column=1, sticky="w", padx=(0, 14), pady=(4, 0))
+        cb_write_cover.grid(row=2, column=1, sticky="w", padx=(0, p10), pady=(p4, 0))
 
         cb_square_cover = ttk.Checkbutton(
             sidecars_tab, text="Square cover", variable=self._vars.square_cover_var
         )
-        cb_square_cover.grid(row=2, column=2, sticky="w", padx=(0, 14), pady=(4, 0))
+        cb_square_cover.grid(row=2, column=2, sticky="w", pady=(p4, 0))
+
+        cb_abs_meta = ttk.Checkbutton(
+            sidecars_tab, text="Write ABS JSON", variable=self._vars.write_abs_metadata_var
+        )
+        cb_abs_meta.grid(row=3, column=0, sticky="w", padx=(0, p10), pady=(p4, 0))
+
+        cb_upload_abs = ttk.Checkbutton(
+            sidecars_tab, text="Upload to ABS", variable=self._vars.upload_to_abs_var
+        )
+        cb_upload_abs.grid(row=3, column=1, sticky="w", padx=(0, p10), pady=(p4, 0))
 
         max_cover_box = ttk.Frame(sidecars_tab)
-        max_cover_box.grid(row=2, column=3, sticky="w", pady=(4, 0))
-        ttk.Label(max_cover_box, text="Max cover:").pack(side=tk.LEFT, padx=(0, 4))
+        max_cover_box.grid(row=3, column=2, sticky="w", pady=(p4, 0))
+        ttk.Label(max_cover_box, text="Max cover:").pack(side=tk.LEFT, padx=(0, p4))
         max_cover_entry = ttk.Entry(
-            max_cover_box, textvariable=self._vars.max_cover_size_var, width=6
+            max_cover_box, textvariable=self._vars.max_cover_size_var, width=5
         )
         max_cover_entry.pack(side=tk.LEFT)
 
         audio_row = ttk.Frame(sidecars_tab)
-        audio_row.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(4, 0))
+        audio_row.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(p4, 0))
         cb_loudnorm = ttk.Checkbutton(
             audio_row, text="Loudnorm", variable=self._vars.loudnorm_var
         )
-        cb_loudnorm.pack(side=tk.LEFT, padx=(0, 14))
-        cb_mono = ttk.Checkbutton(audio_row, text="Mono audio", variable=self._vars.mono_var)
-        cb_mono.pack(side=tk.LEFT, padx=(0, 14))
-        ttk.Label(audio_row, text="Intro numbering:").pack(side=tk.LEFT, padx=(0, 4))
+        cb_loudnorm.pack(side=tk.LEFT, padx=(0, p8))
+        cb_mono = ttk.Checkbutton(audio_row, text="Mono", variable=self._vars.mono_var)
+        cb_mono.pack(side=tk.LEFT, padx=(0, p8))
+        ttk.Label(audio_row, text="Offset (ms):").pack(side=tk.LEFT, padx=(0, p4))
+        chapter_offset_entry = ttk.Entry(
+            audio_row, textvariable=self._vars.chapter_offset_ms_var, width=5
+        )
+        chapter_offset_entry.pack(side=tk.LEFT, padx=(0, p8))
+        ttk.Label(audio_row, text="Intro:").pack(side=tk.LEFT, padx=(0, p4))
         intro_chapter_combo = ttk.Combobox(
             audio_row,
             textvariable=self._vars.intro_chapter_mode_var,
             values=GUI_INTRO_CHAPTER_MODES,
             state="readonly",
-            width=19,
+            width=15,
         )
         intro_chapter_combo.pack(side=tk.LEFT)
 
         remove_row = ttk.Frame(sidecars_tab)
-        remove_row.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(6, 0))
-        ttk.Label(remove_row, text="Remove chars:").pack(side=tk.LEFT, padx=(0, 6))
-        remove_chars_entry = ttk.Entry(remove_row, textvariable=self._vars.remove_chars_var, width=18)
-        remove_chars_entry.pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Label(
+        remove_row.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(p6, 0))
+        ttk.Label(remove_row, text="Remove chars:").pack(side=tk.LEFT, padx=(0, p6))
+        remove_chars_entry = ttk.Entry(remove_row, textvariable=self._vars.remove_chars_var, width=12)
+        remove_chars_entry.pack(side=tk.LEFT, padx=(0, p8))
+        self._remove_chars_hint_label = ttk.Label(
             remove_row,
             text="Characters stripped from output paths",
             style="Muted.TLabel",
-        ).pack(side=tk.LEFT)
+            wraplength=scale_px(self, 210),
+            justify="left",
+        )
+        self._remove_chars_hint_label.pack(side=tk.LEFT)
 
-        network_tab = ttk.Frame(self.options_notebook, padding=(8, 6))
-        network_tab.columnconfigure(5, weight=1)
+        network_tab = ttk.Frame(self.options_notebook, padding=(p8, p6))
+        network_tab.columnconfigure(1, weight=1)
         self.options_notebook.add(network_tab, text="Network & Performance")
 
-        ttk.Label(network_tab, text="Max workers:").grid(row=0, column=0, sticky="w", padx=(0, 4))
+        net_row0 = ttk.Frame(network_tab)
+        net_row0.grid(row=0, column=0, columnspan=3, sticky="ew")
+        ttk.Label(net_row0, text="Max workers:").pack(side=tk.LEFT, padx=(0, p4))
         max_workers_spin = ttk.Spinbox(
-            network_tab,
+            net_row0,
             from_=1,
             to=20,
             textvariable=self._vars.max_workers_var,
-            width=6,
+            width=4,
         )
-        max_workers_spin.grid(row=0, column=1, sticky="w", padx=(0, 14))
+        max_workers_spin.pack(side=tk.LEFT, padx=(0, p8))
 
-        ttk.Label(network_tab, text="Book delay (s):").grid(row=0, column=2, sticky="w", padx=(0, 4))
+        ttk.Label(net_row0, text="Book delay (s):").pack(side=tk.LEFT, padx=(0, p4))
         book_delay_spin = ttk.Spinbox(
-            network_tab,
+            net_row0,
             from_=0,
             to=3600,
             increment=0.5,
             textvariable=self._vars.book_delay_var,
-            width=7,
+            width=5,
         )
-        book_delay_spin.grid(row=0, column=3, sticky="w", padx=(0, 14))
+        book_delay_spin.pack(side=tk.LEFT, padx=(0, p8))
 
-        ttk.Label(network_tab, text="Timeout (s):").grid(row=0, column=4, sticky="w", padx=(0, 4))
+        ttk.Label(net_row0, text="Timeout (s):").pack(side=tk.LEFT, padx=(0, p4))
         timeout_spin = ttk.Spinbox(
-            network_tab,
+            net_row0,
             from_=1,
             to=3600,
             increment=5,
             textvariable=self._vars.timeout_var,
-            width=7,
+            width=5,
         )
-        timeout_spin.grid(row=0, column=5, sticky="w")
+        timeout_spin.pack(side=tk.LEFT)
 
-        ttk.Label(network_tab, text="Max retries:").grid(
-            row=1, column=0, sticky="w", padx=(0, 4), pady=(6, 0)
-        )
+        net_row1 = ttk.Frame(network_tab)
+        net_row1.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(p6, 0))
+        ttk.Label(net_row1, text="Max retries:").pack(side=tk.LEFT, padx=(0, p4))
         max_retries_spin = ttk.Spinbox(
-            network_tab,
+            net_row1,
             from_=0,
             to=20,
             increment=1,
             textvariable=self._vars.max_retries_var,
-            width=6,
+            width=4,
         )
-        max_retries_spin.grid(row=1, column=1, sticky="w", padx=(0, 14), pady=(6, 0))
+        max_retries_spin.pack(side=tk.LEFT, padx=(0, p8))
 
-        ttk.Label(network_tab, text="Limit rate:").grid(
-            row=1, column=2, sticky="w", padx=(0, 4), pady=(6, 0)
-        )
-        limit_rate_entry = ttk.Entry(network_tab, textvariable=self._vars.limit_rate_var, width=10)
-        limit_rate_entry.grid(row=1, column=3, sticky="w", padx=(0, 14), pady=(6, 0))
+        ttk.Label(net_row1, text="Limit rate:").pack(side=tk.LEFT, padx=(0, p4))
+        limit_rate_entry = ttk.Entry(net_row1, textvariable=self._vars.limit_rate_var, width=7)
+        limit_rate_entry.pack(side=tk.LEFT, padx=(0, p8))
 
-        ttk.Label(network_tab, text="Impersonate:").grid(
-            row=1, column=4, sticky="w", padx=(0, 4), pady=(6, 0)
-        )
+        ttk.Label(net_row1, text="Impersonate:").pack(side=tk.LEFT, padx=(0, p4))
         self._impersonate_combo = ttk.Combobox(
-            network_tab,
+            net_row1,
             textvariable=self._vars.impersonate_var,
             values=("", "chrome", "chrome124", "edge", "safari", "firefox"),
             state="normal",
-            width=10,
+            width=8,
         )
-        self._impersonate_combo.grid(row=1, column=5, sticky="w", pady=(6, 0))
+        self._impersonate_combo.pack(side=tk.LEFT)
 
         ttk.Label(network_tab, text="Proxy URL:").grid(
-            row=2, column=0, sticky="w", padx=(0, 4), pady=(6, 0)
+            row=2, column=0, sticky="w", padx=(0, p4), pady=(p6, 0)
         )
-        proxy_entry = ttk.Entry(network_tab, textvariable=self._vars.proxy_var)
-        proxy_entry.grid(row=2, column=1, columnspan=5, sticky="ew", pady=(6, 0))
+        proxy_entry = ttk.Entry(network_tab, textvariable=self._vars.proxy_var, width=16)
+        proxy_entry.grid(row=2, column=1, columnspan=2, sticky="ew", pady=(p6, 0))
 
         ttk.Label(network_tab, text="Post-exec:").grid(
-            row=3, column=0, sticky="w", padx=(0, 4), pady=(6, 0)
+            row=3, column=0, sticky="w", padx=(0, p4), pady=(p6, 0)
         )
-        post_exec_entry = ttk.Entry(network_tab, textvariable=self._vars.post_exec_var)
-        post_exec_entry.grid(row=3, column=1, columnspan=5, sticky="ew", pady=(6, 0))
+        post_exec_entry = ttk.Entry(network_tab, textvariable=self._vars.post_exec_var, width=16)
+        post_exec_entry.grid(row=3, column=1, columnspan=2, sticky="ew", pady=(p6, 0))
 
         ttk.Label(network_tab, text="Decryption key:").grid(
-            row=4, column=0, sticky="w", padx=(0, 4), pady=(6, 0)
+            row=4, column=0, sticky="w", padx=(0, p4), pady=(p6, 0)
         )
         self._show_decryption_key_var = tk.BooleanVar(value=False)
         decryption_key_entry = ttk.Entry(
             network_tab,
             textvariable=self._vars.decryption_key_var,
             show="*",
+            width=12,
         )
-        decryption_key_entry.grid(row=4, column=1, columnspan=4, sticky="ew", padx=(0, 8), pady=(6, 0))
+        decryption_key_entry.grid(row=4, column=1, sticky="ew", padx=(0, p6), pady=(p6, 0))
         key_actions_frame = ttk.Frame(network_tab)
-        key_actions_frame.grid(row=4, column=5, sticky="w", pady=(6, 0))
+        key_actions_frame.grid(row=4, column=2, sticky="e", pady=(p6, 0))
         show_key_cb = ttk.Checkbutton(
             key_actions_frame,
             text="Show key",
@@ -428,20 +460,25 @@ class OptionsPanel(ttk.LabelFrame):
             text="Inspect...",
             command=self._open_drm_inspector,
         )
-        inspect_drm_btn.pack(side=tk.LEFT, padx=(8, 0))
+        inspect_drm_btn.pack(side=tk.LEFT, padx=(p6, 0))
 
-        ttk.Label(
+        self._network_defaults_label = ttk.Label(
             network_tab,
             text="Defaults: 6 workers, 4 retries (exponential backoff), unlimited bandwidth (e.g. 2M), TLS impersonate via curl_cffi (e.g. chrome)",
             style="Muted.TLabel",
-        ).grid(row=5, column=0, columnspan=6, sticky="w", pady=(4, 0))
+            wraplength=scale_px(self, 380),
+            justify="left",
+        )
+        self._network_defaults_label.grid(row=5, column=0, columnspan=3, sticky="w", pady=(p4, 0))
         self._validation_var = tk.StringVar(value="")
         self._validation_label = ttk.Label(
             self,
             textvariable=self._validation_var,
             style="Error.TLabel",
+            wraplength=scale_px(self, 380),
+            justify="left",
         )
-        self._validation_label.grid(row=1, column=0, sticky="w", padx=(4, 0), pady=(2, 0))
+        self._validation_label.grid(row=1, column=0, sticky="w", padx=(p4, 0), pady=(scale_px(self, 2), 0))
         self._validation_label.grid_remove()
 
         self._cb_m4b = cb_m4b

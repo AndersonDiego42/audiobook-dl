@@ -17,12 +17,21 @@ from audiobookdl.credentials import get_credential_store
 from audiobookdl.gui.auth_panel import ServiceAuthCoordinator, ServiceAuthPanel
 from audiobookdl.gui.controller import GuiController
 from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, make_bold_font, scale_px
-from audiobookdl.gui.widgets import ScrolledTreeview, TreeColumnSpec, tree_item_values
+from audiobookdl.gui.widgets import (
+    ResponsiveMode,
+    ScrolledTreeview,
+    TreeColumnSpec,
+    resolve_responsive_mode,
+    tree_item_values,
+)
 from audiobookdl.sources import ServiceInfo
 
 
 class AccountsPage(ttk.Frame):
     """Manage service authentication credentials, profiles, cookie import, and verification."""
+
+    _BTN_BAR_WIDE_ENTER_DP = 680
+    _BTN_BAR_WIDE_EXIT_DP = 640
 
     _COLUMNS = (
         TreeColumnSpec("service", "Service", width=165, stretch=True),
@@ -40,9 +49,9 @@ class AccountsPage(ttk.Frame):
         services: Sequence[ServiceInfo],
         auth_coordinator: ServiceAuthCoordinator,
         *,
-        on_import_cookies: Callable[..., None] | None = None,
-        on_context_label: Callable[[str], None] | None = None,
-        palette: ThemePalette | None = None,
+        on_import_cookies: Callable[..., None] | None=None,
+        on_context_label: Callable[[str], None] | None=None,
+        palette: ThemePalette | None=None,
     ) -> None:
         super().__init__(parent, padding=scale_px(parent, 12))
         self._controller = controller
@@ -56,15 +65,16 @@ class AccountsPage(ttk.Frame):
         self._is_testing = False
         self._active_test_run_id: int | None = None
         self._verification_cache: dict[tuple[str, str], tuple[str, str]] = {}
+        self._btn_bar_mode: ResponsiveMode = "wide"
         self.bind("<Destroy>", self._on_destroy)
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(2, weight=1)
 
         header = ttk.Frame(self)
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        header.grid(row=0, column=0, sticky="ew", pady=(0, scale_px(self, 8)))
         header.columnconfigure(0, weight=1)
-        ttk.Label(header, text="Accounts & Services", font=make_bold_font(self, 13)).grid(
+        ttk.Label(header, text="Accounts & Services", font=make_bold_font(self, 4)).grid(
             row=0, column=0, sticky="w"
         )
         ttk.Label(
@@ -84,7 +94,11 @@ class AccountsPage(ttk.Frame):
         self._scrolled = ScrolledTreeview(overview_frame, self._COLUMNS, selectmode="browse")
         self._scrolled.grid(row=0, column=0, sticky="nsew")
         self._tree = self._scrolled.tree
+        self._tree.bind("<<TreeviewSelect>>", lambda _e: self._sync_selection_buttons(), add="+")
         self._tree.bind("<Double-1>", lambda _e: self._select_in_form())
+        self._tree.bind("<Return>", lambda _e: self._select_in_form(), add="+")
+        self._tree.bind("<Delete>", lambda _e: self._delete_selected_profile(), add="+")
+        self._tree.bind("<F2>", lambda _e: self._rename_selected_profile(), add="+")
 
         self._status_var = tk.StringVar(value="")
         self._loading_bar = ttk.Progressbar(overview_frame, mode="indeterminate")
@@ -92,40 +106,104 @@ class AccountsPage(ttk.Frame):
         self._loading_bar.grid_remove()
 
         btn_bar = ttk.Frame(overview_frame)
-        btn_bar.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        btn_bar.grid(row=2, column=0, sticky="ew", pady=(scale_px(self, 8), 0))
+        self._btn_bar = btn_bar
         self._test_all_btn = ttk.Button(btn_bar, text="Test All Logins", command=self._test_all_logins)
-        self._test_all_btn.pack(side=tk.LEFT, padx=(0, 6))
         self._cancel_test_btn = ttk.Button(
             btn_bar,
             text="Cancel Test",
             command=self._cancel_test_logins,
             state="disabled",
         )
-        self._cancel_test_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self._left_action_btns: list[ttk.Button] = [
+            self._test_all_btn,
+            self._cancel_test_btn,
+        ]
         if self._on_import_cookies is not None:
-            ttk.Button(btn_bar, text="Import Cookies...", command=self._import_cookies).pack(
-                side=tk.LEFT, padx=(0, 6)
+            self._left_action_btns.append(
+                ttk.Button(btn_bar, text="Import Cookies...", command=self._import_cookies)
             )
-        ttk.Button(btn_bar, text="+ New Profile...", command=self._new_profile).pack(
-            side=tk.LEFT, padx=(0, 6)
+        self._new_profile_btn = ttk.Button(
+            btn_bar, text="+ New Profile...", command=self._new_profile
         )
-        ttk.Button(btn_bar, text="Rename Profile...", command=self._rename_selected_profile).pack(
-            side=tk.LEFT, padx=(0, 6)
+        self._rename_profile_btn = ttk.Button(
+            btn_bar,
+            text="Rename Profile...",
+            command=self._rename_selected_profile,
+            state="disabled",
         )
-        ttk.Button(btn_bar, text="Delete Profile", command=self._delete_selected_profile).pack(
-            side=tk.LEFT, padx=(0, 6)
+        self._delete_profile_btn = ttk.Button(
+            btn_bar,
+            text="Delete Profile",
+            command=self._delete_selected_profile,
+            state="disabled",
         )
-        ttk.Button(btn_bar, text="Edit Selected", command=self._select_in_form).pack(
-            side=tk.LEFT, padx=(0, 6)
+        self._edit_selected_btn = ttk.Button(
+            btn_bar, text="Edit Selected", command=self._select_in_form, state="disabled"
         )
-        ttk.Button(btn_bar, text="Refresh", command=self.refresh).pack(side=tk.RIGHT)
+        self._left_action_btns.extend(
+            [
+                self._new_profile_btn,
+                self._rename_profile_btn,
+                self._delete_profile_btn,
+                self._edit_selected_btn,
+            ]
+        )
+        self._refresh_btn = ttk.Button(btn_bar, text="Refresh", command=self.refresh)
+        self._apply_btn_bar_layout("wide")
+        btn_bar.bind("<Configure>", self._on_btn_bar_configure, add="+")
 
         ttk.Label(overview_frame, textvariable=self._status_var, style="Muted.TLabel").grid(
-            row=3, column=0, sticky="w", pady=(6, 0)
+            row=3, column=0, sticky="w", pady=(scale_px(self, 6), 0)
         )
 
         self.apply_theme(self._palette)
         self.refresh()
+
+    def _on_btn_bar_configure(self, event: tk.Event) -> None:
+        w = int(getattr(event, "width", 0) or self._btn_bar.winfo_width())
+        self.sync_responsive_toolbars(w)
+
+    def sync_responsive_toolbars(self, width: int | None=None) -> None:
+        """Reflow overview action buttons into 2 rows when narrow."""
+        w = int(width if width is not None else self._btn_bar.winfo_width())
+        if w <= 1:
+            return
+        mode = resolve_responsive_mode(
+            self._btn_bar_mode,
+            w,
+            scale_px(self, self._BTN_BAR_WIDE_ENTER_DP),
+            scale_px(self, self._BTN_BAR_WIDE_EXIT_DP),
+        )
+        if mode != self._btn_bar_mode:
+            self._apply_btn_bar_layout(mode)
+
+    def _apply_btn_bar_layout(self, mode: ResponsiveMode) -> None:
+        self._btn_bar_mode = mode
+        for col in range(9):
+            self._btn_bar.columnconfigure(col, weight=0)
+        p4 = scale_px(self, 4)
+        p6 = scale_px(self, 6)
+        btns = self._left_action_btns
+        if mode == "wide":
+            for idx, btn in enumerate(btns):
+                btn.grid(row=0, column=idx, sticky="w", padx=(0, p6), pady=0)
+            self._btn_bar.columnconfigure(len(btns), weight=1)
+            self._refresh_btn.grid(row=0, column=len(btns) + 1, sticky="e", padx=0, pady=0)
+            return
+        split_at = (len(btns) + 1) // 2
+        for idx, btn in enumerate(btns):
+            row = 0 if idx < split_at else 1
+            col = idx if idx < split_at else idx - split_at
+            btn.grid(
+                row=row,
+                column=col,
+                sticky="w",
+                padx=(0, p6),
+                pady=(p4, 0) if row == 1 else 0,
+            )
+        self._btn_bar.columnconfigure(split_at, weight=1)
+        self._refresh_btn.grid(row=1, column=split_at + 1, sticky="e", padx=0, pady=(p4, 0))
 
     def apply_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
@@ -151,6 +229,7 @@ class AccountsPage(ttk.Frame):
             self._tree.see(iid)
         if self._on_context_label is not None:
             self._on_context_label(f"{svc.label} ({prof})")
+        self._sync_selection_buttons()
 
     def on_show(self) -> None:
         """Refresh profile statuses and active service form when Accounts is visited."""
@@ -173,7 +252,7 @@ class AccountsPage(ttk.Frame):
             return "Keyring"
         return "Plaintext" if store.is_secure is False else cls_name
 
-    def invalidate_verification(self, service_key: str, profile: str | None = None) -> None:
+    def invalidate_verification(self, service_key: str, profile: str | None=None) -> None:
         """Clear cached login verification status for `(service_key, profile)` or all of `service_key`."""
         if profile is None:
             to_drop = [k for k in self._verification_cache if k[0] == service_key]
@@ -245,6 +324,14 @@ class AccountsPage(ttk.Frame):
                     tags=(row_tag,) if row_tag else (),
                 )
         self._status_var.set(f"{len(self._rows)} account entries across {len(self._services)} services.")
+        self._sync_selection_buttons()
+
+    def _sync_selection_buttons(self) -> None:
+        has_sel = self._selected_service_profile() is not None
+        state = "normal" if has_sel else "disabled"
+        self._rename_profile_btn.configure(state=state)
+        self._delete_profile_btn.configure(state=state)
+        self._edit_selected_btn.configure(state=state)
 
     def _selected_service_profile(self) -> tuple[str, str] | None:
         sel = self._tree.selection()

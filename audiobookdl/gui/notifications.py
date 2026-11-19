@@ -15,6 +15,7 @@ WINDOWS_APP_USER_MODEL_ID = "jo1gi.audiobook-dl"
 _POWERSHELL_FALLBACK_AUMID = (
     r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe"
 )
+_REGISTERED_AUMIDS: set[tuple[str, str, str | None]] = set()
 
 
 def format_completion_notification(
@@ -78,13 +79,39 @@ def set_windows_process_app_id(aumid: str = WINDOWS_APP_USER_MODEL_ID) -> bool:
     if sys.platform != "win32":
         return False
     try:
-        shell32 = getattr(ctypes, "windll", None)
-        if shell32 is None:
+        windll = getattr(ctypes, "windll", None)
+        if windll is None:
             return False
-        rc = int(shell32.shell32.SetCurrentProcessExplicitAppUserModelID(str(aumid)))
+        fn = getattr(windll.shell32, "SetCurrentProcessExplicitAppUserModelID", None)
+        if fn is None:
+            return False
+        fn.argtypes = [ctypes.c_wchar_p]
+        fn.restype = ctypes.c_long
+        rc = int(fn(str(aumid)))
         return rc >= 0
     except (AttributeError, OSError, ValueError):
         return False
+
+
+def _resolve_bundled_icon_path(icon_path: str | None) -> str | None:
+    """Return an existing absolute icon path, skipping ephemeral PyInstaller `_MEIPASS` paths."""
+    resolved = icon_path
+    if resolved is None:
+        candidate = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "icon.ico")
+        if os.path.isfile(candidate):
+            resolved = candidate
+    if not resolved or not os.path.isfile(resolved):
+        return None
+    abs_icon = os.path.abspath(resolved)
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        try:
+            abs_mei = os.path.abspath(str(meipass))
+            if os.path.commonpath([abs_icon, abs_mei]) == abs_mei:
+                return None
+        except ValueError:
+            pass
+    return abs_icon
 
 
 def ensure_windows_aumid_registered(
@@ -96,6 +123,10 @@ def ensure_windows_aumid_registered(
     """Register per-user HKCU AppUserModelId metadata so Windows toasts show `app_name`."""
     if sys.platform != "win32":
         return False
+    resolved_icon = _resolve_bundled_icon_path(icon_path)
+    cache_key = (str(aumid), str(app_name), resolved_icon)
+    if cache_key in _REGISTERED_AUMIDS:
+        return True
     try:
         import winreg
     except ImportError:
@@ -104,13 +135,9 @@ def ensure_windows_aumid_registered(
     try:
         with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_WRITE) as key:
             winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, str(app_name))
-            resolved_icon = icon_path
-            if resolved_icon is None:
-                candidate = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "icon.ico")
-                if os.path.isfile(candidate):
-                    resolved_icon = candidate
-            if resolved_icon and os.path.isfile(resolved_icon):
-                winreg.SetValueEx(key, "IconUri", 0, winreg.REG_SZ, os.path.abspath(resolved_icon))
+            if resolved_icon:
+                winreg.SetValueEx(key, "IconUri", 0, winreg.REG_SZ, resolved_icon)
+        _REGISTERED_AUMIDS.add(cache_key)
         return True
     except OSError:
         return False
@@ -151,7 +178,7 @@ def _send_windows_toast(title: str, message: str, *, app_name: str, timeout: flo
             "$notify.Visible = $true\n"
             "$notify.ShowBalloonTip(5000, $env:ABDL_NOTIFY_TITLE, $env:ABDL_NOTIFY_MSG, "
             "[System.Windows.Forms.ToolTipIcon]::Info)\n"
-            "Start-Sleep -Milliseconds 200\n"
+            "Start-Sleep -Milliseconds 5000\n"
             "$notify.Dispose()\n"
         )
     env = os.environ.copy()
@@ -159,13 +186,14 @@ def _send_windows_toast(title: str, message: str, *, app_name: str, timeout: flo
     env["ABDL_NOTIFY_MSG"] = message
     env["ABDL_NOTIFY_APP"] = aumid
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    eff_timeout = max(float(timeout), 8.0) if not supports_winrt else float(timeout)
     try:
         completed = subprocess.run(
             [exe, "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", script],
             env=env,
             capture_output=True,
             text=True,
-            timeout=timeout,
+            timeout=eff_timeout,
             creationflags=creation_flags,
             check=False,
         )
@@ -198,9 +226,10 @@ def _send_linux_notification(title: str, message: str, *, app_name: str, timeout
     exe = shutil.which("notify-send")
     if not exe:
         return False
+    icon_arg = _resolve_bundled_icon_path(None) or "audio-x-generic"
     try:
         completed = subprocess.run(
-            [exe, "--app-name", app_name, "--", title, message],
+            [exe, "--app-name", app_name, "-i", icon_arg, "--", title, message],
             capture_output=True,
             text=True,
             timeout=timeout,

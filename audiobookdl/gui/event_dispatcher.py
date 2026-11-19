@@ -43,9 +43,8 @@ from audiobookdl.gui.events import (
 from audiobookdl.gui.preview_dialog import ChoiceDialog
 from audiobookdl.gui.queue_panel import ActivityQueuePanel
 from audiobookdl.gui.theme import ThemePalette
+from audiobookdl.gui.widgets import ask_text_input
 from audiobookdl.pipeline import DownloadSummary
-from audiobookdl.sources.source import Source
-from audiobookdl.utils.audiobook import Result
 from audiobookdl.utils.updater import UpdateInfo
 
 if TYPE_CHECKING:
@@ -70,7 +69,7 @@ class EventDispatcher:
         is_running_provider: Callable[[], bool],
         is_previewing_provider: Callable[[], bool],
         is_syncing_provider: Callable[[], bool],
-        on_preview_done: Callable[[str, tuple[Source, Result] | None, Exception | None], None],
+        on_preview_done: Callable[..., None],
         on_auth_verified: Callable[[str, bool, Exception | None], None],
         on_oauth_connected: Callable[[str, str, str, bool, Exception | None], None] | None = None,
         on_oauth_disconnected: Callable[[str, str, str, bool, Exception | None], None] | None = None,
@@ -331,11 +330,13 @@ class EventDispatcher:
             self.schedule_poll_soon(50)
             try:
                 if isinstance(item, PromptInputEvent):
-                    item.holder["value"] = simpledialog.askstring(
+                    item.holder["value"] = ask_text_input(
+                        self._root,
                         "Authentication Required",
                         f"{item.prompt}:",
                         show="*" if item.hidden else None,
-                        parent=self._root,
+                        palette=self._palette_provider(),
+                        askstring_override=simpledialog.askstring,
                     )
                 elif isinstance(item, PromptConfirmEvent):
                     item.holder["value"] = messagebox.askyesno(
@@ -355,7 +356,14 @@ class EventDispatcher:
                 item.done.set()
                 self._modal_prompt_active = False
         elif isinstance(item, PreviewDoneEvent):
-            self._on_preview_done(item.url, item.prepared, item.error)
+            self._on_preview_done(
+                item.url,
+                item.prepared,
+                item.error,
+                duplicate_checked=item.duplicate_checked,
+                duplicate_warning=item.duplicate_warning,
+                existing_series_indices=item.existing_series_indices,
+            )
         elif isinstance(item, AuthVerifiedEvent):
             self._on_auth_verified(item.service_label, item.ok, item.error)
         elif isinstance(item, AccountsVerificationItemEvent):

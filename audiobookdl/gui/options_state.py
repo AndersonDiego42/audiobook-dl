@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -142,6 +143,15 @@ class OptionsCoordinator:
         self._loaded_post_exec_raw: str | list[str] | None = None
         self._loaded_post_exec_display: str = ""
         self._pending_untrusted_post_exec: str | list[str] | None = None
+        self._trace_suppress_depth: int = 0
+
+    @contextmanager
+    def _suppress_traces(self) -> Iterator[None]:
+        self._trace_suppress_depth += 1
+        try:
+            yield
+        finally:
+            self._trace_suppress_depth = max(0, self._trace_suppress_depth - 1)
 
     def bind_collaborators(
         self,
@@ -224,12 +234,35 @@ class OptionsCoordinator:
         o.metrics_var = tk.StringVar(value="")
         o.ffmpeg_status_var = tk.StringVar(value="")
         self.sync_cached_network_prefs()
-        o.proxy_var.trace_add("write", lambda *_args: self.sync_cached_network_prefs())
-        o.timeout_var.trace_add("write", lambda *_args: self.sync_cached_network_prefs())
+        o.proxy_var.trace_add(
+            "write",
+            lambda *_args: self.sync_cached_network_prefs()
+            if self._trace_suppress_depth == 0
+            else None,
+        )
+        o.timeout_var.trace_add(
+            "write",
+            lambda *_args: self.sync_cached_network_prefs()
+            if self._trace_suppress_depth == 0
+            else None,
+        )
 
     def wire_preview_traces(self) -> None:
         """Attach traces that keep template previews and summary chips updated."""
         o = self._owner
+
+        def _on_template_var(*_args: object) -> None:
+            if self._trace_suppress_depth == 0:
+                self.update_template_preview()
+
+        def _on_preset_sync(*_args: object) -> None:
+            if self._trace_suppress_depth == 0:
+                self.sync_preset_from_template()
+
+        def _on_summary_var(*_args: object) -> None:
+            if self._trace_suppress_depth == 0:
+                self.update_download_summaries()
+
         for var in (
             o.output_dir_var,
             o.template_var,
@@ -241,8 +274,8 @@ class OptionsCoordinator:
             o.split_chapters_var,
             o.intro_chapter_mode_var,
         ):
-            var.trace_add("write", lambda *_args: self.update_template_preview())
-        o.template_var.trace_add("write", lambda *_args: self.sync_preset_from_template())
+            var.trace_add("write", _on_template_var)
+        o.template_var.trace_add("write", _on_preset_sync)
         self.update_template_preview()
 
         for summary_var in (
@@ -258,9 +291,11 @@ class OptionsCoordinator:
             o.template_var,
             o.template_preset_var,
         ):
-            summary_var.trace_add("write", lambda *_args: self.update_download_summaries())
+            summary_var.trace_add("write", _on_summary_var)
 
     def sync_cached_network_prefs(self) -> None:
+        if self._trace_suppress_depth > 0:
+            return
         o = self._owner
         raw_proxy = o.proxy_var.get().strip()
         self.cached_proxy = raw_proxy or None
@@ -298,6 +333,8 @@ class OptionsCoordinator:
             o.template_var.set(tpl)
 
     def sync_preset_from_template(self) -> None:
+        if self._trace_suppress_depth > 0:
+            return
         o = self._owner
         tpl = o.template_var.get().strip()
         target_label = TEMPLATE_TO_PRESET_LABEL.get(tpl, "Custom")
@@ -305,6 +342,8 @@ class OptionsCoordinator:
             o.template_preset_var.set(target_label)
 
     def update_template_preview(self) -> None:
+        if self._trace_suppress_depth > 0:
+            return
         o = self._owner
         folder = o.output_dir_var.get().strip() or default_output_dir()
         tpl = o.template_var.get().strip() or "{title}"
@@ -338,6 +377,8 @@ class OptionsCoordinator:
             o.template_standalone_preview_var.set("")
 
     def update_download_summaries(self, page: DownloadPage | None = None) -> None:
+        if self._trace_suppress_depth > 0:
+            return
         o = self._owner
         if self._shell is not None and self._shell.active_page_id == "accounts":
             svc_lbl = o.service_label_var.get().strip()
@@ -600,71 +641,76 @@ class OptionsCoordinator:
         try:
             previous_post_exec_raw = self._loaded_post_exec_raw
             cfg = self._controller.reload_config()
-            o.output_dir_var.set((cfg.gui.output_dir or "").strip() or default_output_dir())
-            o.template_var.set((cfg.gui.output_template or "").strip() or "{title}")
-            for spec in GUI_OPTION_SPECS:
-                binding = spec.gui
-                if binding is None or not spec.config_key or spec.name == "post_exec":
-                    continue
-                cfg_val = getattr(cfg, spec.config_key, None)
-                getattr(o, binding.var_attr).set(binding.init_value(cfg_val))
-            new_post_exec = _normalize_post_exec_value(cfg.post_exec)
-            self._pending_untrusted_post_exec = None
-            if new_post_exec is None:
-                self._apply_loaded_post_exec(None)
-            elif new_post_exec == previous_post_exec_raw or self.is_post_exec_trusted(new_post_exec):
-                self._apply_loaded_post_exec(new_post_exec)
-            else:
-                if self._confirm_post_exec_dialog(new_post_exec, source_label="reloaded configuration"):
-                    self.trust_post_exec(new_post_exec)
+            with self._suppress_traces():
+                o.output_dir_var.set((cfg.gui.output_dir or "").strip() or default_output_dir())
+                o.template_var.set((cfg.gui.output_template or "").strip() or "{title}")
+                for spec in GUI_OPTION_SPECS:
+                    binding = spec.gui
+                    if binding is None or not spec.config_key or spec.name == "post_exec":
+                        continue
+                    cfg_val = getattr(cfg, spec.config_key, None)
+                    getattr(o, binding.var_attr).set(binding.init_value(cfg_val))
+                new_post_exec = _normalize_post_exec_value(cfg.post_exec)
+                self._pending_untrusted_post_exec = None
+                if new_post_exec is None:
+                    self._apply_loaded_post_exec(None)
+                elif new_post_exec == previous_post_exec_raw or self.is_post_exec_trusted(new_post_exec):
                     self._apply_loaded_post_exec(new_post_exec)
                 else:
-                    self._apply_loaded_post_exec(None)
-                    self._on_log("[WARN] Disabled post_exec command from reloaded configuration.")
-            if cfg.gui.use_download_archive is not None:
-                o.download_archive_var.set(cfg.gui.use_download_archive)
-            if cfg.gui.notify_on_complete is not None:
-                o.notify_on_complete_var.set(cfg.gui.notify_on_complete)
-            if cfg.gui.clipboard_monitor is not None:
-                o.clipboard_monitor_var.set(cfg.gui.clipboard_monitor)
-                self._automation.apply_clipboard_monitor(quiet=True, persist=False)
-            if cfg.gui.minimize_to_tray is not None:
-                o.minimize_to_tray_var.set(cfg.gui.minimize_to_tray)
-            if cfg.gui.queue_concurrency is not None:
-                clamped_qc = self._controller.set_queue_concurrency(cfg.gui.queue_concurrency)
-                if hasattr(o, "queue_concurrency_var"):
-                    o.queue_concurrency_var.set(str(clamped_qc))
-            o.check_updates_var.set(cfg.check_updates is not False)
-            if cfg.gui.auto_sync_enabled is not None:
-                self._automation.auto_sync_enabled = cfg.gui.auto_sync_enabled
-            if cfg.gui.auto_sync_minutes is not None:
-                self._automation.auto_sync_minutes = max(1, cfg.gui.auto_sync_minutes)
-            if cfg.gui.auto_sync_mode in VALID_AUTO_SYNC_MODES:
-                self._automation.auto_sync_mode = cfg.gui.auto_sync_mode
-            if cfg.gui.auto_sync_targets is not None:
-                self._automation.auto_sync_targets = [
-                    split_source_profile_key(t) for t in cfg.gui.auto_sync_targets
-                ]
-            self._automation.configure_auto_sync_timer(
-                self._automation.auto_sync_enabled,
-                self._automation.auto_sync_minutes,
-            )
-            lib_page = self._shell.get_page("library")
-            if lib_page is not None:
-                lib_page.sync_tab.apply_saved_schedule(
-                    enabled=self._automation.auto_sync_enabled,
-                    minutes=self._automation.auto_sync_minutes,
-                    mode=self._automation.auto_sync_mode,
-                    targets=self._automation.auto_sync_targets or None,
+                    if self._confirm_post_exec_dialog(new_post_exec, source_label="reloaded configuration"):
+                        self.trust_post_exec(new_post_exec)
+                        self._apply_loaded_post_exec(new_post_exec)
+                    else:
+                        self._apply_loaded_post_exec(None)
+                        self._on_log("[WARN] Disabled post_exec command from reloaded configuration.")
+                if cfg.gui.use_download_archive is not None:
+                    o.download_archive_var.set(cfg.gui.use_download_archive)
+                if cfg.gui.notify_on_complete is not None:
+                    o.notify_on_complete_var.set(cfg.gui.notify_on_complete)
+                if cfg.gui.clipboard_monitor is not None:
+                    o.clipboard_monitor_var.set(cfg.gui.clipboard_monitor)
+                    self._automation.apply_clipboard_monitor(quiet=True, persist=False)
+                if cfg.gui.minimize_to_tray is not None:
+                    o.minimize_to_tray_var.set(cfg.gui.minimize_to_tray)
+                if cfg.gui.queue_concurrency is not None:
+                    clamped_qc = self._controller.set_queue_concurrency(cfg.gui.queue_concurrency)
+                    if hasattr(o, "queue_concurrency_var"):
+                        o.queue_concurrency_var.set(str(clamped_qc))
+                o.check_updates_var.set(cfg.check_updates is not False)
+                if cfg.gui.auto_sync_enabled is not None:
+                    self._automation.auto_sync_enabled = cfg.gui.auto_sync_enabled
+                if cfg.gui.auto_sync_minutes is not None:
+                    self._automation.auto_sync_minutes = max(1, cfg.gui.auto_sync_minutes)
+                if cfg.gui.auto_sync_mode in VALID_AUTO_SYNC_MODES:
+                    self._automation.auto_sync_mode = cfg.gui.auto_sync_mode
+                if cfg.gui.auto_sync_targets is not None:
+                    self._automation.auto_sync_targets = [
+                        split_source_profile_key(t) for t in cfg.gui.auto_sync_targets
+                    ]
+                self._automation.configure_auto_sync_timer(
+                    self._automation.auto_sync_enabled,
+                    self._automation.auto_sync_minutes,
                 )
-            self._set_theme(cfg.gui.theme or "system")
-            o.m4b_var.set(o.output_format_var.get() == "m4b")
-            self._auth.load_service_into_form()
-            self._auth.update_field_states()
-            self.sync_custom_providers_ui()
-            settings_page = self._shell.get_page("settings")
-            if settings_page is not None:
-                settings_page.on_show()
+                lib_page = self._shell.get_page("library")
+                if lib_page is not None:
+                    lib_page.sync_tab.apply_saved_schedule(
+                        enabled=self._automation.auto_sync_enabled,
+                        minutes=self._automation.auto_sync_minutes,
+                        mode=self._automation.auto_sync_mode,
+                        targets=self._automation.auto_sync_targets or None,
+                    )
+                self._set_theme(cfg.gui.theme or "system")
+                o.m4b_var.set(o.output_format_var.get() == "m4b")
+                self._auth.load_service_into_form()
+                self._auth.update_field_states()
+                self.sync_custom_providers_ui()
+                settings_page = self._shell.get_page("settings")
+                if settings_page is not None:
+                    settings_page.on_show()
+            self.sync_cached_network_prefs()
+            self.sync_preset_from_template()
+            self.update_template_preview()
+            self.update_download_summaries()
             o.status_var.set("Config reloaded")
             self._on_log("Reloaded configuration.")
         except Exception as exc:

@@ -1099,6 +1099,42 @@ class DownloadArchive:
                     matched += 1
         return matched
 
+    @staticmethod
+    def _build_order_by_sql(sort_by: str, descending: bool) -> str:
+        """Build a whitelisted `ORDER BY` SQL clause for `list_entries`."""
+        direction = "DESC" if descending else "ASC"
+        key = (sort_by or "id").strip().lower()
+        if key == "downloaded_at":
+            return f" ORDER BY downloaded_at {direction}, id {direction}"
+        if key == "status":
+            return f" ORDER BY status COLLATE NOCASE {direction}, id DESC"
+        if key == "source":
+            return (
+                f" ORDER BY source COLLATE NOCASE {direction}, "
+                f"profile COLLATE NOCASE {direction}, id DESC"
+            )
+        if key == "title":
+            return f" ORDER BY title COLLATE NOCASE {direction}, id DESC"
+        if key == "author":
+            return f" ORDER BY author COLLATE NOCASE {direction}, title COLLATE NOCASE ASC, id DESC"
+        if key == "series":
+            return (
+                " ORDER BY CASE WHEN series IS NULL OR series = '' THEN 1 ELSE 0 END ASC, "
+                f"series COLLATE NOCASE {direction}, COALESCE(series_order, 0) {direction}, "
+                "title COLLATE NOCASE ASC, id DESC"
+            )
+        if key == "output_path":
+            return (
+                " ORDER BY CASE WHEN output_path IS NULL OR output_path = '' THEN 1 ELSE 0 END ASC, "
+                f"output_path COLLATE NOCASE {direction}, id DESC"
+            )
+        if key == "tags":
+            return (
+                " ORDER BY (SELECT COALESCE(GROUP_CONCAT(tag, ' '), '') FROM item_tags "
+                f"WHERE item_id = downloads.id) COLLATE NOCASE {direction}, id DESC"
+            )
+        return f" ORDER BY id {direction}"
+
     def list_entries(
         self,
         *,
@@ -1108,6 +1144,8 @@ class DownloadArchive:
         include_trashed: bool = False,
         include_hidden: bool = True,
         status: str | None = None,
+        sort_by: str = "id",
+        descending: bool = True,
     ) -> list[ArchiveEntry]:
         """Return library/ledger rows filtered by rich `query`, status, and visibility flags."""
         terms, explicit_hidden_query, where_sql, params, needs_python_filter = self._build_filter_plan(
@@ -1118,12 +1156,13 @@ class DownloadArchive:
         )
         effective_limit = max(1, int(limit))
         effective_offset = max(0, int(offset))
+        order_sql = self._build_order_by_sql(sort_by, descending)
 
         sql = """
             SELECT id, source, book_key, url, title, author, output_path, format, downloaded_at,
                    profile, status, series, series_order, narrator, duration_seconds, isbn, asin, last_seen_at
             FROM downloads
-        """ + where_sql + " ORDER BY id DESC"
+        """ + where_sql + order_sql
         if not needs_python_filter:
             sql += " LIMIT ? OFFSET ?"
             params.extend([effective_limit, effective_offset])

@@ -11,7 +11,11 @@ from typing import Literal
 
 from audiobookdl.exceptions import AudiobookDLException
 from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, make_bold_font, scale_px
-from audiobookdl.gui.widgets import MainThreadCallbackQueue, ModalDialog
+from audiobookdl.gui.widgets import (
+    MainThreadCallbackQueue,
+    ModalDialog,
+    bind_adaptive_wraplength,
+)
 from audiobookdl.utils.drm_inspect import (
     ProtectionReport,
     format_report,
@@ -61,13 +65,13 @@ class DrmInspectDialog(ModalDialog):
         body = ttk.Frame(self, padding=scale_px(self, 12))
         body.pack(fill=tk.BOTH, expand=True)
         body.columnconfigure(1, weight=1)
-        body.rowconfigure(3, weight=1)
+        body.rowconfigure(4, weight=1)
 
         ttk.Label(
             body,
             text="DRM / PSSH Inspector (parse-only; no license acquisition)",
-            font=make_bold_font(self, 10),
-        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+            font=make_bold_font(self, 1),
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, scale_px(self, 8)))
 
         ttk.Label(body, text="File or URL:").grid(
             row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 6)
@@ -84,14 +88,25 @@ class DrmInspectDialog(ModalDialog):
         self.inspect_btn.grid(row=1, column=3, padx=(6, 0), pady=(0, 6))
 
         self.status_var = tk.StringVar(value="Ready.")
-        self.status_label = ttk.Label(body, textvariable=self.status_var, style="Muted.TLabel")
-        self.status_label.grid(row=2, column=0, columnspan=4, sticky="w", pady=(0, 6))
+        self.status_label = ttk.Label(
+            body,
+            textvariable=self.status_var,
+            style="Muted.TLabel",
+            wraplength=scale_px(self, 580),
+            justify="left",
+        )
+        self.status_label.grid(row=2, column=0, columnspan=4, sticky="w", pady=(0, scale_px(self, 6)))
+        bind_adaptive_wraplength(body, self.status_label, margin_dp=24, min_dp=280)
+
+        self.loading_bar = ttk.Progressbar(body, mode="indeterminate")
+        self.loading_bar.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(0, scale_px(self, 6)))
+        self.loading_bar.grid_remove()
 
         self.result_text = ScrolledText(body, wrap="word", height=14, state="disabled")
-        self.result_text.grid(row=3, column=0, columnspan=4, sticky="nsew")
+        self.result_text.grid(row=4, column=0, columnspan=4, sticky="nsew")
 
         btns = ttk.Frame(body)
-        btns.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        btns.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(10, 0))
         self.copy_kids_btn = ttk.Button(
             btns,
             text="Copy KIDs",
@@ -127,9 +142,17 @@ class DrmInspectDialog(ModalDialog):
         self.browse_btn.configure(state=entry_state)
         self.inspect_btn.configure(state=entry_state)
 
+    def _hide_loading_bar(self) -> None:
+        try:
+            self.loading_bar.stop()
+            self.loading_bar.grid_remove()
+        except tk.TclError:
+            pass
+
     def _set_empty_state(self) -> None:
         self._state = "empty"
         self._last_report = None
+        self._hide_loading_bar()
         self.status_label.configure(style="Muted.TLabel")
         self.status_var.set("Ready — enter a local file path or HTTP(S) URL.")
         self.copy_kids_btn.configure(state="disabled")
@@ -142,11 +165,14 @@ class DrmInspectDialog(ModalDialog):
         self.status_var.set(f"Inspecting {target}...")
         self.copy_kids_btn.configure(state="disabled")
         self._set_controls_busy(True)
+        self.loading_bar.grid()
+        self.loading_bar.start(12)
         self._set_result_text("Inspecting target, please wait...")
 
     def _set_error_state(self, message: str) -> None:
         self._state = "error"
         self._last_report = None
+        self._hide_loading_bar()
         self._set_controls_busy(False)
         self.copy_kids_btn.configure(state="disabled")
         self.status_label.configure(style="Error.TLabel")
@@ -156,6 +182,7 @@ class DrmInspectDialog(ModalDialog):
     def _set_success_state(self, report: ProtectionReport) -> None:
         self._state = "success"
         self._last_report = report
+        self._hide_loading_bar()
         self._set_controls_busy(False)
         self.status_label.configure(style="Muted.TLabel")
         kid_count = len(report.key_ids)

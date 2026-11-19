@@ -117,6 +117,9 @@ class PreviewDoneEvent:
     url: str
     prepared: tuple[Any, Any] | None
     error: Exception | None
+    duplicate_checked: bool = False
+    duplicate_warning: str | None = None
+    existing_series_indices: frozenset[int] | None = None
 
 
 @dataclass(frozen=True, slots=True)

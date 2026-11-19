@@ -173,6 +173,7 @@ class CookieImportDialog(ModalDialog):
 
         preview = ScrolledTreeview(body, self._COLUMNS, selectmode="browse", height=9)
         preview.grid(row=5, column=0, columnspan=3, sticky="nsew", pady=(0, 8))
+        self._preview = preview
         self._tree = preview.tree
 
         self._status_label = ttk.Label(
@@ -198,6 +199,9 @@ class CookieImportDialog(ModalDialog):
             style="Accent.TButton",
         )
         self._save_btn.pack(side=tk.RIGHT, padx=(0, 8))
+        self._preview.set_empty_state(
+            True, "Click 'Scan Browser' to preview matching cookies."
+        )
 
         self.finalize_modal(initial_focus=self._scan_btn)
 
@@ -258,11 +262,20 @@ class CookieImportDialog(ModalDialog):
         self._status_var.set(message)
         self._status_label.configure(style=style_name)
 
-    def _clear_preview(self) -> None:
+    def _clear_preview(
+        self,
+        *,
+        empty_text: str | None = "Click 'Scan Browser' to preview matching cookies.",
+    ) -> None:
         self._matched_cookies = []
         for item_id in self._tree.get_children():
             self._tree.delete(item_id)
         self._save_btn.configure(state="disabled")
+        if hasattr(self, "_preview"):
+            if empty_text:
+                self._preview.set_empty_state(True, empty_text)
+            else:
+                self._preview.set_empty_state(False)
 
     def start_scan(self) -> None:
         """Validate domain filters and begin scanning the selected browser asynchronously."""
@@ -278,7 +291,7 @@ class CookieImportDialog(ModalDialog):
 
         browser_key = self._selected_browser_key()
         self._is_scanning = True
-        self._clear_preview()
+        self._clear_preview(empty_text=None)
         self._scan_btn.configure(state="disabled")
         self._service_combo.configure(state="disabled")
         self._browser_combo.configure(state="disabled")
@@ -319,12 +332,14 @@ class CookieImportDialog(ModalDialog):
         self._browser_combo.configure(state="readonly")
 
         if error is not None:
-            self._clear_preview()
+            self._clear_preview(empty_text="Scan failed. Check status above and try again.")
             self._set_status(str(error), "Error.TLabel")
             return
 
         if result is None or not result.cookies:
-            self._clear_preview()
+            self._clear_preview(
+                empty_text="No matching cookies found. Sign in to the service in your browser and scan again."
+            )
             domains_text = ", ".join(result.domains) if result and result.domains else self._domains_var.get()
             self._set_status(
                 f"No cookies matched ({domains_text}). Sign in to the service in {self._browser_var.get()} first or adjust the domains.",
@@ -332,6 +347,7 @@ class CookieImportDialog(ModalDialog):
             )
             return
 
+        self._preview.set_empty_state(False)
         self._matched_cookies = list(result.cookies)
         for item_id in self._tree.get_children():
             self._tree.delete(item_id)

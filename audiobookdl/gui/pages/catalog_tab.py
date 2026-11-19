@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
+import sqlite3
 import sys
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -15,10 +17,15 @@ from audiobookdl.gui.pages.catalog_covers import CatalogCoverLoader
 from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, apply_theme_to_widget_tree, make_bold_font, scale_px
 from audiobookdl.gui.widgets import (
     MainThreadCallbackQueue,
+    ResponsiveMode,
+    ScrollableFrame,
     ScrolledTreeview,
+    Tooltip,
     TreeColumnSpec,
     populate_grouped_tree,
+    resolve_responsive_mode,
     resolve_selected_leaf_iids,
+    update_label_wraplength,
 )
 from audiobookdl.sources import ServiceInfo
 from audiobookdl.sources.source import CatalogBook
@@ -30,6 +37,10 @@ class CatalogTab(ttk.Frame):
     _TREE_WIDTH_GROUPED = 102
     _TREE_WIDTH_FLAT = 84
     _TREE_MINWIDTH = 84
+    _TOP_BAR_WIDE_ENTER_DP = 680
+    _TOP_BAR_WIDE_EXIT_DP = 640
+    _FILTER_BAR_WIDE_ENTER_DP = 680
+    _FILTER_BAR_WIDE_EXIT_DP = 640
     _COLUMNS = (
         TreeColumnSpec("title", "Title", width=250, stretch=True),
         TreeColumnSpec("author", "Author", width=155, stretch=True),
@@ -47,17 +58,19 @@ class CatalogTab(ttk.Frame):
         *,
         on_fetch: Callable[[str, ServiceInfo, str, CatalogTab], None],
         on_add_urls: Callable[[list[str]], None],
-        on_download_urls: Callable[[list[str], str, str], None] | None = None,
-        on_save_to_library: Callable[[str, str, Sequence[CatalogBook]], tuple[int, int]] | None = None,
-        on_sync_libraries: Callable[[str], None] | None = None,
-        profile_resolver: Callable[[str], Sequence[str]] | None = None,
-        status_resolver: Callable[[str, Sequence[CatalogBook]], Sequence[str]] | None = None,
-        cover_fetcher: Callable[[str], bytes | None] | None = None,
-        on_cancel_fetch: Callable[[], object] | None = None,
-        on_manage_account: Callable[[str, str], object] | None = None,
-        config_provider: Callable[[], Config] | None = None,
-        selected_profile: str = "default",
-        palette: ThemePalette | None = None,
+        on_download_urls: Callable[[list[str], str, str], None] | None=None,
+        on_save_to_library: Callable[[str, str, Sequence[CatalogBook]], tuple[int, int]] | None=None,
+        on_sync_libraries: Callable[[str], None] | None=None,
+        profile_resolver: Callable[[str], Sequence[str]] | None=None,
+        status_resolver: Callable[[str, Sequence[CatalogBook]], Sequence[str]] | None=None,
+        cover_fetcher: Callable[[str], bytes | None] | None=None,
+        on_cancel_fetch: Callable[[], object] | None=None,
+        on_manage_account: Callable[[str, str], object] | None=None,
+        config_provider: Callable[[], Config] | None=None,
+        selected_profile: str="default",
+        palette: ThemePalette | None=None,
+        db_executor: ThreadPoolExecutor | None=None,
+        on_library_saved: Callable[[int, int], None] | None=None,
     ) -> None:
         super().__init__(parent, padding=scale_px(parent, 10))
         browseable = [svc for svc in services if svc.supports_search or svc.supports_library]
@@ -71,8 +84,12 @@ class CatalogTab(ttk.Frame):
         self._status_resolver = status_resolver
         self._on_cancel_fetch = on_cancel_fetch
         self._on_manage_account = on_manage_account
+        self._db_executor = db_executor
+        self._on_library_saved = on_library_saved
         self._loaded_books: list[CatalogBook] = []
         self._book_statuses: list[str] = []
+        self._status_token = 0
+        self._saving_to_library = False
         self._visible_count = 0
         self._is_fetching = False
         self._pending_fetch_service_key: str = ""
@@ -91,6 +108,8 @@ class CatalogTab(ttk.Frame):
         )
         self._filter_after_id: str | None = None
         self._details_visible = True
+        self._top_bar_mode: ResponsiveMode = "wide"
+        self._filter_bar_mode: ResponsiveMode = "wide"
         self.bind("<Destroy>", self._on_destroy, add="+")
 
         self.columnconfigure(0, weight=1)
@@ -132,8 +151,9 @@ class CatalogTab(ttk.Frame):
 
     def _build_top_bar(self, browseable: Sequence[ServiceInfo]) -> ttk.Combobox:
         top_bar = ttk.Frame(self)
-        top_bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        ttk.Label(top_bar, text="Service:").pack(side=tk.LEFT, padx=(0, 6))
+        top_bar.grid(row=0, column=0, sticky="ew", pady=(0, scale_px(self, 6)))
+        self._top_bar = top_bar
+        self._svc_label = ttk.Label(top_bar, text="Service:")
         svc_combo = ttk.Combobox(
             top_bar,
             textvariable=self._service_var,
@@ -141,9 +161,9 @@ class CatalogTab(ttk.Frame):
             state="readonly",
             width=18,
         )
-        svc_combo.pack(side=tk.LEFT, padx=(0, 8))
+        self._svc_combo = svc_combo
 
-        ttk.Label(top_bar, text="Profile:").pack(side=tk.LEFT, padx=(0, 4))
+        self._profile_label = ttk.Label(top_bar, text="Profile:")
         self._profile_combo = ttk.Combobox(
             top_bar,
             textvariable=self._profile_var,
@@ -151,7 +171,6 @@ class CatalogTab(ttk.Frame):
             state="readonly",
             width=11,
         )
-        self._profile_combo.pack(side=tk.LEFT, padx=(0, 6))
         self._account_btn: ttk.Button | None = None
         if self._on_manage_account is not None:
             self._account_btn = ttk.Button(
@@ -159,34 +178,31 @@ class CatalogTab(ttk.Frame):
                 text="Account...",
                 command=self._open_selected_account,
             )
-            self._account_btn.pack(side=tk.LEFT, padx=(0, 8))
 
         self._query_entry = ttk.Entry(top_bar, textvariable=self._query_var, width=24)
-        self._query_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
         self._search_btn = ttk.Button(
             top_bar, text="Search", command=lambda: self.run_fetch("search")
         )
-        self._search_btn.pack(side=tk.LEFT, padx=(0, 6))
         self._library_btn = ttk.Button(
             top_bar, text="List Library", command=lambda: self.run_fetch("library")
         )
-        self._library_btn.pack(side=tk.LEFT, padx=(0, 6))
         self._cancel_btn = ttk.Button(
             top_bar, text="Cancel", command=self.cancel_fetch, state="disabled"
         )
-        self._cancel_btn.pack(side=tk.LEFT)
+        self._apply_top_bar_layout("wide")
+        top_bar.bind("<Configure>", self._on_top_bar_configure, add="+")
         return svc_combo
 
     def _build_filter_bar(self) -> None:
         filter_bar = ttk.Frame(self)
-        filter_bar.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        ttk.Label(filter_bar, text="Filter:").pack(side=tk.LEFT, padx=(0, 6))
+        filter_bar.grid(row=1, column=0, sticky="ew", pady=(0, scale_px(self, 8)))
+        self._filter_bar = filter_bar
+        self._filter_label = ttk.Label(filter_bar, text="Filter:")
         self._local_filter_entry = ttk.Entry(
             filter_bar,
             textvariable=self._local_filter_var,
             width=22,
         )
-        self._local_filter_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
         self._clear_filter_btn = ttk.Button(
             filter_bar,
             text="\u00d7",
@@ -194,45 +210,129 @@ class CatalogTab(ttk.Frame):
             command=self._clear_local_filter,
             state="disabled",
         )
-        self._clear_filter_btn.pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Checkbutton(
+        self._group_cb = ttk.Checkbutton(
             filter_bar,
             text="Group Series",
             variable=self._group_var,
             command=self._on_group_toggled,
-        ).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Checkbutton(
+        )
+        self._hide_downloaded_cb = ttk.Checkbutton(
             filter_bar,
             text="Hide Downloaded",
             variable=self._hide_downloaded_var,
             command=self._on_filter_toggled,
-        ).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Checkbutton(
+        )
+        self._has_ebook_cb = ttk.Checkbutton(
             filter_bar,
             text="Has Ebook",
             variable=self._has_ebook_var,
             command=self._on_filter_toggled,
-        ).pack(side=tk.LEFT, padx=(0, 8))
+        )
         self._expand_all_btn = ttk.Button(
             filter_bar,
             text="Expand All",
             command=self.expand_all_groups,
             state="disabled",
         )
-        self._expand_all_btn.pack(side=tk.LEFT, padx=(0, 4))
         self._collapse_all_btn = ttk.Button(
             filter_bar,
             text="Collapse All",
             command=self.collapse_all_groups,
             state="disabled",
         )
-        self._collapse_all_btn.pack(side=tk.LEFT, padx=(0, 8))
         self._details_toggle_btn = ttk.Button(
             filter_bar,
             text="Hide Details",
             command=self._toggle_details_pane,
         )
-        self._details_toggle_btn.pack(side=tk.LEFT)
+        self._apply_filter_bar_layout("wide")
+        filter_bar.bind("<Configure>", self._on_filter_bar_configure, add="+")
+
+    def _on_top_bar_configure(self, event: tk.Event) -> None:
+        w = int(getattr(event, "width", 0) or self._top_bar.winfo_width())
+        self.sync_responsive_toolbars(w)
+
+    def _on_filter_bar_configure(self, event: tk.Event) -> None:
+        w = int(getattr(event, "width", 0) or self._filter_bar.winfo_width())
+        self.sync_responsive_toolbars(w)
+
+    def sync_responsive_toolbars(self, width: int | None=None) -> None:
+        """Reflow catalog top search bar and filter bar for the available width."""
+        w = int(width if width is not None else self.winfo_width())
+        if w <= 1:
+            return
+        top_mode = resolve_responsive_mode(
+            self._top_bar_mode,
+            w,
+            scale_px(self, self._TOP_BAR_WIDE_ENTER_DP),
+            scale_px(self, self._TOP_BAR_WIDE_EXIT_DP),
+        )
+        if top_mode != self._top_bar_mode:
+            self._apply_top_bar_layout(top_mode)
+        filter_mode = resolve_responsive_mode(
+            self._filter_bar_mode,
+            w,
+            scale_px(self, self._FILTER_BAR_WIDE_ENTER_DP),
+            scale_px(self, self._FILTER_BAR_WIDE_EXIT_DP),
+        )
+        if filter_mode != self._filter_bar_mode:
+            self._apply_filter_bar_layout(filter_mode)
+
+    def _apply_top_bar_layout(self, mode: ResponsiveMode) -> None:
+        self._top_bar_mode = mode
+        for col in range(9):
+            self._top_bar.columnconfigure(col, weight=0)
+        p4 = scale_px(self, 4)
+        p6 = scale_px(self, 6)
+        p8 = scale_px(self, 8)
+        self._svc_label.grid(row=0, column=0, sticky="w", padx=(0, p6), pady=0)
+        self._svc_combo.grid(row=0, column=1, sticky="w", padx=(0, p8), pady=0)
+        self._profile_label.grid(row=0, column=2, sticky="w", padx=(0, p4), pady=0)
+        self._profile_combo.grid(row=0, column=3, sticky="w", padx=(0, p6), pady=0)
+        if mode == "wide":
+            col = 4
+            if self._account_btn is not None:
+                self._account_btn.grid(row=0, column=col, sticky="w", padx=(0, p8), pady=0)
+                col += 1
+            self._top_bar.columnconfigure(col, weight=1)
+            self._query_entry.grid(row=0, column=col, columnspan=1, sticky="ew", padx=(0, p8), pady=0)
+            self._search_btn.grid(row=0, column=col + 1, sticky="e", padx=(0, p6), pady=0)
+            self._library_btn.grid(row=0, column=col + 2, sticky="e", padx=(0, p6), pady=0)
+            self._cancel_btn.grid(row=0, column=col + 3, sticky="e", padx=0, pady=0)
+        else:
+            if self._account_btn is not None:
+                self._account_btn.grid(row=0, column=4, sticky="w", padx=0, pady=0)
+            self._top_bar.columnconfigure(1, weight=1)
+            self._query_entry.grid(row=1, column=0, columnspan=4, sticky="ew", padx=(0, p6), pady=(p4, 0))
+            self._search_btn.grid(row=1, column=4, sticky="e", padx=(0, p6), pady=(p4, 0))
+            self._library_btn.grid(row=1, column=5, sticky="e", padx=(0, p6), pady=(p4, 0))
+            self._cancel_btn.grid(row=1, column=6, sticky="e", padx=0, pady=(p4, 0))
+
+    def _apply_filter_bar_layout(self, mode: ResponsiveMode) -> None:
+        self._filter_bar_mode = mode
+        for col in range(9):
+            self._filter_bar.columnconfigure(col, weight=0)
+        p4 = scale_px(self, 4)
+        p6 = scale_px(self, 6)
+        p8 = scale_px(self, 8)
+        self._filter_label.grid(row=0, column=0, sticky="w", padx=(0, p6), pady=0)
+        self._filter_bar.columnconfigure(1, weight=1)
+        self._local_filter_entry.grid(row=0, column=1, columnspan=1, sticky="ew", padx=(0, p4), pady=0)
+        self._clear_filter_btn.grid(row=0, column=2, sticky="w", padx=(0, p8), pady=0)
+        if mode == "wide":
+            self._group_cb.grid(row=0, column=3, sticky="w", padx=(0, p8), pady=0)
+            self._hide_downloaded_cb.grid(row=0, column=4, sticky="w", padx=(0, p8), pady=0)
+            self._has_ebook_cb.grid(row=0, column=5, sticky="w", padx=(0, p8), pady=0)
+            self._expand_all_btn.grid(row=0, column=6, sticky="e", padx=(0, p4), pady=0)
+            self._collapse_all_btn.grid(row=0, column=7, sticky="e", padx=(0, p8), pady=0)
+            self._details_toggle_btn.grid(row=0, column=8, sticky="e", padx=0, pady=0)
+        else:
+            self._expand_all_btn.grid(row=0, column=3, sticky="e", padx=(0, p4), pady=0)
+            self._collapse_all_btn.grid(row=0, column=4, sticky="e", padx=(0, p6), pady=0)
+            self._details_toggle_btn.grid(row=0, column=5, sticky="e", padx=0, pady=0)
+            self._group_cb.grid(row=1, column=0, columnspan=2, sticky="w", padx=(0, p8), pady=(p4, 0))
+            self._hide_downloaded_cb.grid(row=1, column=2, columnspan=2, sticky="w", padx=(0, p8), pady=(p4, 0))
+            self._has_ebook_cb.grid(row=1, column=4, columnspan=2, sticky="w", padx=0, pady=(p4, 0))
 
     def _build_tree_and_details(self) -> None:
         self._split = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
@@ -256,31 +356,42 @@ class CatalogTab(ttk.Frame):
         )
 
         self._details_pane = ttk.LabelFrame(
-            self._split, text="Book Details", padding=scale_px(self, 8)
+            self._split, text="Book Details", padding=scale_px(self, 6)
         )
         self._details_pane.columnconfigure(0, weight=1)
-        self._detail_cover_label = ttk.Label(
-            self._details_pane, text="No Cover", anchor="center"
+        self._details_pane.rowconfigure(0, weight=1)
+        self._details_scroll = ScrollableFrame(
+            self._details_pane,
+            content_padding=(2, 2),
         )
-        self._detail_cover_label.grid(row=0, column=0, pady=(0, 8))
+        self._details_scroll.grid(row=0, column=0, sticky="nsew")
+        details_body = self._details_scroll.content_frame
+        details_body.columnconfigure(0, weight=1)
+
+        self._detail_cover_label = ttk.Label(
+            details_body, text="No Cover", anchor="center"
+        )
+        self._detail_cover_label.grid(row=0, column=0, pady=(0, scale_px(self, 8)))
         self._detail_title_var = tk.StringVar(value="Select a book")
         self._detail_meta_var = tk.StringVar(value="")
-        ttk.Label(
-            self._details_pane,
+        self._detail_title_label = ttk.Label(
+            details_body,
             textvariable=self._detail_title_var,
-            font=make_bold_font(self, 10),
+            font=make_bold_font(self, 1),
             wraplength=scale_px(self, 230),
             justify="left",
-        ).grid(row=1, column=0, sticky="w", pady=(0, 6))
-        ttk.Label(
-            self._details_pane,
+        )
+        self._detail_title_label.grid(row=1, column=0, sticky="w", pady=(0, scale_px(self, 6)))
+        self._detail_meta_label = ttk.Label(
+            details_body,
             textvariable=self._detail_meta_var,
             wraplength=scale_px(self, 230),
             justify="left",
-        ).grid(row=2, column=0, sticky="nw")
+        )
+        self._detail_meta_label.grid(row=2, column=0, sticky="nw")
 
         detail_actions = ttk.Frame(self._details_pane)
-        detail_actions.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        detail_actions.grid(row=1, column=0, sticky="ew", pady=(scale_px(self, 8), 0))
         detail_actions.columnconfigure(0, weight=1)
         detail_actions.columnconfigure(1, weight=1)
         self._detail_download_btn: ttk.Button | None = None
@@ -322,12 +433,23 @@ class CatalogTab(ttk.Frame):
             state="disabled",
         )
         self._detail_copy_url_btn.grid(row=1, column=1, sticky="ew", padx=(3, 0))
+        self._detail_copy_details_btn = ttk.Button(
+            detail_actions,
+            text="Copy Details",
+            command=self._copy_detail_summary,
+            state="disabled",
+        )
+        self._detail_copy_details_btn.grid(
+            row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0)
+        )
 
+        self._details_pane.bind("<Configure>", self._on_details_pane_configure, add="+")
         self._split.add(self._details_pane, weight=1)
 
         self._build_context_menu()
         self._tree.bind("<<TreeviewSelect>>", self._on_tree_selected)
         self._tree.bind("<Double-1>", self._on_tree_double_click)
+        self._tree.bind("<Return>", self._on_tree_return, add="+")
         self._tree.bind("<Button-3>", self._show_context_menu)
         self._tree.bind("<Control-a>", self._select_all_visible)
         self._tree.bind("<Control-A>", self._select_all_visible)
@@ -336,6 +458,23 @@ class CatalogTab(ttk.Frame):
         self._local_filter_entry.bind("<Escape>", self._on_filter_escape)
         if sys.platform == "darwin":
             self._tree.bind("<Button-2>", self._show_context_menu)
+        for seq in ("<Shift-F10>", "<Menu>"):
+            try:
+                self._tree.bind(seq, self._show_context_menu_from_key, add="+")
+            except tk.TclError:
+                pass
+        self._tooltips = [
+            Tooltip(
+                self._query_entry,
+                "Search the selected service catalog by title, author, or narrator (Enter to search)",
+                palette_provider=lambda: self._palette,
+            ),
+            Tooltip(
+                self._local_filter_entry,
+                "Filter loaded catalog rows locally by title, author, or series (Ctrl+F, Esc to clear)",
+                palette_provider=lambda: self._palette,
+            ),
+        ]
 
     def _build_button_bar(self) -> None:
         btn_bar = ttk.Frame(self)
@@ -353,13 +492,18 @@ class CatalogTab(ttk.Frame):
                 btn_bar,
                 text="Download Selected",
                 command=self.download_selected,
+                state="disabled",
                 style="Accent.TButton",
             )
             download_btn.pack(side=tk.RIGHT)
             self._download_btn = download_btn
-        ttk.Button(btn_bar, text="Add Selected to URLs", command=self.add_selected).pack(
-            side=tk.RIGHT, padx=(0, 6)
+        self._add_selected_btn = ttk.Button(
+            btn_bar,
+            text="Add Selected to URLs",
+            command=self.add_selected,
+            state="disabled",
         )
+        self._add_selected_btn.pack(side=tk.RIGHT, padx=(0, 6))
         self._save_lib_btn: ttk.Button | None = None
         if self._on_save_to_library is not None:
             save_lib_btn = ttk.Button(
@@ -385,12 +529,22 @@ class CatalogTab(ttk.Frame):
             row=0, column=0, sticky="w"
         )
 
+    def _on_details_pane_configure(self, event: tk.Event) -> None:
+        w = int(getattr(event, "width", 0) or self._details_pane.winfo_width())
+        if w <= 1:
+            return
+        min_w = scale_px(self, 160)
+        target_w = w - scale_px(self, 32)
+        update_label_wraplength(self._detail_title_label, target_w, min_px=min_w)
+        update_label_wraplength(self._detail_meta_label, target_w, min_px=min_w)
+
     def apply_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
         self._tree.tag_configure("downloaded", foreground=palette.success)
         self._tree.tag_configure("pending", foreground=palette.warning)
         self._tree.tag_configure("hidden", foreground=palette.fg_muted)
         self._tree.tag_configure("trashed", foreground=palette.fg_muted)
+        self._details_scroll.apply_theme(palette)
         self._covers.refresh_placeholder(palette)
         if self._loaded_books:
             self._render_tree()
@@ -435,12 +589,12 @@ class CatalogTab(ttk.Frame):
             self._details_visible = True
             self._details_toggle_btn.configure(text="Hide Details")
 
-    def _focus_local_filter(self, _event: tk.Event | None = None) -> str:
+    def _focus_local_filter(self, _event: tk.Event | None=None) -> str:
         self._local_filter_entry.focus_set()
         self._local_filter_entry.selection_range(0, tk.END)
         return "break"
 
-    def _on_filter_escape(self, _event: tk.Event | None = None) -> str | None:
+    def _on_filter_escape(self, _event: tk.Event | None=None) -> str | None:
         if self._local_filter_var.get():
             self._clear_local_filter()
             return "break"
@@ -513,7 +667,7 @@ class CatalogTab(ttk.Frame):
             self._tree.focus(leaf_iids[0])
             self._on_tree_selected()
 
-    def _select_all_visible(self, _event: tk.Event | None = None) -> str:
+    def _select_all_visible(self, _event: tk.Event | None=None) -> str:
         self.select_all_visible()
         return "break"
 
@@ -723,7 +877,7 @@ class CatalogTab(ttk.Frame):
         if self._save_lib_btn is not None:
             self._save_lib_btn.configure(state="normal" if self._loaded_books else "disabled")
 
-    def set_error_status(self, message: str = "Error loading items") -> None:
+    def set_error_status(self, message: str="Error loading items") -> None:
         self._stop_loading()
         self.sync_buttons()
         self._status_var.set(message)
@@ -834,13 +988,14 @@ class CatalogTab(ttk.Frame):
         self,
         books: Sequence[CatalogBook],
         *,
-        statuses: Sequence[str] | None = None,
+        statuses: Sequence[str] | None=None,
     ) -> None:
         self._stop_loading()
         if self._pending_fetch_service_key:
             self._loaded_service_key = self._pending_fetch_service_key
             self._loaded_profile = self._pending_fetch_profile
         self._covers.cover_fetch_token += 1
+        self._status_token += 1
         token = self._covers.cover_fetch_token
         self._loaded_books = list(books)
         if statuses is not None:
@@ -848,6 +1003,9 @@ class CatalogTab(ttk.Frame):
             if len(resolved) < len(self._loaded_books):
                 resolved.extend([""] * (len(self._loaded_books) - len(resolved)))
             self._book_statuses = [str(s or "") for s in resolved[: len(self._loaded_books)]]
+        elif self._db_executor is not None and self._status_resolver is not None and self._loaded_books:
+            self._book_statuses = [""] * len(self._loaded_books)
+            self.refresh_statuses()
         else:
             self._refresh_statuses()
         visible_count = self._render_tree()
@@ -859,14 +1017,64 @@ class CatalogTab(ttk.Frame):
         self._update_details_pane()
         self._covers.start_thumbnail_loading(self._loaded_books, token, self._on_cover_bytes_ready)
 
+    def _apply_resolved_statuses(self, resolved: Sequence[str]) -> None:
+        normalized = list(resolved)
+        if len(normalized) < len(self._loaded_books):
+            normalized.extend([""] * (len(self._loaded_books) - len(normalized)))
+        self._book_statuses = [str(s or "") for s in normalized[: len(self._loaded_books)]]
+        visible_count = self._render_tree()
+        self._update_count_status(visible_count)
+        self._update_details_pane()
+
+    def _on_statuses_loaded(
+        self,
+        token: int,
+        books_snapshot: list[CatalogBook],
+        resolved: list[str],
+    ) -> None:
+        if (
+            not self.winfo_exists()
+            or token != self._status_token
+            or books_snapshot != self._loaded_books
+        ):
+            return
+        self._apply_resolved_statuses(resolved)
+
     def refresh_statuses(self) -> None:
         """Re-query library statuses for loaded books and refresh the tree."""
         if not self._loaded_books:
             return
-        self._refresh_statuses()
-        visible_count = self._render_tree()
-        self._update_count_status(visible_count)
-        self._update_details_pane()
+        if self._db_executor is None or self._status_resolver is None:
+            self._refresh_statuses()
+            visible_count = self._render_tree()
+            self._update_count_status(visible_count)
+            self._update_details_pane()
+            return
+        self._status_token += 1
+        token = self._status_token
+        service_key, _profile = self._active_service_and_profile()
+        books_snapshot = list(self._loaded_books)
+        resolver = self._status_resolver
+        self._cb_queue.begin_task()
+
+        def _worker() -> None:
+            try:
+                resolved = list(resolver(service_key, books_snapshot))
+            except sqlite3.Error:
+                return
+            except Exception:
+                return
+            else:
+                self._cb_queue.post(
+                    lambda: self._on_statuses_loaded(token, books_snapshot, resolved)
+                )
+            finally:
+                self._cb_queue.finish_worker()
+
+        try:
+            self._db_executor.submit(_worker)
+        except RuntimeError:
+            self._cb_queue.finish_worker()
 
     def _selected_book_indices(self) -> list[int]:
         chosen: list[int] = []
@@ -891,9 +1099,12 @@ class CatalogTab(ttk.Frame):
                 urls.append(url)
         return urls
 
-    def _on_tree_selected(self, _event: tk.Event | None = None) -> None:
+    def _on_tree_selected(self, _event: tk.Event | None=None) -> None:
         self._update_details_pane()
-        if self._loaded_books:
+        if self._loaded_books and (
+            self._tree.selection()
+            or not self._status_var.get().startswith("Saved to Library DB:")
+        ):
             self._update_count_status(self._visible_count)
 
     def _set_detail_buttons_state(self, *, has_books: bool, has_http_url: bool) -> None:
@@ -902,7 +1113,24 @@ class CatalogTab(ttk.Frame):
             self._detail_download_btn.configure(state=state_books)
         self._detail_add_btn.configure(state=state_books)
         self._detail_copy_url_btn.configure(state=state_books)
+        if hasattr(self, "_detail_copy_details_btn"):
+            self._detail_copy_details_btn.configure(state=state_books)
         self._detail_open_url_btn.configure(state="normal" if has_http_url else "disabled")
+        if getattr(self, "_download_btn", None) is not None:
+            assert self._download_btn is not None
+            self._download_btn.configure(state=state_books)
+        if hasattr(self, "_add_selected_btn"):
+            self._add_selected_btn.configure(state=state_books)
+
+    def _copy_detail_summary(self) -> None:
+        title = self._detail_title_var.get().strip()
+        meta = self._detail_meta_var.get().strip()
+        text = "\n\n".join(part for part in (title, meta) if part)
+        if not text or title == "Select a book":
+            return
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self._status_var.set("Copied catalog book details to clipboard.")
 
     def _update_details_pane(self) -> None:
         self._covers.detail_token += 1
@@ -1012,7 +1240,7 @@ class CatalogTab(ttk.Frame):
         cover_url: str,
         png_bytes: bytes | None,
         *,
-        cache_result: bool = False,
+        cache_result: bool=False,
     ) -> None:
         if not self.winfo_exists() or token != self._covers.detail_token:
             return
@@ -1077,12 +1305,30 @@ class CatalogTab(ttk.Frame):
         has_text = bool(self._local_filter_var.get().strip())
         self._clear_filter_btn.configure(state="normal" if has_text else "disabled")
 
+    def _show_context_menu_from_key(self, _event: tk.Event | None=None) -> str:
+        sel = self._tree.selection()
+        focus_iid = self._tree.focus() or (sel[0] if sel else "")
+        try:
+            bbox = self._tree.bbox(focus_iid) if focus_iid else None
+            if bbox and len(bbox) == 4:
+                x_root = self._tree.winfo_rootx() + bbox[0] + 16
+                y_root = self._tree.winfo_rooty() + bbox[1] + bbox[3]
+            else:
+                x_root = self._tree.winfo_rootx() + 16
+                y_root = self._tree.winfo_rooty() + 16
+        except tk.TclError:
+            return "break"
+        return self._popup_context_menu_at(x_root, y_root)
+
     def _show_context_menu(self, event: tk.Event) -> str:
         row_iid = self._tree.identify_row(event.y)
         if row_iid:
             if row_iid not in self._tree.selection():
                 self._tree.selection_set(row_iid)
             self._tree.focus(row_iid)
+        return self._popup_context_menu_at(event.x_root, event.y_root)
+
+    def _popup_context_menu_at(self, x_root: int, y_root: int) -> str:
         selected_books = self._selected_books()
         has_urls = bool(self._selected_urls())
         has_http = any(
@@ -1117,9 +1363,19 @@ class CatalogTab(ttk.Frame):
         menu.entryconfigure("Copy URL(s)", state="normal" if has_urls else "disabled")
         menu.entryconfigure("Open URL in Browser", state="normal" if has_http else "disabled")
         try:
-            menu.tk_popup(event.x_root, event.y_root)
+            menu.tk_popup(x_root, y_root)
         finally:
             menu.grab_release()
+        return "break"
+
+    def _on_tree_return(self, _event: tk.Event | None=None) -> str:
+        urls = self._selected_urls()
+        if not urls:
+            return "break"
+        if self._on_download_urls is not None:
+            self.download_selected()
+        else:
+            self.add_selected()
         return "break"
 
     def _on_tree_double_click(self, event: tk.Event) -> None:
@@ -1146,8 +1402,50 @@ class CatalogTab(ttk.Frame):
         else:
             self.add_selected()
 
+    def _on_library_save_error(self, err_exc: Exception) -> None:
+        if not self.winfo_exists():
+            return
+        self._saving_to_library = False
+        if self._save_lib_btn is not None:
+            self._save_lib_btn.configure(
+                state="normal" if (self._loaded_books and not self._is_fetching) else "disabled"
+            )
+        self._status_var.set(f"Library DB error: {err_exc}")
+
+    def _on_library_save_done(
+        self,
+        token: int,
+        books_snapshot: list[CatalogBook],
+        inserted: int,
+        updated: int,
+        resolved: list[str] | None,
+    ) -> None:
+        if not self.winfo_exists():
+            return
+        self._saving_to_library = False
+        if self._save_lib_btn is not None:
+            self._save_lib_btn.configure(
+                state="normal" if (self._loaded_books and not self._is_fetching) else "disabled"
+            )
+        if (
+            resolved is not None
+            and token == self._status_token
+            and books_snapshot == self._loaded_books
+        ):
+            self._apply_resolved_statuses(resolved)
+        self._status_var.set(
+            f"Saved to Library DB: +{inserted} new, {updated} updated."
+        )
+        if self._on_library_saved is not None:
+            self._on_library_saved(inserted, updated)
+
     def save_to_library(self) -> None:
-        if self._on_save_to_library is None or not self._loaded_books or self._is_fetching:
+        if (
+            self._on_save_to_library is None
+            or not self._loaded_books
+            or self._is_fetching
+            or self._saving_to_library
+        ):
             return
         service_key, profile = self._active_service_and_profile()
         chosen = self._selected_books()
@@ -1161,11 +1459,52 @@ class CatalogTab(ttk.Frame):
             chosen = list(self._loaded_books)
         if not chosen or not service_key:
             return
-        inserted, updated = self._on_save_to_library(service_key, profile, chosen)
-        self._refresh_statuses()
-        self._visible_count = self._render_tree()
-        self._update_details_pane()
-        self._status_var.set(f"Saved to Library DB: +{inserted} new, {updated} updated.")
+        if self._db_executor is None:
+            inserted, updated = self._on_save_to_library(service_key, profile, chosen)
+            self._refresh_statuses()
+            self._visible_count = self._render_tree()
+            self._update_details_pane()
+            self._status_var.set(f"Saved to Library DB: +{inserted} new, {updated} updated.")
+            if self._on_library_saved is not None:
+                self._on_library_saved(inserted, updated)
+            return
+
+        self._saving_to_library = True
+        if self._save_lib_btn is not None:
+            self._save_lib_btn.configure(state="disabled")
+        self._status_var.set(f"Saving {len(chosen)} book(s) to Library DB...")
+        self._status_token += 1
+        token = self._status_token
+        books_snapshot = list(self._loaded_books)
+        save_fn = self._on_save_to_library
+        resolver = self._status_resolver
+        self._cb_queue.begin_task()
+
+        def _worker() -> None:
+            try:
+                inserted, updated = save_fn(service_key, profile, chosen)
+                resolved: list[str] | None = (
+                    list(resolver(service_key, books_snapshot))
+                    if resolver is not None
+                    else None
+                )
+            except Exception as exc:
+                err_exc = exc
+                self._cb_queue.post(lambda: self._on_library_save_error(err_exc))
+            else:
+                self._cb_queue.post(
+                    lambda: self._on_library_save_done(
+                        token, books_snapshot, inserted, updated, resolved
+                    )
+                )
+            finally:
+                self._cb_queue.finish_worker()
+
+        try:
+            self._db_executor.submit(_worker)
+        except RuntimeError:
+            self._saving_to_library = False
+            self._cb_queue.finish_worker()
 
     def _trigger_sync(self) -> None:
         if self._on_sync_libraries is None:

@@ -7,8 +7,10 @@ import importlib.resources
 import os
 import subprocess
 import sys
+import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
+from typing import Any
 
 from audiobookdl import __version__
 from audiobookdl.config import is_portable_mode
@@ -25,9 +27,11 @@ from audiobookdl.gui.theme import (
     THEME_LABELS,
     THEME_MODES,
     ThemePalette,
+    _configure_clam_palette,
     apply_theme,
-    apply_theme_to_window,
+    configure_hidpi_scaling,
     detect_system_theme,
+    get_dpi_scale,
     make_bold_font,
     normalize_theme_mode,
     scale_px,
@@ -59,8 +63,8 @@ class AboutDialog(ModalDialog):
         ttk.Label(
             body,
             text=f"audiobook-dl  v{__version__}{mode_suffix}",
-            font=make_bold_font(self, 12),
-        ).pack(anchor="w", pady=(0, 6))
+            font=make_bold_font(self, 3),
+        ).pack(anchor="w", pady=(0, scale_px(self, 6)))
 
         self._info_text = (
             f"audiobook-dl v{__version__}{mode_suffix}\n"
@@ -71,18 +75,50 @@ class AboutDialog(ModalDialog):
             body,
             text=f"Supported services: {services_count}\nhttps://github.com/jo1gi/audiobook-dl",
             justify="left",
-        ).pack(anchor="w", pady=(0, 12))
+        ).pack(anchor="w", pady=(0, scale_px(self, 12)))
 
         btns = ttk.Frame(body)
         btns.pack(fill=tk.X)
-        ttk.Button(btns, text="Copy Info", command=self._copy_info).pack(side=tk.LEFT)
+        self._copy_after_id: str | None = None
+        self._copy_btn = ttk.Button(btns, text="Copy Info", command=self._copy_info)
+        self._copy_btn.pack(side=tk.LEFT)
         close_btn = ttk.Button(btns, text="Close", command=self.destroy, style="Accent.TButton")
         close_btn.pack(side=tk.RIGHT)
         self.finalize_modal(initial_focus=close_btn)
 
     def _copy_info(self) -> None:
-        self.clipboard_clear()
-        self.clipboard_append(self._info_text)
+        target: tk.Misc = self._owner if getattr(self._owner, "winfo_exists", lambda: False)() else self
+        target.clipboard_clear()
+        target.clipboard_append(self._info_text)
+        target.update_idletasks()
+        if self._copy_after_id is not None:
+            try:
+                self.after_cancel(self._copy_after_id)
+            except tk.TclError:
+                pass
+            self._copy_after_id = None
+        self._copy_btn.configure(text="Copied!")
+
+        def _restore() -> None:
+            self._copy_after_id = None
+            try:
+                if self.winfo_exists():
+                    self._copy_btn.configure(text="Copy Info")
+            except tk.TclError:
+                pass
+
+        self._copy_after_id = self.after(1500, _restore)
+
+
+def _spawn_detached_posix(argv: list[str]) -> None:
+    """Launch a detached POSIX child process and reap it on exit to prevent zombies."""
+    proc = subprocess.Popen(argv)
+    if proc is not None and hasattr(proc, "wait"):
+        threading.Thread(
+            target=proc.wait,
+            daemon=True,
+            name="audiobook-dl-os-reaper",
+        ).start()
 
 
 def open_path_in_os(parent: tk.Misc, target_path: str, reveal_in_folder: bool = False) -> None:
@@ -98,11 +134,12 @@ def open_path_in_os(parent: tk.Misc, target_path: str, reveal_in_folder: bool = 
     try:
         if reveal_in_folder and os.path.isfile(cleaned):
             if sys.platform.startswith("win"):
-                subprocess.Popen(["explorer", "/select,", os.path.abspath(cleaned)])
+                norm_path = os.path.normpath(os.path.abspath(cleaned))
+                subprocess.Popen(["explorer", f"/select,{norm_path}"])
             elif sys.platform == "darwin":
-                subprocess.Popen(["open", "-R", cleaned])
+                _spawn_detached_posix(["open", "-R", cleaned])
             else:
-                subprocess.Popen(["xdg-open", os.path.dirname(os.path.abspath(cleaned)) or "."])
+                _spawn_detached_posix(["xdg-open", os.path.dirname(os.path.abspath(cleaned)) or "."])
             return
         open_target = (
             os.path.dirname(os.path.abspath(cleaned)) or "."
@@ -113,9 +150,9 @@ def open_path_in_os(parent: tk.Misc, target_path: str, reveal_in_folder: bool = 
         if sys.platform.startswith("win") and startfile is not None:
             startfile(open_target)
         elif sys.platform == "darwin":
-            subprocess.Popen(["open", open_target])
+            _spawn_detached_posix(["open", open_target])
         else:
-            subprocess.Popen(["xdg-open", open_target])
+            _spawn_detached_posix(["xdg-open", open_target])
     except OSError as exc:
         messagebox.showerror(
             "Open Path Failed",
@@ -143,15 +180,19 @@ def build_menu_bar(
     on_start_download: Callable[[], None],
 ) -> None:
     """Attach the application menu bar and root keyboard shortcuts."""
+    is_macos = sys.platform == "darwin"
+    accel_mod = "Cmd" if is_macos else "Ctrl"
+    bind_mod = "Command" if is_macos else "Control"
+
     menubar = tk.Menu(root, tearoff=0)
     file_menu = tk.Menu(menubar, tearoff=0)
     file_menu.add_command(
-        label="Load URLs from .txt...", command=on_browse_url_file, accelerator="Ctrl+O"
+        label="Load URLs from .txt...", command=on_browse_url_file, accelerator=f"{accel_mod}+O"
     )
     file_menu.add_command(label="Open Output Folder", command=on_open_output_folder)
     file_menu.add_command(label="Reload Config", command=on_reload_config)
     file_menu.add_separator()
-    file_menu.add_command(label="Exit", command=on_exit, accelerator="Ctrl+Q")
+    file_menu.add_command(label="Exit", command=on_exit, accelerator=f"{accel_mod}+Q")
     menubar.add_cascade(label="File", menu=file_menu)
 
     view_menu = tk.Menu(menubar, tearoff=0)
@@ -177,10 +218,13 @@ def build_menu_bar(
         def _make_nav_cb(page_id: str = spec.page_id) -> object:
             return on_navigate(page_id)
 
+        nav_accel = (
+            spec.shortcut_hint.replace("Ctrl+", "Cmd+") if is_macos else spec.shortcut_hint
+        )
         view_menu.add_command(
             label=spec.label,
             command=_make_nav_cb,
-            accelerator=spec.shortcut_hint,
+            accelerator=nav_accel,
         )
     lib_tabs_menu = tk.Menu(view_menu, tearoff=0)
     for tab_key, tab_label in (
@@ -203,10 +247,36 @@ def build_menu_bar(
     menubar.add_cascade(label="Help", menu=help_menu)
 
     root.configure(menu=menubar)
-    root.bind("<Control-o>", lambda _e: on_browse_url_file())
-    root.bind("<Control-q>", lambda _e: on_exit())
-    root.bind("<Control-p>", lambda _e: on_preview_metadata())
-    root.bind("<F5>", lambda _e: on_start_download())
+
+    def _is_text_focused(ev: tk.Event) -> bool:
+        try:
+            focus = root.focus_get()
+        except (tk.TclError, AttributeError):
+            focus = getattr(ev, "widget", None)
+        return isinstance(focus, tk.Text)
+
+    def _bind_global(key: str, callback: Callable[[], object], *, skip_in_text: bool = False) -> None:
+        def _handler(ev: tk.Event) -> str | None:
+            if skip_in_text and not is_macos and _is_text_focused(ev):
+                return None
+            callback()
+            return "break"
+
+        for seq in (f"<{bind_mod}-{key.lower()}>", f"<{bind_mod}-{key.upper()}>"):
+            try:
+                root.bind(seq, _handler)
+            except tk.TclError:
+                pass
+
+    _bind_global("o", on_browse_url_file, skip_in_text=True)
+    _bind_global("q", on_exit)
+    _bind_global("p", on_preview_metadata, skip_in_text=True)
+
+    def _start_download_shortcut(_e: tk.Event) -> str:
+        on_start_download()
+        return "break"
+
+    root.bind("<F5>", _start_download_shortcut)
 
     def _nav_back(_e: tk.Event) -> str:
         on_go_back()
@@ -220,10 +290,14 @@ def build_menu_bar(
     root.bind("<Alt-Right>", _nav_forward)
     for idx, spec in enumerate(NAV_ITEMS, start=1):
 
-        def _make_shortcut_cb(_e: tk.Event, page_id: str = spec.page_id) -> object:
-            return on_navigate(page_id)
+        def _make_shortcut_cb(_e: tk.Event, page_id: str = spec.page_id) -> str:
+            on_navigate(page_id)
+            return "break"
 
-        root.bind(f"<Control-Key-{idx}>", _make_shortcut_cb)
+        try:
+            root.bind(f"<{bind_mod}-Key-{idx}>", _make_shortcut_cb)
+        except tk.TclError:
+            pass
 
 
 class WindowManager:
@@ -247,6 +321,7 @@ class WindowManager:
         on_exit: Callable[[], None],
         on_theme_applied: Callable[[ThemePalette], None],
         on_tray_started: Callable[[], None] | None = None,
+        on_dpi_changed: Callable[[], None] | None = None,
     ) -> None:
         self._root = root
         self._controller = controller
@@ -256,6 +331,8 @@ class WindowManager:
         self._minimize_to_tray_var = minimize_to_tray_var
         self._on_theme_applied = on_theme_applied
         self._on_tray_started = on_tray_started
+        self._on_dpi_changed = on_dpi_changed
+        self._last_dpi_scale = get_dpi_scale(self._root)
 
         self.normal_geometry: str | None = None
         self.is_maximized = False
@@ -266,7 +343,12 @@ class WindowManager:
         self.theme_var = tk.StringVar(value=self._theme_mode)
         self._last_system_theme = detect_system_theme()
         self.theme_watch_after_id: str | None = None
-        self.palette: ThemePalette = apply_theme(self._root, self._style, self._theme_mode)
+        self.palette: ThemePalette = apply_theme(
+            self._root,
+            self._style,
+            self._theme_mode,
+            walk_tree=False,
+        )
         self.about_dialog: AboutDialog | None = None
 
         self.tray_controller = TrayIconController(
@@ -352,6 +434,17 @@ class WindowManager:
         if getattr(event, "widget", None) is not self._root:
             return
         try:
+            current_scale = get_dpi_scale(self._root)
+            if abs(current_scale - self._last_dpi_scale) >= 0.05:
+                self._last_dpi_scale = current_scale
+                configure_hidpi_scaling(self._root, self._style)
+                _configure_clam_palette(self._style, self.palette, root=self._root)
+                self._root.minsize(
+                    scale_px(self._root, self.MIN_WIDTH_DP),
+                    scale_px(self._root, self.MIN_HEIGHT_DP),
+                )
+                if self._on_dpi_changed is not None:
+                    self._on_dpi_changed()
             if self.is_window_maximized():
                 self.is_maximized = True
                 return
@@ -369,7 +462,22 @@ class WindowManager:
             icon_ref = importlib.resources.files("audiobookdl").joinpath("assets/icon.ico")
             with importlib.resources.as_file(icon_ref) as icon_path:
                 if icon_path.is_file():
-                    self._root.iconbitmap(default=str(icon_path))  # type: ignore[no-untyped-call]
+                    if sys.platform.startswith("win"):
+                        try:
+                            self._root.iconbitmap(default=str(icon_path))  # type: ignore[no-untyped-call]
+                        except tk.TclError:
+                            pass
+                    try:
+                        from PIL import Image, ImageTk
+
+                        with Image.open(icon_path) as img:
+                            photo: Any = ImageTk.PhotoImage(
+                                img.convert("RGBA"), master=self._root
+                            )
+                        self._icon_photo: Any = photo
+                        self._root.iconphoto(True, photo)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -380,9 +488,6 @@ class WindowManager:
         if self._theme_mode == "system":
             self._last_system_theme = detect_system_theme()
         self.palette = apply_theme(self._root, self._style, self._theme_mode)
-        for child in self._root.winfo_children():
-            if isinstance(child, tk.Toplevel):
-                apply_theme_to_window(child, self.palette)
         self._on_theme_applied(self.palette)
         self.sync_system_theme_watch()
         return self.palette

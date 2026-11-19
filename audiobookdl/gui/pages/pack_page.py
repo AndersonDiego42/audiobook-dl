@@ -15,9 +15,24 @@ from audiobookdl.exceptions import AudiobookDLException, DownloadCancelled
 from audiobookdl.gui.chapter_editor import ChapterEditorFrame
 from audiobookdl.gui.controller import GuiController, PackJobRequest
 from audiobookdl.gui.formatting import format_duration
-from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, make_bold_font, scale_px
-from audiobookdl.gui.widgets import MainThreadCallbackQueue, ModalDialog, ScrolledTreeview, TreeColumnSpec, tree_item_values
-from audiobookdl.pack import PackBookSpec, PackOverrides, scope_overrides_for_batch
+from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, apply_theme_to_widget_tree, make_bold_font, scale_px
+from audiobookdl.gui.widgets import (
+    MainThreadCallbackQueue,
+    ModalDialog,
+    ResponsiveMode,
+    ScrolledTreeview,
+    Tooltip,
+    TreeColumnSpec,
+    bind_text_tab_navigation,
+    resolve_responsive_mode,
+    tree_item_values,
+)
+from audiobookdl.pack import (
+    PackBookSpec,
+    PackOverrides,
+    resolve_pack_output_path,
+    scope_overrides_for_batch,
+)
 from audiobookdl.utils.audiobook import Chapter, parse_language, parse_release_date
 
 
@@ -106,6 +121,9 @@ class _PackBookEditDialog(ModalDialog):
 class PackPage(ttk.Frame):
     """Page for inspecting local audio folders and queuing `.m4b` repackaging."""
 
+    _OPTS_ROW_WIDE_ENTER_DP = 620
+    _OPTS_ROW_WIDE_EXIT_DP = 580
+
     _PREVIEW_COLUMNS = (
         TreeColumnSpec("title", "Title", width=180, stretch=True),
         TreeColumnSpec("authors", "Author", width=130, stretch=True),
@@ -142,6 +160,7 @@ class PackPage(ttk.Frame):
         self._prune_edits_on_scan: bool = False
         self._scan_token = 0
         self._is_scanning = False
+        self._opts_row_mode: ResponsiveMode = "wide"
         self._cb_queue = MainThreadCallbackQueue(self)
         self.bind("<Destroy>", self._on_destroy_page, add="+")
 
@@ -196,15 +215,17 @@ class PackPage(ttk.Frame):
         self._palette = palette
         if hasattr(self, "_chapter_editor"):
             self._chapter_editor.apply_theme(palette)
+        if hasattr(self, "_desc_text"):
+            apply_theme_to_widget_tree(self._desc_text, palette)
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
         self.rowconfigure(4, weight=1)
 
         header = ttk.Frame(self)
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        header.grid(row=0, column=0, sticky="ew", pady=(0, scale_px(self, 8)))
         header.columnconfigure(0, weight=1)
-        ttk.Label(header, text="Pack Local Audiobooks", font=make_bold_font(self, 13)).grid(
+        ttk.Label(header, text="Pack Local Audiobooks", font=make_bold_font(self, 4)).grid(
             row=0, column=0, sticky="w"
         )
         ttk.Label(
@@ -215,7 +236,7 @@ class PackPage(ttk.Frame):
 
         # Row 1: Source Paths
         sources_frame = ttk.LabelFrame(self, text="Local Sources", padding=scale_px(self, 8))
-        sources_frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        sources_frame.grid(row=1, column=0, sticky="ew", pady=(0, scale_px(self, 8)))
         sources_frame.columnconfigure(0, weight=1)
 
         list_row = ttk.Frame(sources_frame)
@@ -223,31 +244,65 @@ class PackPage(ttk.Frame):
         list_row.columnconfigure(0, weight=1)
 
         self._paths_listbox = tk.Listbox(list_row, height=4, selectmode=tk.EXTENDED)
-        self._paths_listbox.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self._paths_scroll = ttk.Scrollbar(
+            list_row, orient="vertical", command=self._paths_listbox.yview
+        )
+        self._paths_listbox.configure(yscrollcommand=self._paths_scroll.set)
+        self._paths_listbox.grid(row=0, column=0, sticky="ew")
+        self._paths_scroll.grid(row=0, column=1, sticky="ns", padx=(0, scale_px(self, 8)))
 
         src_btns = ttk.Frame(list_row)
-        src_btns.grid(row=0, column=1, sticky="ns")
+        src_btns.grid(row=0, column=2, sticky="ns")
         ttk.Button(src_btns, text="Add Folder...", command=self._add_folder).pack(fill=tk.X, pady=(0, 4))
         ttk.Button(src_btns, text="Add Tracks...", command=self._add_tracks).pack(fill=tk.X, pady=(0, 4))
-        ttk.Button(src_btns, text="Remove", command=self._remove_selected_paths).pack(fill=tk.X, pady=(0, 4))
-        ttk.Button(src_btns, text="Clear All", command=self._clear_all_paths).pack(fill=tk.X)
+        self._remove_path_btn = ttk.Button(
+            src_btns, text="Remove", command=self._remove_selected_paths, state="disabled"
+        )
+        self._remove_path_btn.pack(fill=tk.X, pady=(0, 4))
+        self._clear_paths_btn = ttk.Button(
+            src_btns, text="Clear All", command=self._clear_all_paths, state="disabled"
+        )
+        self._clear_paths_btn.pack(fill=tk.X)
+
+        self._paths_listbox.bind("<<ListboxSelect>>", lambda _e: self._sync_source_buttons(), add="+")
+
+        def _on_paths_delete(_e: tk.Event) -> str:
+            self._remove_selected_paths()
+            return "break"
+
+        def _on_paths_select_all(_e: tk.Event) -> str:
+            if self._paths_listbox.size() > 0:
+                self._paths_listbox.selection_set(0, tk.END)
+                self._sync_source_buttons()
+            return "break"
+
+        self._paths_listbox.bind("<Delete>", _on_paths_delete, add="+")
+        self._paths_listbox.bind("<Control-a>", _on_paths_select_all, add="+")
+        self._paths_listbox.bind("<Control-A>", _on_paths_select_all, add="+")
 
         opts_row = ttk.Frame(sources_frame)
-        opts_row.grid(row=1, column=0, sticky="ew", pady=(6, 0))
-        ttk.Checkbutton(
+        opts_row.grid(row=1, column=0, sticky="ew", pady=(scale_px(self, 6), 0))
+        self._opts_row = opts_row
+        self._recursive_cb = ttk.Checkbutton(
             opts_row,
             text="Recursive subfolders (each folder with tracks = 1 book)",
             variable=self.recursive_var,
             command=self._on_scan_option_changed,
-        ).pack(side=tk.LEFT, padx=(0, 14))
-        ttk.Checkbutton(
+        )
+        self._delete_source_cb = ttk.Checkbutton(
             opts_row,
             text="Delete source tracks after packing",
             variable=self.delete_source_var,
-        ).pack(side=tk.LEFT, padx=(0, 14))
-        ttk.Label(opts_row, text="Format:").pack(side=tk.LEFT, padx=(0, 4))
+        )
+        ttk.Label(
+            sources_frame,
+            text="Tip: Drag and drop local audiobook folders or audio files onto the window.",
+            style="Muted.TLabel",
+        ).grid(row=2, column=0, sticky="w", pady=(scale_px(self, 4), 0))
+        self._format_box = ttk.Frame(opts_row)
+        ttk.Label(self._format_box, text="Format:").pack(side=tk.LEFT, padx=(0, scale_px(self, 4)))
         format_combo = ttk.Combobox(
-            opts_row,
+            self._format_box,
             textvariable=self.format_var,
             values=("m4b", "m4a", "mp3", "ogg", "opus"),
             state="readonly",
@@ -255,10 +310,13 @@ class PackPage(ttk.Frame):
         )
         format_combo.pack(side=tk.LEFT)
         format_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_scan_option_changed())
+        self._apply_opts_row_layout("wide")
+        opts_row.bind("<Configure>", self._on_opts_row_configure, add="+")
 
         # Row 2: Optional Metadata Overrides (Basic & Extended tabs)
         meta_nb = ttk.Notebook(self)
         meta_nb.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        meta_nb.enable_traversal()
 
         meta_frame = ttk.Frame(meta_nb, padding=scale_px(self, 8))
         meta_frame.columnconfigure(1, weight=1)
@@ -312,8 +370,51 @@ class PackPage(ttk.Frame):
         ttk.Label(ext_frame, text="Language:").grid(row=1, column=2, sticky="w", padx=(0, 6), pady=(6, 0))
         ttk.Entry(ext_frame, textvariable=self.language_var).grid(row=1, column=3, sticky="ew", pady=(6, 0))
 
-        ttk.Label(ext_frame, text="Description:").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
-        ttk.Entry(ext_frame, textvariable=self.description_var).grid(row=2, column=1, columnspan=3, sticky="ew", pady=(6, 0))
+        ttk.Label(ext_frame, text="Description:").grid(row=2, column=0, sticky="nw", padx=(0, 6), pady=(6, 0))
+        desc_container = ttk.Frame(ext_frame)
+        desc_container.grid(row=2, column=1, columnspan=3, sticky="ew", pady=(6, 0))
+        desc_container.columnconfigure(0, weight=1)
+        self._desc_text = tk.Text(desc_container, height=3, wrap="word")
+        desc_scroll = ttk.Scrollbar(
+            desc_container, orient="vertical", command=self._desc_text.yview
+        )
+        self._desc_text.configure(yscrollcommand=desc_scroll.set)
+        self._desc_text.grid(row=0, column=0, sticky="ew")
+        desc_scroll.grid(row=0, column=1, sticky="ns")
+        bind_text_tab_navigation(self._desc_text)
+        self._desc_syncing = False
+
+        def _sync_desc_from_widget(_event: tk.Event | None = None) -> None:
+            if self._desc_syncing:
+                return
+            self._desc_syncing = True
+            try:
+                val = self._desc_text.get("1.0", "end-1c")
+                if self.description_var.get() != val:
+                    self.description_var.set(val)
+            finally:
+                self._desc_syncing = False
+
+        def _sync_desc_to_widget(*_args: object) -> None:
+            if self._desc_syncing:
+                return
+            self._desc_syncing = True
+            try:
+                target = self.description_var.get()
+                current = self._desc_text.get("1.0", "end-1c")
+                if current != target:
+                    self._desc_text.delete("1.0", tk.END)
+                    if target:
+                        self._desc_text.insert("1.0", target)
+            finally:
+                self._desc_syncing = False
+
+        initial_desc = self.description_var.get()
+        if initial_desc:
+            self._desc_text.insert("1.0", initial_desc)
+        self._desc_text.bind("<KeyRelease>", _sync_desc_from_widget, add="+")
+        self._desc_text.bind("<FocusOut>", _sync_desc_from_widget, add="+")
+        self.description_var.trace_add("write", _sync_desc_to_widget)
 
         # Row 3: Scan Bar
         scan_bar = ttk.Frame(self)
@@ -329,7 +430,7 @@ class PackPage(ttk.Frame):
         )
         self._cancel_scan_btn.grid(row=0, column=1, padx=(0, 6))
         self._edit_book_btn = ttk.Button(
-            scan_bar, text="Edit Book...", command=self._edit_selected_book
+            scan_bar, text="Edit Book...", command=self._edit_selected_book, state="disabled"
         )
         self._edit_book_btn.grid(row=0, column=2, padx=(0, 10))
         scan_bar.columnconfigure(1, weight=0)
@@ -344,6 +445,7 @@ class PackPage(ttk.Frame):
         # Row 4: Preview Tree & Chapters Editor Notebook
         preview_nb = ttk.Notebook(self)
         preview_nb.grid(row=4, column=0, sticky="nsew")
+        preview_nb.enable_traversal()
 
         books_tab = ttk.Frame(preview_nb, padding=4)
         books_tab.columnconfigure(0, weight=1)
@@ -355,6 +457,8 @@ class PackPage(ttk.Frame):
         self._tree = self._scrolled_tree.tree
         self._tree.bind("<<TreeviewSelect>>", self._on_book_selected)
         self._tree.bind("<Double-1>", lambda _e: self._edit_selected_book())
+        self._tree.bind("<Return>", lambda _e: self._edit_selected_book(), add="+")
+        self._tree.bind("<F2>", lambda _e: self._edit_selected_book(), add="+")
         self._scrolled_tree.set_empty_state(
             True,
             "Add a local folder or audio tracks above to preview.",
@@ -388,6 +492,61 @@ class PackPage(ttk.Frame):
             style="Accent.TButton",
         )
         self._pack_btn.pack(side=tk.RIGHT)
+        self._tooltips = [
+            Tooltip(
+                self._recursive_cb,
+                "Scan subdirectories recursively and treat each folder containing audio tracks as a separate audiobook",
+                palette_provider=lambda: self._palette,
+            ),
+            Tooltip(
+                self._delete_source_cb,
+                "Permanently delete original source tracks after packaging succeeds (irreversible)",
+                palette_provider=lambda: self._palette,
+            ),
+        ]
+        self._sync_source_buttons()
+        self._sync_book_buttons()
+
+    def _sync_source_buttons(self) -> None:
+        has_paths = bool(self._paths)
+        has_sel = bool(self._paths_listbox.curselection())  # type: ignore[no-untyped-call]
+        self._remove_path_btn.configure(state="normal" if has_sel else "disabled")
+        self._clear_paths_btn.configure(state="normal" if has_paths else "disabled")
+
+    def _sync_book_buttons(self) -> None:
+        can_edit = self._selected_book_index() is not None and not self._is_scanning
+        self._edit_book_btn.configure(state="normal" if can_edit else "disabled")
+
+    def _on_opts_row_configure(self, event: tk.Event) -> None:
+        w = int(getattr(event, "width", 0) or self._opts_row.winfo_width())
+        self.sync_responsive_toolbars(w)
+
+    def sync_responsive_toolbars(self, width: int | None = None) -> None:
+        """Reflow pack options row into 2 rows when narrow."""
+        w = int(width if width is not None else self._opts_row.winfo_width())
+        if w <= 1:
+            return
+        mode = resolve_responsive_mode(
+            self._opts_row_mode,
+            w,
+            scale_px(self, self._OPTS_ROW_WIDE_ENTER_DP),
+            scale_px(self, self._OPTS_ROW_WIDE_EXIT_DP),
+        )
+        if mode != self._opts_row_mode:
+            self._apply_opts_row_layout(mode)
+
+    def _apply_opts_row_layout(self, mode: ResponsiveMode) -> None:
+        self._opts_row_mode = mode
+        p4 = scale_px(self, 4)
+        p14 = scale_px(self, 14)
+        if mode == "wide":
+            self._recursive_cb.grid(row=0, column=0, sticky="w", padx=(0, p14), pady=0)
+            self._delete_source_cb.grid(row=0, column=1, sticky="w", padx=(0, p14), pady=0)
+            self._format_box.grid(row=0, column=2, sticky="w", padx=0, pady=0)
+        else:
+            self._recursive_cb.grid(row=0, column=0, columnspan=2, sticky="w", padx=0, pady=0)
+            self._delete_source_cb.grid(row=1, column=0, sticky="w", padx=(0, p14), pady=(p4, 0))
+            self._format_box.grid(row=1, column=1, sticky="w", padx=0, pady=(p4, 0))
 
     def _append_path(self, path: str) -> None:
         normalized = os.path.abspath(path)
@@ -395,6 +554,7 @@ class PackPage(ttk.Frame):
             return
         self._paths.append(normalized)
         self._paths_listbox.insert(tk.END, normalized)
+        self._sync_source_buttons()
 
     def _add_folder(self) -> None:
         chosen = filedialog.askdirectory(parent=self.winfo_toplevel(), title="Select Audiobook Folder")
@@ -448,6 +608,7 @@ class PackPage(ttk.Frame):
         self._scan_btn.configure(state="normal")
         self._cancel_scan_btn.configure(state="disabled")
         self._pack_btn.configure(state="normal")
+        self._sync_book_buttons()
         self.status_var.set("Scan cancelled.")
 
     def _cancel_active_scan(self) -> None:
@@ -458,6 +619,7 @@ class PackPage(ttk.Frame):
     def _clear_all_paths(self) -> None:
         self._paths.clear()
         self._paths_listbox.delete(0, tk.END)
+        self._sync_source_buttons()
         self._invalidate_preview(
             "Add one or more local folders or audio tracks to preview.",
             clear_edits=True,
@@ -486,6 +648,7 @@ class PackPage(ttk.Frame):
             action_text="Add Folder...",
             action_command=self._add_folder,
         )
+        self._sync_book_buttons()
         self.status_var.set(message)
 
     def _selected_book_index(self) -> int | None:
@@ -499,6 +662,7 @@ class PackPage(ttk.Frame):
         return idx if 0 <= idx < len(self._preview_specs) else None
 
     def _on_book_selected(self, _event: tk.Event | None = None) -> None:
+        self._sync_book_buttons()
         idx = self._selected_book_index()
         if idx is None:
             return
@@ -574,12 +738,22 @@ class PackPage(ttk.Frame):
             self.author_var.set("; ".join(book_ov.get("authors") or []))
             order_val = book_ov.get("series_order")
             self.series_order_var.set("" if order_val is None else str(order_val))
+        opts = self._clone_options_for_pack()
+        if opts is not None:
+            spec.output_path = resolve_pack_output_path(
+                spec.audiobook.metadata,
+                opts,
+                spec.output_format,
+                output_dir=self._output_dir_provider(),
+            )
         iid = str(idx)
         if self._tree.exists(iid):
             vals = tree_item_values(self._tree, iid)
             if len(vals) >= 2:
                 vals[0] = spec.audiobook.title
                 vals[1] = spec.audiobook.metadata.author or "(Unknown)"
+                if len(vals) >= 6:
+                    vals[5] = spec.output_path
                 self._tree.item(iid, values=tuple(vals))
 
     def _apply_saved_edits_to_spec(self, spec: PackBookSpec) -> None:
@@ -611,6 +785,7 @@ class PackPage(ttk.Frame):
         for idx in reversed(selected):
             self._paths_listbox.delete(idx)
             del self._paths[idx]
+        self._sync_source_buttons()
         if not self._paths:
             self._invalidate_preview(
                 "Add one or more local folders or audio tracks to preview.",
@@ -642,6 +817,8 @@ class PackPage(ttk.Frame):
         asin = self.asin_var.get().strip() or None
         isbn = self.isbn_var.get().strip() or None
         cover_path = self.cover_path_var.get().strip() or None
+        if cover_path and not os.path.isfile(cover_path):
+            raise ValueError(f"Cover image file not found: {cover_path!r}")
         genres = self._split_multi_value(self.genres_var.get())
         publisher = self.publisher_var.get().strip() or None
         raw_release = self.release_date_var.get().strip()
@@ -756,6 +933,7 @@ class PackPage(ttk.Frame):
         self._scan_btn.configure(state="disabled")
         self._cancel_scan_btn.configure(state="normal")
         self._pack_btn.configure(state="disabled")
+        self._sync_book_buttons()
         self._scrolled_tree.set_empty_state(False)
         self._loading_bar.grid()
         self._loading_bar.start(12)
@@ -782,6 +960,7 @@ class PackPage(ttk.Frame):
                 self._preview_specs.clear()
                 self._scrolled_tree.set_empty_state(True, f"Scan error: {e}")
                 self.status_var.set(f"Scan error: {e}")
+                self._sync_book_buttons()
                 return
             self._preview_specs = s or []
             if self._prune_edits_on_scan:
@@ -819,6 +998,7 @@ class PackPage(ttk.Frame):
                 self._on_book_selected()
                 self._scrolled_tree.set_empty_state(False)
                 self.status_var.set(f"Ready: {count} audiobook{'s' if count != 1 else ''} detected.")
+            self._sync_book_buttons()
 
         self._cb_queue.begin_task()
 

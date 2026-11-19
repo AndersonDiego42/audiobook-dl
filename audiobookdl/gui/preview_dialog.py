@@ -17,7 +17,8 @@ from audiobookdl.gui.formatting import (
     format_multi_metadata_values,
     format_size_estimate,
     load_cover_from_file,
-    render_cover_thumbnail,
+    photo_from_image_bytes,
+    resize_cover_bytes_aspect_thumbnail,
 )
 from audiobookdl.output.download import DownloadSizeEstimate, estimate_download_size
 from audiobookdl.gui.theme import (
@@ -31,7 +32,9 @@ from audiobookdl.gui.widgets import (
     ModalDialog,
     ScrollableFrame,
     ScrolledTreeview,
+    Tooltip,
     TreeColumnSpec,
+    bind_adaptive_wraplength,
 )
 from audiobookdl.sources.source import Source
 from audiobookdl.utils.audiobook import Audiobook, AudiobookMetadata, BookId, Cover, Result, Series
@@ -106,8 +109,8 @@ class ChoiceDialog(ModalDialog):
         body.columnconfigure(0, weight=1)
         body.rowconfigure(1, weight=1)
 
-        ttk.Label(body, text=title, font=make_bold_font(self, 10)).grid(
-            row=0, column=0, sticky="w", pady=(0, 8)
+        ttk.Label(body, text=title, font=make_bold_font(self, 1)).grid(
+            row=0, column=0, sticky="w", pady=(0, scale_px(self, 8))
         )
 
         list_frame = ttk.Frame(body)
@@ -218,10 +221,15 @@ class _EnrichmentPickerDialog(ModalDialog):
             )
 
         diff_frame = ttk.LabelFrame(body, text="Current vs Selected Match", padding=scale_px(self, 6))
-        diff_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        diff_frame.grid(row=2, column=0, sticky="ew", pady=(scale_px(self, 8), 0))
         diff_frame.columnconfigure(0, weight=1)
         self._diff_text = tk.Text(diff_frame, height=6, wrap="word", state="disabled")
+        self._diff_scroll = ttk.Scrollbar(
+            diff_frame, orient="vertical", command=self._diff_text.yview
+        )
+        self._diff_text.configure(yscrollcommand=self._diff_scroll.set)
         self._diff_text.grid(row=0, column=0, sticky="ew")
+        self._diff_scroll.grid(row=0, column=1, sticky="ns")
 
         self._tree.bind("<<TreeviewSelect>>", self._render_candidate_diff)
         if self._candidates:
@@ -337,11 +345,14 @@ class PreviewDialog(ModalDialog):
         self._initial_focus_widget: tk.Misc | None = None
 
         self._cover_photo: Any | None = None
+        self._cover_token: int = 0
         self._pending_cover: Cover | None = result.cover if isinstance(result, Audiobook) else None
         self._cover_modified = False
         self._cover_label: ttk.Label | None = None
         self._clear_cover_btn: ttk.Button | None = None
         self._readonly_frame: ttk.Frame | None = None
+        self._readonly_keys: tuple[str, ...] = ()
+        self._readonly_value_vars: dict[str, tk.StringVar] = {}
         self._probed_size_estimate: DownloadSizeEstimate | None = None
         self._enrich_btn: ttk.Button | None = None
         self._confirm_btn: ttk.Button | None = None
@@ -370,7 +381,10 @@ class PreviewDialog(ModalDialog):
         self._filter_after_id: str | None = None
         self._item_labels: list[str] = []
         self._last_clicked_index: int | None = None
+        self._scrolled_tree: ScrolledTreeview | None = None
         self._tree: ttk.Treeview | None = None
+        self._filter_entry: ttk.Entry | None = None
+        self._tooltips: list[Tooltip] = []
 
         body = ttk.Frame(self, padding=scale_px(self, 14))
         body.pack(fill=tk.BOTH, expand=True)
@@ -443,18 +457,15 @@ class PreviewDialog(ModalDialog):
     def _refresh_cover_preview(self) -> None:
         if self._cover_label is None:
             return
-        max_size = scale_px(self, 180)
-        photo = render_cover_thumbnail(self._pending_cover, self, max_size=max_size)
-        if photo is not None:
-            self._cover_photo = photo
-            self._cover_label.configure(
-                image=photo,
-                text="",
-                width=0,
-                relief="flat",
-                padding=0,
+        self._cover_token += 1
+        token = self._cover_token
+        if self._clear_cover_btn is not None:
+            self._clear_cover_btn.configure(
+                state="normal" if self._pending_cover is not None else "disabled"
             )
-        else:
+        cover = self._pending_cover
+        raw_bytes = getattr(cover, "image", None) if cover is not None else None
+        if not raw_bytes:
             self._cover_photo = None
             self._cover_label.configure(
                 image="",
@@ -463,10 +474,59 @@ class PreviewDialog(ModalDialog):
                 relief="groove",
                 padding=scale_px(self, 24),
             )
-        if self._clear_cover_btn is not None:
-            self._clear_cover_btn.configure(
-                state="normal" if self._pending_cover is not None else "disabled"
-            )
+            return
+
+        max_size = scale_px(self, 180)
+        self._cover_photo = None
+        self._cover_label.configure(
+            image="",
+            text="Loading cover...",
+            width=20,
+            relief="groove",
+            padding=scale_px(self, 24),
+        )
+        self._begin_worker()
+        self._cb_queue.begin_task()
+
+        def _worker() -> None:
+            png_bytes: bytes | None = None
+            try:
+                if not self._cancel_event.is_set() and token == self._cover_token:
+                    png_bytes = resize_cover_bytes_aspect_thumbnail(raw_bytes, max_size=max_size)
+            finally:
+                def _deliver() -> None:
+                    if (
+                        self._cancel_event.is_set()
+                        or not self._is_alive()
+                        or token != self._cover_token
+                        or self._cover_label is None
+                    ):
+                        return
+                    photo = photo_from_image_bytes(png_bytes, self) if png_bytes else None
+                    if photo is not None:
+                        self._cover_photo = photo
+                        self._cover_label.configure(
+                            image=photo,
+                            text="",
+                            width=0,
+                            relief="flat",
+                            padding=0,
+                        )
+                    else:
+                        self._cover_photo = None
+                        self._cover_label.configure(
+                            image="",
+                            text="No Cover",
+                            width=20,
+                            relief="groove",
+                            padding=scale_px(self, 24),
+                        )
+
+                self._cb_queue.post(_deliver)
+                self._cb_queue.finish_worker()
+                self._end_worker()
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _choose_cover_file(self) -> None:
         path = filedialog.askopenfilename(
@@ -560,6 +620,7 @@ class PreviewDialog(ModalDialog):
 
         right_nb = ttk.Notebook(top)
         right_nb.grid(row=0, column=1, sticky="nsew")
+        right_nb.enable_traversal()
 
         pad = scale_px(self, 8)
         self._meta_scroll = ScrollableFrame(
@@ -583,7 +644,7 @@ class PreviewDialog(ModalDialog):
             ttk.Label(
                 meta_frame,
                 text=f"{label}:",
-                font=make_bold_font(self, 9),
+                font=make_bold_font(self, 0),
             ).grid(row=row_idx, column=0, sticky="w", padx=(0, 8), pady=2)
             entry = ttk.Entry(meta_frame, textvariable=var)
             entry.grid(
@@ -593,13 +654,13 @@ class PreviewDialog(ModalDialog):
                 self._initial_focus_widget = entry
             row_idx += 1
 
-        ttk.Label(meta_frame, text="Series:", font=make_bold_font(self, 9)).grid(
+        ttk.Label(meta_frame, text="Series:", font=make_bold_font(self, 0)).grid(
             row=row_idx, column=0, sticky="w", padx=(0, 8), pady=2
         )
         ttk.Entry(meta_frame, textvariable=self._series_var).grid(
             row=row_idx, column=1, sticky="ew", padx=(0, 8), pady=2
         )
-        ttk.Label(meta_frame, text="Order:", font=make_bold_font(self, 9)).grid(
+        ttk.Label(meta_frame, text="Order:", font=make_bold_font(self, 0)).grid(
             row=row_idx, column=2, sticky="w", padx=(0, 6), pady=2
         )
         ttk.Entry(meta_frame, textvariable=self._series_order_var, width=10).grid(
@@ -613,13 +674,13 @@ class PreviewDialog(ModalDialog):
             ("ISBN", self._isbn_var, "ASIN", self._asin_var),
         )
         for l1, v1, l2, v2 in paired_rows:
-            ttk.Label(meta_frame, text=f"{l1}:", font=make_bold_font(self, 9)).grid(
+            ttk.Label(meta_frame, text=f"{l1}:", font=make_bold_font(self, 0)).grid(
                 row=row_idx, column=0, sticky="w", padx=(0, 8), pady=2
             )
             ttk.Entry(meta_frame, textvariable=v1).grid(
                 row=row_idx, column=1, sticky="ew", padx=(0, 8), pady=2
             )
-            ttk.Label(meta_frame, text=f"{l2}:", font=make_bold_font(self, 9)).grid(
+            ttk.Label(meta_frame, text=f"{l2}:", font=make_bold_font(self, 0)).grid(
                 row=row_idx, column=2, sticky="w", padx=(0, 6), pady=2
             )
             ttk.Entry(meta_frame, textvariable=v2).grid(
@@ -634,7 +695,7 @@ class PreviewDialog(ModalDialog):
         ).grid(row=row_idx, column=1, columnspan=3, sticky="w", pady=(0, 4))
         row_idx += 1
 
-        ttk.Label(meta_frame, text="Description:", font=make_bold_font(self, 9)).grid(
+        ttk.Label(meta_frame, text="Description:", font=make_bold_font(self, 0)).grid(
             row=row_idx, column=0, sticky="nw", padx=(0, 8), pady=(2, 2)
         )
         self._desc_text = ScrolledText(meta_frame, height=4, width=34, wrap="word")
@@ -663,21 +724,35 @@ class PreviewDialog(ModalDialog):
         self._chapter_editor.set_chapters(audiobook.chapters, source_label=self._source.name)
 
         btn_bar = ttk.Frame(body)
-        btn_bar.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        btn_bar.grid(row=1, column=0, sticky="ew", pady=(scale_px(self, 12), 0))
         if self._duplicate_warning:
-            ttk.Label(
+            self._duplicate_warning_label = ttk.Label(
                 body,
                 text=self._duplicate_warning,
-                foreground=self._palette.warning,
+                style="Warning.TLabel",
                 wraplength=scale_px(self, 740),
-            ).grid(row=1, column=0, sticky="w", pady=(8, 0))
-            btn_bar.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+                justify="left",
+            )
+            self._duplicate_warning_label.grid(
+                row=1, column=0, sticky="w", pady=(scale_px(self, 8), 0)
+            )
+            bind_adaptive_wraplength(
+                body, self._duplicate_warning_label, margin_dp=32, min_dp=360
+            )
+            btn_bar.grid(row=2, column=0, sticky="ew", pady=(scale_px(self, 8), 0))
         self._enrich_btn = ttk.Button(
             btn_bar,
             text="Enrich Metadata...",
             command=lambda: self._start_enrichment(audiobook),
         )
         self._enrich_btn.pack(side=tk.LEFT)
+        self._tooltips.append(
+            Tooltip(
+                self._enrich_btn,
+                "Search Audnexus, Audible, OpenLibrary, or Google Books to fill missing metadata fields",
+                palette_provider=lambda: self._palette,
+            )
+        )
         ttk.Label(
             btn_bar,
             textvariable=self._enrich_status_var,
@@ -707,9 +782,6 @@ class PreviewDialog(ModalDialog):
     def _render_readonly_metadata(self, audiobook: Audiobook) -> None:
         if self._readonly_frame is None:
             return
-        for child in self._readonly_frame.winfo_children():
-            child.destroy()
-
         readonly_rows = [
             (label, value)
             for label, value in format_audiobook_preview(audiobook)
@@ -730,16 +802,32 @@ class PreviewDialog(ModalDialog):
                 len(readonly_rows),
             )
             readonly_rows.insert(insert_at, ("Est. Size", est_text))
+
+        keys = tuple(label for label, _ in readonly_rows)
+        if keys == self._readonly_keys and all(
+            label in self._readonly_value_vars for label in keys
+        ):
+            for label, value in readonly_rows:
+                self._readonly_value_vars[label].set(value)
+            return
+
+        for child in self._readonly_frame.winfo_children():
+            child.destroy()
+        self._readonly_value_vars.clear()
+        self._readonly_keys = keys
+
         row_idx = 0
         for label, value in readonly_rows:
             ttk.Label(
                 self._readonly_frame,
                 text=f"{label}:",
-                font=make_bold_font(self, 9),
+                font=make_bold_font(self, 0),
             ).grid(row=row_idx, column=0, sticky="nw", padx=(0, 8), pady=2)
+            val_var = tk.StringVar(value=value)
+            self._readonly_value_vars[label] = val_var
             ttk.Label(
                 self._readonly_frame,
-                text=value,
+                textvariable=val_var,
                 wraplength=scale_px(self, 320),
                 justify="left",
             ).grid(row=row_idx, column=1, sticky="nw", pady=2)
@@ -994,7 +1082,7 @@ class PreviewDialog(ModalDialog):
         header = ttk.Frame(body)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         header.columnconfigure(1, weight=1)
-        ttk.Label(header, text="Series Title:", font=make_bold_font(self, 10)).grid(
+        ttk.Label(header, text="Series Title:", font=make_bold_font(self, 1)).grid(
             row=0, column=0, sticky="w", padx=(0, 8)
         )
         ttk.Entry(header, textvariable=self._series_title_var).grid(
@@ -1032,7 +1120,31 @@ class PreviewDialog(ModalDialog):
         ttk.Label(toolbar, text="Filter:").pack(side=tk.LEFT, padx=(0, 4))
         filter_entry = ttk.Entry(toolbar, textvariable=self._filter_var, width=20)
         filter_entry.pack(side=tk.LEFT, padx=(0, 8))
+        self._filter_entry = filter_entry
         self._initial_focus_widget = filter_entry
+        self._tooltips.append(
+            Tooltip(
+                filter_entry,
+                "Filter series books by title, author, or narrator (Ctrl+F, Esc to clear)",
+                palette_provider=lambda: self._palette,
+            )
+        )
+
+        def _focus_filter(_e: tk.Event) -> str:
+            filter_entry.focus_set()
+            filter_entry.selection_range(0, tk.END)
+            return "break"
+
+        def _clear_filter_or_close(event: tk.Event) -> str:
+            if self._filter_var.get():
+                self._filter_var.set("")
+                self._apply_filter()
+                return "break"
+            return self._on_escape(event)
+
+        self.bind("<Control-f>", _focus_filter, add="+")
+        self.bind("<Control-F>", _focus_filter, add="+")
+        filter_entry.bind("<Escape>", _clear_filter_or_close, add="+")
         ttk.Label(
             toolbar,
             textvariable=self._selected_count_var,
@@ -1059,8 +1171,11 @@ class PreviewDialog(ModalDialog):
                 height=12,
             )
             scrolled_tree.grid(row=0, column=0, sticky="nsew")
+            self._scrolled_tree = scrolled_tree
             tree = scrolled_tree.tree
             self._tree = tree
+            tree.bind("<Control-f>", _focus_filter, add="+")
+            tree.bind("<Control-F>", _focus_filter, add="+")
 
             has_existing = False
             for idx, book in enumerate(series.books):
@@ -1325,6 +1440,13 @@ class PreviewDialog(ModalDialog):
         chosen = sum(1 for v in self._check_vars if v.get())
         self._selected_count_var.set(f"Selected: {chosen} / {total}")
 
+    def _sync_tree_mark(self, idx_item: int) -> None:
+        if self._tree is None or not (0 <= idx_item < len(self._check_vars)):
+            return
+        iid = str(idx_item)
+        if self._tree.exists(iid):
+            self._tree.set(iid, "selected", "[x]" if self._check_vars[idx_item].get() else "[ ]")
+
     def _sync_tree_marks(self) -> None:
         if self._tree is None:
             return
@@ -1351,6 +1473,7 @@ class PreviewDialog(ModalDialog):
         self._update_selected_count()
 
     def _toggle_series_item(self, idx: int, shift_held: bool = False) -> None:
+        updated_indices: list[int] = [idx]
         if shift_held and self._last_clicked_index is not None:
             target_val = self._check_vars[idx].get()
             if self._tree is not None:
@@ -1359,6 +1482,7 @@ class PreviewDialog(ModalDialog):
                 cur_iid = str(idx)
                 if prev_iid in visible_iids and cur_iid in visible_iids:
                     v_start, v_end = sorted((visible_iids.index(prev_iid), visible_iids.index(cur_iid)))
+                    updated_indices = []
                     for row_iid in visible_iids[v_start : v_end + 1]:
                         try:
                             pos = int(row_iid)
@@ -1366,16 +1490,20 @@ class PreviewDialog(ModalDialog):
                             continue
                         if 0 <= pos < len(self._check_vars):
                             self._check_vars[pos].set(target_val)
+                            updated_indices.append(pos)
                 else:
                     self._check_vars[idx].set(target_val)
             else:
                 start, end = sorted((self._last_clicked_index, idx))
                 query = self._filter_var.get().strip().lower()
+                updated_indices = []
                 for pos in range(start, end + 1):
                     if not query or query in self._item_labels[pos].lower():
                         self._check_vars[pos].set(target_val)
+                        updated_indices.append(pos)
         self._last_clicked_index = idx
-        self._sync_tree_marks()
+        for pos in updated_indices:
+            self._sync_tree_mark(pos)
         self._update_selected_count()
 
     def _on_tree_click(self, event: tk.Event) -> str | None:
@@ -1444,6 +1572,13 @@ class PreviewDialog(ModalDialog):
         except tk.TclError:
             self._filter_after_id = None
 
+    def _on_escape(self, event: tk.Event | None = None) -> str:
+        if self._series_ref is not None and self._filter_var.get():
+            self._filter_var.set("")
+            self._apply_filter()
+            return "break"
+        return super()._on_escape(event)
+
     def _apply_filter(self, *_args: object) -> None:
         if self._filter_after_id is not None:
             try:
@@ -1463,6 +1598,11 @@ class PreviewDialog(ModalDialog):
             else:
                 self._tree.detach(iid)
         visible = self._tree.get_children()
+        if self._scrolled_tree is not None:
+            self._scrolled_tree.set_empty_state(
+                len(visible) == 0,
+                "No books in series match the current filter.",
+            )
         focused = self._tree.focus()
         if focused not in visible:
             if visible:

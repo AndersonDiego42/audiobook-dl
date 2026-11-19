@@ -53,6 +53,32 @@ SAMPLE_PREVIEW_METADATA = AudiobookMetadata(
     source="storytel",
 )
 _GEOMETRY_RE = re.compile(r"^(\d+)x(\d+)(?:([+-]-?\d+)([+-]-?\d+))?$")
+_XRANDR_LINE_RE = re.compile(
+    r"\bconnected\b(?:\s+(primary))?\s+(\d+)x(\d+)([+-]\d+)([+-]\d+)\b"
+)
+
+
+def _parse_xrandr_monitors(raw_output: str) -> list[tuple[int, int, int, int]]:
+    """Parse `xrandr --query` output into `[(left, top, right, bottom), ...]` with primary first."""
+    primary: list[tuple[int, int, int, int]] = []
+    secondary: list[tuple[int, int, int, int]] = []
+    for line in raw_output.splitlines():
+        m = _XRANDR_LINE_RE.search(line)
+        if not m:
+            continue
+        is_primary = bool(m.group(1))
+        w = int(m.group(2))
+        h = int(m.group(3))
+        x = int(m.group(4))
+        y = int(m.group(5))
+        if w > 0 and h > 0:
+            rect = (x, y, x + w, y + h)
+            if is_primary:
+                primary.append(rect)
+            else:
+                secondary.append(rect)
+    return primary + secondary
+
 
 
 def _parse_tk_offset(token: str) -> int:
@@ -139,9 +165,36 @@ def get_monitor_work_areas(widget: tk.Misc) -> list[tuple[int, int, int, int]]:
                     return ordered
         except Exception:
             pass
+    if sys.platform.startswith("linux"):
+        try:
+            import subprocess
+
+            proc = subprocess.run(
+                ["xrandr", "--query"],
+                capture_output=True,
+                text=True,
+                timeout=0.5,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                parsed = _parse_xrandr_monitors(proc.stdout)
+                if parsed:
+                    return parsed
+        except Exception:
+            pass
     try:
         sw = max(1, int(widget.winfo_screenwidth()))
         sh = max(1, int(widget.winfo_screenheight()))
+        vx = int(getattr(widget, "winfo_vrootx", lambda: 0)())
+        vy = int(getattr(widget, "winfo_vrooty", lambda: 0)())
+        vw = int(getattr(widget, "winfo_vrootwidth", lambda: sw)())
+        vh = int(getattr(widget, "winfo_vrootheight", lambda: sh)())
+        left = min(0, vx)
+        top = min(0, vy)
+        right = max(sw, vx + max(1, vw))
+        bottom = max(sh, vy + max(1, vh))
+        if (left, top, right, bottom) != (0, 0, sw, sh):
+            return [(0, 0, sw, sh), (left, top, right, bottom)]
         return [(0, 0, sw, sh)]
     except Exception:
         return [(0, 0, 1280, 800)]

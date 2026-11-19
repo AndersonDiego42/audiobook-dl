@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import tkinter as tk
 from tkinter import ttk
 from collections.abc import Callable, Sequence
@@ -160,12 +161,21 @@ class DownloadPage(ttk.Frame):
         top_pane.columnconfigure(0, weight=1)
 
         # URLs
-        self.url_frame = ttk.LabelFrame(top_pane, text="Audiobook URL(s)", padding=(10, 6))
-        self.url_frame.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        self.url_frame = ttk.LabelFrame(
+            top_pane,
+            text="Audiobook URL(s)",
+            padding=(scale_px(self, 10), scale_px(self, 6)),
+        )
+        self.url_frame.grid(row=0, column=0, sticky="ew", pady=(0, scale_px(self, 6)))
         self.url_frame.columnconfigure(0, weight=1)
 
         self.urls_text = tk.Text(self.url_frame, height=3, width=40, wrap="word")
+        self.urls_scroll = ttk.Scrollbar(
+            self.url_frame, orient="vertical", command=self.urls_text.yview
+        )
+        self.urls_text.configure(yscrollcommand=self.urls_scroll.set)
         self.urls_text.grid(row=0, column=0, sticky="ew")
+        self.urls_scroll.grid(row=0, column=1, sticky="ns")
         self.urls_text.tag_configure(
             "warning_line", foreground=palette_provider().warning, underline=True
         )
@@ -180,10 +190,12 @@ class DownloadPage(ttk.Frame):
         )
 
         self._url_footer = ttk.Frame(self.url_frame)
-        self._url_footer.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        self._url_footer.grid(
+            row=1, column=0, columnspan=2, sticky="ew", pady=(scale_px(self, 4), 0)
+        )
         self._url_hint_label = ttk.Label(
             self._url_footer,
-            text="One URL per line \u2022 Right-click: Paste & Queue \u2022 Ctrl+Enter / F5 to start",
+            text="Drag & drop URLs/.txt/folders \u2022 Ctrl+Enter / F5 to start",
             style="Muted.TLabel",
         )
         self._url_btn_row = ttk.Frame(self._url_footer)
@@ -216,6 +228,13 @@ class DownloadPage(ttk.Frame):
             command=on_open_accounts,
         )
         self.account_chip_btn.bind("<Button-3>", self.show_profile_menu)
+        if sys.platform == "darwin":
+            self.account_chip_btn.bind("<Button-2>", self.show_profile_menu)
+        for seq in ("<Shift-F10>", "<Menu>"):
+            try:
+                self.account_chip_btn.bind(seq, self.show_profile_menu)
+            except tk.TclError:
+                pass
         self._apply_folder_bar_layout("wide")
         self._folder_bar.bind("<Configure>", self._on_folder_bar_configure, add="+")
         attach_tooltip(
@@ -384,14 +403,15 @@ class DownloadPage(ttk.Frame):
 
     def show_profile_menu(self, event: tk.Event | None = None) -> None:
         """Open a quick context menu to switch active profile or manage accounts."""
-        if self._profile_menu is not None:
+        menu = self._profile_menu
+        if menu is not None:
             try:
-                self._profile_menu.destroy()
+                menu.delete(0, tk.END)
             except tk.TclError:
-                pass
-            self._profile_menu = None
-        menu = tk.Menu(self, tearoff=False)
-        self._profile_menu = menu
+                menu = None
+        if menu is None:
+            menu = tk.Menu(self, tearoff=False)
+            self._profile_menu = menu
         profiles = self._profile_choices_provider() if self._profile_choices_provider is not None else ["default"]
         if not profiles:
             profiles = ["default"]
@@ -407,7 +427,7 @@ class DownloadPage(ttk.Frame):
         menu.add_separator()
         menu.add_command(label="Manage Accounts...", command=self._on_open_accounts)
         apply_theme_to_widget_tree(menu, self._palette_provider())
-        if event is not None:
+        if event is not None and (event.x_root or event.y_root):
             x, y = event.x_root, event.y_root
         else:
             x = self.account_chip_btn.winfo_rootx()
@@ -518,13 +538,19 @@ class DownloadPage(ttk.Frame):
         elif self._layout_mode == "horizontal" and total_w < scale_px(self, self.TWO_COL_EXIT_DP):
             self._set_layout_mode("vertical")
 
-    def fit_splitter_to_top_content(self, *, total_height: int | None = None) -> int | None:
+    def fit_splitter_to_top_content(
+        self,
+        *,
+        total_height: int | None = None,
+        flush_layout: bool = True,
+    ) -> int | None:
         """Resize the vertical splitter so top content fits without shrinking queue below minimum."""
         if total_height is None and self._layout_mode != "vertical":
             self.top_scroll.sync_layout()
             return None
         try:
-            self.update_idletasks()
+            if flush_layout:
+                self.update_idletasks()
             total_h = total_height if total_height is not None else self._vpaned.winfo_height()
             if total_h <= 1:
                 return None
@@ -538,10 +564,16 @@ class DownloadPage(ttk.Frame):
         except tk.TclError:
             return None
 
-    def fit_horizontal_splitter(self, *, total_width: int | None = None) -> int | None:
+    def fit_horizontal_splitter(
+        self,
+        *,
+        total_width: int | None = None,
+        flush_layout: bool = True,
+    ) -> int | None:
         """Size the horizontal splitter to fit left-column content while preserving Activity minimum width."""
         try:
-            self.update_idletasks()
+            if flush_layout:
+                self.update_idletasks()
             if self._layout_mode != "horizontal" or len(self._hpaned.panes()) < 2:  # type: ignore[no-untyped-call]
                 return None
             total_w = total_width if total_width is not None else self._hpaned.winfo_width()
@@ -594,21 +626,24 @@ class DownloadPage(ttk.Frame):
         except tk.TclError:
             return
         if self._layout_mode == "horizontal":
-            self._apply_horizontal_split_for_width(self._hpaned.winfo_width())
+            self._apply_horizontal_split_for_width(
+                self._hpaned.winfo_width(),
+                flush_layout=False,
+            )
         else:
-            self.fit_splitter_to_top_content()
+            self._apply_split_for_height(
+                self._vpaned.winfo_height(),
+                flush_layout=False,
+            )
 
     def _on_section_toggled(self) -> None:
         if self._layout_mode == "horizontal":
             self._h_user_dragged_split = False
-            if self.fit_horizontal_splitter() is None:
-                self.schedule_fit_splitter()
-            return
-        self._user_dragged_split = False
-        if self.fit_splitter_to_top_content() is None:
-            self.schedule_fit_splitter()
+        else:
+            self._user_dragged_split = False
+        self.schedule_fit_splitter()
 
-    def _apply_split_for_height(self, total_h: int) -> None:
+    def _apply_split_for_height(self, total_h: int, *, flush_layout: bool = True) -> None:
         if total_h <= 1:
             return
         min_top, max_top = self._splitter_bounds(total_h)
@@ -617,9 +652,9 @@ class DownloadPage(ttk.Frame):
             self._vpaned.sashpos(0, target)  # type: ignore[no-untyped-call]
             self.top_scroll.sync_layout()
         else:
-            self.fit_splitter_to_top_content()
+            self.fit_splitter_to_top_content(total_height=total_h, flush_layout=flush_layout)
 
-    def _apply_horizontal_split_for_width(self, total_w: int) -> None:
+    def _apply_horizontal_split_for_width(self, total_w: int, *, flush_layout: bool = True) -> None:
         if total_w <= 1:
             return
         min_left, max_left = self._horizontal_splitter_bounds(total_w)
@@ -629,21 +664,20 @@ class DownloadPage(ttk.Frame):
             self.top_scroll.sync_layout()
             self.queue_panel.sync_responsive_toolbars(max(1, total_w - target))
         else:
-            self.fit_horizontal_splitter(total_width=total_w)
+            self.fit_horizontal_splitter(total_width=total_w, flush_layout=flush_layout)
 
     def _on_paned_configure(self, mode: Literal["vertical", "horizontal"], event: tk.Event) -> None:
         if mode != self._layout_mode:
             return
         if not self._initial_split_applied:
             self._initial_split_applied = True
-        if mode == "horizontal":
-            total_w = int(getattr(event, "width", 0) or self._hpaned.winfo_width())
-            if total_w > 1:
-                self._apply_horizontal_split_for_width(total_w)
-            return
-        total_h = int(getattr(event, "height", 0) or self._vpaned.winfo_height())
-        if total_h > 1:
-            self._apply_split_for_height(total_h)
+        dim = (
+            int(getattr(event, "width", 0) or self._hpaned.winfo_width())
+            if mode == "horizontal"
+            else int(getattr(event, "height", 0) or self._vpaned.winfo_height())
+        )
+        if dim > 1:
+            self.schedule_fit_splitter()
 
     def _on_paned_release(self, mode: Literal["vertical", "horizontal"], _event: tk.Event) -> None:
         def _record() -> None:

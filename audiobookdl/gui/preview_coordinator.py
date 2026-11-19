@@ -130,13 +130,21 @@ class PreviewCoordinator:
         self._status_var.set("Fetching preview...")
         self._active_job_var.set("Fetching preview...")
         queue_panel.append_log(f"--- Fetching preview: {target_url} ---")
-        self._controller.start_preview(target_url, options)
+        self._controller.start_preview(
+            target_url,
+            options,
+            check_duplicate=bool(self._download_archive_var.get()),
+        )
 
     def handle_preview_done(
         self,
         url: str,
         prepared: tuple[Source, Result] | None,
         exc: Exception | None,
+        *,
+        duplicate_checked: bool = False,
+        duplicate_warning: str | None = None,
+        existing_series_indices: frozenset[int] | None = None,
     ) -> None:
         self.set_previewing_state(False)
         self._controller.preview_interaction = None
@@ -167,7 +175,14 @@ class PreviewCoordinator:
             self.close_prefetched_source(prepared)
             return
         self._status_var.set(f"Preview ready: {result.title[:60]}")
-        self.show_preview_dialog(url, _source, result)
+        self.show_preview_dialog(
+            url,
+            _source,
+            result,
+            duplicate_checked=duplicate_checked,
+            duplicate_warning=duplicate_warning,
+            existing_series_indices=existing_series_indices,
+        )
 
     @staticmethod
     def close_prefetched_source(prefetched: tuple[Source, Result] | None) -> None:
@@ -180,7 +195,16 @@ class PreviewCoordinator:
             except Exception:
                 pass
 
-    def show_preview_dialog(self, url: str, source: Source, result: Result) -> PreviewDialog:
+    def show_preview_dialog(
+        self,
+        url: str,
+        source: Source,
+        result: Result,
+        *,
+        duplicate_checked: bool = False,
+        duplicate_warning: str | None = None,
+        existing_series_indices: frozenset[int] | None = None,
+    ) -> PreviewDialog:
         """Display resolved `Audiobook` metadata/cover or a selectable `Series` checklist."""
         if self.dialog is not None and self.dialog.winfo_exists():
             self.dialog.destroy()
@@ -198,20 +222,46 @@ class PreviewCoordinator:
             resolved = opts if opts is not None else DownloadOptions(urls=[url])
             return self._controller.apply_enrichment_candidate(book, candidate, resolved)
 
-        cached_series_opts = self._options.build_options() if isinstance(result, Series) else None
+        cached_series_opts: DownloadOptions | None = None
         dir_stems_cache: dict[str, set[str]] = {}
         archive_titles_cache: set[str] | None = None
-        if isinstance(result, Series) and cached_series_opts and cached_series_opts.download_archive:
-            if os.path.exists(cached_series_opts.download_archive):
-                with DownloadArchive(cached_series_opts.download_archive, persistent=True) as archive:
-                    archive_titles_cache = {
-                        e.title.strip().casefold()
-                        for e in archive.list_entries(limit=5000, include_hidden=True)
-                        if e.status == "downloaded" and e.title and e.title.strip()
-                    }
         series_title = result.title if isinstance(result, Series) else None
-        duplicate_warning: str | None = None
-        if isinstance(result, Audiobook) and self._download_archive_var.get():
+        existing_book_ids: set[int] | None = None
+        if isinstance(result, Series):
+            if existing_series_indices is not None:
+                existing_book_ids = {
+                    id(result.books[idx])
+                    for idx in existing_series_indices
+                    if 0 <= idx < len(result.books)
+                }
+            else:
+                cached_series_opts = self._options.build_options()
+                if cached_series_opts.download_archive and os.path.exists(cached_series_opts.download_archive):
+                    with DownloadArchive(cached_series_opts.download_archive, persistent=True) as archive:
+                        archive_titles_cache = {
+                            e.title.strip().casefold()
+                            for e in archive.list_entries(limit=5000, include_hidden=True)
+                            if e.status == "downloaded" and e.title and e.title.strip()
+                        }
+
+        def _series_book_exists(book: Any) -> bool:
+            if existing_book_ids is not None and not isinstance(book, Audiobook):
+                return id(book) in existing_book_ids
+            if existing_book_ids is not None and id(book) in existing_book_ids:
+                return True
+            nonlocal cached_series_opts
+            if cached_series_opts is None:
+                cached_series_opts = self._options.build_options()
+            return series_book_exists(
+                book,
+                options=cached_series_opts,
+                dir_stems_cache=dir_stems_cache,
+                archive_titles_cache=archive_titles_cache,
+                series_title=series_title,
+            )
+
+        resolved_duplicate_warning = duplicate_warning
+        if not duplicate_checked and isinstance(result, Audiobook) and self._download_archive_var.get():
             archive_path = resolve_archive_path(self._controller.config_snapshot())
             dup = self._controller.find_cross_source_duplicate(
                 result.metadata,
@@ -220,7 +270,7 @@ class PreviewCoordinator:
             )
             if dup is not None:
                 dup_where = dup.get("output_path") or dup.get("title") or ""
-                duplicate_warning = (
+                resolved_duplicate_warning = (
                     f"Duplicate Alert: Already in library from {dup['source']}"
                     + (f" ({dup_where})" if dup_where else "")
                 )
@@ -231,23 +281,13 @@ class PreviewCoordinator:
             result,
             is_running=self._is_running_provider(),
             skip_downloaded=self._skip_downloaded_var.get(),
-            series_book_exists=lambda book: (
-                series_book_exists(
-                    book,
-                    options=cached_series_opts,
-                    dir_stems_cache=dir_stems_cache,
-                    archive_titles_cache=archive_titles_cache,
-                    series_title=series_title,
-                )
-                if cached_series_opts is not None
-                else False
-            ),
+            series_book_exists=_series_book_exists,
             on_confirm=self.enqueue_from_preview,
             palette=self._palette_provider(),
             on_prepare_enrichment_options=_prepare_enrichment_options,
             on_search_enrichment=_search_enrichment,
             on_apply_enrichment=_apply_enrichment,
-            duplicate_warning=duplicate_warning,
+            duplicate_warning=resolved_duplicate_warning,
         )
         self.dialog = dialog
         return dialog
