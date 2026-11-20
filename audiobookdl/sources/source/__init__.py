@@ -25,6 +25,7 @@ import lxml.html
 from lxml.cssselect import CSSSelector
 import re
 import os
+import threading
 import weakref
 from dataclasses import dataclass
 from http.cookiejar import CookieJar, MozillaCookieJar
@@ -140,8 +141,9 @@ class Source(Generic[T]):
         self._oauth_token: OAuthTokenBundle | None = None
         self._oauth_client_id_override: str | None = None
         self._oauth_scopes_override: tuple[str, ...] | None = None
-        self.__pages: OrderedDict[str, bytes] = OrderedDict()
+        self.__pages: OrderedDict[Any, bytes] = OrderedDict()
         self.__pages_bytes: int = 0
+        self._pages_lock = threading.RLock()
         self._options: DownloadOptions = options
         self.database_directory = os.path.join(options.database_directory, self.name)
         self.skip_downloaded = options.skip_downloaded
@@ -396,13 +398,18 @@ class Source(Generic[T]):
         *,
         default_ext: str = "jpg",
         headers: Mapping[str, str] | None = None,
+        credentials: bool = False,
     ) -> Cover | None:
         """Download cover bytes from `url` non-fatally and sniff the true image extension."""
         cleaned = (url or "").strip()
         if not cleaned:
             return None
         try:
-            data = self.get(cleaned, headers=headers) if headers is not None else self.get(cleaned)
+            data = (
+                self.get(cleaned, headers=headers, credentials=credentials)
+                if headers is not None
+                else self.get(cleaned, credentials=credentials)
+            )
         except Exception as exc:
             logging.debug(f"Could not download cover from {cleaned}: {exc}")
             return None
@@ -443,29 +450,60 @@ class Source(Generic[T]):
         """Called after the download is complete"""
 
 
+    @staticmethod
+    def _page_cache_key(url: str, kwargs: Mapping[str, Any]) -> Any:
+        """Build a cache key covering every request parameter that can change the response body."""
+        params = kwargs.get("params")
+        if isinstance(params, Mapping):
+            norm_params = tuple(sorted((str(k), str(v)) for k, v in params.items()))
+        elif params is None:
+            norm_params = ()
+        else:
+            norm_params = tuple(sorted((str(k), str(v)) for k, v in params))
+        headers = kwargs.get("headers")
+        if isinstance(headers, Mapping):
+            norm_headers = tuple(
+                sorted((str(k).lower(), str(v)) for k, v in headers.items())
+            )
+        elif headers is None:
+            norm_headers = ()
+        else:
+            norm_headers = tuple(sorted((str(k).lower(), str(v)) for k, v in headers))
+        return (
+            url,
+            norm_params,
+            norm_headers,
+            bool(kwargs.get("force_cookies", False)),
+            bool(kwargs.get("credentials", True)),
+        )
+
     def clear_page_cache(self) -> None:
         """Drop cached HTML/JSON page payloads held by this source instance."""
-        self.__pages.clear()
-        self.__pages_bytes = 0
+        with self._pages_lock:
+            self.__pages.clear()
+            self.__pages_bytes = 0
 
     def _get_page(self, url: str, use_cache: bool = True, **kwargs) -> bytes:
         """Download a page and cache it in a bounded LRU cache."""
         if not use_cache:
             return self.get(url, **kwargs)
-        cached = self.__pages.get(url)
-        if cached is not None:
-            self.__pages.move_to_end(url)
-            return cached
+        cache_key = self._page_cache_key(url, kwargs)
+        with self._pages_lock:
+            cached = self.__pages.get(cache_key)
+            if cached is not None:
+                self.__pages.move_to_end(cache_key)
+                return cached
         data = self.get(url, **kwargs)
         if len(data) <= self._MAX_PAGE_CACHE_BYTES:
-            self.__pages[url] = data
-            self.__pages_bytes += len(data)
-            while (
-                len(self.__pages) > self._MAX_PAGE_CACHE_ENTRIES
-                or self.__pages_bytes > self._MAX_PAGE_CACHE_BYTES
-            ) and len(self.__pages) > 1:
-                _evicted_url, evicted_bytes = self.__pages.popitem(last=False)
-                self.__pages_bytes = max(0, self.__pages_bytes - len(evicted_bytes))
+            with self._pages_lock:
+                self.__pages[cache_key] = data
+                self.__pages_bytes += len(data)
+                while (
+                    len(self.__pages) > self._MAX_PAGE_CACHE_ENTRIES
+                    or self.__pages_bytes > self._MAX_PAGE_CACHE_BYTES
+                ) and len(self.__pages) > 1:
+                    _evicted_key, evicted_bytes = self.__pages.popitem(last=False)
+                    self.__pages_bytes = max(0, self.__pages_bytes - len(evicted_bytes))
         return data
 
 
@@ -565,4 +603,12 @@ class Source(Generic[T]):
         child_sessions = getattr(self, "_child_sessions", None)
         if isinstance(child_sessions, list):
             child_sessions.append(session)
+        return session
+
+    def _get_unauthenticated_session(self) -> requests.Session:
+        """Return a cached pooled session without auth headers or cookies for third-party fetches."""
+        session = getattr(self, "_cached_unauthenticated_session", None)
+        if session is None:
+            session = self.create_unauthenticated_session()
+            self._cached_unauthenticated_session = session
         return session

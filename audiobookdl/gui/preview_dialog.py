@@ -541,7 +541,7 @@ class PreviewDialog(ModalDialog):
             return
         try:
             cover = load_cover_from_file(path)
-        except Exception as exc:
+        except (ImportError, OSError, ValueError) as exc:
             messagebox.showerror(
                 "Invalid Cover Image",
                 f"Could not load image:\n{exc}",

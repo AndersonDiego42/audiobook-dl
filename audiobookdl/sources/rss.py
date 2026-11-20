@@ -11,8 +11,8 @@ from urllib.parse import urljoin, urlparse
 from lxml import etree
 
 from .source import Source
-from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover
-from audiobookdl.exceptions import BookNotFound
+from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, logging
+from audiobookdl.exceptions import BookNotFound, DownloadCancelled
 from audiobookdl.utils.audiobook import (
     clean_html_description,
     detect_image_extension,
@@ -154,9 +154,15 @@ class RssSource(Source):
 
     def _fetch_podcast_chapters(self, chapters_url: str) -> list[Chapter]:
         """Fetch Podcasting 2.0 JSON chapters from `chapters_url` non-fatally."""
+        ctx = logging.get_job_context()
+        cancel_event = ctx.cancel_event if ctx is not None else None
+        if cancel_event is not None and cancel_event.is_set():
+            raise DownloadCancelled
         try:
             raw = self.get(chapters_url)
             payload = json.loads(raw.decode("utf-8", errors="replace"))
+        except DownloadCancelled:
+            raise
         except Exception:
             return []
         if not isinstance(payload, dict):
@@ -290,6 +296,10 @@ class RssSource(Source):
         running_ms = 0
         all_have_duration = all(ep[3] is not None and ep[3] > 0 for ep in episodes)
         for ep_url, ext, ep_title, duration_ms, _ep_num, _pub_ts, ch_url, ep_size in episodes:
+            ctx = logging.get_job_context()
+            cancel_event = ctx.cancel_event if ctx is not None else None
+            if cancel_event is not None and cancel_event.is_set():
+                raise DownloadCancelled
             files.append(AudiobookFile(url=ep_url, ext=ext, title=ep_title, size=ep_size))
             if len(episodes) == 1 and ch_url:
                 chapters.extend(self._fetch_podcast_chapters(ch_url))

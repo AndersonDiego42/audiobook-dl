@@ -26,6 +26,7 @@ from audiobookdl.gui.event_dispatcher import EventDispatcher
 from audiobookdl.gui.ffmpeg_assistant import FFmpegAssistant
 from audiobookdl.gui.notifications import set_windows_process_app_id
 from audiobookdl.gui.options_state import OptionsCoordinator
+from audiobookdl.gui.options_view_model import OptionsViewModel
 from audiobookdl.gui.page_factories import (
     create_accounts_page,
     create_download_page,
@@ -388,6 +389,24 @@ class AudiobookDLApp:
         return self._controller
 
     @property
+    def view_model(self) -> OptionsViewModel:
+        """Typed holder for all GUI option/status Tk variables."""
+        vm = self._options.view_model
+        assert vm is not None
+        return vm
+
+    def __getattr__(self, name: str) -> Any:
+        # Delegate ``<name>_var`` lookups to the OptionsViewModel so call sites
+        # keep using ``app.<name>_var`` without dynamic setattr stamping.
+        options = self.__dict__.get("_options")
+        if options is None:
+            raise AttributeError(name)
+        view_model = options.view_model
+        if view_model is None:
+            raise AttributeError(name)
+        return getattr(view_model, name)
+
+    @property
     def theme_mode(self) -> str:
         return self._window.theme_mode
 
@@ -406,42 +425,6 @@ class AudiobookDLApp:
     @property
     def download_page(self) -> DownloadPage:
         return self.shell.ensure_page("download")
-
-    @property
-    def urls_text(self) -> tk.Text:
-        return self.download_page.urls_text
-
-    @property
-    def queue_tree(self) -> ttk.Treeview:
-        return self.download_page.queue_panel.queue_tree
-
-    @property
-    def progressbar(self) -> ttk.Progressbar:
-        return self.download_page.queue_panel.progressbar
-
-    @property
-    def log_text(self) -> Any:
-        return self.download_page.queue_panel.log_text
-
-    @property
-    def download_btn(self) -> ttk.Button:
-        return self.download_page.queue_panel.download_btn
-
-    @property
-    def pause_btn(self) -> ttk.Button:
-        return self.download_page.queue_panel.pause_btn
-
-    @property
-    def cancel_btn(self) -> ttk.Button:
-        return self.download_page.queue_panel.cancel_btn
-
-    @property
-    def preview_btn(self) -> ttk.Button:
-        return self.download_page.queue_panel.preview_btn
-
-    @property
-    def pack_btn(self) -> ttk.Button:
-        return self.download_page.queue_panel.pack_btn
 
     def set_theme(self, mode: str) -> ThemePalette:
         """Switch between `'system'`, `'light'`, and `'dark'` themes live."""

@@ -1,11 +1,9 @@
 """Declarative runtime option registry shared by Config, Pipeline, and Desktop GUI."""
 
-from dataclasses import dataclass, field
-import math
+from dataclasses import dataclass, field, replace
 import os
-import shlex
 from typing import Any
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Container, Mapping
 
 from audiobookdl.utils import normalize_audio_bitrate, normalize_sample_rate
 from audiobookdl.utils.http import DEFAULT_MAX_RETRIES
@@ -13,15 +11,6 @@ from audiobookdl.utils.http import DEFAULT_MAX_RETRIES
 
 MEDIA_TYPE_CHOICES: tuple[str, ...] = ("auto", "audiobook", "ebook", "video", "both")
 INTRO_CHAPTER_MODE_CHOICES: tuple[str, ...] = ("auto", "always", "off")
-GUI_OUTPUT_FORMATS: tuple[str, ...] = ("Original", "m4b", "mp3", "m4a", "mp4", "mkv", "flac", "opus")
-GUI_MEDIA_TYPE_OPTIONS: tuple[str, ...] = ("Auto", "Audiobook", "Ebook", "Video", "Both")
-GUI_INTRO_CHAPTER_MODES: tuple[str, ...] = (
-    "Auto (detect intro)",
-    "Always (first is 00)",
-    "Off (start at 01)",
-)
-GUI_OVERWRITE_OPTIONS: tuple[str, ...] = ("Ask", "Overwrite", "Keep existing")
-
 GUI_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         "window_geometry",
@@ -308,286 +297,6 @@ def _serialize_post_exec(val: Any) -> tuple[bool, Any]:
     return (True, str(val)) if val else (False, None)
 
 
-def _gui_init_output_format(cfg_val: Any) -> str:
-    val = cfg_val or "Original"
-    return val if val in GUI_OUTPUT_FORMATS else "Original"
-
-
-def _gui_read_output_format(raw: Any) -> str | None:
-    cleaned = str(raw).strip()
-    return None if cleaned in ("", "Original") else cleaned
-
-
-def _gui_init_media_type(cfg_val: Any) -> str:
-    normalized = (cfg_val or "auto").strip().lower()
-    return {
-        "auto": "Auto",
-        "audiobook": "Audiobook",
-        "ebook": "Ebook",
-        "video": "Video",
-        "both": "Both",
-    }.get(normalized, "Auto")
-
-
-def _gui_read_media_type(raw: Any) -> str:
-    cleaned = str(raw).strip().lower()
-    return cleaned if cleaned in MEDIA_TYPE_CHOICES else "auto"
-
-
-def _gui_init_intro_chapter_mode(cfg_val: Any) -> str:
-    normalized = (cfg_val or "auto").strip().lower()
-    return {
-        "auto": "Auto (detect intro)",
-        "always": "Always (first is 00)",
-        "off": "Off (start at 01)",
-    }.get(normalized, "Auto (detect intro)")
-
-
-def _gui_read_intro_chapter_mode(raw: Any) -> str:
-    cleaned = str(raw).strip().lower()
-    if cleaned in ("always", "always (first is 00)", "force"):
-        return "always"
-    if cleaned in ("off", "off (start at 01)", "never"):
-        return "off"
-    return "auto"
-
-
-def _gui_init_audio_bitrate(cfg_val: Any) -> str:
-    cleaned = (cfg_val or "").strip()
-    if not cleaned or cleaned.lower() == "auto":
-        return "Auto"
-    return cleaned
-
-
-def _gui_read_audio_bitrate(raw: Any) -> str | None:
-    cleaned = str(raw).strip()
-    if not cleaned or cleaned.lower() == "auto":
-        return None
-    return normalize_audio_bitrate(cleaned)
-
-
-def _gui_init_sample_rate(cfg_val: Any) -> str:
-    if cfg_val is None:
-        return "Auto"
-    try:
-        normalized = normalize_sample_rate(cfg_val)
-    except ValueError:
-        return "Auto"
-    return str(normalized) if normalized is not None else "Auto"
-
-
-def _gui_read_sample_rate(raw: Any) -> int | None:
-    if raw is None:
-        return None
-    return normalize_sample_rate(str(raw))
-
-
-def _gui_init_bool_default_true(cfg_val: Any) -> bool:
-    return True if cfg_val is None else bool(cfg_val)
-
-
-def _gui_init_bool_from_truthy(cfg_val: Any) -> bool:
-    return bool(cfg_val)
-
-
-def _gui_init_optional_str(cfg_val: Any) -> str:
-    return "" if cfg_val is None else str(cfg_val)
-
-
-def _gui_init_post_exec(cfg_val: Any) -> str:
-    if isinstance(cfg_val, list):
-        return shlex.join(str(part) for part in cfg_val if str(part))
-    return "" if cfg_val is None else str(cfg_val)
-
-
-def _gui_read_optional_str(raw: Any) -> str | None:
-    cleaned = str(raw).strip()
-    return cleaned or None
-
-
-def _gui_read_enrich_providers(raw: Any) -> str | None:
-    cleaned = str(raw).strip()
-    if not cleaned:
-        return None
-    from audiobookdl.utils.enrichment import parse_provider_list
-
-    return ",".join(parse_provider_list(cleaned))
-
-
-def _gui_read_limit_rate(raw: Any) -> str | None:
-    cleaned = str(raw).strip()
-    if not cleaned:
-        return None
-    from audiobookdl.utils.http import parse_byte_rate
-
-    parse_byte_rate(cleaned)
-    return cleaned
-
-
-def _gui_read_decryption_key(raw: Any) -> str | None:
-    cleaned = str(raw).strip()
-    if not cleaned:
-        return None
-    from audiobookdl.utils.audiobook import parse_decryption_key_spec
-
-    parse_decryption_key_spec(cleaned)
-    return cleaned
-
-
-def _gui_init_raw_str(cfg_val: Any) -> str:
-    return "" if cfg_val is None else str(cfg_val)
-
-
-def _gui_read_raw_str(raw: Any) -> str:
-    return str(raw)
-
-
-def _gui_init_overwrite(cfg_val: Any) -> str:
-    if cfg_val is True:
-        return "Overwrite"
-    if cfg_val is False:
-        return "Keep existing"
-    return "Ask"
-
-
-def _gui_read_overwrite(raw: Any) -> bool | None:
-    cleaned = str(raw).strip().lower()
-    if cleaned == "overwrite":
-        return True
-    if cleaned in ("keep existing", "no", "false"):
-        return False
-    return None
-
-
-def _gui_init_max_workers(cfg_val: Any) -> str:
-    return "" if cfg_val is None else str(cfg_val)
-
-
-def _gui_init_int_str(cfg_val: Any) -> str:
-    return "0" if cfg_val is None else str(int(cfg_val))
-
-
-def _gui_read_int(raw: Any) -> int:
-    cleaned = str(raw).strip()
-    if not cleaned:
-        return 0
-    try:
-        return int(cleaned)
-    except ValueError as exc:
-        raise ValueError(f"Expected whole number, got '{cleaned}'") from exc
-
-
-def _gui_read_optional_positive_int(raw: Any) -> int | None:
-    cleaned = str(raw).strip()
-    if not cleaned:
-        return None
-    try:
-        parsed = int(cleaned)
-    except ValueError as exc:
-        raise ValueError(f"Expected positive integer, got '{cleaned}'") from exc
-    if parsed < 1:
-        raise ValueError("Expected integer >= 1")
-    return parsed
-
-
-def _gui_read_max_workers(raw: Any) -> int | None:
-    cleaned = str(raw).strip()
-    if not cleaned or cleaned.lower() in ("auto", "default"):
-        return None
-    try:
-        parsed = int(cleaned)
-    except ValueError as exc:
-        raise ValueError(f"Max workers must be a whole number >= 1, got '{cleaned}'") from exc
-    if parsed < 1:
-        raise ValueError("Max workers must be >= 1")
-    return parsed
-
-
-def _gui_format_number(cfg_val: Any, default_str: str = "") -> str:
-    if cfg_val is None:
-        return default_str
-    num = float(cfg_val)
-    return str(int(num)) if num.is_integer() else str(num)
-
-
-def _gui_init_book_delay(cfg_val: Any) -> str:
-    return _gui_format_number(cfg_val, default_str="0")
-
-
-def _gui_read_book_delay(raw: Any) -> float:
-    cleaned = str(raw).strip()
-    if not cleaned:
-        return 0.0
-    try:
-        parsed = float(cleaned)
-    except ValueError as exc:
-        raise ValueError(f"Book delay must be a number >= 0, got '{cleaned}'") from exc
-    if not math.isfinite(parsed) or parsed < 0:
-        raise ValueError("Book delay must be >= 0")
-    return parsed
-
-
-def _gui_init_timeout(cfg_val: Any) -> str:
-    return _gui_format_number(cfg_val, default_str="")
-
-
-def _gui_read_timeout(raw: Any) -> float | None:
-    cleaned = str(raw).strip()
-    if not cleaned or cleaned.lower() in ("auto", "default"):
-        return None
-    try:
-        parsed = float(cleaned)
-    except ValueError as exc:
-        raise ValueError(f"Timeout must be a number > 0, got '{cleaned}'") from exc
-    if not math.isfinite(parsed) or parsed <= 0:
-        raise ValueError("Timeout must be > 0")
-    return parsed
-
-
-def _gui_init_max_retries(cfg_val: Any) -> str:
-    return str(DEFAULT_MAX_RETRIES) if cfg_val is None else str(int(cfg_val))
-
-
-def _gui_read_max_retries(raw: Any) -> int:
-    cleaned = str(raw).strip()
-    if not cleaned:
-        return DEFAULT_MAX_RETRIES
-    try:
-        parsed = int(cleaned)
-    except ValueError as exc:
-        raise ValueError(f"Max retries must be a whole number >= 0, got '{cleaned}'") from exc
-    if parsed < 0:
-        raise ValueError("Max retries must be >= 0")
-    return parsed
-
-
-@dataclass(frozen=True)
-class GuiBinding:
-    """Declarative binding between a runtime option and a Tkinter variable."""
-
-    var_attr: str
-    var_type: str  # "bool" | "str"
-    gui_default: Any
-    from_config: Callable[[Any], Any] | None = None
-    to_option: Callable[[Any], Any] | None = None
-    persisted_in_output_prefs: bool = False
-    tooltip: str | None = None
-
-    def init_value(self, config_value: Any) -> Any:
-        if self.from_config is not None:
-            return self.from_config(config_value)
-        if self.var_type == "bool":
-            return bool(config_value) if config_value is not None else bool(self.gui_default)
-        return self.gui_default if config_value is None else str(config_value)
-
-    def read_option(self, raw_var_value: Any) -> Any:
-        if self.to_option is not None:
-            return self.to_option(raw_var_value)
-        if self.var_type == "bool":
-            return bool(raw_var_value)
-        return raw_var_value
-
-
 @dataclass(frozen=True)
 class OptionSpec:
     """Single source of truth describing a runtime option across Config, Pipeline, and Desktop GUI."""
@@ -604,7 +313,7 @@ class OptionSpec:
     merge_only_if_default: bool = False
     merge_require_truthy: bool = False
     merge_cast: Callable[[Any], Any] | None = None
-    gui: GuiBinding | None = None
+    persist_output_pref: bool = False
 
     def resolve_default(self) -> Any:
         if self.default_factory is not None:
@@ -632,13 +341,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         config_kind="bool",
         toml_serializer=_serialize_bool,
         merge_from_config=True,
-        gui=GuiBinding(
-            var_attr="combine_var",
-            var_type="bool",
-            gui_default=True,
-            from_config=_gui_init_bool_default_true,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="output_template",
@@ -660,15 +363,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         merge_from_config=True,
         merge_only_if_default=True,
         merge_require_truthy=True,
-        gui=GuiBinding(
-            var_attr="remove_chars_var",
-            var_type="str",
-            gui_default="",
-            from_config=_gui_init_raw_str,
-            to_option=_gui_read_raw_str,
-            persisted_in_output_prefs=True,
-            tooltip="Characters to strip from generated output folder and file names (e.g. :?*)",
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="debug",
@@ -679,12 +374,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_bool,
         merge_from_config=True,
         merge_only_if_default=True,
-        gui=GuiBinding(
-            var_attr="debug_var",
-            var_type="bool",
-            gui_default=False,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="cover",
@@ -695,12 +385,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_bool,
         merge_from_config=True,
         merge_only_if_default=True,
-        gui=GuiBinding(
-            var_attr="cover_only_var",
-            var_type="bool",
-            gui_default=False,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="no_chapters",
@@ -711,12 +396,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_bool,
         merge_from_config=True,
         merge_only_if_default=True,
-        gui=GuiBinding(
-            var_attr="no_chapters_var",
-            var_type="bool",
-            gui_default=False,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="split_chapters",
@@ -727,12 +407,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_bool,
         merge_from_config=True,
         merge_only_if_default=True,
-        gui=GuiBinding(
-            var_attr="split_chapters_var",
-            var_type="bool",
-            gui_default=False,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="output_format",
@@ -744,14 +419,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         merge_from_config=True,
         merge_only_if_default=True,
         merge_require_truthy=True,
-        gui=GuiBinding(
-            var_attr="output_format_var",
-            var_type="str",
-            gui_default="Original",
-            from_config=_gui_init_output_format,
-            to_option=_gui_read_output_format,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="media_type",
@@ -762,14 +430,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_media_type,
         merge_from_config=True,
         merge_require_truthy=True,
-        gui=GuiBinding(
-            var_attr="media_type_var",
-            var_type="str",
-            gui_default="Auto",
-            from_config=_gui_init_media_type,
-            to_option=_gui_read_media_type,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="username",
@@ -799,12 +460,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         config_kind="bool",
         toml_serializer=_serialize_bool,
         merge_from_config=True,
-        gui=GuiBinding(
-            var_attr="skip_downloaded_var",
-            var_type="bool",
-            gui_default=False,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="skip_unavailable",
@@ -815,13 +471,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_bool,
         merge_from_config=True,
         merge_only_if_default=True,
-        gui=GuiBinding(
-            var_attr="skip_unavailable_var",
-            var_type="bool",
-            gui_default=True,
-            from_config=_gui_init_bool_default_true,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="download_archive",
@@ -832,14 +482,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         merge_from_config=True,
         merge_only_if_default=True,
         merge_require_truthy=True,
-        gui=GuiBinding(
-            var_attr="download_archive_var",
-            var_type="bool",
-            gui_default=False,
-            from_config=_gui_init_bool_from_truthy,
-            tooltip="Record completed downloads in the SQLite archive ledger (downloads.db) and skip already-archived books when 'Skip downloaded' is enabled",
-        ),
-    ),
+            ),
     OptionSpec(
         name="database_directory",
         default_factory=default_database_directory,
@@ -859,12 +502,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_bool,
         merge_from_config=True,
         merge_only_if_default=True,
-        gui=GuiBinding(
-            var_attr="write_json_var",
-            var_type="bool",
-            gui_default=False,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="write_cover",
@@ -875,12 +513,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_bool,
         merge_from_config=True,
         merge_only_if_default=True,
-        gui=GuiBinding(
-            var_attr="write_cover_var",
-            var_type="bool",
-            gui_default=False,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="write_opf",
@@ -891,12 +524,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_bool,
         merge_from_config=True,
         merge_only_if_default=True,
-        gui=GuiBinding(
-            var_attr="write_opf_var",
-            var_type="bool",
-            gui_default=False,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="write_abs_metadata",
@@ -907,12 +535,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_bool,
         merge_from_config=True,
         merge_only_if_default=True,
-        gui=GuiBinding(
-            var_attr="write_abs_metadata_var",
-            var_type="bool",
-            gui_default=False,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="upload_to_abs",
@@ -923,12 +546,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_bool,
         merge_from_config=True,
         merge_only_if_default=True,
-        gui=GuiBinding(
-            var_attr="upload_to_abs_var",
-            var_type="bool",
-            gui_default=False,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="write_cue",
@@ -939,12 +557,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_bool,
         merge_from_config=True,
         merge_only_if_default=True,
-        gui=GuiBinding(
-            var_attr="write_cue_var",
-            var_type="bool",
-            gui_default=False,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="config_location",
@@ -959,12 +572,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         config_kind="bool",
         toml_serializer=_serialize_bool,
         merge_from_config=True,
-        gui=GuiBinding(
-            var_attr="resume_var",
-            var_type="bool",
-            gui_default=False,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="audio_bitrate",
@@ -976,14 +584,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         merge_from_config=True,
         merge_only_if_default=True,
         merge_require_truthy=True,
-        gui=GuiBinding(
-            var_attr="audio_bitrate_var",
-            var_type="str",
-            gui_default="Auto",
-            from_config=_gui_init_audio_bitrate,
-            to_option=_gui_read_audio_bitrate,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="sample_rate",
@@ -995,14 +596,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         merge_from_config=True,
         merge_only_if_default=True,
         merge_require_truthy=True,
-        gui=GuiBinding(
-            var_attr="sample_rate_var",
-            var_type="str",
-            gui_default="Auto",
-            from_config=_gui_init_sample_rate,
-            to_option=_gui_read_sample_rate,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="overwrite",
@@ -1013,14 +607,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_optional_bool,
         merge_from_config=True,
         merge_only_if_default=True,
-        gui=GuiBinding(
-            var_attr="overwrite_var",
-            var_type="str",
-            gui_default="Ask",
-            from_config=_gui_init_overwrite,
-            to_option=_gui_read_overwrite,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="max_workers",
@@ -1031,14 +618,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_positive_int,
         merge_from_config=True,
         merge_only_if_default=True,
-        gui=GuiBinding(
-            var_attr="max_workers_var",
-            var_type="str",
-            gui_default="",
-            from_config=_gui_init_max_workers,
-            to_option=_gui_read_max_workers,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="book_delay",
@@ -1050,14 +630,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         merge_from_config=True,
         merge_only_if_default=True,
         merge_cast=float,
-        gui=GuiBinding(
-            var_attr="book_delay_var",
-            var_type="str",
-            gui_default="0",
-            from_config=_gui_init_book_delay,
-            to_option=_gui_read_book_delay,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="limit_rate",
@@ -1069,14 +642,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         merge_from_config=True,
         merge_only_if_default=True,
         merge_require_truthy=True,
-        gui=GuiBinding(
-            var_attr="limit_rate_var",
-            var_type="str",
-            gui_default="",
-            from_config=_gui_init_optional_str,
-            to_option=_gui_read_limit_rate,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="post_exec",
@@ -1091,19 +657,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         merge_from_config=True,
         merge_only_if_default=True,
         merge_require_truthy=True,
-        gui=GuiBinding(
-            var_attr="post_exec_var",
-            var_type="str",
-            gui_default="",
-            from_config=_gui_init_post_exec,
-            to_option=_gui_read_optional_str,
-            persisted_in_output_prefs=True,
-            tooltip=(
-                "Command to run after each completed audiobook (300s timeout; reads "
-                "AUDIOBOOK_DL_PATH/TITLE/AUTHOR/SOURCE/FORMAT env vars; prefix with "
-                "[argv, shell=False] or configure a TOML list to avoid shell expansion)"
-            ),
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="loudnorm",
@@ -1114,12 +668,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_bool,
         merge_from_config=True,
         merge_only_if_default=True,
-        gui=GuiBinding(
-            var_attr="loudnorm_var",
-            var_type="bool",
-            gui_default=False,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="mono",
@@ -1130,12 +679,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_bool,
         merge_from_config=True,
         merge_only_if_default=True,
-        gui=GuiBinding(
-            var_attr="mono_var",
-            var_type="bool",
-            gui_default=False,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="chapters_from_silence",
@@ -1146,12 +690,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_bool,
         merge_from_config=True,
         merge_only_if_default=True,
-        gui=GuiBinding(
-            var_attr="chapters_from_silence_var",
-            var_type="bool",
-            gui_default=False,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="override_chapters",
@@ -1162,12 +701,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_bool,
         merge_from_config=True,
         merge_only_if_default=True,
-        gui=GuiBinding(
-            var_attr="override_chapters_var",
-            var_type="bool",
-            gui_default=False,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="silence_noise_db",
@@ -1200,14 +734,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_int,
         merge_from_config=True,
         merge_only_if_default=True,
-        gui=GuiBinding(
-            var_attr="chapter_offset_ms_var",
-            var_type="str",
-            gui_default="0",
-            from_config=_gui_init_int_str,
-            to_option=_gui_read_int,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="intro_chapter_mode",
@@ -1219,14 +746,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         merge_from_config=True,
         merge_only_if_default=True,
         merge_require_truthy=True,
-        gui=GuiBinding(
-            var_attr="intro_chapter_mode_var",
-            var_type="str",
-            gui_default="Auto (detect intro)",
-            from_config=_gui_init_intro_chapter_mode,
-            to_option=_gui_read_intro_chapter_mode,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="square_cover",
@@ -1237,12 +757,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_bool,
         merge_from_config=True,
         merge_only_if_default=True,
-        gui=GuiBinding(
-            var_attr="square_cover_var",
-            var_type="bool",
-            gui_default=False,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="max_cover_size",
@@ -1253,14 +768,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_positive_int,
         merge_from_config=True,
         merge_only_if_default=True,
-        gui=GuiBinding(
-            var_attr="max_cover_size_var",
-            var_type="str",
-            gui_default="",
-            from_config=_gui_init_optional_str,
-            to_option=_gui_read_optional_positive_int,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="proxy",
@@ -1272,14 +780,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         merge_from_config=True,
         merge_only_if_default=True,
         merge_require_truthy=True,
-        gui=GuiBinding(
-            var_attr="proxy_var",
-            var_type="str",
-            gui_default="",
-            from_config=_gui_init_optional_str,
-            to_option=_gui_read_optional_str,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="timeout",
@@ -1291,14 +792,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         merge_from_config=True,
         merge_only_if_default=True,
         merge_cast=float,
-        gui=GuiBinding(
-            var_attr="timeout_var",
-            var_type="str",
-            gui_default="",
-            from_config=_gui_init_timeout,
-            to_option=_gui_read_timeout,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="max_retries",
@@ -1310,14 +804,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         merge_from_config=True,
         merge_only_if_default=True,
         merge_cast=int,
-        gui=GuiBinding(
-            var_attr="max_retries_var",
-            var_type="str",
-            gui_default=str(DEFAULT_MAX_RETRIES),
-            from_config=_gui_init_max_retries,
-            to_option=_gui_read_max_retries,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="impersonate",
@@ -1329,28 +816,13 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         merge_from_config=True,
         merge_only_if_default=True,
         merge_require_truthy=True,
-        gui=GuiBinding(
-            var_attr="impersonate_var",
-            var_type="str",
-            gui_default="",
-            from_config=_gui_init_optional_str,
-            to_option=_gui_read_optional_str,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="decryption_key",
         default=None,
         help="Optional session-only clear decryption key (32/64-char hex or KID:KEY pairs) for CENC/HLS overrides; errors list required KIDs when PSSH/tenc metadata is present",
-        gui=GuiBinding(
-            var_attr="decryption_key_var",
-            var_type="str",
-            gui_default="",
-            from_config=_gui_init_optional_str,
-            to_option=_gui_read_decryption_key,
-            persisted_in_output_prefs=False,
-        ),
-    ),
+            ),
     OptionSpec(
         name="locale",
         default=None,
@@ -1371,12 +843,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_bool,
         merge_from_config=True,
         merge_only_if_default=True,
-        gui=GuiBinding(
-            var_attr="enrich_metadata_var",
-            var_type="bool",
-            gui_default=False,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="enrich_providers",
@@ -1388,14 +855,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         merge_from_config=True,
         merge_only_if_default=True,
         merge_require_truthy=True,
-        gui=GuiBinding(
-            var_attr="enrich_providers_var",
-            var_type="str",
-            gui_default="",
-            from_config=_gui_init_optional_str,
-            to_option=_gui_read_enrich_providers,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     OptionSpec(
         name="enrich_interactive",
@@ -1406,12 +866,7 @@ OPTION_REGISTRY: tuple[OptionSpec, ...] = (
         toml_serializer=_serialize_bool,
         merge_from_config=True,
         merge_only_if_default=True,
-        gui=GuiBinding(
-            var_attr="enrich_interactive_var",
-            var_type="bool",
-            gui_default=False,
-            persisted_in_output_prefs=True,
-        ),
+        persist_output_pref=True,
     ),
     # Config-only top-level keys (not part of DownloadOptions)
     OptionSpec(
@@ -1442,11 +897,8 @@ CONFIG_OPTION_SPECS: tuple[OptionSpec, ...] = tuple(
 MERGEABLE_OPTION_SPECS: tuple[OptionSpec, ...] = tuple(
     spec for spec in OPTION_REGISTRY if spec.merge_from_config and spec.config_key is not None
 )
-GUI_OPTION_SPECS: tuple[OptionSpec, ...] = tuple(
-    spec for spec in OPTION_REGISTRY if spec.gui is not None
-)
-PERSISTED_GUI_OPTION_SPECS: tuple[OptionSpec, ...] = tuple(
-    spec for spec in OPTION_REGISTRY if spec.gui is not None and spec.gui.persisted_in_output_prefs
+PERSISTED_OUTPUT_PREF_SPECS: tuple[OptionSpec, ...] = tuple(
+    spec for spec in OPTION_REGISTRY if spec.persist_output_pref
 )
 KNOWN_TOP_LEVEL_CONFIG_KEYS: frozenset[str] = frozenset(
     {"sources", "gui", "audiobookshelf", "enrichment"}
@@ -1516,6 +968,28 @@ class DownloadOptions:
         repr=False,
         compare=False,
     )
+
+    def with_overrides(
+        self,
+        overrides: Mapping[str, Any],
+        *,
+        allowed_keys: Container[str] | None = None,
+    ) -> "DownloadOptions":
+        """Return a copy with the allowed override keys applied and marked explicit."""
+        if not overrides:
+            return self
+        updates = {
+            key: value
+            for key, value in overrides.items()
+            if allowed_keys is None or key in allowed_keys
+        }
+        if not updates:
+            return self
+        opts = replace(self)
+        for key, value in updates.items():
+            setattr(opts, key, value)
+        opts._explicit_fields = frozenset(self._explicit_fields) | frozenset(updates)
+        return opts
 
 
 def build_default_options(**overrides: Any) -> DownloadOptions:

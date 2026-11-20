@@ -10,7 +10,7 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, DownloadOptions
-from audiobookdl.exceptions import DownloadCancelled, DownloadError
+from audiobookdl.exceptions import DownloadCancelled, DownloadError, RequestError
 from audiobookdl.output.download import (
     DOWNLOAD_ATTEMPTS,
     DOWNLOAD_CHUNK_SIZE,
@@ -32,12 +32,10 @@ def _mock_probe_for_dummy_download_bytes(request, monkeypatch):
         or request.node.get_closest_marker("no_probe_stub") is not None
     ):
         return
-    from audiobookdl.output import output as output_mod
     from audiobookdl.utils import AudioProbeInfo
 
     monkeypatch.setattr(
-        output_mod,
-        "_probe_audio_info",
+        "audiobookdl.output.ffmpeg_ops._probe_audio_info",
         lambda _path: AudioProbeInfo(duration=10.0, codec_name="mp3"),
     )
 
@@ -153,7 +151,7 @@ def test_download_files_sizes_thread_pool_dynamically(tmp_path):
     # 1 file: skips ThreadPoolExecutor and calls download_file directly
     with (
         patch("audiobookdl.utils.concurrency.ThreadPoolExecutor") as pool_cls,
-        patch("audiobookdl.output.download.download_file", return_value="single.mp3") as mock_dl,
+        patch("audiobookdl.output.http_download.download_file", return_value="single.mp3") as mock_dl,
     ):
         assert download_files(make_book(1), str(tmp_path), lambda _: None) == ["single.mp3"]
         pool_cls.assert_not_called()
@@ -169,7 +167,7 @@ def test_download_files_sizes_thread_pool_dynamically(tmp_path):
 
     with (
         patch("audiobookdl.utils.concurrency.ThreadPoolExecutor", side_effect=tracking_executor),
-        patch("audiobookdl.output.download.download_file", side_effect=lambda args: f"p{args[2]}.mp3"),
+        patch("audiobookdl.output.http_download.download_file", side_effect=lambda args: f"p{args[2]}.mp3"),
     ):
         paths_4 = download_files(make_book(4), str(tmp_path), lambda _: None)
         paths_25 = download_files(make_book(25), str(tmp_path), lambda _: None)
@@ -186,7 +184,7 @@ def test_download_files_sizes_thread_pool_dynamically(tmp_path):
 
 
 def test_download_files_cancels_queued_futures_promptly(tmp_path, monkeypatch):
-    monkeypatch.setattr("audiobookdl.output.download.MAX_DOWNLOAD_WORKERS", 2)
+    monkeypatch.setattr("audiobookdl.output.http_download.MAX_DOWNLOAD_WORKERS", 2)
     cancel_event = threading.Event()
     started = []
     first_started = threading.Event()
@@ -208,7 +206,7 @@ def test_download_files_cancels_queued_futures_promptly(tmp_path, monkeypatch):
     timer = threading.Timer(0.05, lambda: (first_started.wait(1.0), cancel_event.set()))
     timer.start()
     try:
-        with patch("audiobookdl.output.download.download_file", side_effect=slow_download):
+        with patch("audiobookdl.output.http_download.download_file", side_effect=slow_download):
             with pytest.raises(DownloadCancelled):
                 download_files(audiobook, str(tmp_path), lambda _: None, cancel_event=cancel_event)
     finally:
@@ -313,16 +311,17 @@ def test_download_file_raises_download_error_on_non_200_with_raw_body(tmp_path):
     resp.close.assert_called_once()
 
 
-def test_download_file_exhausts_retries_and_reraises_request_exception(tmp_path, monkeypatch):
+def test_download_file_exhausts_retries_and_raises_request_error(tmp_path, monkeypatch):
     monkeypatch.setattr("audiobookdl.output.download.time.sleep", lambda _: None)
     session = MagicMock()
     session.get.side_effect = requests.exceptions.ConnectionError("reset")
     audiobook = _make_audiobook(session)
 
-    with pytest.raises(requests.exceptions.ConnectionError):
+    with pytest.raises(RequestError) as exc_info:
         download_file((audiobook, str(tmp_path / "fail"), 0, lambda _: None, None))
 
     assert session.get.call_count == DOWNLOAD_ATTEMPTS
+    assert isinstance(exc_info.value.__cause__, requests.exceptions.ConnectionError)
 
 
 def test_download_file_resumes_partial_tmp_with_http_range_206(tmp_path):
@@ -532,7 +531,7 @@ def test_download_file_retries_and_fails_on_truncated_stream(tmp_path, monkeypat
         _mock_response(headers={"Content-Length": "10"}, chunks=[b"1234"])
         for _ in range(DOWNLOAD_ATTEMPTS)
     ]
-    with pytest.raises(requests.exceptions.ChunkedEncodingError, match="Incomplete download"):
+    with pytest.raises(RequestError, match="Incomplete download"):
         download_file((_make_audiobook(session_trunc), str(tmp_path / "trunc"), 0, lambda _: None, None))
     assert session_trunc.get.call_count == DOWNLOAD_ATTEMPTS
     assert not (tmp_path / "trunc.mp3").exists()
@@ -1200,7 +1199,6 @@ def test_download_audiobook_atomic_staging_preserves_existing_dir_on_cancel_or_e
 @pytest.mark.no_probe_stub
 def test_download_file_rejects_corrupt_audio_before_replacing_existing_file(tmp_path):
     from audiobookdl.exceptions import GenericAudiobookDLException
-    from audiobookdl.output import output as output_mod
     from audiobookdl.utils import AudioProbeInfo
 
     target = tmp_path / "Existing.mp3"
@@ -1214,8 +1212,8 @@ def test_download_file_rejects_corrupt_audio_before_replacing_existing_file(tmp_
     book = _make_audiobook(session)
 
     with (
-        patch("audiobookdl.output.output.find_executable", return_value="ffprobe"),
-        patch.object(output_mod, "_probe_audio_info", return_value=AudioProbeInfo(duration=0.0, codec_name="")),
+        patch("audiobookdl.output.ffmpeg_ops.find_executable", return_value="ffprobe"),
+        patch("audiobookdl.output.ffmpeg_ops._probe_audio_info", return_value=AudioProbeInfo(duration=0.0, codec_name="")),
     ):
         with pytest.raises(GenericAudiobookDLException):
             download_file((book, str(tmp_path / "Existing"), 0, lambda _d: None, None))
@@ -1242,7 +1240,7 @@ def test_download_file_surfaces_ffprobe_execution_error_without_false_integrity_
     with (
         patch("audiobookdl.utils.find_executable", return_value="C:/bad/ffprobe.exe"),
         patch(
-            "audiobookdl.utils.subprocess.run",
+            "audiobookdl.utils.concurrency.run_cancellable_subprocess",
             side_effect=OSError(216, "This version of %1 is not compatible"),
         ),
     ):
@@ -1733,8 +1731,8 @@ def test_download_reuses_probe_cache_from_download_file_for_combine(tmp_path, mo
         dur = 25.0 if ".tmp." in os.path.basename(path) else 12.5
         return AudioProbeInfo(duration=dur, codec_name="mp3", bitrate=128000, sample_rate=44100, channels=2)
 
-    monkeypatch.setattr(out_mod, "_probe_audio_info", counting_probe)
-    monkeypatch.setattr(out_mod, "find_executable", lambda _name: "ffprobe")
+    monkeypatch.setattr("audiobookdl.output.ffmpeg_ops._probe_audio_info", counting_probe)
+    monkeypatch.setattr("audiobookdl.output.ffmpeg_ops.find_executable", lambda _name: "ffprobe")
     monkeypatch.setattr(out_mod, "_require_executable", lambda name: name)
     monkeypatch.setattr(out_mod, "_remux_to_mpegts", lambda _src, dst, **_kw: open(dst, "wb").write(b"ts") > 0)
     monkeypatch.setattr(dl_mod, "add_metadata_to_file", lambda *a, **kw: None)
@@ -1788,8 +1786,8 @@ def test_download_reuses_probe_cache_for_multipart_convert_output(tmp_path, monk
             return AudioProbeInfo(duration=12.5, codec_name="mp3", bitrate=128000, sample_rate=44100, channels=2)
         return AudioProbeInfo(duration=12.5, codec_name="aac", bitrate=128000, sample_rate=44100, channels=2)
 
-    monkeypatch.setattr(out_mod, "_probe_audio_info", counting_probe)
-    monkeypatch.setattr(out_mod, "find_executable", lambda _name: "ffprobe")
+    monkeypatch.setattr("audiobookdl.output.ffmpeg_ops._probe_audio_info", counting_probe)
+    monkeypatch.setattr("audiobookdl.output.ffmpeg_ops.find_executable", lambda _name: "ffprobe")
     monkeypatch.setattr(out_mod, "_require_executable", lambda name: name)
     monkeypatch.setattr(dl_mod.metadata, "add_metadata", lambda *a, **kw: False)
     monkeypatch.setattr(
@@ -1847,9 +1845,10 @@ def test_download_split_silence_fallback_preserves_probe_cache(tmp_path, monkeyp
             return AudioProbeInfo(duration=10.0, codec_name="mp3", bitrate=128000, sample_rate=44100, channels=2)
         return AudioProbeInfo(duration=20.0, codec_name="mp3", bitrate=128000, sample_rate=44100, channels=2)
 
-    monkeypatch.setattr(out_mod, "_probe_audio_info", counting_probe)
-    monkeypatch.setattr(out_mod, "find_executable", lambda _name: "ffprobe")
+    monkeypatch.setattr("audiobookdl.output.ffmpeg_ops._probe_audio_info", counting_probe)
+    monkeypatch.setattr("audiobookdl.output.ffmpeg_ops.find_executable", lambda _name: "ffprobe")
     monkeypatch.setattr(out_mod, "_require_executable", lambda name: name)
+    monkeypatch.setattr("audiobookdl.output.ffmpeg_ops._require_executable", lambda name: name)
     monkeypatch.setattr(out_mod, "_remux_to_mpegts", lambda _src, dst, **_kw: open(dst, "wb").write(b"ts") > 0)
     monkeypatch.setattr(dl_mod.metadata, "add_metadata", lambda *a, **kw: False)
     monkeypatch.setattr(
@@ -1865,6 +1864,7 @@ def test_download_split_silence_fallback_preserves_probe_cache(tmp_path, monkeyp
         return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(out_mod, "run_cancellable_subprocess", fake_run)
+    monkeypatch.setattr("audiobookdl.output.ffmpeg_ops.run_cancellable_subprocess", fake_run)
 
     session = MagicMock()
     session.get.side_effect = [
@@ -1923,10 +1923,10 @@ def test_download_audiobook_split_intro_chapter_mode_updates_filenames_tags_and_
     from audiobookdl.utils import AudioProbeInfo
 
     monkeypatch.setattr(out_mod, "_require_executable", lambda _n: "ffmpeg")
-    monkeypatch.setattr(out_mod, "find_executable", lambda _n: "ffprobe")
+    monkeypatch.setattr("audiobookdl.output.ffmpeg_ops._require_executable", lambda _n: "ffmpeg")
+    monkeypatch.setattr("audiobookdl.output.ffmpeg_ops.find_executable", lambda _n: "ffprobe")
     monkeypatch.setattr(
-        out_mod,
-        "_probe_audio_info",
+        "audiobookdl.output.ffmpeg_ops._probe_audio_info",
         lambda _p: AudioProbeInfo(duration=30.0, codec_name="mp3", bitrate=128000, sample_rate=44100, channels=2),
     )
 
@@ -1941,6 +1941,7 @@ def test_download_audiobook_split_intro_chapter_mode_updates_filenames_tags_and_
         return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(out_mod, "run_cancellable_subprocess", fake_run)
+    monkeypatch.setattr("audiobookdl.output.ffmpeg_ops.run_cancellable_subprocess", fake_run)
 
     tagged_calls: list[tuple[str, str]] = []
 
@@ -2264,7 +2265,7 @@ def test_download_audiobook_forwards_max_retries_option(tmp_path, monkeypatch):
         skip_downloaded=False,
         write_json_metadata=False,
     )
-    with pytest.raises(requests.exceptions.ConnectionError):
+    with pytest.raises(RequestError):
         download_audiobook(book, str(tmp_path / "book_fail"), opts)
     assert session.get.call_count == 2  # 1 initial + 1 retry
 
@@ -2710,7 +2711,7 @@ def test_download_file_verifies_http_content_md5_and_repr_digest_with_retry(tmp_
         metadata=AudiobookMetadata(title="Digest Fail"),
         files=[AudiobookFile(url="https://cdn.example.com/fail.mp3", ext="mp3")],
     )
-    with pytest.raises(requests.exceptions.ChunkedEncodingError, match="digest mismatch"):
+    with pytest.raises(RequestError, match="digest mismatch"):
         download_file((book_bad, str(tmp_path / "digest_fail"), 0, lambda _: None, None), max_retries=1)
     assert not (tmp_path / "digest_fail.mp3").exists()
     assert not (tmp_path / "digest_fail.mp3.tmp").exists()
@@ -2820,7 +2821,6 @@ def test_download_file_validates_ebooks_and_rejects_corrupt_epub_or_pdf(tmp_path
 
 @pytest.mark.no_probe_stub
 def test_download_file_resume_redownloads_corrupt_existing_file(tmp_path):
-    from audiobookdl.output import output as output_mod
     from audiobookdl.utils import AudioProbeInfo
 
     existing = tmp_path / "Corrupt Resume.mp3"
@@ -2841,8 +2841,8 @@ def test_download_file_resume_redownloads_corrupt_existing_file(tmp_path):
         return AudioProbeInfo(duration=0.0, codec_name="")
 
     with (
-        patch("audiobookdl.output.output.find_executable", return_value="ffprobe"),
-        patch.object(output_mod, "_probe_audio_info", side_effect=fake_probe),
+        patch("audiobookdl.output.ffmpeg_ops.find_executable", return_value="ffprobe"),
+        patch("audiobookdl.output.ffmpeg_ops._probe_audio_info", side_effect=fake_probe),
     ):
         out_path = download_file(
             (book, str(tmp_path / "Corrupt Resume"), 0, lambda _: None, None),

@@ -83,10 +83,12 @@ def default_domains_for_service(service_key: str) -> list[str]:
     if normalized in SERVICE_COOKIE_DOMAINS:
         return list(SERVICE_COOKIE_DOMAINS[normalized])
 
+    from audiobookdl.exceptions import NoSourceFound
     from audiobookdl.sources import find_source_by_name
 
-    source_cls = find_source_by_name(normalized)
-    if source_cls is None:
+    try:
+        source_cls = find_source_by_name(normalized)
+    except NoSourceFound:
         return []
     domains: list[str] = []
     seen = set()
@@ -425,38 +427,17 @@ def read_firefox_cookies(
 
 
 def _dpapi_unprotect(encrypted_bytes: bytes) -> bytes:
-    """Decrypt Windows DPAPI-protected bytes via `crypt32.CryptUnprotectData`."""
+    """Decrypt Windows DPAPI-protected bytes via the shared Win32 helper."""
     if not sys.platform.startswith("win"):
         raise BrowserCookieError("DPAPI decryption is only available on Windows.")
-    import ctypes
-    from ctypes import wintypes
-
-    class _DataBlob(ctypes.Structure):
-        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
-
-    windll: Any = getattr(ctypes, "windll", None)
-    if windll is None:
-        raise BrowserCookieError("DPAPI decryption is only available on Windows.")
-    crypt32 = windll.crypt32
-    kernel32 = windll.kernel32
-    in_buf = ctypes.create_string_buffer(encrypted_bytes, len(encrypted_bytes))
-    blob_in = _DataBlob(len(encrypted_bytes), ctypes.cast(in_buf, ctypes.POINTER(ctypes.c_char)))
-    blob_out = _DataBlob()
-
-    if not crypt32.CryptUnprotectData(
-        ctypes.byref(blob_in),
-        None,
-        None,
-        None,
-        None,
-        0,
-        ctypes.byref(blob_out),
-    ):
-        raise BrowserCookieError("Windows DPAPI decryption failed for browser key.")
     try:
-        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
-    finally:
-        kernel32.LocalFree(blob_out.pbData)
+        from audiobookdl.utils._win32 import dpapi_unprotect
+
+        return dpapi_unprotect(encrypted_bytes)
+    except BrowserCookieError:
+        raise
+    except Exception as exc:
+        raise BrowserCookieError(f"Windows DPAPI decryption failed for browser key: {exc}") from exc
 
 
 def _load_chromium_master_key(local_state_path: Path | None) -> bytes | None:
@@ -477,16 +458,26 @@ def _load_chromium_master_key(local_state_path: Path | None) -> bytes | None:
     return None
 
 
+def _import_aes() -> Any:
+    """Return an AES module (`Crypto` preferred, `Cryptodome` fallback) or `None`."""
+    import importlib
+
+    for module_name in ("Crypto.Cipher", "Cryptodome.Cipher"):
+        try:
+            return importlib.import_module(module_name).AES
+        except ImportError:
+            continue
+    return None
+
+
 def _aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes) -> bytes:
-    try:
-        from Cryptodome.Cipher import AES
-
-        cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+    aes = _import_aes()
+    if aes is not None:
+        cipher = aes.new(key, aes.MODE_GCM, nonce=nonce)
         return cipher.decrypt_and_verify(ciphertext, tag)
-    except ImportError:
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-        return AESGCM(key).decrypt(nonce, ciphertext + tag, None)
+    return AESGCM(key).decrypt(nonce, ciphertext + tag, None)
 
 
 def _decrypt_chromium_value(

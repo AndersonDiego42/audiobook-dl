@@ -1,138 +1,35 @@
 from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from typing import Any
 import os
-import re
-import shlex
 import sqlite3
 import threading
-from typing import Any
 from collections.abc import Generator, Iterable, Sequence
 
 from audiobookdl.sources.source import CatalogBook
-from audiobookdl.utils.audiobook import Audiobook, is_ebook
+from audiobookdl.utils.archive_index import (
+    ArchiveMatchIndex,
+    _fts5_phrase,
+    _normalize_asin_stored,
+    _normalize_isbn_stored,
+    _normalize_output_path_key,
+    _normalize_source_stored,
+    _sql_like_escape,
+    _utc_now,
+    make_catalog_book_key,
+    make_book_key as make_book_key,
+)
+from audiobookdl.utils.archive_models import (
+    VALID_LIBRARY_STATUSES,
+    ArchiveEntry,
+    SearchTerm,
+    normalize_tag,
+    parse_library_query,
+    parse_tags_input as parse_tags_input,
+)
 
 
-VALID_LIBRARY_STATUSES: tuple[str, ...] = ("pending", "downloaded", "trashed")
-_SCHEMA_VERSION = 3
-_TAG_CLEAN_RE = re.compile(r"[^a-z0-9_-]+")
+_SCHEMA_VERSION = 4
 _UNSET: Any = object()
-
-
-def _normalize_output_path_key(output_path: str | None) -> str | None:
-    """Return canonical case-folded absolute path for O(1) `output_path_norm` lookups."""
-    cleaned = str(output_path or "").strip()
-    if not cleaned:
-        return None
-    return os.path.normcase(os.path.abspath(cleaned))
-
-
-def _fts5_phrase(value: str) -> str:
-    """Quote an arbitrary search string as a literal FTS5 phrase token."""
-    return '"' + value.replace('"', '""') + '"'
-
-
-@dataclass(frozen=True)
-class ArchiveEntry:
-    """Single library or download entry stored in the SQLite ledger."""
-
-    id: int
-    source: str
-    book_key: str
-    url: str | None
-    title: str
-    author: str
-    output_path: str | None
-    audio_format: str | None
-    downloaded_at: str
-    profile: str = "default"
-    status: str = "downloaded"
-    series: str | None = None
-    series_order: int | None = None
-    narrator: str = ""
-    duration_seconds: float | None = None
-    isbn: str | None = None
-    asin: str | None = None
-    last_seen_at: str | None = None
-    tags: tuple[str, ...] = ()
-
-    @property
-    def is_hidden(self) -> bool:
-        """Return True if this entry carries the reserved `hidden` tag."""
-        return "hidden" in self.tags
-
-
-@dataclass(frozen=True)
-class SearchTerm:
-    """Parsed token from a library search query."""
-
-    field: str | None
-    value: str
-    negated: bool = False
-
-
-def normalize_tag(raw: str) -> str:
-    """Normalize a tag to lowercase `[a-z0-9_-]` characters."""
-    cleaned = _TAG_CLEAN_RE.sub("_", raw.strip().lower()).strip("_")
-    return cleaned
-
-
-def parse_tags_input(raw: str) -> list[str]:
-    """Parse space- or comma-separated tags into unique normalized tags."""
-    tokens = re.split(r"[\s,]+", raw.strip())
-    out: list[str] = []
-    for token in tokens:
-        tag = normalize_tag(token)
-        if tag and tag not in out:
-            out.append(tag)
-    return out
-
-
-def parse_library_query(query: str) -> list[SearchTerm]:
-    """
-    Parse a Libation-style search query supporting quoted phrases, negation (`-`),
-    and field prefixes (`author:`, `title:`, `narrator:`, `series:`, `source:`,
-    `profile:`, `tag:`, `status:`, `isbn:`, `asin:`).
-    """
-    cleaned = query.strip()
-    if not cleaned:
-        return []
-    try:
-        tokens = shlex.split(cleaned)
-    except ValueError:
-        tokens = cleaned.split()
-
-    known_fields = {
-        "author",
-        "title",
-        "narrator",
-        "series",
-        "source",
-        "profile",
-        "tag",
-        "status",
-        "isbn",
-        "asin",
-    }
-    terms: list[SearchTerm] = []
-    for token in tokens:
-        negated = False
-        body = token
-        if body.startswith("-") and len(body) > 1:
-            negated = True
-            body = body[1:]
-        field: str | None = None
-        value = body
-        if ":" in body:
-            prefix, rest = body.split(":", 1)
-            prefix_lower = prefix.strip().lower()
-            if prefix_lower in known_fields and rest:
-                field = prefix_lower
-                value = rest
-        val_lower = value.strip().lower()
-        if val_lower:
-            terms.append(SearchTerm(field=field, value=val_lower, negated=negated))
-    return terms
 
 
 def default_archive_path(database_directory: str) -> str:
@@ -164,126 +61,6 @@ def resolve_archive_path(config: Any, explicit_path: str | None = None) -> str:
     if configured:
         return str(configured)
     return default_archive_path(resolve_database_directory(config))
-
-
-class ArchiveMatchIndex:
-    """In-memory normalized identifier/path/title index for O(1) bulk ledger matching."""
-
-    def __init__(self) -> None:
-        self._by_url: dict[str, int] = {}
-        self._by_asin: dict[str, int] = {}
-        self._by_isbn: dict[str, int] = {}
-        self._by_path: dict[str, int] = {}
-        self._by_title: dict[str, list[tuple[int, str]]] = {}
-
-    @staticmethod
-    def _norm_text(raw: str | None) -> str:
-        return " ".join((raw or "").casefold().split())
-
-    def add(
-        self,
-        entry_id: int,
-        *,
-        book_key: str | None = None,
-        url: str | None = None,
-        title: str = "",
-        author: str = "",
-        output_path: str | None = None,
-        isbn: str | None = None,
-        asin: str | None = None,
-    ) -> None:
-        if book_key:
-            self._by_url.setdefault(book_key.strip(), entry_id)
-        if url:
-            self._by_url.setdefault(url.strip(), entry_id)
-        norm_asin = (asin or "").strip().lower()
-        if norm_asin:
-            self._by_asin.setdefault(norm_asin, entry_id)
-        norm_isbn = (isbn or "").strip().replace("-", "").lower()
-        if norm_isbn:
-            self._by_isbn.setdefault(norm_isbn, entry_id)
-        if output_path and output_path.strip():
-            norm_path = os.path.normcase(os.path.abspath(output_path))
-            self._by_path.setdefault(norm_path, entry_id)
-        norm_title = self._norm_text(title)
-        if norm_title:
-            self._by_title.setdefault(norm_title, []).append(
-                (entry_id, self._norm_text(author))
-            )
-
-    def find(
-        self,
-        *,
-        title: str = "",
-        author: str = "",
-        isbn: str | None = None,
-        asin: str | None = None,
-        scrape_url: str | None = None,
-        output_path: str | None = None,
-    ) -> int | None:
-        norm_url = (scrape_url or "").strip()
-        if norm_url and norm_url in self._by_url:
-            return self._by_url[norm_url]
-        norm_asin = (asin or "").strip().lower()
-        if norm_asin and norm_asin in self._by_asin:
-            return self._by_asin[norm_asin]
-        norm_isbn = (isbn or "").strip().replace("-", "").lower()
-        if norm_isbn and norm_isbn in self._by_isbn:
-            return self._by_isbn[norm_isbn]
-        if output_path:
-            norm_path = os.path.normcase(os.path.abspath(output_path))
-            if norm_path in self._by_path:
-                return self._by_path[norm_path]
-        norm_title = self._norm_text(title)
-        norm_author = self._norm_text(author)
-        if norm_title:
-            matches = self._by_title.get(norm_title, [])
-            if norm_author:
-                for entry_id, row_author in matches:
-                    if row_author and (
-                        row_author == norm_author
-                        or norm_author in row_author
-                        or row_author in norm_author
-                    ):
-                        return entry_id
-            if len(matches) == 1 and (not norm_author or not matches[0][1]):
-                return matches[0][0]
-        return None
-
-
-def make_book_key(source_name: str, audiobook: Audiobook, fallback_url: str | None = None) -> str:
-    """Build a stable deduplication key for an `Audiobook`."""
-    scrape_url = (audiobook.metadata.scrape_url or "").strip()
-    if scrape_url:
-        base_key = scrape_url
-    elif fallback_url and fallback_url.strip():
-        base_key = fallback_url.strip()
-    else:
-        title = (audiobook.metadata.title or "").strip().lower()
-        author = (audiobook.metadata.author or "").strip().lower()
-        base_key = f"{source_name.lower()}::{title}::{author}"
-    if is_ebook(audiobook):
-        return f"{base_key}::ebook"
-    return base_key
-
-
-def make_catalog_book_key(source_name: str, book: CatalogBook) -> str:
-    """Build a stable deduplication key matching `make_book_key` for a `CatalogBook`."""
-    url = (book.url or "").strip()
-    if url:
-        return url
-    title = (book.title or "").strip().lower()
-    author = (book.author or "").strip().lower()
-    return f"{source_name.lower()}::{title}::{author}"
-
-
-def _sql_like_escape(value: str) -> str:
-    """Escape SQLite `LIKE` wildcards using `\\` as the escape character."""
-    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 class DownloadArchive:
@@ -499,6 +276,19 @@ class DownloadArchive:
             except sqlite3.OperationalError:
                 conn.execute("DROP TABLE IF EXISTS downloads_fts")
                 self._fts5_trigram = False
+            conn.execute(
+                "UPDATE downloads SET source = LOWER(TRIM(source)) "
+                "WHERE source IS NOT NULL AND source != LOWER(TRIM(source))"
+            )
+            conn.execute(
+                "UPDATE downloads SET asin = UPPER(TRIM(asin)) "
+                "WHERE asin IS NOT NULL AND TRIM(asin) != '' AND asin != UPPER(TRIM(asin))"
+            )
+            conn.execute(
+                "UPDATE downloads SET isbn = UPPER(REPLACE(REPLACE(TRIM(isbn), '-', ''), ' ', '')) "
+                "WHERE isbn IS NOT NULL AND TRIM(isbn) != '' "
+                "AND isbn != UPPER(REPLACE(REPLACE(TRIM(isbn), '-', ''), ' ', ''))"
+            )
             conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
     def contains(self, source: str, book_key: str) -> bool:
@@ -506,7 +296,7 @@ class DownloadArchive:
         with self._connection() as conn:
             row = conn.execute(
                 "SELECT 1 FROM downloads WHERE source = ? AND book_key = ? AND status = 'downloaded' LIMIT 1",
-                (source, book_key),
+                (_normalize_source_stored(source), book_key),
             ).fetchone()
             return row is not None
 
@@ -515,7 +305,7 @@ class DownloadArchive:
         with self._connection() as conn:
             row = conn.execute(
                 "SELECT status FROM downloads WHERE source = ? AND book_key = ? LIMIT 1",
-                (source, book_key),
+                (_normalize_source_stored(source), book_key),
             ).fetchone()
             return str(row["status"]) if row is not None else None
 
@@ -541,6 +331,9 @@ class DownloadArchive:
         """Insert or update a library/download entry and return its row id."""
         if status not in VALID_LIBRARY_STATUSES:
             raise ValueError(f"Invalid library status: {status!r}")
+        source = _normalize_source_stored(source)
+        asin = _normalize_asin_stored(asin)
+        isbn = _normalize_isbn_stored(isbn)
         timestamp = _utc_now()
         norm_profile = (profile or "default").strip().lower() or "default"
         output_path_norm = _normalize_output_path_key(output_path)
@@ -612,25 +405,36 @@ class DownloadArchive:
         """
         timestamp = _utc_now()
         norm_profile = (profile or "default").strip().lower() or "default"
-        inserted = 0
-        updated = 0
+        prepared: list[tuple[str, str, CatalogBook]] = []
+        deduped: dict[tuple[str, str], CatalogBook] = {}
+        for book in books:
+            item_source = _normalize_source_stored(book.source or source) or _normalize_source_stored(source)
+            book_key = make_catalog_book_key(item_source, book)
+            deduped[(item_source, book_key)] = book
+        prepared = [(s, k, b) for (s, k), b in deduped.items()]
+
+        existing_ids: dict[tuple[str, str], int] = {}
         with self._connection() as conn:
-            for book in books:
-                item_source = (book.source or source).strip().lower() or source.lower()
-                book_key = make_catalog_book_key(item_source, book)
-                existing = conn.execute(
-                    "SELECT id FROM downloads WHERE source = ? AND book_key = ? LIMIT 1",
-                    (item_source, book_key),
-                ).fetchone()
-                if existing is None:
-                    conn.execute(
-                        """
-                        INSERT INTO downloads (
-                            source, book_key, url, title, author, downloaded_at,
-                            profile, status, series, series_order, last_seen_at
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
-                        """,
+            for start in range(0, len(prepared), 500):
+                batch = prepared[start : start + 500]
+                by_source: dict[str, list[str]] = {}
+                for item_source, book_key, _book in batch:
+                    by_source.setdefault(item_source, []).append(book_key)
+                for item_source, key_list in by_source.items():
+                    placeholders = ",".join("?" for _ in key_list)
+                    rows = conn.execute(
+                        f"SELECT id, book_key FROM downloads WHERE source = ? AND book_key IN ({placeholders})",
+                        (item_source, *key_list),
+                    ).fetchall()
+                    for row in rows:
+                        existing_ids[(item_source, str(row["book_key"]))] = int(row["id"])
+
+            insert_rows: list[tuple[Any, ...]] = []
+            update_rows: list[tuple[Any, ...]] = []
+            for item_source, book_key, book in prepared:
+                existing_id = existing_ids.get((item_source, book_key))
+                if existing_id is None:
+                    insert_rows.append(
                         (
                             item_source,
                             book_key,
@@ -642,22 +446,10 @@ class DownloadArchive:
                             book.series,
                             book.series_order,
                             timestamp,
-                        ),
+                        )
                     )
-                    inserted += 1
                 else:
-                    conn.execute(
-                        """
-                        UPDATE downloads
-                        SET url = COALESCE(?, url),
-                            title = ?,
-                            author = CASE WHEN ? != '' THEN ? ELSE author END,
-                            series = COALESCE(?, series),
-                            series_order = COALESCE(?, series_order),
-                            profile = ?,
-                            last_seen_at = ?
-                        WHERE id = ?
-                        """,
+                    update_rows.append(
                         (
                             book.url or None,
                             book.title,
@@ -667,11 +459,36 @@ class DownloadArchive:
                             book.series_order,
                             norm_profile,
                             timestamp,
-                            int(existing["id"]),
-                        ),
+                            existing_id,
+                        )
                     )
-                    updated += 1
-        return inserted, updated
+            if insert_rows:
+                conn.executemany(
+                    """
+                    INSERT INTO downloads (
+                        source, book_key, url, title, author, downloaded_at,
+                        profile, status, series, series_order, last_seen_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                    """,
+                    insert_rows,
+                )
+            if update_rows:
+                conn.executemany(
+                    """
+                    UPDATE downloads
+                    SET url = COALESCE(?, url),
+                        title = ?,
+                        author = CASE WHEN ? != '' THEN ? ELSE author END,
+                        series = COALESCE(?, series),
+                        series_order = COALESCE(?, series_order),
+                        profile = ?,
+                        last_seen_at = ?
+                    WHERE id = ?
+                    """,
+                    update_rows,
+                )
+        return len(insert_rows), len(update_rows)
 
     def lookup_catalog_statuses(
         self,
@@ -703,7 +520,7 @@ class DownloadArchive:
                                WHERE t.item_id = d.id AND t.tag = 'hidden'
                            ) AS is_hidden
                     FROM downloads d
-                    WHERE lower(d.source) IN ({placeholders})
+                    WHERE d.source IN ({placeholders})
                     """,
                     tuple(sorted(target_sources)),
                 ).fetchall()
@@ -904,9 +721,11 @@ class DownloadArchive:
         elif term.field == "profile":
             matched = val in entry.profile.lower()
         elif term.field == "isbn":
-            matched = val in (entry.isbn or "").lower()
+            needle = _normalize_isbn_stored(val)
+            matched = bool(needle) and needle in (entry.isbn or "")
         elif term.field == "asin":
-            matched = val in (entry.asin or "").lower()
+            needle = _normalize_asin_stored(val)
+            matched = bool(needle) and needle in (entry.asin or "")
         else:
             haystack = " ".join(
                 part
@@ -970,6 +789,10 @@ class DownloadArchive:
         use_fts5 = bool(getattr(self, "_fts5_trigram", False))
         for term in terms:
             val = term.value
+            if term.field == "isbn":
+                val = _normalize_isbn_stored(val) or val
+            elif term.field == "asin":
+                val = _normalize_asin_stored(val) or val
             can_fts5 = use_fts5 and len(val) >= 3
             if term.field in _FIELD_COL_MAP and can_fts5:
                 col = _FIELD_COL_MAP[term.field]
@@ -1190,6 +1013,45 @@ class DownloadArchive:
                         return results
         return results
 
+    def iter_entries(
+        self,
+        *,
+        query: str = "",
+        include_trashed: bool = False,
+        include_hidden: bool = True,
+        status: str | None = None,
+        sort_by: str = "id",
+        descending: bool = True,
+    ) -> Generator[ArchiveEntry, None, None]:
+        """Yield `ArchiveEntry` rows matching filters in batches, without loading all rows into RAM."""
+        terms, explicit_hidden_query, where_sql, params, needs_python_filter = self._build_filter_plan(
+            query=query,
+            include_trashed=include_trashed,
+            include_hidden=include_hidden,
+            status=status,
+        )
+        order_sql = self._build_order_by_sql(sort_by, descending)
+        sql = """
+            SELECT id, source, book_key, url, title, author, output_path, format, downloaded_at,
+                   profile, status, series, series_order, narrator, duration_seconds, isbn, asin, last_seen_at
+            FROM downloads
+        """ + where_sql + order_sql
+
+        with self._connection() as conn:
+            cursor = conn.execute(sql, tuple(params))
+            while True:
+                batch = cursor.fetchmany(500)
+                if not batch:
+                    break
+                tags_by_id = self._fetch_tags_for_ids(conn, [int(r["id"]) for r in batch])
+                for row in batch:
+                    entry = self._build_entry(row, tags_by_id.get(int(row["id"]), ()))
+                    if not include_hidden and not explicit_hidden_query and entry.is_hidden:
+                        continue
+                    if terms and not all(self._matches_term(entry, term) for term in terms):
+                        continue
+                    yield entry
+
     def update_entry(
         self,
         entry_id: int,
@@ -1229,11 +1091,11 @@ class DownloadArchive:
             assignments.append("series_order = ?")
             params.append(int(series_order) if series_order is not None else None)
         if isbn is not _UNSET:
-            clean_isbn = str(isbn or "").strip() or None
+            clean_isbn = _normalize_isbn_stored(isbn)
             assignments.append("isbn = ?")
             params.append(clean_isbn)
         if asin is not _UNSET:
-            clean_asin = str(asin or "").strip() or None
+            clean_asin = _normalize_asin_stored(asin)
             assignments.append("asin = ?")
             params.append(clean_asin)
         if output_path is not _UNSET:
@@ -1298,7 +1160,7 @@ class DownloadArchive:
         for source, book_key in keys:
             if not book_key:
                 continue
-            src_list = by_source.setdefault(source, [])
+            src_list = by_source.setdefault(_normalize_source_stored(source), [])
             if book_key not in src_list:
                 src_list.append(book_key)
         if not by_source:
@@ -1342,8 +1204,8 @@ class DownloadArchive:
     ) -> int | None:
         """Find an existing ledger row matching identifiers, path, or title/author."""
         norm_url = (scrape_url or "").strip()
-        norm_asin = (asin or "").strip().lower()
-        norm_isbn = (isbn or "").strip().replace("-", "").lower()
+        norm_asin = _normalize_asin_stored(asin)
+        norm_isbn = _normalize_isbn_stored(isbn)
         abs_path = os.path.abspath(output_path) if output_path else ""
         norm_path = os.path.normcase(abs_path) if abs_path else ""
         norm_title = " ".join((title or "").casefold().split())
@@ -1360,16 +1222,16 @@ class DownloadArchive:
 
             if norm_asin:
                 row = conn.execute(
-                    "SELECT id FROM downloads WHERE asin = ? COLLATE NOCASE OR TRIM(LOWER(asin)) = ? LIMIT 1",
-                    (norm_asin, norm_asin),
+                    "SELECT id FROM downloads WHERE asin = ? LIMIT 1",
+                    (norm_asin,),
                 ).fetchone()
                 if row is not None:
                     return int(row["id"])
 
             if norm_isbn:
                 row = conn.execute(
-                    "SELECT id FROM downloads WHERE isbn = ? OR REPLACE(LOWER(TRIM(isbn)), '-', '') = ? LIMIT 1",
-                    (isbn.strip(), norm_isbn) if isbn else ("", norm_isbn),
+                    "SELECT id FROM downloads WHERE isbn = ? LIMIT 1",
+                    (norm_isbn,),
                 ).fetchone()
                 if row is not None:
                     return int(row["id"])
@@ -1437,11 +1299,11 @@ class DownloadArchive:
         asin: str | None = None,
     ) -> dict[str, Any] | None:
         """Return an active non-trashed ledger row from another entry matching ASIN, ISBN, or title/author."""
-        norm_asin = (asin or "").strip().lower()
-        norm_isbn = (isbn or "").strip().replace("-", "").lower()
+        norm_asin = _normalize_asin_stored(asin)
+        norm_isbn = _normalize_isbn_stored(isbn)
         norm_title = " ".join((title or "").casefold().split())
         norm_author = " ".join((author or "").casefold().split())
-        src_clean = (source or "").strip()
+        src_clean = _normalize_source_stored(source)
         key_clean = (book_key or "").strip()
 
         def _row_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -1457,20 +1319,20 @@ class DownloadArchive:
 
         with self._connection() as conn:
             excl_sql = (
-                "status IN ('downloaded', 'queued', 'sync') "
+                "status IN ('downloaded', 'pending') "
                 "AND NOT (source = ? AND book_key = ?)"
             )
             cols = "id, source, book_key, title, author, output_path, status"
             if norm_asin:
                 row = conn.execute(
-                    f"SELECT {cols} FROM downloads WHERE {excl_sql} AND TRIM(LOWER(asin)) = ? LIMIT 1",
+                    f"SELECT {cols} FROM downloads WHERE {excl_sql} AND asin = ? LIMIT 1",
                     (src_clean, key_clean, norm_asin),
                 ).fetchone()
                 if row is not None:
                     return _row_dict(row)
             if norm_isbn:
                 row = conn.execute(
-                    f"SELECT {cols} FROM downloads WHERE {excl_sql} AND REPLACE(LOWER(TRIM(isbn)), '-', '') = ? LIMIT 1",
+                    f"SELECT {cols} FROM downloads WHERE {excl_sql} AND isbn = ? LIMIT 1",
                     (src_clean, key_clean, norm_isbn),
                 ).fetchone()
                 if row is not None:
@@ -1537,11 +1399,13 @@ class DownloadArchive:
     ) -> bool:
         """Link an existing entry to a discovered local `output_path` and mark it `'downloaded'`."""
         timestamp = _utc_now()
+        norm_path = _normalize_output_path_key(output_path)
         with self._connection() as conn:
             cur = conn.execute(
                 """
                 UPDATE downloads
                 SET output_path = ?,
+                    output_path_norm = ?,
                     format = COALESCE(?, format),
                     status = CASE WHEN status = 'trashed' THEN 'trashed' ELSE 'downloaded' END,
                     series = COALESCE(series, ?),
@@ -1554,12 +1418,13 @@ class DownloadArchive:
                 """,
                 (
                     output_path,
+                    norm_path,
                     audio_format,
                     series,
                     series_order,
                     narrator,
-                    isbn,
-                    asin,
+                    _normalize_isbn_stored(isbn),
+                    _normalize_asin_stored(asin),
                     timestamp,
                     int(entry_id),
                 ),

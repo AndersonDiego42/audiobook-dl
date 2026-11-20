@@ -16,12 +16,13 @@ from .source import Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, BookId, Chapter, Cover, Result, Series
 from audiobookdl.exceptions import (
     BookNotFound,
+    DownloadCancelled,
     MissingBookAccess,
     NoFilesFound,
     RequestError,
     UserNotAuthorized,
 )
-from audiobookdl.logging import debug as log_debug
+from audiobookdl.logging import debug as log_debug, get_job_context
 from audiobookdl.utils.audiobook import (
     clean_html_description,
     parse_duration_ms,
@@ -45,6 +46,18 @@ _PREFERRED_AUDIO_FORMAT = (
 )
 _UNAVAILABLE_TITLES = frozenset({"[private video]", "[deleted video]", "[unavailable video]"})
 _TOPIC_SUFFIX_RE = re.compile(r"\s*-\s*Topic\s*$", re.IGNORECASE)
+
+
+def _caused_by_download_cancelled(exc: BaseException) -> bool:
+    """Return True when `exc` or its cause/context chain contains `DownloadCancelled`."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, DownloadCancelled):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
 
 
 class _YtdlpLogger:
@@ -329,6 +342,14 @@ class YouTubeMusicSource(Source[dict[str, Any]]):
         retries = resolve_max_retries(getattr(self, "_options", None))
         opts["retries"] = retries
         opts["extractor_retries"] = retries
+
+        def _cancel_progress_hook(_d: dict[str, Any]) -> None:
+            ctx = get_job_context()
+            ev = ctx.cancel_event if ctx is not None else None
+            if ev is not None and ev.is_set():
+                raise DownloadCancelled
+
+        opts["progress_hooks"] = [_cancel_progress_hook]
         return opts
 
     def _map_ytdlp_error(self, exc: Exception) -> Exception:
@@ -356,6 +377,10 @@ class YouTubeMusicSource(Source[dict[str, Any]]):
         noplaylist: bool = True,
     ) -> dict[str, Any]:
         """Run `yt_dlp.YoutubeDL.extract_info(..., download=False)` and normalize failures."""
+        ctx = get_job_context()
+        cancel_event = ctx.cancel_event if ctx is not None else None
+        if cancel_event is not None and cancel_event.is_set():
+            raise DownloadCancelled
         with self._cookie_file_context() as cookiefile:
             ydl_opts = self._build_ydl_opts(
                 flat=flat,
@@ -365,10 +390,18 @@ class YouTubeMusicSource(Source[dict[str, Any]]):
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     raw = ydl.extract_info(url, download=False)
+            except DownloadCancelled:
+                raise
             except yt_dlp.utils.DownloadError as exc:
+                if _caused_by_download_cancelled(exc):
+                    raise DownloadCancelled from exc
                 raise self._map_ytdlp_error(exc) from exc
             except Exception as exc:
+                if _caused_by_download_cancelled(exc):
+                    raise DownloadCancelled from exc
                 raise RequestError(detail=str(exc)) from exc
+        if cancel_event is not None and cancel_event.is_set():
+            raise DownloadCancelled
         if not isinstance(raw, dict):
             raise BookNotFound
         return raw
@@ -388,7 +421,8 @@ class YouTubeMusicSource(Source[dict[str, Any]]):
                 cached[0] = None
             else:
                 info = self._extract_info(track_url, flat=False, noplaylist=True)
-                stream_url, _ext, headers, _is_hls = _select_audio_stream(info)
+                stream_url, ext, headers, is_hls = _select_audio_stream(info)
+                audio_file.ext = ext
             if headers:
                 audio_file.headers.update(headers)
             return stream_url
@@ -567,13 +601,24 @@ class YouTubeMusicSource(Source[dict[str, Any]]):
             if not track_url:
                 continue
             track_title = str(entry.get("track") or entry.get("title") or f"Track {idx}").strip()
-            audio_file = AudiobookFile(
-                url="",
-                ext="m4a",
-                title=track_title,
-            )
-            audio_file.url_resolver = self._make_stream_resolver(track_url, audio_file)
-            files.append(audio_file)
+            track_info = self._extract_info(track_url, flat=False, noplaylist=True)
+            stream_url, ext, headers, is_hls = _select_audio_stream(track_info)
+            if is_hls:
+                files.extend(self.get_stream_files(stream_url, headers=headers))
+            else:
+                audio_file = AudiobookFile(
+                    url="",
+                    ext=ext,
+                    title=track_title,
+                    headers=dict(headers),
+                    size=_extract_stream_filesize(track_info),
+                )
+                audio_file.url_resolver = self._make_stream_resolver(
+                    track_url,
+                    audio_file,
+                    initial_stream=(stream_url, headers),
+                )
+                files.append(audio_file)
             if all_have_durations and dur_ms is not None:
                 chapters.append(Chapter(start=running_ms, title=track_title))
                 running_ms += dur_ms

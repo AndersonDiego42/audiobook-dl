@@ -1,9 +1,12 @@
 from audiobookdl import AudiobookMetadata, Chapter, utils, logging
+from audiobookdl.exceptions import DownloadCancelled
 from audiobookdl.utils.concurrency import run_cancellable_subprocess
+from audiobookdl.utils.fs import replace_with_retry
 from ._chapters import build_bounded_chapters
 from mutagen import File as MutagenFile
 import os
 import threading
+import uuid
 from collections.abc import Sequence
 
 
@@ -102,8 +105,9 @@ def add_chapters_ffmpeg(
     stem, ext = os.path.splitext(filepath)
     container_ext = ext.lstrip(".").lower()
     faststart_args = ["-movflags", "+faststart"] if container_ext in utils.MP4_CONTAINERS else []
-    tmp_chapter_file = f"{filepath}.chapters.tmp.txt"
-    tmp_media_file = f"{stem}.tmp{ext or '.mp4'}"
+    unique_suffix = uuid.uuid4().hex[:8]
+    tmp_chapter_file = f"{filepath}.{unique_suffix}.chapters.tmp.txt"
+    tmp_media_file = f"{stem}.{unique_suffix}.tmp{ext or '.mp4'}"
     try:
         with open(tmp_chapter_file, "w", encoding="utf-8", newline="\n") as f:
             f.write(create_tmp_chapter_file(filepath, chapters))
@@ -171,7 +175,29 @@ def add_chapters_ffmpeg(
         if not succeeded:
             logging.log("Could not embed chapters; leaving file as-is")
             return
-        os.replace(tmp_media_file, filepath)
+        # Verify the remux before replacing the original so a truncated/corrupt
+        # ffmpeg output never overwrites valid audio.
+        try:
+            from audiobookdl.output.output import verify_audio_integrity
+
+            expected_duration = float(
+                getattr(
+                    utils.probe_audio_info(filepath, cancel_event=cancel_event),
+                    "duration",
+                    0.0,
+                )
+                or 0.0
+            )
+            verify_audio_integrity(tmp_media_file, expected_duration=expected_duration)
+        except DownloadCancelled:
+            raise
+        except Exception as exc:
+            logging.debug(
+                f"Chapter remux for '{os.path.basename(filepath)}' failed integrity "
+                f"verification ({exc}); leaving file as-is"
+            )
+            return
+        replace_with_retry(tmp_media_file, filepath)
     finally:
         if os.path.exists(tmp_chapter_file):
             os.remove(tmp_chapter_file)

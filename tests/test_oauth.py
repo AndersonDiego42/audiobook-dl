@@ -382,8 +382,8 @@ def test_pipeline_oauth_lifecycle_authorize_reuse_refresh_and_retry(tmp_path, mo
     )
     _FakeOAuthSource.auth_runs = 0
     _FakeOAuthSource.refresh_calls = 0
-    monkeypatch.setattr("audiobookdl.pipeline.find_compatible_source", lambda _u: _FakeOAuthSource)
-    monkeypatch.setattr("audiobookdl.pipeline.find_source_by_name", lambda _n: _FakeOAuthSource)
+    monkeypatch.setattr("audiobookdl.pipeline.jobs.find_compatible_source", lambda _u: _FakeOAuthSource)
+    monkeypatch.setattr("audiobookdl.pipeline.auth.find_source_by_name", lambda _n: _FakeOAuthSource)
 
     cfg = load_config(str(cfg_path))
     opts = build_default_options(config_location=str(cfg_path), profile="work", database_directory=str(tmp_path / "db"))

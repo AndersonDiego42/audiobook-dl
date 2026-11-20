@@ -775,7 +775,85 @@ def test_strip_auth_headers_removes_tokens_case_insensitively():
     assert strip_auth_headers(None) == {}
 
 
+def test_get_with_credentials_false_neutralizes_session_auth_headers(tmp_path):
+    source = _make_source(tmp_path)
+    source._session.headers["Authorization"] = "Bearer secret-token"
+    source._session.headers["X-Login-Token"] = "secret"
+    source._session.get = MagicMock(return_value=MagicMock(status_code=200, content=b"ok"))
+    source.create_unauthenticated_session = MagicMock()
 
+    assert source.get("https://cdn.example.com/cover.jpg", credentials=False) == b"ok"
+    source.create_unauthenticated_session.assert_not_called()
+    sent_headers = source._session.get.call_args.kwargs["headers"]
+    assert sent_headers["authorization"] is None
+    assert sent_headers["x-login-token"] is None
+
+    # Explicit per-request headers are preserved over neutralization.
+    source._session.get.reset_mock()
+    assert source.get(
+        "https://cdn.example.com/signed.jpg",
+        headers={"Authorization": "Bearer explicit", "X-Custom": "v"},
+        credentials=False,
+    ) == b"ok"
+    sent_headers = source._session.get.call_args.kwargs["headers"]
+    assert sent_headers["Authorization"] == "Bearer explicit"
+    assert sent_headers["X-Custom"] == "v"
+    assert sent_headers["x-login-token"] is None
+
+    # Default behavior still uses the authenticated session untouched.
+    source._session.get.reset_mock()
+    assert source.get("https://api.example.com/me") == b"ok"
+    assert "headers" not in source._session.get.call_args.kwargs
+
+
+def test_get_with_credentials_false_uses_clean_session_for_curl_cffi(tmp_path):
+    source = _make_source(tmp_path)
+    fake_curl_session = type(
+        "Session", (), {"__module__": "curl_cffi.requests.session"}
+    )()
+    fake_curl_session.get = MagicMock(return_value=MagicMock(status_code=200, content=b"ok"))
+    source._session = fake_curl_session
+    unauth = MagicMock()
+    unauth.get.return_value = MagicMock(status_code=200, content=b"ok")
+    source.create_unauthenticated_session = MagicMock(return_value=unauth)
+
+    assert source.get("https://cdn.example.com/cover.jpg", credentials=False) == b"ok"
+    source.create_unauthenticated_session.assert_called_once()
+    fake_curl_session.get.assert_not_called()
+    unauth.get.assert_called_once()
+
+
+def test_fetch_cover_safe_fetches_without_credentials_by_default(tmp_path):
+    source = _make_source(tmp_path)
+    source.get = MagicMock(return_value=b"\xff\xd8\xff\xe0" + b"\x00" * 32)
+
+    cover = source.fetch_cover_safe("https://cdn.example.com/cover.jpg")
+
+    source.get.assert_called_once_with("https://cdn.example.com/cover.jpg", credentials=False)
+    assert cover is not None
+
+
+def test_get_stream_files_credentials_false_neutralizes_auth_headers(tmp_path):
+    playlist_bytes = (
+        b"#EXTM3U\n"
+        b"#EXTINF:10.0,\n"
+        b"seg-0.ts\n"
+        b"#EXT-X-ENDLIST\n"
+    )
+    source = _make_source(tmp_path)
+    source._session.headers["X-Login-Token"] = "secret"
+    source._session.get = MagicMock(return_value=MagicMock(status_code=200, content=playlist_bytes))
+    source.create_unauthenticated_session = MagicMock()
+
+    files = source.get_stream_files(
+        "https://cdn.example.com/audio/playlist.m3u8",
+        credentials=False,
+    )
+
+    source.create_unauthenticated_session.assert_not_called()
+    sent_headers = source._session.get.call_args.kwargs["headers"]
+    assert sent_headers["x-login-token"] is None
+    assert files[0].url == "https://cdn.example.com/audio/seg-0.ts"
 
 
 

@@ -18,8 +18,8 @@ from audiobookdl.exceptions import NoSourceFound
 from audiobookdl.options_schema import DownloadOptions, SyncOptions, build_default_options
 from audiobookdl.pipeline import (
     Downloader,
-    apply_runtime_options,
     list_service_library,
+    resolve_runtime_options,
 )
 from audiobookdl.sources import find_source_by_name
 from audiobookdl.utils.archive import DownloadArchive, make_catalog_book_key, resolve_archive_path
@@ -156,8 +156,7 @@ def _build_sync_download_options(
     if sync_opts.output_format is not None:
         overrides["output_format"] = sync_opts.output_format
     base_opts = build_default_options(**overrides)
-    apply_runtime_options(base_opts, config)
-    return base_opts
+    return resolve_runtime_options(base_opts, config)
 
 
 @dataclass
@@ -210,10 +209,13 @@ def discover_pending_sync_books(
             stats = ProfileSyncStats(service=svc, profile=prof)
             try:
                 dl_opts = _build_sync_download_options(sync_opts, resolved_config, archive_path, prof)
-                if interaction is not None:
-                    books = list_service_library(svc, dl_opts, resolved_config, interaction=interaction)
-                else:
-                    books = list_service_library(svc, dl_opts, resolved_config)
+                books = list_service_library(
+                    svc,
+                    dl_opts,
+                    resolved_config,
+                    interaction=interaction,
+                    cancel_event=cancel_event,
+                )
                 stats.discovered = len(books)
                 cycle.books_discovered += len(books)
 

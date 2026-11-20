@@ -33,11 +33,20 @@ class UpdateInfo:
     release_url: str = _RELEASES_PAGE_URL
 
 
+_VERSION_RELEASE_RE = re.compile(r"\d+(?:\.\d+)*")
+
+
 def parse_version_tuple(version_str: str) -> tuple[int, ...]:
-    """Parse a semantic version string (e.g. `'v1.2.3'`) into numeric parts."""
+    """Parse the numeric release segment of a version string (e.g. `'v1.2.3'`, `'0.7.3rc1'`).
+
+    Pre-release (`rc`, `a`, `b`, `dev`) and local (`+...`) suffixes are ignored so that
+    ``0.7.3rc1`` compares equal to ``0.7.3`` rather than greater.
+    """
     cleaned = version_str.strip().lstrip("vV")
-    parts = [int(m) for m in re.findall(r"\d+", cleaned)]
-    return tuple(parts) if parts else (0,)
+    match = _VERSION_RELEASE_RE.match(cleaned)
+    if match is None:
+        return (0,)
+    return tuple(int(part) for part in match.group(0).split("."))
 
 
 def is_newer_version(latest: str, current: str) -> bool:

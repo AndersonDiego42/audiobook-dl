@@ -126,7 +126,7 @@ class PreviewCoordinator:
         if options is None:
             return
         self.set_previewing_state(True)
-        queue_panel._set_progress(0.0, indeterminate=True)
+        queue_panel.set_progress(0.0, indeterminate=True)
         self._status_var.set("Fetching preview...")
         self._active_job_var.set("Fetching preview...")
         queue_panel.append_log(f"--- Fetching preview: {target_url} ---")
@@ -149,7 +149,7 @@ class PreviewCoordinator:
         self.set_previewing_state(False)
         self._controller.preview_interaction = None
         queue_panel = self._download_page().queue_panel
-        queue_panel._set_progress(0.0)
+        queue_panel.set_progress(0.0)
         if not self._is_running_provider():
             self._active_job_var.set("Idle")
 
@@ -313,7 +313,7 @@ class PreviewCoordinator:
                 options,
                 prefetched,
                 selected_indices,
-                service_label=queue_panel._service_label_for_url(url),
+                service_label=queue_panel.service_label_for_url(url),
             )
             if enqueued is not None:
                 added_job, new_total = enqueued

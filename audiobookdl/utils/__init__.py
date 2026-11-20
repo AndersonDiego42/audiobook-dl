@@ -222,13 +222,24 @@ def validate_ffmpeg_dir(directory: str) -> tuple[str | None, str | None]:
     return resolved, None
 
 
+@functools.lru_cache(maxsize=128)
+def _which_cached(program: str, which: Callable[[str], str | None]) -> str | None:
+    """Cached PATH scan (the expensive part of executable lookup).
+
+    `which` is part of the key so monkeypatched/replaced `shutil.which`
+    implementations never see stale cached results.
+    """
+    return which(program)
+
+
 def find_executable(program: str) -> str | None:
     """
     Locate an external executable (e.g. ffmpeg, ffprobe).
 
     Searches PyInstaller's bundle dir (`_MEIPASS`), the directory containing
     the frozen executable, an optional configured FFmpeg directory, and finally
-    the system PATH.
+    the system PATH. Bundle-dir checks stay fresh; the PATH scan is cached —
+    call `clear_executable_cache()` if PATH may have changed mid-process.
     """
     candidates = [program]
     if os.name == "nt" and not program.lower().endswith(".exe"):
@@ -251,7 +262,12 @@ def find_executable(program: str) -> str | None:
             if os.path.isfile(full_path):
                 return full_path
 
-    return shutil.which(program)
+    return _which_cached(program, shutil.which)
+
+
+def clear_executable_cache() -> None:
+    """Clear cached `find_executable` PATH lookups (e.g. after PATH mutations)."""
+    _which_cached.cache_clear()
 
 
 def program_in_path(program: str) -> bool:
@@ -295,13 +311,20 @@ def _parse_positive_float(raw: Any) -> float:
     return val if math.isfinite(val) and val > 0 else 0.0
 
 
-def probe_audio_info(path: str) -> AudioProbeInfo:
+def probe_audio_info(
+    path: str,
+    *,
+    cancel_event: threading.Event | None = None,
+    timeout: float = 30.0,
+) -> AudioProbeInfo:
     """Probe duration, bitrate, codec, container format, and chapters in one `ffprobe` call."""
+    from audiobookdl.utils.concurrency import run_cancellable_subprocess
+
     ffprobe = find_executable("ffprobe")
     if ffprobe is None:
         return AudioProbeInfo()
     try:
-        result = subprocess.run(
+        result = run_cancellable_subprocess(
             [
                 ffprobe,
                 "-v",
@@ -313,21 +336,24 @@ def probe_audio_info(path: str) -> AudioProbeInfo:
                 "json",
                 path,
             ],
-            capture_output=True,
-            text=True,
-            **subprocess_kwargs(),
+            cancel_event=cancel_event,
+            timeout=timeout,
+            capture_stdout=True,
         )
     except OSError as exc:
         return AudioProbeInfo(probe_error=f"ffprobe failed to execute ({ffprobe}): {exc}")
+    except subprocess.TimeoutExpired:
+        return AudioProbeInfo(probe_error=f"ffprobe timed out after {timeout}s ({ffprobe})")
     if result.returncode != 0:
         exec_err = validate_executable(ffprobe)
         if exec_err is not None:
             return AudioProbeInfo(probe_error=f"ffprobe failed to execute ({ffprobe}): {exec_err}")
         return AudioProbeInfo()
-    if not result.stdout.strip():
+    stdout_text = result.stdout.decode("utf-8", "replace")
+    if not stdout_text.strip():
         return AudioProbeInfo()
     try:
-        payload = json.loads(result.stdout)
+        payload = json.loads(stdout_text)
     except ValueError:
         return AudioProbeInfo()
     fmt = payload.get("format") or {}

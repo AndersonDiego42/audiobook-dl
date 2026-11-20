@@ -169,7 +169,7 @@ class PackPage(ttk.Frame):
             init_opts = options_provider()
             if init_opts and init_opts.output_format:
                 default_fmt = init_opts.output_format
-        except Exception:
+        except (OSError, ValueError, AudiobookDLException):
             pass
 
         self.recursive_var = tk.BooleanVar(value=False)

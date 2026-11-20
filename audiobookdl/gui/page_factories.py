@@ -5,11 +5,18 @@ from __future__ import annotations
 from collections.abc import Sequence
 import os
 import sqlite3
+import tkinter as tk
 from tkinter import ttk
 from typing import TYPE_CHECKING, Any
 
 from audiobookdl.config import DEFAULT_PROFILE, list_source_profiles, normalize_profile_name
 from audiobookdl.gui.formatting import default_output_dir
+from audiobookdl.gui.page_deps import (
+    DownloadPageDeps,
+    LibraryPageDeps,
+    QueuePanelDeps,
+    SettingsPageDeps,
+)
 from audiobookdl.gui.window_manager import open_path_in_os
 from audiobookdl.sources import ServiceInfo
 
@@ -26,9 +33,31 @@ if TYPE_CHECKING:
 def create_download_page(app: AudiobookDLApp, parent: ttk.Frame) -> DownloadPage:
     """Build and wire the lazy `DownloadPage`."""
     from audiobookdl.gui.pages.download_page import DownloadPage
+    from audiobookdl.gui.pages.drm_inspect_dialog import DrmInspectDialog
 
     def _open_path(path: str, reveal: bool = False) -> None:
         open_path_in_os(app.root, path, reveal_in_folder=reveal)
+
+    def _open_drm_inspector(parent_widget: tk.Misc) -> None:
+        vm = app.view_model
+        proxy = vm.proxy_var.get().strip() or None
+        impersonate = vm.impersonate_var.get().strip() or None
+        timeout: float | None = None
+        raw_timeout = str(vm.timeout_var.get()).strip()
+        if raw_timeout:
+            try:
+                parsed = float(raw_timeout)
+                if parsed > 0:
+                    timeout = parsed
+            except ValueError:
+                timeout = None
+        DrmInspectDialog(
+            parent_widget,
+            palette=app._window.palette,
+            proxy=proxy,
+            timeout=timeout,
+            impersonate=impersonate,
+        )
 
     def _active_service_profiles() -> list[str]:
         svc = app._auth.selected_service()
@@ -51,45 +80,58 @@ def create_download_page(app: AudiobookDLApp, parent: ttk.Frame) -> DownloadPage
     naming_collapsed = (
         True if cfg_gui.output_naming_collapsed is None else cfg_gui.output_naming_collapsed
     )
-    page = DownloadPage(
-        parent,
-        app.root,
-        app,
-        style=app._style,
-        palette_provider=lambda: app._window.palette,
-        initial_split_ratio=cfg_gui.download_split_ratio,
-        options_collapsed=options_collapsed,
-        output_naming_collapsed=naming_collapsed,
-        on_locate_ffmpeg=app._ffmpeg_assistant.browse_dir,
-        on_open_accounts=app._open_accounts_from_download,
-        on_open_folder=app._options.open_output_folder,
-        on_browse_output_dir=app._options.browse_output_dir,
-        on_paste_urls=app._urls.paste_urls_from_clipboard,
-        on_paste_and_queue=app._urls.paste_and_queue,
-        on_browse_url_file=app._urls.browse_url_file,
-        on_clear_urls=app._urls.clear_urls,
-        on_urls_modified=app._urls.on_urls_modified,
+    queue_deps = QueuePanelDeps(
+        controller=app.controller,
+        status_var=app.status_var,
+        batch_var=app.batch_var,
+        metrics_var=app.metrics_var,
         on_start_download=app.start_download,
         on_cancel_download=app.cancel_download,
         on_preview_metadata=app.preview_metadata,
         on_pack_local=lambda: app.navigate("pack"),
+        on_open_folder=app._options.open_output_folder,
         on_retry_failed=app._runs.retry_failed_queue_items,
-        on_retry_selected=app._runs.retry_failed_queue_items,
         service_label_for_url=app._auth.service_label_for_url,
+        on_retry_selected=app._runs.retry_failed_queue_items,
         on_preview_url=lambda u: app.preview_metadata(url_override=u),
         on_send_to_urls=app._urls.send_urls_to_input,
         on_open_path=_open_path,
         on_import_queue=app._runs.enqueue_imported_queue_records,
         on_queue_summary_changed=app.shell.set_download_badge,
         on_progress_mode_changed=app.shell.set_footer_progress_mode,
-        on_m4b_toggled=app._options.on_m4b_toggled,
-        on_format_selected=app._options.on_format_selected,
         progress_var=app.progress_var,
         active_job_var=app.active_job_var,
         concurrency_var=app.queue_concurrency_var,
         on_concurrency_changed=app._runs.on_queue_concurrency_changed,
-        profile_choices_provider=_active_service_profiles,
-        on_select_profile=_select_active_profile,
+        palette=app._window.palette,
+    )
+    page = DownloadPage(
+        parent,
+        DownloadPageDeps(
+            root=app.root,
+            style=app._style,
+            vars=app.view_model,
+            queue=queue_deps,
+            palette_provider=lambda: app._window.palette,
+            initial_split_ratio=cfg_gui.download_split_ratio,
+            options_collapsed=options_collapsed,
+            output_naming_collapsed=naming_collapsed,
+            on_locate_ffmpeg=app._ffmpeg_assistant.browse_dir,
+            on_open_accounts=app._open_accounts_from_download,
+            on_open_folder=app._options.open_output_folder,
+            on_browse_output_dir=app._options.browse_output_dir,
+            on_paste_urls=app._urls.paste_urls_from_clipboard,
+            on_paste_and_queue=app._urls.paste_and_queue,
+            on_browse_url_file=app._urls.browse_url_file,
+            on_clear_urls=app._urls.clear_urls,
+            on_urls_modified=app._urls.on_urls_modified,
+            on_start_download=app.start_download,
+            on_m4b_toggled=app._options.on_m4b_toggled,
+            on_format_selected=app._options.on_format_selected,
+            on_open_drm_inspector=_open_drm_inspector,
+            profile_choices_provider=_active_service_profiles,
+            on_select_profile=_select_active_profile,
+        ),
     )
     page.preset_combo.bind("<<ComboboxSelected>>", app._options.on_preset_selected)
     app._urls.bind_drop_target(page.urls_text, stop_prop=True)
@@ -138,7 +180,6 @@ def create_library_page(app: AudiobookDLApp, parent: ttk.Frame) -> LibraryPage:
             svc.key,
             query_text,
             options,
-            tab,
             archive_path=app._sync.archive_ledger_path(),
         )
 
@@ -193,44 +234,46 @@ def create_library_page(app: AudiobookDLApp, parent: ttk.Frame) -> LibraryPage:
 
     return LibraryPage(
         parent,
-        archive_path_provider=app._sync.archive_ledger_path,
-        config_provider=app.controller.config_snapshot,
-        services=app._services,
-        selected_service_provider=app._auth.selected_service,
-        selected_profile_provider=lambda: normalize_profile_name(app.profile_var.get()),
-        on_queue_urls=_on_queue_urls,
-        on_open_path=_open_path,
-        on_pack_paths=app.open_pack_with_paths,
-        on_upload_abs=app._sync.upload_archive_entry_to_abs,
-        on_catalog_fetch=_on_fetch,
-        on_catalog_add_urls=_on_add_urls,
-        on_catalog_download_urls=_on_download_urls,
-        on_save_to_library=_on_save_to_library,
-        on_sync_from_catalog=lambda svc_key: app._sync.sync_libraries(
-            services=[svc_key] if svc_key else ()
+        LibraryPageDeps(
+            archive_path_provider=app._sync.archive_ledger_path,
+            config_provider=app.controller.config_snapshot,
+            services=app._services,
+            selected_service_provider=app._auth.selected_service,
+            selected_profile_provider=lambda: normalize_profile_name(app.profile_var.get()),
+            on_queue_urls=_on_queue_urls,
+            on_open_path=_open_path,
+            on_pack_paths=app.open_pack_with_paths,
+            on_upload_abs=app._sync.upload_archive_entry_to_abs,
+            on_catalog_fetch=_on_fetch,
+            on_catalog_add_urls=_on_add_urls,
+            on_catalog_download_urls=_on_download_urls,
+            on_save_to_library=_on_save_to_library,
+            on_sync_from_catalog=lambda svc_key: app._sync.sync_libraries(
+                services=[svc_key] if svc_key else ()
+            ),
+            profile_resolver=_profile_resolver,
+            status_resolver=_status_resolver,
+            cover_fetcher=lambda url: app.controller.fetch_cover_bytes(
+                url,
+                proxy=app._options.cached_proxy,
+                timeout=app._options.cached_timeout,
+            ),
+            on_catalog_cancel=app.controller.cancel_catalog_fetch,
+            auto_sync_enabled=app._automation.auto_sync_enabled,
+            auto_sync_minutes=app._automation.auto_sync_minutes,
+            auto_sync_mode=app._automation.auto_sync_mode,
+            auto_sync_targets=app._automation.auto_sync_targets or None,
+            on_run_sync=_on_run_sync,
+            on_auto_sync_changed=app._automation.configure_auto_sync_timer,
+            on_cancel_sync=app.cancel_download,
+            on_save_schedule=app._sync.save_sync_schedule,
+            on_manage_account=lambda sk, prof: app.open_accounts(sk or None, prof),
+            on_manage_accounts=lambda: app.open_accounts(),
+            on_tab_changed=app.shell.sync_sub_tab,
+            palette_provider=lambda: app._window.palette,
+            db_executor=app.controller.db_executor,
+            on_library_saved=_on_library_saved,
         ),
-        profile_resolver=_profile_resolver,
-        status_resolver=_status_resolver,
-        cover_fetcher=lambda url: app.controller.fetch_cover_bytes(
-            url,
-            proxy=app._options.cached_proxy,
-            timeout=app._options.cached_timeout,
-        ),
-        on_catalog_cancel=app.controller.cancel_catalog_fetch,
-        auto_sync_enabled=app._automation.auto_sync_enabled,
-        auto_sync_minutes=app._automation.auto_sync_minutes,
-        auto_sync_mode=app._automation.auto_sync_mode,
-        auto_sync_targets=app._automation.auto_sync_targets or None,
-        on_run_sync=_on_run_sync,
-        on_auto_sync_changed=app._automation.configure_auto_sync_timer,
-        on_cancel_sync=app.cancel_download,
-        on_save_schedule=app._sync.save_sync_schedule,
-        on_manage_account=lambda sk, prof: app.open_accounts(sk or None, prof),
-        on_manage_accounts=lambda: app.open_accounts(),
-        on_tab_changed=app.shell.sync_sub_tab,
-        palette_provider=lambda: app._window.palette,
-        db_executor=app.controller.db_executor,
-        on_library_saved=_on_library_saved,
     )
 
 
@@ -300,31 +343,33 @@ def create_settings_page(app: AudiobookDLApp, parent: ttk.Frame) -> SettingsPage
 
     return SettingsPage(
         parent,
-        theme_var=app._window.theme_var,
-        notify_on_complete_var=app.notify_on_complete_var,
-        clipboard_monitor_var=app.clipboard_monitor_var,
-        check_updates_var=app.check_updates_var,
-        minimize_to_tray_var=app.minimize_to_tray_var,
-        tray_available=app._window.tray_controller.is_available(),
-        on_toggle_minimize_to_tray=app._window.toggle_minimize_to_tray,
-        on_theme_changed=app.set_theme,
-        on_toggle_notify_on_complete=app._toggle_notify_on_complete,
-        on_toggle_clipboard_monitor=app._toggle_clipboard_monitor,
-        on_toggle_check_updates=app._toggle_check_updates,
-        on_reload_config=app._options.reload_config,
-        on_check_updates=app.check_updates_interactive,
-        ffmpeg_assistant=app._ffmpeg_assistant,
-        abs_config_provider=lambda: app.controller.config_snapshot().audiobookshelf,
-        config_location=config_loc,
-        on_save_abs_config=app.controller.save_audiobookshelf_config,
-        on_abs_saved=_on_abs_saved,
-        custom_providers_provider=lambda: app.controller.config_snapshot().custom_metadata_providers,
-        on_save_custom_provider=_on_save_custom_provider,
-        on_delete_custom_provider=_on_delete_custom_provider,
-        http_proxy_provider=lambda: (
-            app.proxy_var.get().strip() or app.controller.config_snapshot().proxy
+        SettingsPageDeps(
+            theme_var=app._window.theme_var,
+            notify_on_complete_var=app.notify_on_complete_var,
+            clipboard_monitor_var=app.clipboard_monitor_var,
+            check_updates_var=app.check_updates_var,
+            minimize_to_tray_var=app.minimize_to_tray_var,
+            tray_available=app._window.tray_controller.is_available(),
+            on_toggle_minimize_to_tray=app._window.toggle_minimize_to_tray,
+            on_theme_changed=app.set_theme,
+            on_toggle_notify_on_complete=app._toggle_notify_on_complete,
+            on_toggle_clipboard_monitor=app._toggle_clipboard_monitor,
+            on_toggle_check_updates=app._toggle_check_updates,
+            on_reload_config=app._options.reload_config,
+            on_check_updates=app.check_updates_interactive,
+            ffmpeg_assistant=app._ffmpeg_assistant,
+            abs_config_provider=lambda: app.controller.config_snapshot().audiobookshelf,
+            config_location=config_loc,
+            on_save_abs_config=app.controller.save_audiobookshelf_config,
+            on_abs_saved=_on_abs_saved,
+            custom_providers_provider=lambda: app.controller.config_snapshot().custom_metadata_providers,
+            on_save_custom_provider=_on_save_custom_provider,
+            on_delete_custom_provider=_on_delete_custom_provider,
+            http_proxy_provider=lambda: (
+                app.proxy_var.get().strip() or app.controller.config_snapshot().proxy
+            ),
+            http_timeout_provider=lambda: app.controller.config_snapshot().timeout,
+            palette=app._window.palette,
+            style=app._style,
         ),
-        http_timeout_provider=lambda: app.controller.config_snapshot().timeout,
-        palette=app._window.palette,
-        style=app._style,
     )

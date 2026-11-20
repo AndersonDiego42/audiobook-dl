@@ -13,22 +13,19 @@ def create_tk_root() -> tk.Tk:
     """Create a `TkinterDnD.Tk` root when `tkinterdnd2` is installed, else standard `tk.Tk`."""
     try:
         mod = importlib.import_module("tkinterdnd2")
-    except Exception:
+    except ImportError:
         return tk.Tk()
     prev_default = getattr(tk, "_default_root", None)
     try:
         return cast(tk.Tk, mod.TkinterDnD.Tk())
-    except Exception:
+    except (AttributeError, tk.TclError):
         partial = getattr(tk, "_default_root", None)
         if partial is not None and partial is not prev_default:
             try:
                 partial.destroy()
-            except Exception:
+            except tk.TclError:
                 pass
-            try:
-                tk._default_root = prev_default  # type: ignore[attr-defined]
-            except Exception:
-                pass
+            tk._default_root = prev_default  # type: ignore[attr-defined]
         return tk.Tk()
 
 

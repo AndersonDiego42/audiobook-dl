@@ -25,6 +25,23 @@ class LogSink(Protocol):
     def on_progress_start(self, description: str, total: float) -> None: ...
     def on_progress_advance(self, completed: float, total: float) -> None: ...
     def on_progress_finish(self) -> None: ...
+    def on_progress_metrics(
+        self,
+        completed: float,
+        total: float,
+        bytes_downloaded: int,
+        speed_bps: float,
+        elapsed_seconds: float,
+        eta_seconds: float | None,
+    ) -> None: ...
+    def on_item_progress(self, current: int, total: int, title: str) -> None: ...
+    def on_download_estimate(
+        self,
+        estimated_bytes: int | None,
+        is_exact: bool,
+        known_files: int,
+        total_files: int,
+    ) -> None: ...
 
 
 class InteractionHandler(Protocol):
@@ -189,12 +206,12 @@ class _SinkProgressAdapter:
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         self._sink.on_progress_finish()
 
-    def add_task(self, description: str, total: float = 100.0) -> int:
+    def add_task(self, description: str, total: float | None = 100.0) -> int:
         with self._lock:
-            task = _SinkTask(float(total))
+            task = _SinkTask(float(total) if total is not None else 0.0)
             self.tasks.append(task)
             task_id = len(self.tasks) - 1
-        self._sink.on_progress_start(description, float(total))
+        self._sink.on_progress_start(description, task.total)
         return task_id
 
     @staticmethod
@@ -442,6 +459,9 @@ class _HeadlessProgressAdapter:
         self.tasks: list[_HeadlessTask] = []
         self._bytes_total: dict[int, int] = {}
         self._samples: dict[int, deque[tuple[float, int]]] = {}
+        self._known_sizes: dict[int, dict[int, int]] = {}
+        self._total_files: dict[int, int] = {}
+        self._estimates: dict[int, tuple[int | None, bool, int, int] | None] = {}
 
     def __enter__(self) -> "_HeadlessProgressAdapter":
         return self
@@ -455,6 +475,9 @@ class _HeadlessProgressAdapter:
             self.tasks.append(_HeadlessTask(total=float(total or 0.0)))
             self._bytes_total[task_id] = 0
             self._samples[task_id] = deque()
+            self._known_sizes[task_id] = {}
+            self._total_files[task_id] = 0
+            self._estimates[task_id] = None
             return task_id
 
     def advance(self, task_id: int, advance: float = 1.0) -> None:
@@ -474,6 +497,54 @@ class _HeadlessProgressAdapter:
             bucket.append((now, num_bytes))
             while bucket and bucket[0][0] < cutoff:
                 bucket.popleft()
+
+    @staticmethod
+    def _compute_estimate(
+        known_sizes: dict[int, int], total_files: int
+    ) -> tuple[int | None, bool, int, int]:
+        known_count = len(known_sizes)
+        if known_count <= 0 or total_files <= 0:
+            return (None, False, 0, total_files)
+        known_sum = sum(known_sizes.values())
+        is_exact = known_count >= total_files
+        est_bytes = known_sum if is_exact else round((known_sum / known_count) * total_files)
+        return (est_bytes, is_exact, known_count, total_files)
+
+    def set_file_size_estimates(
+        self,
+        task_id: int,
+        per_file_bytes: Sequence[int | None],
+    ) -> None:
+        """Seed pre-known per-file byte sizes on `task_id`."""
+        with self._lock:
+            if not (0 <= task_id < len(self.tasks)):
+                return
+            known = self._known_sizes.setdefault(task_id, {})
+            known.clear()
+            for idx, size in enumerate(per_file_bytes):
+                if isinstance(size, int) and size > 0:
+                    known[idx] = size
+            self._total_files[task_id] = len(per_file_bytes)
+            self._estimates[task_id] = self._compute_estimate(known, len(per_file_bytes))
+
+    def report_file_size(self, task_id: int, file_index: int, total_bytes: int) -> None:
+        """Record discovered byte size for `file_index` on `task_id`."""
+        if total_bytes <= 0:
+            return
+        with self._lock:
+            if not (0 <= task_id < len(self.tasks)):
+                return
+            known = self._known_sizes.setdefault(task_id, {})
+            if known.get(file_index) == total_bytes:
+                return
+            known[file_index] = total_bytes
+            total_files = self._total_files.get(task_id) or max(known) + 1
+            self._estimates[task_id] = self._compute_estimate(known, total_files)
+
+    def get_download_estimate(self, task_id: int) -> tuple[int | None, bool, int, int] | None:
+        """Return the latest `(estimated_bytes, is_exact, known_files, total_files)` for `task_id`."""
+        with self._lock:
+            return self._estimates.get(task_id)
 
     def get_byte_metrics(self, task_id: int) -> tuple[int, float] | None:
         now = time.monotonic()

@@ -13,22 +13,25 @@ from audiobookdl.config import (
     save_output_preferences,
     structure_config,
 )
+from audiobookdl.gui.options_binding import (
+    GUI_OPTION_BINDINGS,
+    GUI_OPTION_SPECS,
+    PERSISTED_GUI_OPTION_SPECS,
+)
 from audiobookdl.options_schema import (
     CONFIG_OPTION_SPECS,
     DOWNLOAD_OPTION_SPECS,
     GUI_CONFIG_KEYS,
-    GUI_OPTION_SPECS,
     KNOWN_TOP_LEVEL_CONFIG_KEYS,
     MERGEABLE_OPTION_SPECS,
     OPTIONS_BY_NAME,
     OPTION_REGISTRY,
-    PERSISTED_GUI_OPTION_SPECS,
     SOURCE_CONFIG_KEYS,
     DownloadOptions,
     build_default_options,
     validate_config_value,
 )
-from audiobookdl.pipeline import apply_runtime_options
+from audiobookdl.pipeline import resolve_runtime_options
 
 
 def test_registry_names_are_unique():
@@ -134,8 +137,8 @@ def test_persisted_gui_options_match_save_output_preferences(tmp_path):
     for spec in PERSISTED_GUI_OPTION_SPECS:
         assert spec.toml_serializer is not None
         assert spec.config_key is not None
-        assert spec.gui is not None
-        all_persisted[spec.name] = spec.gui.read_option(spec.gui.init_value(None))
+        binding = GUI_OPTION_BINDINGS[spec.name]
+        all_persisted[spec.name] = binding.read_option(binding.init_value(None))
     save_output_preferences(config_location=str(cfg_path), **all_persisted)
     assert cfg_path.is_file()
 
@@ -149,8 +152,7 @@ def test_gui_option_bindings_roundtrip():
     assert len(GUI_OPTION_SPECS) >= 10
     annotations = AudiobookDLApp.__annotations__
     for spec in GUI_OPTION_SPECS:
-        binding = spec.gui
-        assert binding is not None
+        binding = GUI_OPTION_BINDINGS[spec.name]
         assert binding.var_attr in annotations, f"Missing type annotation for {binding.var_attr}"
         val = binding.init_value(None)
         option_val = binding.read_option(val)
@@ -251,37 +253,35 @@ def test_schema_driven_merge_and_preset_precedence(tmp_path):
         credential_store=None,
     )
     opts = build_default_options()
-    apply_runtime_options(opts, cfg)
+    resolved = resolve_runtime_options(opts, cfg)
     for spec in MERGEABLE_OPTION_SPECS:
         key = spec.config_key
         assert key is not None
         raw_val = getattr(cfg, key)
         expected = spec.merge_cast(raw_val) if spec.merge_cast else raw_val
-        assert getattr(opts, spec.name) == expected
+        assert getattr(resolved, spec.name) == expected
 
     override_opts = build_default_options(output_template="{author}/{title}", combine=False)
-    apply_runtime_options(override_opts, cfg)
-    assert override_opts.combine is False
-    assert override_opts.output_template == "{author}/{title}"
+    resolved_override = resolve_runtime_options(override_opts, cfg)
+    assert resolved_override.combine is False
+    assert resolved_override.output_template == "{author}/{title}"
 
 
 def test_gui_tooltip_overrides_for_cli_jargon_options():
     from audiobookdl.gui.options_panel import _option_help
 
     for name in ("post_exec", "download_archive", "remove_chars"):
-        spec = OPTIONS_BY_NAME[name]
-        assert spec.gui is not None
-        assert spec.gui.tooltip
+        binding = GUI_OPTION_BINDINGS[name]
+        assert binding.tooltip
         gui_tip = _option_help(name)
-        assert gui_tip == spec.gui.tooltip
-        assert gui_tip != spec.get_help()
+        assert gui_tip == binding.tooltip
+        assert gui_tip != OPTIONS_BY_NAME[name].get_help()
 
     assert _option_help("output_format") == OPTIONS_BY_NAME["output_format"].get_help()
 
 
 def test_gui_option_bindings_converters():
-    overwrite_binding = OPTIONS_BY_NAME["overwrite"].gui
-    assert overwrite_binding is not None
+    overwrite_binding = GUI_OPTION_BINDINGS["overwrite"]
     assert overwrite_binding.init_value(None) == "Ask"
     assert overwrite_binding.init_value(True) == "Overwrite"
     assert overwrite_binding.init_value(False) == "Keep existing"
@@ -289,8 +289,7 @@ def test_gui_option_bindings_converters():
     assert overwrite_binding.read_option("Overwrite") is True
     assert overwrite_binding.read_option("Keep existing") is False
 
-    workers_binding = OPTIONS_BY_NAME["max_workers"].gui
-    assert workers_binding is not None
+    workers_binding = GUI_OPTION_BINDINGS["max_workers"]
     assert workers_binding.init_value(None) == ""
     assert workers_binding.init_value(8) == "8"
     assert workers_binding.read_option("") is None
@@ -300,8 +299,7 @@ def test_gui_option_bindings_converters():
     with pytest.raises(ValueError, match="Max workers"):
         workers_binding.read_option("abc")
 
-    delay_binding = OPTIONS_BY_NAME["book_delay"].gui
-    assert delay_binding is not None
+    delay_binding = GUI_OPTION_BINDINGS["book_delay"]
     assert delay_binding.init_value(None) == "0"
     assert delay_binding.init_value(2.0) == "2"
     assert delay_binding.init_value(1.5) == "1.5"
@@ -310,8 +308,7 @@ def test_gui_option_bindings_converters():
     with pytest.raises(ValueError, match="Book delay"):
         delay_binding.read_option("-1")
 
-    timeout_binding = OPTIONS_BY_NAME["timeout"].gui
-    assert timeout_binding is not None
+    timeout_binding = GUI_OPTION_BINDINGS["timeout"]
     assert timeout_binding.init_value(None) == ""
     assert timeout_binding.init_value(30.0) == "30"
     assert timeout_binding.read_option("") is None
@@ -319,23 +316,19 @@ def test_gui_option_bindings_converters():
     with pytest.raises(ValueError, match="Timeout"):
         timeout_binding.read_option("0")
 
-    proxy_binding = OPTIONS_BY_NAME["proxy"].gui
-    assert proxy_binding is not None
+    proxy_binding = GUI_OPTION_BINDINGS["proxy"]
     assert proxy_binding.init_value("http://127.0.0.1:8080") == "http://127.0.0.1:8080"
     assert proxy_binding.read_option("   ") is None
     assert proxy_binding.read_option(" http://proxy:8080 ") == "http://proxy:8080"
 
-    remove_chars_binding = OPTIONS_BY_NAME["remove_chars"].gui
-    assert remove_chars_binding is not None
+    remove_chars_binding = GUI_OPTION_BINDINGS["remove_chars"]
     assert remove_chars_binding.read_option(" :") == " :"
 
-    archive_binding = OPTIONS_BY_NAME["download_archive"].gui
-    assert archive_binding is not None
+    archive_binding = GUI_OPTION_BINDINGS["download_archive"]
     assert archive_binding.init_value(None) is False
     assert archive_binding.init_value("/tmp/downloads.db") is True
 
-    impersonate_binding = OPTIONS_BY_NAME["impersonate"].gui
-    assert impersonate_binding is not None
+    impersonate_binding = GUI_OPTION_BINDINGS["impersonate"]
     assert impersonate_binding.init_value(None) == ""
     assert impersonate_binding.init_value("chrome") == "chrome"
     assert impersonate_binding.read_option("  chrome  ") == "chrome"
@@ -362,8 +355,7 @@ def test_persisted_gui_roundtrip_silence_offset_and_abs(tmp_path):
     assert loaded.upload_to_abs is True
     assert validate_config_value("chapter_offset_ms", "int", True)[0] is None
 
-    intro_binding = OPTIONS_BY_NAME["intro_chapter_mode"].gui
-    assert intro_binding is not None
+    intro_binding = GUI_OPTION_BINDINGS["intro_chapter_mode"]
     assert intro_binding.init_value(None) == "Auto (detect intro)"
     assert intro_binding.init_value("always") == "Always (first is 00)"
     assert intro_binding.init_value("off") == "Off (start at 01)"

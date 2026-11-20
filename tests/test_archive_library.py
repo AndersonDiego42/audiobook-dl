@@ -145,7 +145,7 @@ def test_parse_library_query_tokens():
 
 
 def test_skip_downloaded_uses_default_downloads_db_and_records_metadata(tmp_path, monkeypatch):
-    monkeypatch.setattr("audiobookdl.pipeline.download", lambda *a, **kw: None)
+    monkeypatch.setattr("audiobookdl.pipeline.jobs.download", lambda *a, **kw: None)
 
     class _Src:
         name = "storytel"
@@ -223,7 +223,7 @@ def test_gui_archive_dialog_tags_hide_trash_and_queue(tmp_path):
         assert len(iids) == 1
         tab._tree.selection_set(iids[0])
         tab._queue_selected()
-        assert "https://librivox.org/pending" in app.urls_text.get("1.0", tk.END)
+        assert "https://librivox.org/pending" in app.download_page.urls_text.get("1.0", tk.END)
 
         tab._toggle_hide_selected()
         _pump_until(lambda: len(tab._tree.get_children()) == 0)
@@ -352,7 +352,7 @@ def test_gui_series_and_podcast_grouping_in_catalog_and_archive(tmp_path):
         group_iid = next(r for r in arch_roots if arch_tab._tree.get_children(r))
         arch_tab._tree.selection_set((group_iid,))
         arch_tab._queue_selected()
-        queued_text = app.urls_text.get("1.0", tk.END)
+        queued_text = app.download_page.urls_text.get("1.0", tk.END)
         assert "https://example.com/b1" in queued_text
         assert "https://example.com/b2" in queued_text
 
@@ -654,3 +654,134 @@ def test_find_cross_source_duplicate_matches_identifiers_and_ignores_trashed(tmp
 
 
 
+
+
+def test_mark_local_match_populates_output_path_norm(tmp_path):
+    db_path = tmp_path / "norm.db"
+    archive = DownloadArchive(str(db_path))
+    try:
+        archive.upsert_catalog_items(
+            "audible",
+            [CatalogBook(title="Dune", url="https://example.com/dune", author="Frank Herbert")],
+        )
+        pending = archive.list_entries(query="status:pending")[0]
+        local_path = str(tmp_path / "Dune Collection")
+        assert archive.mark_local_match(pending.id, output_path=local_path, audio_format="m4b") is True
+
+        # output_path_norm must be populated so index lookups hit idx_downloads_output_path_norm
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            "SELECT output_path, output_path_norm FROM downloads WHERE id = ?",
+            (pending.id,),
+        ).fetchone()
+        conn.close()
+        assert row[0] == local_path
+        assert row[1]
+
+        assert archive.find_matching_entry_id(output_path=local_path) == pending.id
+        assert archive.find_matching_entry_id(title="Dune", author="Frank Herbert", output_path=local_path) == pending.id
+    finally:
+        archive.close()
+
+
+def test_find_cross_source_duplicate_matches_pending_rows(tmp_path):
+    db_path = tmp_path / "pending_dup.db"
+    archive = DownloadArchive(str(db_path))
+    try:
+        archive.upsert_catalog_items(
+            "storytel",
+            [CatalogBook(title="Pending Dup", url="https://storytel.com/pd", author="Auth P")],
+        )
+        # Pending catalog rows must count as active duplicates for cross-source checks
+        dup = archive.find_cross_source_duplicate("audible", "au-1", title="pending dup", author="auth p")
+        assert dup is not None and dup["source"] == "storytel" and dup["status"] == "pending"
+    finally:
+        archive.close()
+
+
+def test_schema_v4_normalizes_source_asin_isbn_on_migration(tmp_path):
+    db_path = tmp_path / "legacy_v3.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        CREATE TABLE downloads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            book_key TEXT NOT NULL,
+            url TEXT,
+            title TEXT NOT NULL,
+            author TEXT NOT NULL DEFAULT '',
+            output_path TEXT,
+            format TEXT,
+            asin TEXT,
+            isbn TEXT,
+            downloaded_at TEXT NOT NULL,
+            UNIQUE(source, book_key)
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO downloads (source, book_key, title, author, asin, isbn, downloaded_at)
+        VALUES ('StoryTel', 'k1', 'Mixed Case', 'Auth', 'b00abc123', '978-0-441-17271-9', '2025-01-01 00:00:00 UTC')
+        """
+    )
+    conn.commit()
+    conn.execute("PRAGMA user_version = 3")
+    conn.close()
+
+    archive = DownloadArchive(str(db_path))
+    try:
+        entries = archive.list_entries()
+        assert len(entries) == 1
+        assert entries[0].source == "storytel"
+        assert entries[0].asin == "B00ABC123"
+        assert entries[0].isbn == "9780441172719"
+        # Index-friendly lookups work against normalized stored values
+        assert archive.find_matching_entry_id(asin="b00abc123") == entries[0].id
+        assert archive.find_matching_entry_id(isbn="978-0-441-17271-9") == entries[0].id
+    finally:
+        archive.close()
+
+
+def test_iter_entries_streams_same_rows_as_list_entries(tmp_path):
+    db_path = tmp_path / "iter.db"
+    archive = DownloadArchive(str(db_path))
+    try:
+        for i in range(5):
+            archive.record("librivox", f"k{i}", title=f"Book {i}", author="Auth", status="downloaded")
+        archive.record("librivox", "ktrashed", title="Gone", author="Auth", status="trashed")
+
+        listed = archive.list_entries(sort_by="id", descending=False)
+        streamed = list(archive.iter_entries(sort_by="id", descending=False))
+        assert [e.id for e in streamed] == [e.id for e in listed]
+        assert len(streamed) == 5
+        assert archive.count_entries() == 5
+    finally:
+        archive.close()
+
+
+def test_upsert_catalog_items_mixed_insert_update_batch(tmp_path):
+    db_path = tmp_path / "mixed_upsert.db"
+    archive = DownloadArchive(str(db_path))
+    try:
+        archive.upsert_catalog_items(
+            "storytel",
+            [CatalogBook(title="Existing", url="https://storytel.com/ex", author="A")],
+        )
+        inserted, updated = archive.upsert_catalog_items(
+            "storytel",
+            [
+                CatalogBook(title="Existing", url="https://storytel.com/ex", author="A2"),
+                CatalogBook(title="New One", url="https://storytel.com/new", author="B"),
+                CatalogBook(title="New Two", url="https://storytel.com/new2", author="C"),
+            ],
+        )
+        assert (inserted, updated) == (2, 1)
+        entries = {e.title: e for e in archive.list_entries()}
+        assert entries["Existing"].author == "A2"
+        assert entries["Existing"].status == "pending"
+        assert entries["New One"].status == "pending"
+        assert entries["New Two"].status == "pending"
+    finally:
+        archive.close()

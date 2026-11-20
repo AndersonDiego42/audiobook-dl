@@ -86,7 +86,7 @@ def test_convert_output_preserves_original_on_ffmpeg_failure(tmp_path):
     mp3 = tmp_path / "book.mp3"
     mp3.write_bytes(b"mp3-bytes")
     with patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"), \
-         patch("audiobookdl.output.output._probe_audio_info", return_value=AudioProbeInfo(codec_name="mp3")), \
+         patch("audiobookdl.output.ffmpeg_ops._probe_audio_info", return_value=AudioProbeInfo(codec_name="mp3")), \
          patch("audiobookdl.output.output.run_cancellable_subprocess", return_value=SimpleNamespace(returncode=1, stderr=b"boom")):
         with pytest.raises(GenericAudiobookDLException):
             convert_output([str(mp3)], "m4b")
@@ -104,7 +104,7 @@ def test_convert_output_aac_to_m4b_uses_stream_copy(tmp_path):
         return SimpleNamespace(returncode=0, stderr=b"")
 
     with patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"), \
-         patch("audiobookdl.output.output._probe_audio_info", return_value=AudioProbeInfo(duration=10.0, codec_name="aac")), \
+         patch("audiobookdl.output.ffmpeg_ops._probe_audio_info", return_value=AudioProbeInfo(duration=10.0, codec_name="aac")), \
          patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run):
         result = convert_output([str(ts_file)], "m4b")
 
@@ -221,7 +221,7 @@ def test_combine_audiofiles_sizes_remux_pool_dynamically(tmp_path, monkeypatch):
             return AudioProbeInfo(duration=200.0, codec_name="mp3")
         return AudioProbeInfo(duration=10.0, codec_name="mp3")
 
-    monkeypatch.setattr(output, "_probe_audio_info", fake_probe)
+    monkeypatch.setattr("audiobookdl.output.ffmpeg_ops._probe_audio_info", fake_probe)
 
     def fake_run(cmd, **kwargs):
         with open(cmd[-1], "wb") as f:
@@ -312,7 +312,7 @@ def test_convert_combine_and_chapters_clean_partial_output_on_cancel(tmp_path, m
         raise DownloadCancelled
 
     monkeypatch.setattr(output, "_require_executable", lambda name: name)
-    monkeypatch.setattr(output, "_probe_audio_info", lambda path: AudioProbeInfo(codec_name="mp3"))
+    monkeypatch.setattr("audiobookdl.output.ffmpeg_ops._probe_audio_info", lambda path, **_kw: AudioProbeInfo(codec_name="mp3"))
     monkeypatch.setattr(output, "run_cancellable_subprocess", cancelling_convert)
 
     with pytest.raises(DownloadCancelled):
@@ -374,8 +374,7 @@ def test_combine_audiofiles_isolates_work_dir_and_cleans_on_failure(tmp_path, mo
         lambda s, d, cancel_event=None, *, preserve_video=False: open(d, "wb").write(b"ts") > 0,
     )
     monkeypatch.setattr(
-        output,
-        "_probe_audio_info",
+        "audiobookdl.output.ffmpeg_ops._probe_audio_info",
         lambda path: AudioProbeInfo(
             duration=100.0 if path.endswith("combined.ts") else 10.0,
             codec_name="mp3",
@@ -436,7 +435,7 @@ def test_convert_output_passes_auto_and_explicit_aac_bitrate(tmp_path):
 
     # Auto mode uses probed bitrate (e.g., 96k)
     with patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"), \
-         patch("audiobookdl.output.output._probe_audio_info", return_value=AudioProbeInfo(duration=10.0, codec_name="mp3", bitrate=96000)), \
+         patch("audiobookdl.output.ffmpeg_ops._probe_audio_info", return_value=AudioProbeInfo(duration=10.0, codec_name="mp3", bitrate=96000)), \
          patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run):
         convert_output([str(mp3)], "m4b")
 
@@ -447,7 +446,7 @@ def test_convert_output_passes_auto_and_explicit_aac_bitrate(tmp_path):
     mp3.write_bytes(b"mp3-bytes")
     (tmp_path / "book.m4b").unlink()
     with patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"), \
-         patch("audiobookdl.output.output._probe_audio_info", return_value=AudioProbeInfo(duration=10.0, codec_name="mp3", bitrate=64000)), \
+         patch("audiobookdl.output.ffmpeg_ops._probe_audio_info", return_value=AudioProbeInfo(duration=10.0, codec_name="mp3", bitrate=64000)), \
          patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run):
         convert_output([str(mp3)], "m4b", audio_bitrate="192k")
 
@@ -544,11 +543,14 @@ def test_probe_audio_info_single_ffprobe_call(tmp_path):
     sample = tmp_path / "sample.mp3"
     sample.write_bytes(b"audio")
     payload = '{"format": {"duration": "123.45", "bit_rate": "128000", "format_name": "mp3"}, "streams": [{"codec_name": "mp3", "bit_rate": "96000"}]}'
-    mock_result = MagicMock(returncode=0, stdout=payload)
+    mock_result = MagicMock(returncode=0, stdout=payload.encode(), stderr=b"")
 
     with (
         patch("audiobookdl.utils.find_executable", return_value="ffprobe"),
-        patch("audiobookdl.utils.subprocess.run", return_value=mock_result) as mock_run,
+        patch(
+            "audiobookdl.utils.concurrency.run_cancellable_subprocess",
+            return_value=mock_result,
+        ) as mock_run,
     ):
         info = output._probe_audio_info(str(sample))
 
@@ -583,7 +585,7 @@ def test_combine_audiofiles_skips_remux_on_mpegts_and_single_file_embeds_chapter
         patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
         patch("audiobookdl.output.output._remux_to_mpegts") as mock_remux,
         patch(
-            "audiobookdl.output.output._probe_audio_info",
+            "audiobookdl.output.ffmpeg_ops._probe_audio_info",
             side_effect=lambda path: output.AudioProbeInfo(
                 duration=5.0 if path.endswith(("0.ts", "1.ts")) else 10.0,
                 bitrate=128000,
@@ -823,7 +825,7 @@ def test_combine_audiofiles_reuses_ffprobe_cache_and_skips_redundant_combined_pr
     cache = {}
     with (
         patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
-        patch("audiobookdl.output.output._probe_audio_info", side_effect=fake_probe),
+        patch("audiobookdl.output.ffmpeg_ops._probe_audio_info", side_effect=fake_probe),
         patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run),
     ):
         output.combine_audiofiles([str(p0)], str(tmp_dir), str(out_path), probe_cache=cache)
@@ -857,7 +859,7 @@ def test_split_audio_by_chapters_parallel_accurate_and_fallback(tmp_path):
     with (
         patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
         patch(
-            "audiobookdl.output.output._probe_audio_info",
+            "audiobookdl.output.ffmpeg_ops._probe_audio_info",
             return_value=output.AudioProbeInfo(duration=15.0, bitrate=128000, codec_name="aac", format_name="mov,mp4,m4a"),
         ),
         patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run_ok),
@@ -886,7 +888,7 @@ def test_split_audio_by_chapters_parallel_accurate_and_fallback(tmp_path):
     with (
         patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
         patch(
-            "audiobookdl.output.output._probe_audio_info",
+            "audiobookdl.output.ffmpeg_ops._probe_audio_info",
             return_value=output.AudioProbeInfo(duration=15.0, bitrate=128000, codec_name="aac", format_name="mov,mp4,m4a"),
         ),
         patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run_fallback),
@@ -930,8 +932,10 @@ def test_combine_audiofiles_parallel_aac_transcode_concat_and_fallback(tmp_path)
     probed_paths.clear()
     with (
         patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
-        patch("audiobookdl.output.output._probe_audio_info", side_effect=fake_probe),
+        patch("audiobookdl.output.ffmpeg_ops._require_executable", return_value="ffmpeg"),
+        patch("audiobookdl.output.ffmpeg_ops._probe_audio_info", side_effect=fake_probe),
         patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run),
+        patch("audiobookdl.output.ffmpeg_ops.run_cancellable_subprocess", side_effect=fake_run),
     ):
         chapters_ok = combine_audiofiles(
             [str(p0), str(p1)],
@@ -968,8 +972,10 @@ def test_combine_audiofiles_parallel_aac_transcode_concat_and_fallback(tmp_path)
     with (
         patch("audiobookdl.output.output._MAX_CONCAT_ARG_CHARS", 10),
         patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
-        patch("audiobookdl.output.output._probe_audio_info", side_effect=fake_probe),
+        patch("audiobookdl.output.ffmpeg_ops._require_executable", return_value="ffmpeg"),
+        patch("audiobookdl.output.ffmpeg_ops._probe_audio_info", side_effect=fake_probe),
         patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run),
+        patch("audiobookdl.output.ffmpeg_ops.run_cancellable_subprocess", side_effect=fake_run),
     ):
         combine_audiofiles(
             [str(p0), str(p1)],
@@ -1036,7 +1042,7 @@ def test_faststart_flag_on_convert_single_file_and_explicit_output_path(tmp_path
 
     with (
         patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
-        patch("audiobookdl.output.output._probe_audio_info", return_value=AudioProbeInfo(duration=10.0, codec_name="aac")),
+        patch("audiobookdl.output.ffmpeg_ops._probe_audio_info", return_value=AudioProbeInfo(duration=10.0, codec_name="aac")),
         patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run),
     ):
         new_path, chapters_ok = output.convert_single_file(
@@ -1076,8 +1082,8 @@ def test_verify_audio_integrity_and_staged_convert_preserve_existing_on_failure(
 
     with (
         patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
-        patch("audiobookdl.output.output.find_executable", return_value="ffprobe"),
-        patch("audiobookdl.output.output._probe_audio_info", side_effect=_probe_side_effect),
+        patch("audiobookdl.output.ffmpeg_ops.find_executable", return_value="ffprobe"),
+        patch("audiobookdl.output.ffmpeg_ops._probe_audio_info", side_effect=_probe_side_effect),
         patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=_corrupt_ffmpeg),
     ):
         with pytest.raises(GenericAudiobookDLException):
@@ -1099,7 +1105,10 @@ def test_probe_audio_info_distinguishes_ffprobe_execution_failure_from_corrupt_m
     # 1. OSError (e.g. WinError 216 wrong architecture) sets probe_error and raises GenericAudiobookDLException
     with (
         patch("audiobookdl.utils.find_executable", return_value="/bad/ffprobe"),
-        patch("audiobookdl.utils.subprocess.run", side_effect=OSError("Exec format error")),
+        patch(
+            "audiobookdl.utils.concurrency.run_cancellable_subprocess",
+            side_effect=OSError("Exec format error"),
+        ),
     ):
         info = probe_audio_info(str(sample))
         assert info.probe_error is not None
@@ -1108,16 +1117,26 @@ def test_probe_audio_info_distinguishes_ffprobe_execution_failure_from_corrupt_m
             output.verify_audio_integrity(str(sample))
 
     # 2. Non-zero ffprobe exit when `ffprobe -version` works -> normal corrupt-media check (FailedCombining)
-    probe_fail = MagicMock(returncode=1, stdout="", stderr="Invalid data found")
+    probe_fail = MagicMock(returncode=1, stdout=b"", stderr=b"Invalid data found")
     version_ok = MagicMock(returncode=0, stdout="ffprobe version 7.0", stderr="")
     with (
         patch("audiobookdl.utils.find_executable", return_value="/good/ffprobe"),
-        patch("audiobookdl.output.output.find_executable", return_value="/good/ffprobe"),
-        patch("audiobookdl.utils.subprocess.run", side_effect=[probe_fail, version_ok]),
+        patch("audiobookdl.output.ffmpeg_ops.find_executable", return_value="/good/ffprobe"),
+        patch(
+            "audiobookdl.utils.concurrency.run_cancellable_subprocess",
+            return_value=probe_fail,
+        ),
+        patch("audiobookdl.utils.subprocess.run", return_value=version_ok),
     ):
         info_corrupt = probe_audio_info(str(sample))
         assert info_corrupt.probe_error is None
-        with patch("audiobookdl.utils.subprocess.run", side_effect=[probe_fail, version_ok]):
+        with (
+            patch(
+                "audiobookdl.utils.concurrency.run_cancellable_subprocess",
+                return_value=probe_fail,
+            ),
+            patch("audiobookdl.utils.subprocess.run", return_value=version_ok),
+        ):
             with pytest.raises(FailedCombining, match="Invalid or corrupt"):
                 output.verify_audio_integrity(str(sample))
 
@@ -1155,9 +1174,9 @@ def test_chapter_offset_loudnorm_mono_and_silence_detection():
         stderr=b"[silencedetect] silence_end: 15.5 | silence_duration: 2.1\n[silencedetect] silence_end: 32.0 | silence_duration: 1.9\n",
     )
     with (
-        patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
-        patch("audiobookdl.output.output.run_cancellable_subprocess", return_value=fake_res),
-        patch("audiobookdl.output.output._probe_audio_info", return_value=AudioProbeInfo(duration=60.0)),
+        patch("audiobookdl.output.ffmpeg_ops._require_executable", return_value="ffmpeg"),
+        patch("audiobookdl.output.ffmpeg_ops.run_cancellable_subprocess", return_value=fake_res),
+        patch("audiobookdl.output.ffmpeg_ops._probe_audio_info", return_value=AudioProbeInfo(duration=60.0)),
     ):
         detected = output.detect_silence_chapters("book.m4b")
     assert [(c.start, c.title) for c in detected] == [
@@ -1169,6 +1188,7 @@ def test_chapter_offset_loudnorm_mono_and_silence_detection():
 
 def test_combine_audiofiles_flac_concat_demuxer_preserves_tmp_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(output, "_require_executable", lambda name: "ffmpeg")
+    monkeypatch.setattr("audiobookdl.output.ffmpeg_ops._require_executable", lambda name: "ffmpeg")
     user_tmp_dir = tmp_path / "keep_tmp"
     user_tmp_dir.mkdir()
     sentinel = user_tmp_dir / "existing.txt"
@@ -1180,8 +1200,7 @@ def test_combine_audiofiles_flac_concat_demuxer_preserves_tmp_dir(tmp_path, monk
     f2.write_bytes(b"flac2")
 
     monkeypatch.setattr(
-        output,
-        "_probe_audio_info",
+        "audiobookdl.output.ffmpeg_ops._probe_audio_info",
         lambda path: AudioProbeInfo(
             duration=24.0 if path.endswith("book.flac") else 12.0,
             codec_name="flac",
@@ -1200,6 +1219,7 @@ def test_combine_audiofiles_flac_concat_demuxer_preserves_tmp_dir(tmp_path, monk
         return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(output, "run_cancellable_subprocess", fake_run)
+    monkeypatch.setattr("audiobookdl.output.ffmpeg_ops.run_cancellable_subprocess", fake_run)
 
     out_flac = tmp_path / "book.flac"
     combine_audiofiles([str(f1), str(f2)], str(user_tmp_dir), str(out_flac))
@@ -1213,6 +1233,7 @@ def test_combine_audiofiles_flac_concat_demuxer_preserves_tmp_dir(tmp_path, monk
 
 def test_combine_audiofiles_mixed_non_mp4_normalizes_parts(tmp_path, monkeypatch):
     monkeypatch.setattr(output, "_require_executable", lambda name: "ffmpeg")
+    monkeypatch.setattr("audiobookdl.output.ffmpeg_ops._require_executable", lambda name: "ffmpeg")
     f1 = tmp_path / "p1.flac"
     f2 = tmp_path / "p2.flac"
     f1.write_bytes(b"f1")
@@ -1225,7 +1246,7 @@ def test_combine_audiofiles_mixed_non_mp4_normalizes_parts(tmp_path, monkeypatch
             return AudioProbeInfo(duration=5.0, codec_name="flac", sample_rate=44100, channels=1)
         return AudioProbeInfo(duration=7.0, codec_name="flac", sample_rate=48000, channels=2)
 
-    monkeypatch.setattr(output, "_probe_audio_info", fake_probe)
+    monkeypatch.setattr("audiobookdl.output.ffmpeg_ops._probe_audio_info", fake_probe)
 
     commands = []
 
@@ -1236,6 +1257,7 @@ def test_combine_audiofiles_mixed_non_mp4_normalizes_parts(tmp_path, monkeypatch
         return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(output, "run_cancellable_subprocess", fake_run)
+    monkeypatch.setattr("audiobookdl.output.ffmpeg_ops.run_cancellable_subprocess", fake_run)
 
     out_flac = tmp_path / "mixed.flac"
     combine_audiofiles([str(f1), str(f2)], str(tmp_path / "tmp"), str(out_flac))
@@ -1257,8 +1279,7 @@ def test_combine_audiofiles_exceeding_max_concat_files_uses_concat_demuxer(tmp_p
     )
     total_parts = output._MAX_CONCAT_PROTOCOL_FILES + 1
     monkeypatch.setattr(
-        output,
-        "_probe_audio_info",
+        "audiobookdl.output.ffmpeg_ops._probe_audio_info",
         lambda path: AudioProbeInfo(
             duration=float(total_parts) if path.endswith("many.mp3") else 1.0,
             codec_name="mp3",
@@ -1325,8 +1346,7 @@ def test_split_audio_by_chapters_normalizes_chapters_and_applies_filters(tmp_pat
     master = tmp_path / "master.mp3"
     master.write_bytes(b"audio")
     monkeypatch.setattr(
-        output,
-        "_probe_audio_info",
+        "audiobookdl.output.ffmpeg_ops._probe_audio_info",
         lambda path: AudioProbeInfo(duration=20.0, codec_name="mp3", bitrate=128000, sample_rate=44100, channels=2),
     )
 
@@ -1369,17 +1389,15 @@ def test_detect_silence_chapters_reuses_probe_cache(tmp_path, monkeypatch):
     audio_path = tmp_path / "silence.mp3"
     audio_path.write_bytes(b"mp3")
     monkeypatch.setattr(output, "_require_executable", lambda _n: "ffmpeg")
-    monkeypatch.setattr(
-        output,
-        "run_cancellable_subprocess",
-        lambda *_a, **_kw: SimpleNamespace(
-            returncode=0,
-            stderr=b"[silencedetect] silence_end: 10.0 | silence_duration: 2.0\n",
-        ),
+    monkeypatch.setattr("audiobookdl.output.ffmpeg_ops._require_executable", lambda _n: "ffmpeg")
+    _fake_res = SimpleNamespace(
+        returncode=0,
+        stderr=b"[silencedetect] silence_end: 10.0 | silence_duration: 2.0\n",
     )
+    monkeypatch.setattr(output, "run_cancellable_subprocess", lambda *_a, **_kw: _fake_res)
+    monkeypatch.setattr("audiobookdl.output.ffmpeg_ops.run_cancellable_subprocess", lambda *_a, **_kw: _fake_res)
     monkeypatch.setattr(
-        output,
-        "_probe_audio_info",
+        "audiobookdl.output.ffmpeg_ops._probe_audio_info",
         lambda _p: (_ for _ in ()).throw(AssertionError("should not spawn ffprobe on cache hit")),
     )
     cache = {str(audio_path): AudioProbeInfo(duration=30.0, codec_name="mp3")}
@@ -1432,8 +1450,8 @@ def test_convert_output_reuses_and_updates_probe_cache_without_stale_staged_keys
         return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(output, "_require_executable", lambda _n: "ffmpeg")
-    monkeypatch.setattr(output, "find_executable", lambda _n: "ffprobe")
-    monkeypatch.setattr(output, "_probe_audio_info", fake_probe)
+    monkeypatch.setattr("audiobookdl.output.ffmpeg_ops.find_executable", lambda _n: "ffprobe")
+    monkeypatch.setattr("audiobookdl.output.ffmpeg_ops._probe_audio_info", fake_probe)
     monkeypatch.setattr(output, "run_cancellable_subprocess", fake_run)
 
     cache: dict[str, AudioProbeInfo] = {
@@ -1453,7 +1471,7 @@ def test_convert_output_reuses_and_updates_probe_cache_without_stale_staged_keys
 def test_resolve_ffmpeg_pool_workers_cpu_and_explicit_caps(monkeypatch):
     from audiobookdl.output.output import resolve_ffmpeg_pool_workers
 
-    monkeypatch.setattr(output, "COMBINE_REMUX_THREADS", 8)
+    monkeypatch.setattr("audiobookdl.output.ffmpeg_ops.COMBINE_REMUX_THREADS", 8)
     monkeypatch.setattr(output.os, "cpu_count", lambda: 16)
     assert resolve_ffmpeg_pool_workers(None, cpu_bound=False) == 8
     assert resolve_ffmpeg_pool_workers(None, cpu_bound=True) == 8
@@ -1545,10 +1563,9 @@ def test_split_and_merge_segment_groups_respect_intro_chapter_mode(tmp_path, mon
     from pathlib import Path
 
     monkeypatch.setattr(output, "_require_executable", lambda _n: "ffmpeg")
-    monkeypatch.setattr(output, "find_executable", lambda _n: "ffprobe")
+    monkeypatch.setattr("audiobookdl.output.ffmpeg_ops.find_executable", lambda _n: "ffprobe")
     monkeypatch.setattr(
-        output,
-        "_probe_audio_info",
+        "audiobookdl.output.ffmpeg_ops._probe_audio_info",
         lambda _p: AudioProbeInfo(duration=30.0, codec_name="mp3", bitrate=128000, sample_rate=44100, channels=2),
     )
 
@@ -1651,7 +1668,7 @@ def test_mux_codec_args_and_convert_single_file_respect_explicit_bitrate_and_sam
 
     with (
         patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
-        patch("audiobookdl.output.output._probe_audio_info", return_value=mp3_info),
+        patch("audiobookdl.output.ffmpeg_ops._probe_audio_info", return_value=mp3_info),
         patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run),
     ):
         new_p, _ = output.convert_single_file(str(mp3_file), "mp3", sample_rate=44100)
@@ -1687,8 +1704,10 @@ def test_combine_audiofiles_honors_explicit_bitrate_and_sample_rate_on_uniform_a
 
     with (
         patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
-        patch("audiobookdl.output.output._probe_audio_info", side_effect=fake_probe),
+        patch("audiobookdl.output.ffmpeg_ops._require_executable", return_value="ffmpeg"),
+        patch("audiobookdl.output.ffmpeg_ops._probe_audio_info", side_effect=fake_probe),
         patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run),
+        patch("audiobookdl.output.ffmpeg_ops.run_cancellable_subprocess", side_effect=fake_run),
     ):
         combine_audiofiles(
             [str(p0), str(p1)],
@@ -1758,8 +1777,8 @@ def test_verify_audio_integrity_fallback_when_ffprobe_unavailable(tmp_path):
     garbage_bad.write_bytes(b"not-flac-header-bytes")
 
     with (
-        patch("audiobookdl.output.output.find_executable", return_value=None),
-        patch("audiobookdl.output.output._probe_audio_info", return_value=AudioProbeInfo()),
+        patch("audiobookdl.output.ffmpeg_ops.find_executable", return_value=None),
+        patch("audiobookdl.output.ffmpeg_ops._probe_audio_info", return_value=AudioProbeInfo()),
     ):
         output.verify_audio_integrity(str(mp3_ok))
         output.verify_audio_integrity(str(m4b_ok))
@@ -1862,8 +1881,10 @@ def test_debug_mode_preserves_ffmpeg_progress_and_logs_stderr_to_sink(tmp_path):
     sink = _RecordingSink()
     with (
         patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
-        patch("audiobookdl.output.output._probe_audio_info", return_value=AudioProbeInfo(duration=10.0, codec_name="mp3")),
+        patch("audiobookdl.output.ffmpeg_ops._require_executable", return_value="ffmpeg"),
+        patch("audiobookdl.output.ffmpeg_ops._probe_audio_info", return_value=AudioProbeInfo(duration=10.0, codec_name="mp3")),
         patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run),
+        patch("audiobookdl.output.ffmpeg_ops.run_cancellable_subprocess", side_effect=fake_run),
         logging.job_context(logging.JobContext(debug=True, sink=sink)),
     ):
         chapters = output.detect_silence_chapters(str(src))
@@ -1923,7 +1944,7 @@ def test_combine_and_add_chapters_debug_mode_log_stderr_and_progress(tmp_path):
     sink = _RecordingSink()
     with (
         patch("audiobookdl.output.output._require_executable", return_value="ffmpeg"),
-        patch("audiobookdl.output.output._probe_audio_info", return_value=AudioProbeInfo(duration=10.0, codec_name="mp3")),
+        patch("audiobookdl.output.ffmpeg_ops._probe_audio_info", return_value=AudioProbeInfo(duration=10.0, codec_name="mp3")),
         patch("audiobookdl.output.output.run_cancellable_subprocess", side_effect=fake_run),
         patch("audiobookdl.output.output._remux_to_mpegts", lambda _s, dst, **_kw: open(dst, "wb").write(b"ts") > 0),
         patch("audiobookdl.output.output.verify_audio_integrity", return_value=AudioProbeInfo(duration=10.0)),

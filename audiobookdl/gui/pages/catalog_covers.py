@@ -150,7 +150,7 @@ class CatalogCoverLoader:
                     chunks.append(chunk)
                 data = b"".join(chunks)
                 return data if data else None
-        except Exception:
+        except (OSError, requests.RequestException):
             return None
 
     def start_thumbnail_loading(
@@ -276,5 +276,5 @@ class CatalogCoverLoader:
         for session in sessions:
             try:
                 session.close()
-            except Exception:
+            except (OSError, requests.RequestException):
                 pass

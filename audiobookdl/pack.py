@@ -37,6 +37,7 @@ from audiobookdl.output.metadata.reader import (
 from audiobookdl.pipeline import (
     apply_runtime_options,
     enrich_audiobook_with_options,
+    resolve_runtime_options,
     run_post_exec_hook,
 )
 from audiobookdl.utils import (
@@ -47,6 +48,7 @@ from audiobookdl.utils import (
     probe_audio_info,
     subprocess_kwargs,
 )
+from audiobookdl.utils.fs import replace_with_retry
 from audiobookdl.utils.audiobook import AudiobookFile
 from audiobookdl.utils.concurrency import run_cancellable_pool
 from audiobookdl.utils.http import create_configured_http_session, resolve_http_timeout
@@ -560,7 +562,9 @@ def inspect_local_book(
         AudiobookFile(url=p, ext=os.path.splitext(p)[1].lstrip(".").lower())
         for p in sorted_tracks
     ]
-    book_session = session if session is not None else requests.Session()
+    book_session = (
+        session if session is not None else create_configured_http_session(options)
+    )
     audiobook = Audiobook(
         session=book_session,
         metadata=metadata,
@@ -687,6 +691,7 @@ def pack_book(
             options,
             interaction=interaction,
             config=config,
+            cancel_event=cancel_event,
         )
         # Recompute output path after enrichment in case template uses newly populated fields
         spec.output_path = resolve_pack_output_path(
@@ -741,6 +746,8 @@ def pack_book(
     if may_silence_chapters and len(spec.track_paths) == 1:
         detected = output.detect_silence_chapters(
             spec.track_paths[0],
+            noise_db=float(getattr(options, "silence_noise_db", -35.0) or -35.0),
+            min_silence_sec=float(getattr(options, "silence_min_seconds", 1.8) or 1.8),
             cancel_event=cancel_event,
             probe_cache=cache,
         )
@@ -811,7 +818,7 @@ def pack_book(
             probe_cache=cache,
             write_sidecars=False,
         )
-        os.replace(staged_path, output_path)
+        replace_with_retry(staged_path, output_path)
         output.move_cached_probe(cache, staged_path, output_path)
         output_download.write_file_sidecars(
             spec.audiobook,
@@ -840,6 +847,7 @@ def pack_book(
         output_path=output_path,
         metadata=spec.audiobook.metadata,
         audio_format=spec.output_format,
+        cancel_event=cancel_event,
     )
     return output_path
 
@@ -879,6 +887,7 @@ def run_pack(
 ) -> PackSummary:
     """Discover, inspect, and repackage local audiobooks with isolated `JobContext`."""
     resolved_config = config if config is not None else load_config(options.config_location)
+    options = resolve_runtime_options(options, resolved_config)
     ctx = apply_runtime_options(options, resolved_config)
     ctx.interaction = interaction if interaction is not None else logging.NonInteractiveInteractionHandler()
     ctx.cancel_event = cancel_event
@@ -894,7 +903,7 @@ def run_pack(
     session = create_configured_http_session(options, proxy=resolved_proxy)
     try:
         with logging.job_context(ctx):
-            groups = discover_pack_groups(paths, recursive=recursive)
+            groups = discover_pack_groups(paths, recursive=recursive, cancel_event=cancel_event)
             total = len(groups)
             probe_cache: dict[str, AudioProbeInfo] = {}
             for idx, (source_root, raw_tracks) in enumerate(groups, start=1):
@@ -918,6 +927,7 @@ def run_pack(
                         overrides=book_overrides,
                         probe_cache=probe_cache,
                         session=session,
+                        cancel_event=cancel_event,
                     )
                     logging.emit_item_progress(idx, total, spec.audiobook.title)
                     if dry_run:
@@ -955,8 +965,11 @@ def run_pack(
                             force_upload=bool(getattr(options, "upload_to_abs", False)),
                             proxy=resolved_proxy,
                             timeout=resolved_timeout,
+                            cancel_event=cancel_event,
                         ):
                             logging.log(f"Synced {spec.audiobook.title} to Audiobookshelf")
+                    except DownloadCancelled:
+                        raise
                     except Exception as exc:
                         logging.error(f"Audiobookshelf sync failed for '{spec.audiobook.title}': {exc}")
                 except (DownloadCancelled, KeyboardInterrupt):

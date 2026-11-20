@@ -1,6 +1,6 @@
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, Result, Series
-from audiobookdl.exceptions import BookHasNoAudiobook, BookHasNoEbook, MissingBookAccess, RequestError, UserNotAuthorized
+from audiobookdl.exceptions import BookHasNoAudiobook, BookHasNoEbook, BookNotFound, MissingBookAccess, RequestError, UserNotAuthorized
 from audiobookdl.options_schema import DownloadOptions
 from audiobookdl.utils.audiobook import parse_language, parse_release_date
 from audiobookdl.utils.http import strip_auth_headers
@@ -71,7 +71,9 @@ class BookBeatSource(Source):
             "https://api.bookbeat.com/api/login",
             json=login_json,
         )
-        token = tokens["token"]
+        token = (tokens or {}).get("token")
+        if not token:
+            raise UserNotAuthorized
         self._session.headers.update({"authorization": f"Bearer {token}"})
 
     def _fetch_saved_books(self) -> dict[str, Any]:
@@ -84,9 +86,11 @@ class BookBeatSource(Source):
         while next_url and next_url not in seen_urls:
             seen_urls.add(next_url)
             page = self.get_json(next_url)
-            page_books = page.get("_embedded", {}).get("savedBooks", [])
+            if not isinstance(page, dict):
+                break
+            page_books = (page.get("_embedded") or {}).get("savedBooks") or []
             all_saved.extend(page_books)
-            next_link = page.get("_links", {}).get("next", {}).get("href")
+            next_link = ((page.get("_links") or {}).get("next") or {}).get("href")
             if next_link:
                 next_url = next_link
             elif len(page_books) >= limit:
@@ -178,8 +182,11 @@ class BookBeatSource(Source):
         cached = book_info.get("_downloads")
         if isinstance(cached, list):
             return cached
+        book_id = book_info.get("bookid")
+        if book_id is None:
+            raise BookNotFound
         dl_info = self.get_json(
-            "https://api.bookbeat.com/api/downloadinfo/" + str(book_info["bookid"])
+            "https://api.bookbeat.com/api/downloadinfo/" + str(book_id)
         )
         entries = list((dl_info.get("_embedded") or {}).get("downloads") or [])
         book_info["_downloads"] = entries
@@ -188,7 +195,9 @@ class BookBeatSource(Source):
     def download_license_url(self, book_info) -> str:
         for dl in self._get_download_entries(book_info):
             if dl.get("format") == "audioBook":
-                return dl["_links"]["license"]["href"]
+                href = (((dl.get("_links") or {}).get("license") or {}).get("href"))
+                if href:
+                    return href
         raise MissingBookAccess
 
     def _get_license(self, book_info: dict[str, Any]) -> dict[str, Any]:
@@ -202,11 +211,12 @@ class BookBeatSource(Source):
 
     def get_files(self, book_info: dict) -> list[AudiobookFile]:
         lic = self._get_license(book_info)
-        if "_links" in lic:
+        download_href = (((lic.get("_links") or {}).get("download") or {}).get("href"))
+        if download_href:
             cdn_headers: dict[str, str | bytes] = dict(strip_auth_headers(self._session.headers))
             return [
                 AudiobookFile(
-                    url=lic["_links"]["download"]["href"],
+                    url=download_href,
                     headers=cdn_headers,
                     ext="mp4",
                 )

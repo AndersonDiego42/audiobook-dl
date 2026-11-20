@@ -2,19 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from tkinter import ttk
 
-from audiobookdl.config import DEFAULT_AUTO_SYNC_MODE, Config
+from audiobookdl.gui.page_deps import LibraryPageDeps
 from audiobookdl.gui.pages.archive_tab import ArchiveTab
 from audiobookdl.gui.pages.catalog_tab import CatalogTab
 from audiobookdl.gui.pages.sync_tab import SyncTab
 from audiobookdl.gui.theme import ThemePalette, make_bold_font, scale_px
-from audiobookdl.sources import ServiceInfo
-from audiobookdl.sources.source import CatalogBook
-from audiobookdl.utils.archive import ArchiveEntry
 
 
 class LibraryPage(ttk.Frame):
@@ -23,45 +18,13 @@ class LibraryPage(ttk.Frame):
     def __init__(
         self,
         parent: tk.Misc,
-        *,
-        archive_path_provider: Callable[[], str],
-        config_provider: Callable[[], Config],
-        services: Sequence[ServiceInfo],
-        selected_service_provider: Callable[[], ServiceInfo | None],
-        selected_profile_provider: Callable[[], str],
-        on_queue_urls: Callable[[list[str]], None],
-        on_open_path: Callable[[str, bool], None],
-        on_pack_paths: Callable[[list[str]], object],
-        on_upload_abs: Callable[[ArchiveEntry], None],
-        on_catalog_fetch: Callable[[str, ServiceInfo, str, CatalogTab], None],
-        on_catalog_add_urls: Callable[[list[str]], None],
-        on_catalog_download_urls: Callable[[list[str], str, str], None],
-        on_save_to_library: Callable[[str, str, Sequence[CatalogBook]], tuple[int, int]],
-        on_sync_from_catalog: Callable[[str], None],
-        profile_resolver: Callable[[str], Sequence[str]],
-        status_resolver: Callable[[str, Sequence[CatalogBook]], Sequence[str]],
-        cover_fetcher: Callable[[str], bytes | None] | None = None,
-        on_catalog_cancel: Callable[[], object] | None = None,
-        auto_sync_enabled: bool = False,
-        auto_sync_minutes: int = 30,
-        auto_sync_mode: str = DEFAULT_AUTO_SYNC_MODE,
-        auto_sync_targets: Sequence[tuple[str, str]] | None = None,
-        on_run_sync: Callable[[list[tuple[str, str]], str], None],
-        on_auto_sync_changed: Callable[[bool, int], None],
-        on_save_schedule: Callable[[bool, int, str, list[tuple[str, str]]], None] | None = None,
-        on_manage_account: Callable[[str, str], object] | None = None,
-        on_manage_accounts: Callable[[], object] | None = None,
-        on_cancel_sync: Callable[[], None] | None = None,
-        on_tab_changed: Callable[[str], None] | None = None,
-        palette_provider: Callable[[], ThemePalette],
-        db_executor: ThreadPoolExecutor | None = None,
-        on_library_saved: Callable[[int, int], None] | None = None,
+        deps: LibraryPageDeps,
     ) -> None:
         super().__init__(parent, padding=scale_px(parent, 12))
-        self._archive_path_provider = archive_path_provider
-        self._palette_provider = palette_provider
-        self._on_tab_changed = on_tab_changed
-        self._on_library_saved = on_library_saved
+        self._archive_path_provider = deps.archive_path_provider
+        self._palette_provider = deps.palette_provider
+        self._on_tab_changed = deps.on_tab_changed
+        self._on_library_saved = deps.on_library_saved
         self._suppress_tab_event = False
         self._tab_events_armed = False
         self._dirty_tabs: set[str] = {"archive", "catalog", "sync"}
@@ -84,16 +47,16 @@ class LibraryPage(ttk.Frame):
         self.notebook.grid(row=1, column=0, sticky="nsew")
         self.notebook.enable_traversal()
 
-        palette = palette_provider()
+        palette = deps.palette_provider()
         self.archive_tab = ArchiveTab(
             self.notebook,
-            archive_path_provider(),
-            on_queue_urls=on_queue_urls,
-            on_open_path=on_open_path,
-            on_pack_paths=on_pack_paths,
-            on_upload_abs=on_upload_abs,
+            deps.archive_path_provider(),
+            on_queue_urls=deps.on_queue_urls,
+            on_open_path=deps.on_open_path,
+            on_pack_paths=deps.on_pack_paths,
+            on_upload_abs=deps.on_upload_abs,
             palette=palette,
-            db_executor=db_executor,
+            db_executor=deps.db_executor,
             defer_initial_refresh=True,
         )
 
@@ -104,37 +67,37 @@ class LibraryPage(ttk.Frame):
 
         self.catalog_tab = CatalogTab(
             self.notebook,
-            services,
-            selected_service_provider(),
-            on_fetch=on_catalog_fetch,
-            on_add_urls=on_catalog_add_urls,
-            on_download_urls=on_catalog_download_urls,
-            on_save_to_library=on_save_to_library,
-            on_sync_libraries=on_sync_from_catalog,
-            profile_resolver=profile_resolver,
-            status_resolver=status_resolver,
-            cover_fetcher=cover_fetcher,
-            on_cancel_fetch=on_catalog_cancel,
-            on_manage_account=on_manage_account,
-            config_provider=config_provider,
-            selected_profile=selected_profile_provider(),
+            deps.services,
+            deps.selected_service_provider(),
+            on_fetch=deps.on_catalog_fetch,
+            on_add_urls=deps.on_catalog_add_urls,
+            on_download_urls=deps.on_catalog_download_urls,
+            on_save_to_library=deps.on_save_to_library,
+            on_sync_libraries=deps.on_sync_from_catalog,
+            profile_resolver=deps.profile_resolver,
+            status_resolver=deps.status_resolver,
+            cover_fetcher=deps.cover_fetcher,
+            on_cancel_fetch=deps.on_catalog_cancel,
+            on_manage_account=deps.on_manage_account,
+            config_provider=deps.config_provider,
+            selected_profile=deps.selected_profile_provider(),
             palette=palette,
-            db_executor=db_executor,
+            db_executor=deps.db_executor,
             on_library_saved=_handle_library_saved,
         )
         self.sync_tab = SyncTab(
             self.notebook,
-            config_provider,
-            services,
-            auto_sync_enabled=auto_sync_enabled,
-            auto_sync_minutes=auto_sync_minutes,
-            auto_sync_mode=auto_sync_mode,
-            auto_sync_targets=auto_sync_targets,
-            on_run_sync=on_run_sync,
-            on_auto_sync_changed=on_auto_sync_changed,
-            on_save_schedule=on_save_schedule,
-            on_manage_accounts=on_manage_accounts,
-            on_cancel_sync=on_cancel_sync,
+            deps.config_provider,
+            deps.services,
+            auto_sync_enabled=deps.auto_sync_enabled,
+            auto_sync_minutes=deps.auto_sync_minutes,
+            auto_sync_mode=deps.auto_sync_mode,
+            auto_sync_targets=deps.auto_sync_targets,
+            on_run_sync=deps.on_run_sync,
+            on_auto_sync_changed=deps.on_auto_sync_changed,
+            on_save_schedule=deps.on_save_schedule,
+            on_manage_accounts=deps.on_manage_accounts,
+            on_cancel_sync=deps.on_cancel_sync,
             defer_initial_refresh=True,
         )
 

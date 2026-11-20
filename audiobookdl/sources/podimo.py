@@ -1,6 +1,6 @@
 from .source import CatalogBook, Source
 from audiobookdl import logging
-from audiobookdl.exceptions import DataNotPresent, NoSourceFound, RequestError, UserNotAuthorized
+from audiobookdl.exceptions import DataNotPresent, DownloadCancelled, NoSourceFound, RequestError, UserNotAuthorized
 from audiobookdl.utils import http, read_asset_file
 from audiobookdl.utils.audiobook import (
     Audiobook,
@@ -25,9 +25,9 @@ from urllib3.util import parse_url
 
 class PodimoSource(Source[dict]):
     match = [
-        "https://open.podimo.com/audiobook/[^/]+",
-        "https://open.podimo.com/podcast/[^/]+",
-        "https://share.podimo.com/s/[^/]+",
+        r"https://open\.podimo\.com/audiobook/[^/]+",
+        r"https://open\.podimo\.com/podcast/[^/]+",
+        r"https://share\.podimo\.com/s/[^/]+",
     ]
     names = ["Podimo"]
     _authentication_methods = ["login"]
@@ -118,7 +118,7 @@ class PodimoSource(Source[dict]):
         url_with_id = http.redirect_of(
             url,
             amount=5,
-            session=self._session,
+            session=self._get_unauthenticated_session(),
             stop_non_redirect=True,
             target_pattern=r"https?://open\.podimo\.com/(?:audiobook|podcast)/[^/?#]+",
         )
@@ -155,6 +155,10 @@ class PodimoSource(Source[dict]):
         limit = 100
         offset = 0
         while True:
+            ctx = logging.get_job_context()
+            cancel_event = ctx.cancel_event if ctx is not None else None
+            if cancel_event is not None and cancel_event.is_set():
+                raise DownloadCancelled
             data = self.graphql_request(
                 operation_name="PodcastEpisodesResultsQuery",
                 query="podcast_episodes",

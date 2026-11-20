@@ -280,11 +280,11 @@ class GuiHarness:
         if self.app is None:
             return {"state": "not_started"}
         try:
-            log_content = self.app.log_text.get("1.0", tk.END).strip()
+            log_content = self.app.download_page.queue_panel.log_text.get("1.0", tk.END).strip()
         except tk.TclError:
             log_content = "<destroyed>"
         try:
-            progress_val = self.app.progressbar.cget("value")
+            progress_val = self.app.download_page.queue_panel.progressbar.cget("value")
         except tk.TclError:
             progress_val = None
         return {

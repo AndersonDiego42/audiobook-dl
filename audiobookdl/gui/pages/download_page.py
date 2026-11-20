@@ -5,11 +5,12 @@ from __future__ import annotations
 import sys
 import tkinter as tk
 from tkinter import ttk
-from collections.abc import Callable, Sequence
-from typing import Any, Literal
+from collections.abc import Sequence
+from typing import Literal
 
 from audiobookdl.gui.formatting import TEMPLATE_PRESET_LABELS
 from audiobookdl.gui.options_panel import OptionsPanel
+from audiobookdl.gui.page_deps import DownloadPageDeps
 from audiobookdl.gui.queue_panel import ActivityQueuePanel
 from audiobookdl.gui.theme import ThemePalette, apply_theme_to_widget_tree, scale_px
 from audiobookdl.gui.widgets import (
@@ -55,54 +56,27 @@ class DownloadPage(ttk.Frame):
     def __init__(
         self,
         parent: tk.Misc,
-        root: tk.Tk,
-        app: Any,
-        *,
-        style: ttk.Style,
-        palette_provider: Callable[[], ThemePalette],
-        initial_split_ratio: float | None = None,
-        options_collapsed: bool = True,
-        output_naming_collapsed: bool = True,
-        on_locate_ffmpeg: Callable[[], object],
-        on_open_accounts: Callable[[], None],
-        on_open_folder: Callable[[], None],
-        on_browse_output_dir: Callable[[], None],
-        on_paste_urls: Callable[[], object],
-        on_paste_and_queue: Callable[[], None],
-        on_browse_url_file: Callable[[], None],
-        on_clear_urls: Callable[[], None],
-        on_urls_modified: Callable[[tk.Event | None], None],
-        on_start_download: Callable[[], None],
-        on_cancel_download: Callable[[], None],
-        on_preview_metadata: Callable[[], None],
-        on_pack_local: Callable[[], object],
-        on_retry_failed: Callable[[], None],
-        service_label_for_url: Callable[[str], str],
-        on_preview_url: Callable[[str], None],
-        on_send_to_urls: Callable[[Sequence[str]], None],
-        on_open_path: Callable[[str, bool], None],
-        on_import_queue: Callable[[list[dict[str, Any]]], None],
-        on_queue_summary_changed: Callable[[int, int], None],
-        on_progress_mode_changed: Callable[[str], None],
-        on_m4b_toggled: Callable[[], None],
-        on_format_selected: Callable[[tk.Event | None], None],
-        progress_var: tk.DoubleVar,
-        active_job_var: tk.StringVar,
-        concurrency_var: tk.IntVar | None = None,
-        on_concurrency_changed: Callable[[int], None] | None = None,
-        on_retry_selected: Callable[[Sequence[str]], None] | None = None,
-        profile_choices_provider: Callable[[], list[str]] | None = None,
-        on_select_profile: Callable[[str], None] | None = None,
+        deps: DownloadPageDeps,
     ) -> None:
         super().__init__(parent, padding=(scale_px(parent, 12), scale_px(parent, 8)))
-        self._window = root
-        self._palette_provider = palette_provider
-        self._on_open_accounts = on_open_accounts
-        self._profile_choices_provider = profile_choices_provider
-        self._on_select_profile = on_select_profile
+        self._window = deps.root
+        self._palette_provider = deps.palette_provider
+        self._on_open_accounts = deps.on_open_accounts
+        self._profile_choices_provider = deps.profile_choices_provider
+        self._on_select_profile = deps.on_select_profile
+        self._vars = deps.vars
+        self._on_m4b_toggled_cb = deps.on_m4b_toggled
+        self._on_format_selected_cb = deps.on_format_selected
+        self._on_open_drm_inspector = deps.on_open_drm_inspector
+        self._options_panel: OptionsPanel | None = None
+        self._options_panel_enabled = True
+        self._options_custom_provider_names: tuple[str, ...] = ()
         self._split_ratio: float | None = (
-            float(initial_split_ratio)
-            if (initial_split_ratio is not None and 0.0 < float(initial_split_ratio) < 1.0)
+            float(deps.initial_split_ratio)
+            if (
+                deps.initial_split_ratio is not None
+                and 0.0 < float(deps.initial_split_ratio) < 1.0
+            )
             else None
         )
         self._user_dragged_split = self._split_ratio is not None
@@ -139,7 +113,7 @@ class DownloadPage(ttk.Frame):
         ).grid(row=0, column=0, sticky="w")
         banner_btns = ttk.Frame(self._ffmpeg_banner, style="Banner.TFrame")
         banner_btns.grid(row=0, column=1, sticky="e", padx=(8, 0))
-        ttk.Button(banner_btns, text="Locate...", command=on_locate_ffmpeg).pack(
+        ttk.Button(banner_btns, text="Locate...", command=deps.on_locate_ffmpeg).pack(
             side=tk.LEFT, padx=(0, 4)
         )
         ttk.Button(banner_btns, text="Dismiss", command=self.dismiss_ffmpeg_banner).pack(side=tk.LEFT)
@@ -153,7 +127,7 @@ class DownloadPage(ttk.Frame):
 
         self.top_scroll = ScrollableFrame(
             self,
-            style=style,
+            style=deps.style,
             content_padding=(scale_px(self, 2), scale_px(self, 2)),
             inner_scrollables=lambda: (self.urls_text,),
         )
@@ -177,16 +151,16 @@ class DownloadPage(ttk.Frame):
         self.urls_text.grid(row=0, column=0, sticky="ew")
         self.urls_scroll.grid(row=0, column=1, sticky="ns")
         self.urls_text.tag_configure(
-            "warning_line", foreground=palette_provider().warning, underline=True
+            "warning_line", foreground=deps.palette_provider().warning, underline=True
         )
         bind_text_tab_navigation(self.urls_text)
-        self.urls_text.bind("<Control-Return>", lambda _e: on_start_download())
-        self.urls_text.bind("<<Modified>>", on_urls_modified)
+        self.urls_text.bind("<Control-Return>", lambda _e: deps.on_start_download())
+        self.urls_text.bind("<<Modified>>", deps.on_urls_modified)
         attach_url_context_menu(
             self.urls_text,
-            on_paste=on_paste_urls,
-            on_paste_and_queue=on_paste_and_queue,
-            on_clear=on_clear_urls,
+            on_paste=deps.on_paste_urls,
+            on_paste_and_queue=deps.on_paste_and_queue,
+            on_clear=deps.on_clear_urls,
         )
 
         self._url_footer = ttk.Frame(self.url_frame)
@@ -199,13 +173,13 @@ class DownloadPage(ttk.Frame):
             style="Muted.TLabel",
         )
         self._url_btn_row = ttk.Frame(self._url_footer)
-        ttk.Button(self._url_btn_row, text="Paste", command=on_paste_urls).pack(
+        ttk.Button(self._url_btn_row, text="Paste", command=deps.on_paste_urls).pack(
             side=tk.LEFT, padx=(0, 4)
         )
-        ttk.Button(self._url_btn_row, text="Load .txt...", command=on_browse_url_file).pack(
+        ttk.Button(self._url_btn_row, text="Load .txt...", command=deps.on_browse_url_file).pack(
             side=tk.LEFT, padx=(0, 4)
         )
-        ttk.Button(self._url_btn_row, text="Clear", command=on_clear_urls).pack(side=tk.LEFT)
+        ttk.Button(self._url_btn_row, text="Clear", command=deps.on_clear_urls).pack(side=tk.LEFT)
         self._apply_url_footer_layout("wide")
         self._url_footer.bind("<Configure>", self._on_url_footer_configure, add="+")
 
@@ -214,18 +188,18 @@ class DownloadPage(ttk.Frame):
         self._folder_bar.grid(row=1, column=0, sticky="ew", pady=(0, 6))
 
         self._output_label = ttk.Label(self._folder_bar, text="Output Folder:")
-        self.output_entry = ttk.Entry(self._folder_bar, textvariable=app.output_dir_var)
+        self.output_entry = ttk.Entry(self._folder_bar, textvariable=self._vars.output_dir_var)
         self.output_browse_btn = ttk.Button(
-            self._folder_bar, text="Browse...", command=on_browse_output_dir
+            self._folder_bar, text="Browse...", command=deps.on_browse_output_dir
         )
-        self.output_open_btn = ttk.Button(self._folder_bar, text="Open", command=on_open_folder)
+        self.output_open_btn = ttk.Button(self._folder_bar, text="Open", command=deps.on_open_folder)
 
         self.account_chip_var = tk.StringVar(value="")
         self.account_chip_btn = ttk.Button(
             self._folder_bar,
             textvariable=self.account_chip_var,
             style="Chip.TButton",
-            command=on_open_accounts,
+            command=deps.on_open_accounts,
         )
         self.account_chip_btn.bind("<Button-3>", self.show_profile_menu)
         if sys.platform == "darwin":
@@ -240,20 +214,20 @@ class DownloadPage(ttk.Frame):
         attach_tooltip(
             self.account_chip_btn,
             "Active service and profile (click to edit credentials on Accounts page; right-click to switch profile)",
-            palette_provider=palette_provider,
+            palette_provider=deps.palette_provider,
         )
         attach_tooltip(
             self.output_entry,
             "Destination folder where downloaded or packed audiobooks are written",
-            palette_provider=palette_provider,
+            palette_provider=deps.palette_provider,
         )
 
         # Collapsible Output naming section (collapsed by default)
         self.naming_section = CollapsibleSection(
             top_pane,
             "Output naming",
-            collapsed=output_naming_collapsed,
-            on_toggle=lambda _c: self._on_section_toggled(),
+            collapsed=deps.output_naming_collapsed,
+            on_toggle=lambda collapsed: self._on_section_toggled("naming", collapsed),
         )
         self.naming_section.grid(row=2, column=0, sticky="ew", pady=(0, 4))
         naming_content = self.naming_section.content
@@ -265,7 +239,7 @@ class DownloadPage(ttk.Frame):
         tpl_row = ttk.Frame(naming_content)
         tpl_row.grid(row=0, column=1, sticky="ew", pady=(0, 4))
         tpl_row.columnconfigure(0, weight=1)
-        self.tpl_entry = ttk.Entry(tpl_row, textvariable=app.template_var)
+        self.tpl_entry = ttk.Entry(tpl_row, textvariable=self._vars.template_var)
         self.tpl_entry.grid(row=0, column=0, sticky="ew")
         self.token_btn = ttk.Menubutton(tpl_row, text="Insert Token")
         token_menu = tk.Menu(self.token_btn, tearoff=0)
@@ -279,7 +253,7 @@ class DownloadPage(ttk.Frame):
         self.token_btn.grid(row=0, column=1, padx=(6, 0))
         self.preset_combo = ttk.Combobox(
             tpl_row,
-            textvariable=app.template_preset_var,
+            textvariable=self._vars.template_preset_var,
             values=[label for label, _tpl in TEMPLATE_PRESET_LABELS],
             state="readonly",
             width=16,
@@ -287,13 +261,13 @@ class DownloadPage(ttk.Frame):
         self.preset_combo.grid(row=0, column=2, padx=(6, 0))
 
         ttk.Label(naming_content, text="Series:").grid(row=1, column=0, sticky="w", padx=(0, 8))
-        ttk.Label(naming_content, textvariable=app.template_preview_var, style="Muted.TLabel").grid(
+        ttk.Label(naming_content, textvariable=self._vars.template_preview_var, style="Muted.TLabel").grid(
             row=1, column=1, sticky="w"
         )
         ttk.Label(naming_content, text="Standalone:").grid(row=2, column=0, sticky="w", padx=(0, 8))
         ttk.Label(
             naming_content,
-            textvariable=app.template_standalone_preview_var,
+            textvariable=self._vars.template_standalone_preview_var,
             style="Muted.TLabel",
         ).grid(row=2, column=1, sticky="w")
 
@@ -301,24 +275,18 @@ class DownloadPage(ttk.Frame):
         if tpl_spec:
             tpl_help = tpl_spec.get_help()
             if tpl_help:
-                attach_tooltip(self.tpl_entry, tpl_help, palette_provider=palette_provider)
+                attach_tooltip(self.tpl_entry, tpl_help, palette_provider=deps.palette_provider)
 
         # Collapsible Options section (collapsed by default)
         self.options_section = CollapsibleSection(
             top_pane,
             "Options",
-            collapsed=options_collapsed,
-            on_toggle=lambda _c: self._on_section_toggled(),
+            collapsed=deps.options_collapsed,
+            on_toggle=lambda collapsed: self._on_section_toggled("options", collapsed),
         )
         self.options_section.grid(row=3, column=0, sticky="ew", pady=(0, 4))
-        self.options_panel = OptionsPanel(
-            self.options_section.content,
-            app,
-            on_m4b_toggled=on_m4b_toggled,
-            on_format_selected=on_format_selected,
-            palette_provider=palette_provider,
-        )
-        self.options_panel.grid(row=0, column=0, sticky="ew")
+        if not deps.options_collapsed:
+            self._ensure_options_panel()
 
         self.output_widgets: list[ttk.Entry | ttk.Button | ttk.Combobox | ttk.Menubutton] = [
             self.output_entry,
@@ -329,33 +297,7 @@ class DownloadPage(ttk.Frame):
         ]
 
         # Secondary pane: Queue & Activity Log
-        self.queue_panel = ActivityQueuePanel(
-            self,
-            root,
-            app.controller,
-            status_var=app.status_var,
-            batch_var=app.batch_var,
-            metrics_var=app.metrics_var,
-            on_start_download=on_start_download,
-            on_cancel_download=on_cancel_download,
-            on_preview_metadata=on_preview_metadata,
-            on_pack_local=on_pack_local,
-            on_open_folder=on_open_folder,
-            on_retry_failed=on_retry_failed,
-            service_label_for_url=service_label_for_url,
-            on_retry_selected=on_retry_selected or (lambda _ids: on_retry_failed()),
-            on_preview_url=on_preview_url,
-            on_send_to_urls=on_send_to_urls,
-            on_open_path=on_open_path,
-            on_import_queue=on_import_queue,
-            on_queue_summary_changed=on_queue_summary_changed,
-            on_progress_mode_changed=on_progress_mode_changed,
-            progress_var=progress_var,
-            active_job_var=active_job_var,
-            concurrency_var=concurrency_var,
-            on_concurrency_changed=on_concurrency_changed,
-            palette=palette_provider(),
-        )
+        self.queue_panel = ActivityQueuePanel(self, deps.root, deps.queue)
 
         self.paned.add(self.top_scroll, weight=0)
         self.paned.add(self.queue_panel, weight=1)
@@ -374,6 +316,43 @@ class DownloadPage(ttk.Frame):
         self.urls_text.tag_configure("warning_line", foreground=palette.warning, underline=True)
         self.top_scroll.apply_theme(palette)
         self.queue_panel.apply_theme_palette(palette)
+
+    @property
+    def options_panel(self) -> OptionsPanel:
+        return self._ensure_options_panel()
+
+    def _ensure_options_panel(self) -> OptionsPanel:
+        panel = self._options_panel
+        if panel is not None:
+            return panel
+        panel = OptionsPanel(
+            self.options_section.content,
+            self._vars,
+            on_m4b_toggled=self._on_m4b_toggled_cb,
+            on_format_selected=self._on_format_selected_cb,
+            palette_provider=self._palette_provider,
+            on_open_drm_inspector=self._on_open_drm_inspector,
+        )
+        panel.grid(row=0, column=0, sticky="ew")
+        self._options_panel = panel
+        apply_theme_to_widget_tree(panel, self._palette_provider())
+        if not self._options_panel_enabled:
+            panel.set_enabled(False)
+        if self._options_custom_provider_names:
+            panel.update_custom_providers_hint(self._options_custom_provider_names)
+        self.top_scroll.guard_scroll_inputs(force=True)
+        return panel
+
+    def set_options_panel_enabled(self, enabled: bool) -> None:
+        self._options_panel_enabled = enabled
+        if self._options_panel is not None:
+            self._options_panel.set_enabled(enabled)
+
+    def update_options_custom_providers_hint(self, names: Sequence[str]) -> None:
+        cleaned = tuple(str(name).strip() for name in names if str(name).strip())
+        self._options_custom_provider_names = cleaned
+        if self._options_panel is not None:
+            self._options_panel.update_custom_providers_hint(cleaned)
 
     def update_ffmpeg_banner(self, available: bool, status_text: str) -> None:
         self._ffmpeg_available = available
@@ -636,7 +615,9 @@ class DownloadPage(ttk.Frame):
                 flush_layout=False,
             )
 
-    def _on_section_toggled(self) -> None:
+    def _on_section_toggled(self, section: str, collapsed: bool) -> None:
+        if section == "options" and not collapsed:
+            self._ensure_options_panel()
         if self._layout_mode == "horizontal":
             self._h_user_dragged_split = False
         else:

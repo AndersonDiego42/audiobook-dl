@@ -370,6 +370,10 @@ def test_add_chapters_ffmpeg_fallback_respects_container_bitrate_and_os_replace(
 
         monkeypatch.setattr(ffmeta, "run_cancellable_subprocess", fake_subprocess)
         monkeypatch.setattr(ffmeta.utils, "ffprobe_audio_bitrate", lambda _p: probed_bps)
+        monkeypatch.setattr(
+            "audiobookdl.output.output.verify_audio_integrity",
+            lambda *a, **k: SimpleNamespace(),
+        )
 
         replace_calls = []
         real_replace = ffmeta.os.replace
@@ -730,6 +734,16 @@ def test_cover_square_padding_and_max_size_normalization():
     assert ext == "jpg"
     with Image.open(BytesIO(data)) as out_img:
         assert out_img.size == (128, 128)
+
+
+def test_normalize_cover_image_returns_original_on_corrupt_bytes():
+    from audiobookdl import Cover
+    from audiobookdl.output.metadata._cover import normalize_cover_image
+
+    cover = Cover(image=b"this is not a valid image", extension="webp")
+    data, ext = normalize_cover_image(cover)
+    assert data == b"this is not a valid image"
+    assert ext == "webp"
 
 
 @pytest.mark.ffmpeg

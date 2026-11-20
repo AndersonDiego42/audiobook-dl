@@ -1,8 +1,9 @@
 import base64
 import binascii
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from datetime import datetime, timezone
 import email.utils
+import http.client
 from http.cookiejar import Cookie, CookieJar
 import importlib
 import math
@@ -520,6 +521,57 @@ def parse_repr_digest(header_val: Any) -> dict[str, str]:
     return digests
 
 
+def _iter_response_chunks(resp: Any, chunk_size: int = 64 * 1024) -> Iterator[bytes]:
+    """Yield decoded body chunks from a `requests`-like response."""
+    iter_content = getattr(resp, "iter_content", None)
+    if callable(iter_content):
+        yield from iter_content(chunk_size=chunk_size)
+        return
+    raw_content = getattr(resp, "content", None)
+    if isinstance(raw_content, (bytes, bytearray)):
+        view = memoryview(raw_content)
+        for off in range(0, len(view), chunk_size):
+            yield bytes(view[off : off + chunk_size])
+
+
+def read_bounded_prefix(resp: Any, max_bytes: int = 16384) -> bytes:
+    """Consume and return up to `max_bytes` from a response body.
+
+    Only use where the remaining body will not be streamed afterward
+    (error paths); the response should be closed by the caller.
+    """
+    if max_bytes <= 0:
+        return b""
+    raw = getattr(resp, "_content", None)
+    if isinstance(raw, (bytes, bytearray)):
+        return bytes(raw[:max_bytes])
+    buf = bytearray()
+    try:
+        for chunk in _iter_response_chunks(resp):
+            if not chunk:
+                continue
+            remaining = max_bytes - len(buf)
+            if remaining <= 0:
+                break
+            buf.extend(chunk[:remaining])
+            if len(buf) >= max_bytes:
+                break
+    except (AttributeError, TypeError):
+        pass
+    if buf:
+        return bytes(buf)
+    if getattr(resp, "_content", None) is False:
+        # Unconsumed `requests` stream: never trigger a full body download.
+        return b""
+    try:
+        content = getattr(resp, "content", None)
+    except Exception:
+        content = None
+    if isinstance(content, (bytes, bytearray)):
+        return bytes(content[:max_bytes])
+    return b""
+
+
 def is_cloudflare_challenge(response: Any, *, body: bytes | str | None = None) -> bool:
     """Return `True` when an HTTP response represents an interactive Cloudflare/WAF challenge."""
     if response is None and body is None:
@@ -548,11 +600,28 @@ def is_cloudflare_challenge(response: Any, *, body: bytes | str | None = None) -
     elif isinstance(body, str):
         sample_text = body[:16384].lower()
     elif response is not None:
-        raw_content = getattr(response, "content", None)
+        # Never trigger a full body download on streamed responses: only sample
+        # content that is already materialized (`requests` sets `_content` to
+        # `False` until consumed; curl_cffi-style responses expose `.content`
+        # eagerly for non-streamed requests).
+        raw_content = getattr(response, "_content", None)
+        unconsumed_stream = raw_content is False
+        if unconsumed_stream:
+            raw_content = None
+        if not isinstance(raw_content, (bytes, bytearray)) and not unconsumed_stream:
+            try:
+                candidate = getattr(response, "content", None)
+            except Exception:
+                candidate = None
+            if isinstance(candidate, (bytes, bytearray)):
+                raw_content = candidate
         if isinstance(raw_content, (bytes, bytearray)) and raw_content:
             sample_text = bytes(raw_content[:16384]).decode("utf-8", errors="ignore").lower()
-        else:
-            raw_text = getattr(response, "text", None)
+        elif not unconsumed_stream:
+            try:
+                raw_text = getattr(response, "text", None)
+            except Exception:
+                raw_text = None
             if isinstance(raw_text, str):
                 sample_text = raw_text[:16384].lower()
 
@@ -757,14 +826,22 @@ def update_session_cookies(session: Any, cookie_jar: CookieJar) -> None:
 
 def is_transient_network_error(exc: BaseException) -> bool:
     """Return `True` for retryable timeout or connection errors across `requests` and `curl_cffi`."""
-    if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+    if isinstance(
+        exc,
+        (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+            http.client.IncompleteRead,
+        ),
+    ):
         return True
     module_name = getattr(type(exc), "__module__", "") or ""
-    if module_name.startswith("curl_cffi"):
+    if module_name.startswith("urllib3") or module_name.startswith("curl_cffi"):
         cls_name = type(exc).__name__.lower()
         return any(
             token in cls_name
-            for token in ("timeout", "connection", "requestexception", "curlerror")
+            for token in ("timeout", "connection", "requestexception", "curlerror", "protocolerror", "incompleteread")
         )
     return False
 

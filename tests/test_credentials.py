@@ -12,6 +12,7 @@ from audiobookdl.credentials import (
     PLAINTEXT_OPT_IN_ENV,
     PlaintextFallbackCredentialStore,
     get_credential_store,
+    get_plaintext_vault_path,
     get_vault_path,
 )
 
@@ -266,3 +267,53 @@ def test_dpapi_empty_vault_retained_and_private_write_skips_icacls(tmp_path, mon
     atomic_write_text(str(priv_file), "hello-secret", private=True)
     assert priv_file.read_text(encoding="utf-8") == "hello-secret"
 
+
+
+def test_keyring_delete_password_resolves_indexed_username_and_keeps_empty_index(tmp_path):
+    import json
+
+    backing = {}
+
+    class _FakeKeyring:
+        def get_password(self, service, account):
+            return backing.get((service, account))
+
+        def set_password(self, service, account, password):
+            backing[(service, account)] = password
+
+        def delete_password(self, service, account):
+            backing.pop((service, account), None)
+
+    index_path = str(tmp_path / "credentials.keyring.json")
+    store = KeyringCredentialStore(_FakeKeyring(), index_path=index_path)
+    store.set_password("storytel", "main@example.com", "pw-main")
+
+    # username=None must still delete the indexed account, not the empty-account key
+    store.delete_password("storytel", None)
+    assert backing == {}
+    assert store.stored_services() == {}
+
+    # Emptying the index writes a valid empty JSON document instead of unlinking
+    assert os.path.exists(index_path)
+    assert json.loads(open(index_path, encoding="utf-8").read()) == {
+        "version": 1,
+        "entries": {},
+    }
+
+
+def test_get_credential_store_plaintext_fallback_persists_vault(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.delenv(PLAINTEXT_OPT_IN_ENV, raising=False)
+    monkeypatch.setenv(PLAINTEXT_OPT_IN_ENV, "1")
+    with patch("audiobookdl.credentials._is_usable_keyring_backend", return_value=False):
+        store = get_credential_store(str(cfg_path))
+    assert isinstance(store, PlaintextFallbackCredentialStore)
+    assert store.allow_plaintext is True
+    assert store.vault_path == get_plaintext_vault_path(str(cfg_path))
+
+    store.set_password("nextory", "n@example.com", "persisted-pw")
+    reloaded = PlaintextFallbackCredentialStore(
+        allow_plaintext=True, vault_path=store.vault_path
+    )
+    assert reloaded.get_password("nextory", "n@example.com") == "persisted-pw"

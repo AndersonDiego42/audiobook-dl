@@ -168,7 +168,6 @@ class OAuthDisconnectedEvent:
 @dataclass(frozen=True, slots=True)
 class CatalogLoadedEvent:
     request_id: int
-    target_tab: Any
     payload: Any
     error: Exception | None
 

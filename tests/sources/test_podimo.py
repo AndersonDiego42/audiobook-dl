@@ -212,6 +212,8 @@ def test_download_podcast_and_episodes_with_hls_and_mp3_streams(tmp_path):
 
 def test_share_link_follows_two_redirects_to_podcast_and_handles_failures(tmp_path):
     src = _make_source(tmp_path)
+    unauth = MagicMock()
+    src._cached_unauthenticated_session = unauth
     src._session.post = MagicMock(
         side_effect=[
             _json_resp({"data": {"podcastById": {"title": "Shared Pod"}}}),
@@ -219,7 +221,7 @@ def test_share_link_follows_two_redirects_to_podcast_and_handles_failures(tmp_pa
         ]
     )
 
-    src._session.get = MagicMock(
+    unauth.get = MagicMock(
         side_effect=[
             MagicMock(status_code=302, headers={"location": "https://podimo.com/landing/xyz"}),
             MagicMock(status_code=301, headers={"location": "https://open.podimo.com/podcast/pod-77"}),
@@ -229,20 +231,20 @@ def test_share_link_follows_two_redirects_to_podcast_and_handles_failures(tmp_pa
 
     assert isinstance(result, Series)
     assert result.title == "Shared Pod"
-    assert src._session.get.call_count == 2
+    assert unauth.get.call_count == 2
 
     # Non-redirect response in redirect_of -> DataNotPresent
-    src._session.get = MagicMock(return_value=MagicMock(status_code=200, headers={}))
+    unauth.get = MagicMock(return_value=MagicMock(status_code=200, headers={}))
     with pytest.raises(DataNotPresent):
         src.download("https://share.podimo.com/s/broken")
 
     # Redirect missing Location header -> DataNotPresent
-    src._session.get = MagicMock(return_value=MagicMock(status_code=302, headers={}))
+    unauth.get = MagicMock(return_value=MagicMock(status_code=302, headers={}))
     with pytest.raises(DataNotPresent):
         src.download("https://share.podimo.com/s/no-loc")
 
     # Redirect to pathless host -> DataNotPresent
-    src._session.get = MagicMock(
+    unauth.get = MagicMock(
         side_effect=[
             MagicMock(status_code=302, headers={"location": "https://open.podimo.com"}),
             MagicMock(status_code=302, headers={"location": "https://open.podimo.com"}),
@@ -252,7 +254,7 @@ def test_share_link_follows_two_redirects_to_podcast_and_handles_failures(tmp_pa
         src.download("https://share.podimo.com/s/no-path")
 
     # Redirect to unsupported kind (neither audiobook nor podcast) -> DataNotPresent
-    src._session.get = MagicMock(
+    unauth.get = MagicMock(
         side_effect=[
             MagicMock(status_code=302, headers={"location": "https://open.podimo.com/user/123"}),
             MagicMock(status_code=302, headers={"location": "https://open.podimo.com/user/123"}),
@@ -372,7 +374,9 @@ def test_podimo_main_m3u8_chapters_search_and_library(tmp_path):
 
 def test_podimo_one_hop_and_307_share_redirects_and_extended_metadata(tmp_path):
     src = _make_source(tmp_path)
-    src._session.get = MagicMock(
+    unauth = MagicMock()
+    src._cached_unauthenticated_session = unauth
+    unauth.get = MagicMock(
         return_value=MagicMock(
             status_code=307,
             headers={"Location": "https://open.podimo.com/audiobook/ab-307"},

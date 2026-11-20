@@ -8,6 +8,7 @@ import sys
 import threading
 import tkinter as tk
 from tkinter import simpledialog, ttk
+import typing
 from typing import Any, Literal
 from collections.abc import Callable, Sequence
 import weakref
@@ -144,8 +145,6 @@ def _column_sort_key(raw: Any, sort_kind: str) -> tuple[int, Any]:
         return (0, text.casefold())
     return (0, _natural_text_sort_key(text))
 
-
-import typing
 
 _TreeItemT = typing.TypeVar("_TreeItemT")
 
@@ -746,7 +745,7 @@ class ScrollableFrame(ttk.Frame):
                             if (lo, hi) != (0.0, 1.0):
                                 if (scroll_up and lo > 0.0) or (not scroll_up and hi < 1.0):
                                     return
-                        except Exception:
+                        except tk.TclError:
                             return
         first, last = self.canvas.yview()
         if first <= 0.0 and last >= 1.0:

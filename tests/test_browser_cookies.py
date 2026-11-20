@@ -4,7 +4,7 @@ import os
 import sqlite3
 import time
 
-from Cryptodome.Cipher import AES
+from Crypto.Cipher import AES
 import pytest
 
 from audiobookdl.utils.browser_cookies import (

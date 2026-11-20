@@ -16,6 +16,7 @@ from audiobookdl.utils.pssh import (
     parse_pssh_boxes,
 )
 from audiobookdl.utils.http import (
+    AUTH_HEADER_NAMES,
     DEFAULT_HTTP_TIMEOUT,
     DEFAULT_MAX_RETRIES,
     RETRIABLE_CDN_STATUS_CODES,
@@ -23,6 +24,7 @@ from audiobookdl.utils.http import (
     extract_session_cookies,
     is_cloudflare_challenge,
     is_transient_network_error,
+    read_bounded_prefix,
     resolve_max_retries,
     sleep_or_cancel,
 )
@@ -42,23 +44,57 @@ import requests
 RETRIABLE_STATUS_CODES = RETRIABLE_CDN_STATUS_CODES
 
 
+def _is_curl_cffi_session(session: Any) -> bool:
+    return (getattr(type(session), "__module__", "") or "").startswith("curl_cffi")
+
+
+def _neutralize_session_auth_headers(kwargs: dict[str, Any]) -> None:
+    """Force session-level auth headers off for this request via `None` header values.
+
+    `requests` drops headers explicitly set to `None`, which removes matching
+    `session.headers` entries (e.g. `Authorization`, `X-Login-Token`) from the
+    wire request while preserving explicitly provided per-request headers.
+    """
+    req_headers = dict(kwargs.get("headers") or {})
+    present = {str(k).lower() for k in req_headers}
+    for name in AUTH_HEADER_NAMES:
+        if name not in present:
+            req_headers[name] = None
+    kwargs["headers"] = req_headers
+
+
 def request(
     self,
     method: str,
     url: str,
     *,
     force_cookies: bool = False,
+    credentials: bool = True,
     max_retries: int | None = None,
     **kwargs,
 ) -> requests.Response:
-    """Make an HTTP request with retry/backoff for transient errors and configurable timeout."""
+    """Make an HTTP request with retry/backoff for transient errors and configurable timeout.
+
+    :param credentials: when False, `self._session` auth headers/cookies are not
+        sent to the target host (third-party fetches such as CDN/cover URLs)
+    """
     if "timeout" in kwargs:
         timeout = kwargs.pop("timeout")
     else:
         opt_timeout = getattr(getattr(self, "_options", None), "timeout", None)
         timeout = (DEFAULT_HTTP_TIMEOUT[0], float(opt_timeout)) if opt_timeout else DEFAULT_HTTP_TIMEOUT
-    if force_cookies:
+    session = self._session
+    neutralize_auth = False
+    if not credentials:
+        if _is_curl_cffi_session(session):
+            # curl_cffi does not support `None` header removal; use a clean session instead.
+            session = self._get_unauthenticated_session()
+        else:
+            neutralize_auth = True
+    if force_cookies and credentials:
         kwargs["cookies"] = _get_all_cookies(self._session)
+    if neutralize_auth:
+        _neutralize_session_auth_headers(kwargs)
 
     effective_retries = (
         max(0, int(max_retries))
@@ -69,10 +105,10 @@ def request(
 
     def _send() -> requests.Response:
         if upper_method == "GET":
-            return self._session.get(url, timeout=timeout, **kwargs)
+            return session.get(url, timeout=timeout, **kwargs)
         if upper_method == "POST":
-            return self._session.post(url, timeout=timeout, **kwargs)
-        return self._session.request(method, url, timeout=timeout, **kwargs)
+            return session.post(url, timeout=timeout, **kwargs)
+        return session.request(method, url, timeout=timeout, **kwargs)
 
     def _cancel_event() -> threading.Event | None:
         ctx = logging.get_job_context()
@@ -80,6 +116,9 @@ def request(
 
     last_exc: BaseException | None = None
     for attempt in range(effective_retries + 1):
+        cancel_event = _cancel_event()
+        if cancel_event is not None and cancel_event.is_set():
+            raise exceptions.DownloadCancelled
         try:
             resp = _send()
         except Exception as exc:
@@ -94,6 +133,14 @@ def request(
             )
             sleep_or_cancel(delay, _cancel_event(), sleep_fn=time.sleep)
             continue
+
+        cancel_event = _cancel_event()
+        if cancel_event is not None and cancel_event.is_set():
+            try:
+                resp.close()
+            except Exception:
+                pass
+            raise exceptions.DownloadCancelled
 
         if is_cloudflare_challenge(resp):
             try:
@@ -146,26 +193,32 @@ def _raise_for_failed_response(url: str, resp: requests.Response) -> None:
                 "or importing fresh browser cookies on the Accounts page."
             )
         )
-    logging.debug(f"Failed to download data from: {url}\nResponse:\n{resp.content!r}")
+    try:
+        body_preview = read_bounded_prefix(resp, 4096)
+    except Exception:
+        body_preview = b""
+    logging.debug(
+        f"Failed to download data from: {url}\nResponse:\n{body_preview!r}"
+    )
     detail = f"HTTP {resp.status_code} from {_safe_url_label(url)}"
     if resp.status_code in (401, 403):
         raise exceptions.UserNotAuthorized(detail=detail)
     raise exceptions.RequestError(detail=detail)
 
 
-def post(self, url: str, **kwargs) -> bytes:
+def post(self, url: str, credentials: bool = True, **kwargs) -> bytes:
     """Make post request with `Source` session"""
-    resp = self.request("POST", url, **kwargs)
-    if resp.status_code == 200:
+    resp = self.request("POST", url, credentials=credentials, **kwargs)
+    if 200 <= resp.status_code < 300:
         return resp.content
     _raise_for_failed_response(url, resp)
     raise exceptions.RequestError  # unreachable, satisfies type checker
 
 
-def get(self, url: str, force_cookies: bool = False, **kwargs) -> bytes:
+def get(self, url: str, force_cookies: bool = False, credentials: bool = True, **kwargs) -> bytes:
     """Make get request with `Source` session"""
-    resp = self.request("GET", url, force_cookies=force_cookies, **kwargs)
-    if resp.status_code == 200:
+    resp = self.request("GET", url, force_cookies=force_cookies, credentials=credentials, **kwargs)
+    if 200 <= resp.status_code < 300:
         return resp.content
     _raise_for_failed_response(url, resp)
     raise exceptions.RequestError  # unreachable, satisfies type checker
@@ -409,14 +462,16 @@ def _load_m3u8_playlist(
     source_obj: Any,
     target_url: str,
     headers: dict[str, str],
+    *,
+    credentials: bool = True,
 ) -> m3u8.M3U8:
     """Fetch an HLS playlist via `source_obj`, honoring post-redirect URLs and rejecting CDN error pages."""
     if "get" in getattr(source_obj, "__dict__", {}) or getattr(type(source_obj), "get", None) is not get:
-        raw_bytes = source_obj.get(target_url, headers=headers)
+        raw_bytes = source_obj.get(target_url, headers=headers, credentials=credentials)
         resolved_url = target_url
         resp_obj: Any = None
     else:
-        resp_obj = source_obj.request("GET", target_url, headers=headers)
+        resp_obj = source_obj.request("GET", target_url, headers=headers, credentials=credentials)
         if resp_obj.status_code != 200:
             _raise_for_failed_response(target_url, resp_obj)
         raw_bytes = resp_obj.content
@@ -451,6 +506,7 @@ def get_stream_files(
     expected_content_type="application/octet-stream",
     *,
     prefer_video: bool = False,
+    credentials: bool = True,
 ) -> list[AudiobookFile]:
     """Creates a list of stream segment files from an m3u8 playlist"""
     base_headers = dict(headers) if headers else {}
@@ -462,11 +518,15 @@ def get_stream_files(
     has_user_key = user_default_key is not None or bool(user_key_map)
 
     preferred_locale = getattr(getattr(self, "_options", None), "locale", None)
-    playlist = _load_m3u8_playlist(self, url, base_headers)
+    playlist = _load_m3u8_playlist(self, url, base_headers, credentials=credentials)
 
     # Resolve master/variant playlists to the preferred audio or highest-bandwidth video stream.
     seen_urls = {url}
     while playlist.is_variant and playlist.playlists:
+        ctx = logging.get_job_context()
+        job_cancel = ctx.cancel_event if ctx is not None else None
+        if job_cancel is not None and job_cancel.is_set():
+            raise exceptions.DownloadCancelled
         next_url = _select_variant_playlist_uri(
             playlist,
             prefer_video=prefer_video,
@@ -475,7 +535,7 @@ def get_stream_files(
         if not next_url or next_url in seen_urls:
             break
         seen_urls.add(next_url)
-        playlist = _load_m3u8_playlist(self, next_url, base_headers)
+        playlist = _load_m3u8_playlist(self, next_url, base_headers, credentials=credentials)
 
     media_sequence = playlist.media_sequence or 0
     files = []
@@ -499,7 +559,7 @@ def get_stream_files(
     if len(unique_key_uris) > 1:
         ctx = logging.get_job_context()
         fetched_keys = run_cancellable_pool(
-            lambda uri: self._get_page(uri, headers=base_headers),
+            lambda uri: self._get_page(uri, headers=base_headers, credentials=credentials),
             unique_key_uris,
             max_workers=min(8, len(unique_key_uris)),
             cancel_event=ctx.cancel_event if ctx is not None else None,
@@ -530,7 +590,7 @@ def get_stream_files(
                 if init_range:
                     init_start, init_end = _parse_hls_byterange(str(init_range), default_offset=0)
                     init_headers["Range"] = f"bytes={init_start}-{init_end}"
-                    resp = self.request("GET", init_uri, headers=init_headers)
+                    resp = self.request("GET", init_uri, headers=init_headers, credentials=credentials)
                     if resp.status_code not in (200, 206):
                         _raise_for_failed_response(init_uri, resp)
                     init_payload = resp.content
@@ -540,7 +600,7 @@ def get_stream_files(
                         init_payload = init_payload[init_start : init_end + 1]
                     init_cache[cache_key] = init_payload
                 else:
-                    init_cache[cache_key] = self.get(init_uri, headers=init_headers)
+                    init_cache[cache_key] = self.get(init_uri, headers=init_headers, credentials=credentials)
             init_bytes = init_cache[cache_key]
 
         current = AudiobookFile(
@@ -574,7 +634,7 @@ def get_stream_files(
                     key_cache[key_uri] = (
                         inline_key
                         if inline_key is not None
-                        else self._get_page(key_uri, headers=base_headers)
+                        else self._get_page(key_uri, headers=base_headers, credentials=credentials)
                     )
                 resolved_key = key_cache[key_uri]
             elif user_default_key is not None:

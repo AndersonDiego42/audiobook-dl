@@ -16,7 +16,7 @@ from audiobookdl.config import (
     get_config_location,
     save_audiobookshelf_config,
 )
-from audiobookdl.gui.ffmpeg_assistant import FFmpegAssistant
+from audiobookdl.gui.page_deps import SettingsPageDeps
 from audiobookdl.gui.window_manager import open_path_in_os
 from audiobookdl.gui.theme import (
     LIGHT_PALETTE,
@@ -156,47 +156,22 @@ class SettingsPage(ttk.Frame):
     def __init__(
         self,
         parent: tk.Misc,
-        *,
-        theme_var: tk.StringVar,
-        notify_on_complete_var: tk.BooleanVar,
-        clipboard_monitor_var: tk.BooleanVar,
-        check_updates_var: tk.BooleanVar | None = None,
-        minimize_to_tray_var: tk.BooleanVar | None = None,
-        tray_available: bool = False,
-        on_toggle_minimize_to_tray: Callable[[], None] | None = None,
-        on_theme_changed: Callable[[str], object],
-        on_toggle_notify_on_complete: Callable[[], None] | None = None,
-        on_toggle_clipboard_monitor: Callable[[], None],
-        on_toggle_check_updates: Callable[[], None] | None = None,
-        on_reload_config: Callable[[], None],
-        on_check_updates: Callable[[], None],
-        ffmpeg_assistant: FFmpegAssistant,
-        abs_config_provider: Callable[[], AudiobookshelfConfig],
-        config_location: str | None = None,
-        on_save_abs_config: Callable[..., object] | None = None,
-        on_abs_saved: Callable[[AudiobookshelfConfig], None] | None = None,
-        custom_providers_provider: Callable[[], Mapping[str, CustomMetadataProviderConfig]] | None = None,
-        on_save_custom_provider: Callable[..., object] | None = None,
-        on_delete_custom_provider: Callable[[str], object] | None = None,
-        http_proxy_provider: Callable[[], str | None] | None = None,
-        http_timeout_provider: Callable[[], float | None] | None = None,
-        palette: ThemePalette | None = None,
-        style: ttk.Style | None = None,
+        deps: SettingsPageDeps,
     ) -> None:
         super().__init__(parent, padding=scale_px(parent, 12))
-        self._config_location = config_location
-        self._on_save_abs_config = on_save_abs_config
-        self._on_abs_saved = on_abs_saved
-        self._abs_config_provider = abs_config_provider
+        self._config_location = deps.config_location
+        self._on_save_abs_config = deps.on_save_abs_config
+        self._on_abs_saved = deps.on_abs_saved
+        self._abs_config_provider = deps.abs_config_provider
         self._loading_abs = False
         self._abs_dirty = False
-        self._custom_providers_provider = custom_providers_provider
-        self._on_save_custom_provider = on_save_custom_provider
-        self._on_delete_custom_provider = on_delete_custom_provider
-        self._http_proxy_provider = http_proxy_provider
-        self._http_timeout_provider = http_timeout_provider
-        self._ffmpeg = ffmpeg_assistant
-        self._palette = palette or LIGHT_PALETTE
+        self._custom_providers_provider = deps.custom_providers_provider
+        self._on_save_custom_provider = deps.on_save_custom_provider
+        self._on_delete_custom_provider = deps.on_delete_custom_provider
+        self._http_proxy_provider = deps.http_proxy_provider
+        self._http_timeout_provider = deps.http_timeout_provider
+        self._ffmpeg = deps.ffmpeg_assistant
+        self._palette = deps.palette or LIGHT_PALETTE
         self._libraries: list[tuple[str, str]] = []
         self._testing_custom_provider = False
         self._cb_queue = MainThreadCallbackQueue(self)
@@ -217,7 +192,7 @@ class SettingsPage(ttk.Frame):
 
         self._scroll = ScrollableFrame(
             self,
-            style=style,
+            style=deps.style,
             content_padding=(scale_px(self, 2), scale_px(self, 2)),
             inner_scrollables=lambda: (self._custom_tree,),
         )
@@ -236,24 +211,24 @@ class SettingsPage(ttk.Frame):
         for mode in THEME_MODES:
             def _make_theme_cb(selected_mode: str) -> Callable[[], None]:
                 def _cb() -> None:
-                    on_theme_changed(selected_mode)
+                    deps.on_theme_changed(selected_mode)
 
                 return _cb
 
             ttk.Radiobutton(
                 theme_row,
                 text=THEME_LABELS[mode],
-                variable=theme_var,
+                variable=deps.theme_var,
                 value=mode,
                 command=_make_theme_cb(mode),
             ).pack(side=tk.LEFT, padx=(0, 12))
 
         notify_kwargs: dict[str, object] = {
             "text": "Send OS notification when a download run finishes",
-            "variable": notify_on_complete_var,
+            "variable": deps.notify_on_complete_var,
         }
-        if on_toggle_notify_on_complete is not None:
-            notify_kwargs["command"] = on_toggle_notify_on_complete
+        if deps.on_toggle_notify_on_complete is not None:
+            notify_kwargs["command"] = deps.on_toggle_notify_on_complete
         ttk.Checkbutton(app_frame, **notify_kwargs).grid(  # type: ignore[arg-type]
             row=1, column=0, columnspan=2, sticky="w", pady=(6, 2)
         )
@@ -261,23 +236,23 @@ class SettingsPage(ttk.Frame):
         ttk.Checkbutton(
             app_frame,
             text="Monitor clipboard for audiobook URLs",
-            variable=clipboard_monitor_var,
-            command=on_toggle_clipboard_monitor,
+            variable=deps.clipboard_monitor_var,
+            command=deps.on_toggle_clipboard_monitor,
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=2)
 
-        tray_var = minimize_to_tray_var if minimize_to_tray_var is not None else tk.BooleanVar(value=False)
+        tray_var = deps.minimize_to_tray_var if deps.minimize_to_tray_var is not None else tk.BooleanVar(value=False)
         tray_label = (
             "Minimize to system tray when closing window (keeps scheduled sync active)"
-            if tray_available
+            if deps.tray_available
             else "Minimize to system tray when closing window (install 'pystray' to enable)"
         )
         tray_kwargs: dict[str, object] = {
             "text": tray_label,
             "variable": tray_var,
-            "state": "normal" if tray_available else "disabled",
+            "state": "normal" if deps.tray_available else "disabled",
         }
-        if on_toggle_minimize_to_tray is not None:
-            tray_kwargs["command"] = on_toggle_minimize_to_tray
+        if deps.on_toggle_minimize_to_tray is not None:
+            tray_kwargs["command"] = deps.on_toggle_minimize_to_tray
         ttk.Checkbutton(app_frame, **tray_kwargs).grid(  # type: ignore[arg-type]
             row=3, column=0, columnspan=2, sticky="w", pady=2
         )
@@ -315,7 +290,7 @@ class SettingsPage(ttk.Frame):
         abs_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         abs_frame.columnconfigure(1, weight=1)
 
-        current = abs_config_provider()
+        current = deps.abs_config_provider()
         self._url_var = tk.StringVar(value=current.url or "")
         self._token_var = tk.StringVar(value=current.api_key or "")
         self._library_var = tk.StringVar(value=current.library_id or "")
@@ -454,7 +429,7 @@ class SettingsPage(ttk.Frame):
         cfg_frame.grid(row=4, column=0, sticky="ew")
         cfg_frame.columnconfigure(0, weight=1)
 
-        resolved_cfg = config_location or get_config_location(None)
+        resolved_cfg = deps.config_location or get_config_location(None)
         self._resolved_cfg_path = resolved_cfg
         self._cfg_file_label = ttk.Label(
             cfg_frame,
@@ -466,13 +441,13 @@ class SettingsPage(ttk.Frame):
         self._cfg_file_label.grid(row=0, column=0, sticky="w", pady=(0, scale_px(self, 6)))
         bind_adaptive_wraplength(cfg_frame, self._cfg_file_label, margin_dp=24, min_dp=280)
 
-        updates_var = check_updates_var if check_updates_var is not None else tk.BooleanVar(value=True)
+        updates_var = deps.check_updates_var if deps.check_updates_var is not None else tk.BooleanVar(value=True)
         chk_kwargs: dict[str, object] = {
             "text": "Automatically check for updates at startup",
             "variable": updates_var,
         }
-        if on_toggle_check_updates is not None:
-            chk_kwargs["command"] = on_toggle_check_updates
+        if deps.on_toggle_check_updates is not None:
+            chk_kwargs["command"] = deps.on_toggle_check_updates
         ttk.Checkbutton(cfg_frame, **chk_kwargs).grid(row=1, column=0, sticky="w", pady=(0, 6))  # type: ignore[arg-type]
 
         cfg_btns = ttk.Frame(cfg_frame)
@@ -480,7 +455,7 @@ class SettingsPage(ttk.Frame):
         ttk.Button(
             cfg_btns,
             text="Reload Config",
-            command=lambda: self._reload_config_and_reset_abs(on_reload_config),
+            command=lambda: self._reload_config_and_reset_abs(deps.on_reload_config),
         ).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(
             cfg_btns,
@@ -492,7 +467,7 @@ class SettingsPage(ttk.Frame):
             text="Copy Path",
             command=self._copy_config_path,
         ).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(cfg_btns, text="Check for Updates...", command=on_check_updates).pack(
+        ttk.Button(cfg_btns, text="Check for Updates...", command=deps.on_check_updates).pack(
             side=tk.LEFT, padx=(0, 10)
         )
         ttk.Label(cfg_btns, text=f"v{__version__}", style="Muted.TLabel").pack(side=tk.LEFT)

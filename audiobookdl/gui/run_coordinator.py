@@ -8,8 +8,9 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import TYPE_CHECKING, Any
 
-from audiobookdl.gui.controller import GuiController, PackJobRequest
+from audiobookdl.gui.controller import GuiController, PackJobRequest, QueuedJob
 from audiobookdl.gui.formatting import parse_url_text
+from audiobookdl.gui.queue_store import EDITABLE_OVERRIDE_KEYS
 from audiobookdl.options_schema import DownloadOptions
 from audiobookdl.pipeline import DownloadSummary
 from audiobookdl.sources.source import Source
@@ -68,7 +69,7 @@ class RunCoordinator:
                 widget.configure(state="disabled" if running else "readonly")
             else:
                 widget.configure(state="disabled" if running else "normal")
-        dl_page.options_panel.set_enabled(not running)
+        dl_page.set_options_panel_enabled(not running)
 
     def set_running_state(self, running: bool) -> None:
         self.is_running = running
@@ -144,7 +145,7 @@ class RunCoordinator:
         queue_panel = self._download_page().queue_panel
         run_id, queued_jobs = self._controller.start_new_run(
             job_specs,
-            service_label_resolver=queue_panel._service_label_for_url,
+            service_label_resolver=queue_panel.service_label_for_url,
         )
         self.set_running_state(True)
         queue_panel.prepare_run_ui_state(
@@ -152,10 +153,7 @@ class RunCoordinator:
             len(job_specs),
             f"--- Starting download ({len(job_specs)} URL{'s' if len(job_specs) != 1 else ''}) ---",
         )
-        for job in queued_jobs:
-            queue_panel.register_queue_job(job, persist=False)
-        if queued_jobs:
-            self._controller.save_queue_state()
+        self._register_queued_jobs(queued_jobs)
 
     def enqueue_additional_urls(
         self,
@@ -181,7 +179,7 @@ class RunCoordinator:
             urls,
             _build_for_url,
             allow_existing=allow_existing,
-            service_label_resolver=queue_panel._service_label_for_url,
+            service_label_resolver=queue_panel.service_label_for_url,
         )
         if not has_active_run:
             return False
@@ -189,9 +187,7 @@ class RunCoordinator:
             self._status_var.set("URL(s) already in active queue")
             queue_panel.append_log("All entered URL(s) are already in the active queue.")
             return True
-        for job in added_jobs:
-            queue_panel.register_queue_job(job, persist=False)
-        self._controller.save_queue_state()
+        self._register_queued_jobs(added_jobs)
         queue_panel.ui_item_total = new_total
         queue_panel.refresh_batch_label()
         self._status_var.set(f"Queued +{len(added_jobs)} (total {new_total})")
@@ -205,7 +201,7 @@ class RunCoordinator:
         *,
         was_appended: bool,
         run_id: int,
-        queued_jobs: Sequence[Any],
+        queued_jobs: Sequence[QueuedJob],
         new_total: int,
         start_header: str,
         append_status: str,
@@ -215,10 +211,7 @@ class RunCoordinator:
             return
         queue_panel = self._download_page().queue_panel
         if was_appended:
-            for job in queued_jobs:
-                queue_panel.register_queue_job(job, persist=False)
-            if queued_jobs:
-                self._controller.save_queue_state()
+            self._register_queued_jobs(queued_jobs)
             queue_panel.ui_item_total = new_total
             queue_panel.refresh_batch_label()
             self._status_var.set(append_status)
@@ -231,31 +224,36 @@ class RunCoordinator:
             len(queued_jobs),
             start_header,
         )
+        self._register_queued_jobs(queued_jobs)
+
+    def _register_queued_jobs(
+        self,
+        queued_jobs: Sequence[QueuedJob],
+        *,
+        persist: bool = False,
+    ) -> None:
+        """Register queued jobs in the queue panel and persist queue state once."""
+        if not queued_jobs:
+            return
+        queue_panel = self._download_page().queue_panel
         for job in queued_jobs:
-            queue_panel.register_queue_job(job, persist=False)
-        if queued_jobs:
-            self._controller.save_queue_state()
+            queue_panel.register_queue_job(job, persist=persist)
+        self._controller.save_queue_state()
 
     @staticmethod
     def apply_job_overrides_to_options(
         opts: DownloadOptions,
         rec: Mapping[str, Any] | None,
-    ) -> None:
+    ) -> DownloadOptions:
         if not isinstance(rec, Mapping):
-            return
+            return opts
         job_overrides = rec.get("job_overrides")
         if not isinstance(job_overrides, Mapping):
-            return
-        explicit = set(getattr(opts, "_explicit_fields", set()))
-        for attr in GuiController._EDITABLE_OVERRIDE_KEYS:
-            if attr in job_overrides:
-                setattr(opts, attr, job_overrides[attr])
-                explicit.add(attr)
-        opts._explicit_fields = frozenset(explicit)
+            return opts
+        return opts.with_overrides(job_overrides, allowed_keys=EDITABLE_OVERRIDE_KEYS)
 
     def build_retry_download_spec(
         self,
-        _base_opts: DownloadOptions,
         rec: dict[str, Any],
     ) -> tuple[str, DownloadOptions, list[int] | None, None]:
         url = str(rec.get("url") or "").strip()
@@ -263,7 +261,7 @@ class RunCoordinator:
         profile = str(rec.get("profile") or "").strip()
         if profile:
             opts.profile = profile
-        self.apply_job_overrides_to_options(opts, rec)
+        opts = self.apply_job_overrides_to_options(opts, rec)
         raw_indices = rec.get("selected_indices")
         selected_indices = (
             [i for i in raw_indices if isinstance(i, int) and not isinstance(i, bool)]
@@ -279,10 +277,11 @@ class RunCoordinator:
         req: PackJobRequest,
         rec: Mapping[str, Any] | None = None,
     ) -> DownloadOptions:
-        opts = dataclasses.replace(base_opts)
-        opts._explicit_fields = frozenset(base_opts._explicit_fields)
-        cls.apply_job_overrides_to_options(opts, rec)
         overrides = rec.get("job_overrides") if isinstance(rec, Mapping) else None
+        opts = base_opts.with_overrides(
+            overrides if isinstance(overrides, Mapping) else {},
+            allowed_keys=EDITABLE_OVERRIDE_KEYS,
+        )
         override_fmt = (
             overrides.get("output_format") if isinstance(overrides, Mapping) else None
         )
@@ -306,7 +305,7 @@ class RunCoordinator:
             else:
                 url = str(rec.get("url") or "").strip()
                 if url:
-                    dl_specs.append(self.build_retry_download_spec(base_opts, rec))
+                    dl_specs.append(self.build_retry_download_spec(rec))
         if not dl_specs and not pack_specs:
             self._status_var.set("No valid jobs found in imported queue")
             return
@@ -316,7 +315,7 @@ class RunCoordinator:
         was_appended, run_id, queued_jobs, new_total = self._controller.start_or_enqueue_jobs(
             download_specs=dl_specs,
             pack_requests=pack_specs,
-            service_label_resolver=queue_panel._service_label_for_url,
+            service_label_resolver=queue_panel.service_label_for_url,
         )
         self.register_enqueued_batch(
             was_appended=was_appended,
@@ -330,7 +329,7 @@ class RunCoordinator:
 
     def retry_failed_queue_items(self, job_ids: Sequence[str] | None = None) -> None:
         queue_panel = self._download_page().queue_panel
-        target_ids = list(job_ids) if job_ids is not None else list(queue_panel._queue_order)
+        target_ids = list(job_ids) if job_ids is not None else list(queue_panel.queue_order)
         retry_records = self._controller.retryable_jobs(target_ids)
         if not retry_records:
             self._status_var.set("No failed or cancelled jobs to retry")
@@ -382,7 +381,7 @@ class RunCoordinator:
         if download_recs and not self._ffmpeg_assistant.ensure_available(base_opts):
             return
         self._options.save_run_preferences(base_opts)
-        dl_specs = [self.build_retry_download_spec(base_opts, rec) for rec in download_recs]
+        dl_specs = [self.build_retry_download_spec(rec) for rec in download_recs]
 
         if not self.is_running and dl_specs and not pack_pairs:
             self.start_new_run(dl_specs)
@@ -391,7 +390,7 @@ class RunCoordinator:
         was_appended, run_id, queued_jobs, new_total = self._controller.start_or_enqueue_jobs(
             download_specs=dl_specs,
             pack_requests=pack_pairs,
-            service_label_resolver=queue_panel._service_label_for_url,
+            service_label_resolver=queue_panel.service_label_for_url,
         )
         self.register_enqueued_batch(
             was_appended=was_appended,

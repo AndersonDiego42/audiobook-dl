@@ -9,7 +9,8 @@ import pytest
 
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata
 from audiobookdl.exceptions import GenericAudiobookDLException, MissingDependency
-from audiobookdl.options_schema import OPTIONS_BY_NAME, PERSISTED_GUI_OPTION_SPECS, build_default_options
+from audiobookdl.gui.options_binding import PERSISTED_GUI_OPTION_SPECS
+from audiobookdl.options_schema import OPTIONS_BY_NAME, build_default_options
 from audiobookdl.output.download import download_file
 from audiobookdl.output.encryption import (
     AESCBCStreamDecryptor,
@@ -430,11 +431,11 @@ def test_decrypt_file_cenc_invokes_ffmpeg_and_handles_init_prefix(tmp_path):
         out_path = cmd[-1]
         with open(out_path, "wb") as f:
             f.write(b"decrypted-mp4")
-        return SimpleNamespace(returncode=0, stderr="", stdout="")
+        return SimpleNamespace(returncode=0, stderr=b"", stdout=b"")
 
     with (
         patch("audiobookdl.output.encryption.find_executable", return_value="ffmpeg"),
-        patch("audiobookdl.output.encryption.subprocess.run", side_effect=_fake_run),
+        patch("audiobookdl.output.encryption.run_cancellable_subprocess", side_effect=_fake_run),
     ):
         decrypt_file(
             str(src_path),
@@ -505,9 +506,8 @@ def test_decrypt_file_cenc_real_ffmpeg_roundtrip(tmp_path):
 
 
 def test_download_file_streams_aead_and_blocks_tampered_commit(tmp_path, monkeypatch):
-    from audiobookdl.output import output as output_mod
 
-    monkeypatch.setattr(output_mod, "_probe_audio_info", lambda _p: AudioProbeInfo(duration=1.0, codec_name="aac"))
+    monkeypatch.setattr("audiobookdl.output.ffmpeg_ops._probe_audio_info", lambda _p: AudioProbeInfo(duration=1.0, codec_name="aac"))
 
     key = os.urandom(32)
     nonce = os.urandom(12)
@@ -761,7 +761,7 @@ def test_pipeline_and_decrypt_file_cenc_pssh_reconciliation(tmp_path):
     mp4_path.write_bytes(init_section + struct.pack(">I4s", 12, b"mdat") + b"\x00\x00\x00\x00")
     with (
         patch("audiobookdl.output.encryption.find_executable", return_value="ffmpeg"),
-        patch("audiobookdl.output.encryption.subprocess.run", side_effect=AssertionError("ffmpeg should not run")),
+        patch("audiobookdl.output.encryption.run_cancellable_subprocess", side_effect=AssertionError("ffmpeg should not run")),
     ):
         with pytest.raises(GenericAudiobookDLException, match=kid.hex()):
             decrypt_file(str(mp4_path), CENCDecryption(key_map={wrong_kid: key16}))

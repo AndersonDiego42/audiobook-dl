@@ -2,9 +2,16 @@
 
 from dataclasses import dataclass, field
 import os
+import threading
 from collections.abc import Callable, Sequence
 
-from audiobookdl.output.metadata.reader import read_sidecar_metadata, read_track_tags
+from audiobookdl import logging
+from audiobookdl.exceptions import DownloadCancelled
+from audiobookdl.output.metadata.reader import (
+    TrackTagInfo,
+    read_sidecar_metadata,
+    read_track_tags,
+)
 from audiobookdl.pack import (
     SUPPORTED_PACK_EXTENSIONS,
     aggregate_book_metadata,
@@ -84,7 +91,24 @@ def _has_book_sidecar(directory: str) -> bool:
     return False
 
 
-def _split_folder_units(walk_root: str, audio_paths: list[str]) -> list[tuple[str, list[str], str]]:
+def _read_tags_cached(
+    path: str,
+    tag_cache: dict[str, TrackTagInfo] | None,
+) -> TrackTagInfo:
+    if tag_cache is None:
+        return read_track_tags(path)
+    cached = tag_cache.get(path)
+    if cached is None:
+        cached = read_track_tags(path)
+        tag_cache[path] = cached
+    return cached
+
+
+def _split_folder_units(
+    walk_root: str,
+    audio_paths: list[str],
+    tag_cache: dict[str, TrackTagInfo] | None = None,
+) -> list[tuple[str, list[str], str]]:
     """Split audio files inside `walk_root` into `(source_root, tracks, output_path)` book units."""
     if len(audio_paths) == 1:
         p = audio_paths[0]
@@ -95,7 +119,7 @@ def _split_folder_units(walk_root: str, audio_paths: list[str]) -> list[tuple[st
         albums = set()
         has_track_num = False
         for p in audio_paths:
-            tag = read_track_tags(p)
+            tag = _read_tags_cached(p, tag_cache)
             alb = (tag.album or "").strip().lower()
             if alb:
                 albums.add(alb)
@@ -116,7 +140,10 @@ def _split_folder_units(walk_root: str, audio_paths: list[str]) -> list[tuple[st
     return [(walk_root, audio_paths, walk_root)]
 
 
-def _discover_local_units(paths: Sequence[str]) -> tuple[list[tuple[str, list[str], str]], list[str]]:
+def _discover_local_units(
+    paths: Sequence[str],
+    tag_cache: dict[str, TrackTagInfo] | None = None,
+) -> tuple[list[tuple[str, list[str], str]], list[str]]:
     """Walk `paths` and return `(units, errors)` without mutating the database."""
     units: list[tuple[str, list[str], str]] = []
     errors: list[str] = []
@@ -151,7 +178,7 @@ def _discover_local_units(paths: Sequence[str]) -> tuple[list[tuple[str, list[st
                 if _is_supported_audio(os.path.join(walk_root, name))
             ]
             if audio_paths:
-                for unit in _split_folder_units(walk_root, audio_paths):
+                for unit in _split_folder_units(walk_root, audio_paths, tag_cache=tag_cache):
                     _add_unit(unit)
 
     return units, errors
@@ -181,17 +208,24 @@ def scan_local_library(
     verify_missing: bool = False,
     dry_run: bool = False,
     on_progress: Callable[[str], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> LocalScanResult:
     """Scan local directories/files, match or register books in `archive`, and optionally check missing files."""
+    if cancel_event is None:
+        ctx = logging.get_job_context()
+        cancel_event = ctx.cancel_event if ctx is not None else None
     result = LocalScanResult(dry_run=dry_run)
-    units, errors = _discover_local_units(paths)
+    tag_cache: dict[str, TrackTagInfo] = {}
+    units, errors = _discover_local_units(paths, tag_cache=tag_cache)
     result.errors.extend(errors)
 
     with archive.batch_connection():
         match_index = archive.build_match_index()
         for source_root, track_paths, unit_output_path in units:
+            if cancel_event is not None and cancel_event.is_set():
+                raise DownloadCancelled
             try:
-                sorted_tracks, tag_map = sort_track_paths(track_paths)
+                sorted_tracks, tag_map = sort_track_paths(track_paths, tag_map=tag_cache)
                 sidecar_dir = source_root if os.path.isdir(source_root) else os.path.dirname(source_root)
                 audio_stem = os.path.splitext(os.path.basename(sorted_tracks[0]))[0] if len(sorted_tracks) == 1 else None
                 sidecar_meta, _cover, _chapters = read_sidecar_metadata(sidecar_dir, audio_stem=audio_stem)
@@ -286,7 +320,9 @@ def scan_local_library(
                 result.errors.append(f"{unit_output_path}: {exc}")
 
         if verify_missing:
-            for entry in archive.list_entries(limit=100000, include_trashed=False, include_hidden=True):
+            for entry in archive.iter_entries(include_trashed=False, include_hidden=True):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise DownloadCancelled
                 if entry.status == "downloaded" and entry.output_path and not os.path.exists(entry.output_path):
                     result.missing += 1
                     result.missing_paths.append(entry.output_path)

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import MutableMapping
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import escape
 import json
 import mimetypes
@@ -15,7 +14,7 @@ from urllib.parse import quote_plus, urljoin
 import zipfile
 
 from .source import CatalogBook, Source
-from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, Result, Series
+from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, Result, Series, logging
 from audiobookdl.options_schema import MEDIA_TYPE_CHOICES
 from audiobookdl.exceptions import (
     BookHasNoAudiobook,
@@ -489,12 +488,15 @@ class OReillySource(Source[str]):
                     )
             return title, dur_ms, resolved_segment_files
 
+        ctx = logging.get_job_context()
+        cancel_event = ctx.cancel_event if ctx is not None else None
         indexed_entries = list(enumerate(entries))
         if len(indexed_entries) > 1:
             resolved_entries = run_cancellable_pool(
                 _resolve_entry,
                 indexed_entries,
                 max_workers=min(6, len(indexed_entries)),
+                cancel_event=cancel_event,
             )
         else:
             resolved_entries = [_resolve_entry(item) for item in indexed_entries]
@@ -588,20 +590,22 @@ class OReillySource(Source[str]):
                     content = self.get(asset_url, headers={"Referer": f"{_BASE_URL}/"})
                     zf.writestr(rel_path, content, compress_type=zipfile.ZIP_DEFLATED)
             else:
-                with ThreadPoolExecutor(max_workers=min(8, len(asset_specs))) as pool:
-                    futures = {
-                        pool.submit(
-                            self.get,
-                            asset_url,
-                            headers={"Referer": f"{_BASE_URL}/"},
-                        ): rel_path
-                        for rel_path, asset_url, _mt in asset_specs
-                    }
-                    for fut in as_completed(futures):
-                        rel_path = futures[fut]
-                        content = fut.result()
-                        with zip_lock:
-                            zf.writestr(rel_path, content, compress_type=zipfile.ZIP_DEFLATED)
+                ctx = logging.get_job_context()
+                cancel_event = ctx.cancel_event if ctx is not None else None
+
+                def _fetch_and_write(spec: tuple[str, str, str]) -> str:
+                    rel_path, asset_url, _mt = spec
+                    content = self.get(asset_url, headers={"Referer": f"{_BASE_URL}/"})
+                    with zip_lock:
+                        zf.writestr(rel_path, content, compress_type=zipfile.ZIP_DEFLATED)
+                    return rel_path
+
+                run_cancellable_pool(
+                    _fetch_and_write,
+                    asset_specs,
+                    max_workers=min(8, len(asset_specs)),
+                    cancel_event=cancel_event,
+                )
 
             if not has_container:
                 opf_path = next((p for p in member_paths if p.lower().endswith(".opf")), "OEBPS/content.opf")

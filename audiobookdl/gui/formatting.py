@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     import tkinter as tk
 
 from audiobookdl import output
-from audiobookdl.options_schema import (
+from audiobookdl.gui.options_binding import (
     GUI_MEDIA_TYPE_OPTIONS,
     GUI_OUTPUT_FORMATS,
     GUI_OVERWRITE_OPTIONS,
@@ -180,7 +180,7 @@ def get_monitor_work_areas(widget: tk.Misc) -> list[tuple[int, int, int, int]]:
                 parsed = _parse_xrandr_monitors(proc.stdout)
                 if parsed:
                     return parsed
-        except Exception:
+        except (OSError, subprocess.SubprocessError):
             pass
     try:
         sw = max(1, int(widget.winfo_screenwidth()))
@@ -196,7 +196,7 @@ def get_monitor_work_areas(widget: tk.Misc) -> list[tuple[int, int, int, int]]:
         if (left, top, right, bottom) != (0, 0, sw, sh):
             return [(0, 0, sw, sh), (left, top, right, bottom)]
         return [(0, 0, sw, sh)]
-    except Exception:
+    except tk.TclError:
         return [(0, 0, 1280, 800)]
 
 
@@ -556,7 +556,7 @@ def render_cover_thumbnail(
         image = Image.open(io.BytesIO(cover.image))
         image.thumbnail((max_size, max_size))
         return ImageTk.PhotoImage(image, master=master)
-    except Exception:
+    except (ImportError, OSError, ValueError, tk.TclError):
         return None
 
 
@@ -573,7 +573,7 @@ def resize_cover_thumbnail_bytes(raw_bytes: bytes, size: int = 48) -> bytes | No
             buf = io.BytesIO()
             square.save(buf, format="PNG")
             return buf.getvalue()
-    except Exception:
+    except (ImportError, OSError, ValueError):
         return None
 
 
@@ -590,7 +590,7 @@ def resize_cover_bytes_aspect_thumbnail(raw_bytes: bytes, max_size: int = 160) -
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         return buf.getvalue()
-    except Exception:
+    except (ImportError, OSError, ValueError):
         return None
 
 
@@ -602,7 +602,7 @@ def resize_cover_file_thumbnail_bytes(path: str, max_size: int = 140) -> bytes |
         with open(path, "rb") as handle:
             raw_bytes = handle.read()
         return resize_cover_bytes_aspect_thumbnail(raw_bytes, max_size=max_size)
-    except Exception:
+    except (OSError, ValueError):
         return None
 
 
@@ -615,7 +615,7 @@ def photo_from_image_bytes(raw_bytes: bytes, master: tk.Misc) -> Any | None:
 
         with Image.open(io.BytesIO(raw_bytes)) as image:
             return ImageTk.PhotoImage(image.copy(), master=master)
-    except Exception:
+    except (ImportError, OSError, ValueError, tk.TclError):
         return None
 
 
@@ -642,7 +642,7 @@ def create_placeholder_cover_thumbnail(
         draw.rectangle([bx0, by0, bx1, by1], outline=glyph_hex, width=1)
         draw.line([bx0 + max(2, size // 14), by0, bx0 + max(2, size // 14), by1], fill=glyph_hex, width=1)
         return ImageTk.PhotoImage(img, master=master)
-    except Exception:
+    except (ImportError, OSError, ValueError, tk.TclError):
         return None
 
 

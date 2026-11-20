@@ -65,7 +65,7 @@ def test_concurrent_run_downloads_isolate_logging_sinks_and_flags():
     def run_job(name, url, opts, sink):
         results[name] = run_downloads([url], opts, cfg, sink=sink)
 
-    with patch("audiobookdl.pipeline.process_url", side_effect=fake_process_url):
+    with patch("audiobookdl.pipeline.core.process_url", side_effect=fake_process_url):
         t_a = threading.Thread(target=run_job, args=("a", "https://a.example/1", opts_a, sink_a))
         t_b = threading.Thread(target=run_job, args=("b", "https://b.example/2", opts_b, sink_b))
         t_a.start()
@@ -187,8 +187,8 @@ def test_series_download_pauses_between_books(tmp_path):
         def download_from_id(self, bid: str):
             return bid
 
-    with patch("audiobookdl.pipeline._flatten_resolved_books", side_effect=lambda _s, b: [SimpleNamespace(title=f"T{b}")]), patch(
-        "audiobookdl.pipeline.process_audiobook",
+    with patch("audiobookdl.pipeline.jobs._flatten_resolved_books", side_effect=lambda _s, b: [SimpleNamespace(title=f"T{b}")]), patch(
+        "audiobookdl.pipeline.jobs.process_audiobook",
         side_effect=lambda _src, ab, *_a, **_kw: (
             processed.append(ab.title),
             pause_ev.clear() if len(processed) == 1 else None,

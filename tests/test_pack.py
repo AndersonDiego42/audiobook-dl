@@ -665,7 +665,7 @@ def test_app_wires_pack_button_and_submission(tmp_path: Path):
 
     app = AudiobookDLApp(root, config_location=str(tmp_path / "missing-config.toml"))
     try:
-        assert app.pack_btn.cget("text") == "Pack Local..."
+        assert app.download_page.queue_panel.pack_btn.cget("text") == "Pack Local..."
         app.output_dir_var.set(str(tmp_path / "out"))
         app.template_var.set("{author}/{title}")
         req = PackJobRequest(paths=[str(src_dir)], label="App Book")
@@ -680,13 +680,13 @@ def test_app_wires_pack_button_and_submission(tmp_path: Path):
                 root.update()
                 time.sleep(0.02)
             root.update()
-        children = app.queue_tree.get_children()
+        children = app.download_page.queue_panel.queue_tree.get_children()
         assert len(children) == 1
-        row_values = tree_item_values(app.queue_tree, children[0])
+        row_values = tree_item_values(app.download_page.queue_panel.queue_tree, children[0])
         assert row_values[0] == "Local Pack"
-        assert app.queue_tree.set(children[0], "status") == "Completed", (
+        assert app.download_page.queue_panel.queue_tree.set(children[0], "status") == "Completed", (
             f"row={row_values}, running={app.is_running}, "
-            f"status={app.status_var.get()!r}, log={app.log_text.get('1.0', tk.END)!r}"
+            f"status={app.status_var.get()!r}, log={app.download_page.queue_panel.log_text.get('1.0', tk.END)!r}"
         )
     finally:
         app.controller.shutdown(is_running=False, is_previewing=False)
@@ -943,13 +943,13 @@ def test_pack_job_persistence_and_retry_across_restart(tmp_path: Path, monkeypat
     root2.withdraw()
     try:
         app2 = AudiobookDLApp(root2, config_location=str(cfg_path))
-        children = app2.queue_tree.get_children()
+        children = app2.download_page.queue_panel.queue_tree.get_children()
         assert len(children) == 1
         restored_id = children[0]
-        row_values = tree_item_values(app2.queue_tree, restored_id)
+        row_values = tree_item_values(app2.download_page.queue_panel.queue_tree, restored_id)
         assert row_values[0] == "Local Pack"
-        assert app2.queue_tree.set(restored_id, "url") == "Persisted Book"
-        assert app2.queue_tree.set(restored_id, "status") == "Interrupted"
+        assert app2.download_page.queue_panel.queue_tree.set(restored_id, "url") == "Persisted Book"
+        assert app2.download_page.queue_panel.queue_tree.set(restored_id, "status") == "Interrupted"
 
         retryable = app2.controller.retryable_jobs(children)
         assert len(retryable) == 1
@@ -976,7 +976,7 @@ def test_pack_job_persistence_and_retry_across_restart(tmp_path: Path, monkeypat
                 time.sleep(0.02)
             root2.update()
 
-        all_children = app2.queue_tree.get_children()
+        all_children = app2.download_page.queue_panel.queue_tree.get_children()
         assert len(all_children) == 2
         retried_id = all_children[-1]
         retried_rec = app2.controller.queue_records[retried_id]
@@ -1098,7 +1098,7 @@ def test_run_pack_passes_custom_providers_from_config(tmp_path: Path):
         return False, False
 
     with (
-        patch("audiobookdl.pipeline.enrich_audiobook_metadata", side_effect=_fake_enrich),
+        patch("audiobookdl.pipeline.jobs.enrich_audiobook_metadata", side_effect=_fake_enrich),
         patch("audiobookdl.pack.output_download.confirm_overwrite_file"),
         patch("audiobookdl.pack._pack_single_track", side_effect=_fake_pack_single),
         patch("audiobookdl.pack.output_download.add_metadata_to_file"),

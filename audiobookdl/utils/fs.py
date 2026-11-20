@@ -12,7 +12,6 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any
 import weakref
 
 _PATH_LOCKS_GUARD = threading.Lock()
@@ -143,65 +142,38 @@ def _current_user_private_sddl() -> str | None:
     """Return a protected SDDL string granting File All Access solely to the current Windows user."""
     if os.name != "nt":
         return None
-    windll: Any = getattr(ctypes, "windll", None)
-    if windll is None:
-        return None
-    kernel32 = windll.kernel32
-    advapi32 = windll.advapi32
+    from audiobookdl.utils._win32 import advapi32, kernel32
 
-    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
-    kernel32.LocalFree.restype = wintypes.HLOCAL
-
-    advapi32.OpenProcessToken.argtypes = [
-        wintypes.HANDLE,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.HANDLE),
-    ]
-    advapi32.OpenProcessToken.restype = wintypes.BOOL
-    advapi32.GetTokenInformation.argtypes = [
-        wintypes.HANDLE,
-        ctypes.c_int,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD),
-    ]
-    advapi32.GetTokenInformation.restype = wintypes.BOOL
-    advapi32.ConvertSidToStringSidW.argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(wintypes.LPWSTR),
-    ]
-    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+    kernel32_dll = kernel32()
+    advapi32_dll = advapi32()
 
     h_token = wintypes.HANDLE()
-    if not advapi32.OpenProcessToken(
-        kernel32.GetCurrentProcess(), _TOKEN_QUERY, ctypes.byref(h_token)
+    if not advapi32_dll.OpenProcessToken(
+        kernel32_dll.GetCurrentProcess(), _TOKEN_QUERY, ctypes.byref(h_token)
     ):
         return None
     try:
         needed = wintypes.DWORD(0)
-        advapi32.GetTokenInformation(h_token, _TOKEN_USER, None, 0, ctypes.byref(needed))
+        advapi32_dll.GetTokenInformation(h_token, _TOKEN_USER, None, 0, ctypes.byref(needed))
         if not needed.value:
             return None
         buf = (ctypes.c_ubyte * needed.value)()
-        if not advapi32.GetTokenInformation(
+        if not advapi32_dll.GetTokenInformation(
             h_token, _TOKEN_USER, buf, needed.value, ctypes.byref(needed)
         ):
             return None
         sid_ptr = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
         sid_str_ptr = wintypes.LPWSTR()
-        if not advapi32.ConvertSidToStringSidW(sid_ptr, ctypes.byref(sid_str_ptr)):
+        if not advapi32_dll.ConvertSidToStringSidW(sid_ptr, ctypes.byref(sid_str_ptr)):
             return None
         try:
             sid_str = sid_str_ptr.value
             return f"D:P(A;;FA;;;{sid_str})" if sid_str else None
         finally:
             if sid_str_ptr:
-                kernel32.LocalFree(sid_str_ptr)
+                kernel32_dll.LocalFree(ctypes.cast(sid_str_ptr, wintypes.HLOCAL))
     finally:
-        kernel32.CloseHandle(h_token)
+        kernel32_dll.CloseHandle(h_token)
 
 
 def _apply_windows_private_dacl(path: str) -> bool:
@@ -209,41 +181,13 @@ def _apply_windows_private_dacl(path: str) -> bool:
     sddl = _current_user_private_sddl()
     if not sddl:
         return False
-    windll: Any = getattr(ctypes, "windll", None)
-    if windll is None:
-        return False
-    kernel32 = windll.kernel32
-    advapi32 = windll.advapi32
+    from audiobookdl.utils._win32 import advapi32, kernel32
 
-    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
-    kernel32.LocalFree.restype = wintypes.HLOCAL
-    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.POINTER(wintypes.ULONG),
-    ]
-    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
-    advapi32.GetSecurityDescriptorDacl.argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(wintypes.BOOL),
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.POINTER(wintypes.BOOL),
-    ]
-    advapi32.GetSecurityDescriptorDacl.restype = wintypes.BOOL
-    advapi32.SetNamedSecurityInfoW.argtypes = [
-        wintypes.LPWSTR,
-        ctypes.c_int,
-        wintypes.DWORD,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-    ]
-    advapi32.SetNamedSecurityInfoW.restype = wintypes.DWORD
+    kernel32_dll = kernel32()
+    advapi32_dll = advapi32()
 
     sd_ptr = ctypes.c_void_p()
-    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+    if not advapi32_dll.ConvertStringSecurityDescriptorToSecurityDescriptorW(
         sddl, _SDDL_REVISION_1, ctypes.byref(sd_ptr), None
     ):
         return False
@@ -251,14 +195,14 @@ def _apply_windows_private_dacl(path: str) -> bool:
         dacl_present = wintypes.BOOL()
         dacl_defaulted = wintypes.BOOL()
         dacl_ptr = ctypes.c_void_p()
-        if not advapi32.GetSecurityDescriptorDacl(
+        if not advapi32_dll.GetSecurityDescriptorDacl(
             sd_ptr,
             ctypes.byref(dacl_present),
             ctypes.byref(dacl_ptr),
             ctypes.byref(dacl_defaulted),
         ) or not dacl_present.value:
             return False
-        status = advapi32.SetNamedSecurityInfoW(
+        status = advapi32_dll.SetNamedSecurityInfoW(
             path,
             _SE_FILE_OBJECT,
             _DACL_SECURITY_INFORMATION | _PROTECTED_DACL_SECURITY_INFORMATION,
@@ -270,7 +214,7 @@ def _apply_windows_private_dacl(path: str) -> bool:
         return status == 0
     finally:
         if sd_ptr:
-            kernel32.LocalFree(sd_ptr)
+            kernel32_dll.LocalFree(sd_ptr)
 
 
 def _restrict_windows_private_file(path: str) -> None:
@@ -301,6 +245,42 @@ def _restrict_windows_private_file(path: str) -> None:
         pass
 
 
+def replace_with_retry(
+    src: str,
+    dst: str,
+    *,
+    attempts: int = 5,
+    base_delay: float = 0.05,
+) -> None:
+    """`os.replace` with bounded exponential backoff on `PermissionError`.
+
+    Retries transient Windows `WinError 5`/`WinError 32` failures caused by
+    antivirus scanners or the search indexer briefly holding the target open.
+    Other `OSError`s propagate immediately.
+    """
+    last_exc: PermissionError | None = None
+    for attempt in range(max(1, attempts)):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            if attempt + 1 >= attempts:
+                break
+            time.sleep(base_delay * (2**attempt))
+    assert last_exc is not None
+    raise last_exc
+
+
+def _apply_private_permissions(tmp_path: str, private: bool) -> None:
+    if not private:
+        return
+    if os.name == "nt":
+        _restrict_windows_private_file(tmp_path)
+    else:
+        os.chmod(tmp_path, 0o600)
+
+
 def atomic_write_text(
     target_path: str,
     content: str,
@@ -324,12 +304,41 @@ def atomic_write_text(
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        if private:
-            if os.name == "nt":
-                _restrict_windows_private_file(tmp_path)
-            else:
-                os.chmod(tmp_path, 0o600)
-        os.replace(tmp_path, abs_path)
+        _apply_private_permissions(tmp_path, private)
+        replace_with_retry(tmp_path, abs_path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    return target_path
+
+
+def atomic_write_bytes(
+    target_path: str,
+    data: bytes,
+    *,
+    private: bool = False,
+) -> str:
+    """Atomically write `data` to `target_path` via a unique temp file."""
+    abs_path = os.path.abspath(target_path)
+    parent = os.path.dirname(abs_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(abs_path)}.",
+        suffix=".tmp",
+        dir=parent or ".",
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _apply_private_permissions(tmp_path, private)
+        replace_with_retry(tmp_path, abs_path)
     except Exception:
         try:
             if os.path.exists(tmp_path):

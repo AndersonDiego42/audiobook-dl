@@ -3,6 +3,7 @@ from collections.abc import Sequence
 from xml.sax.saxutils import escape, quoteattr
 
 from audiobookdl import AudiobookMetadata, Chapter, Cover
+from audiobookdl.utils.fs import atomic_write_bytes, atomic_write_text
 
 
 def _cue_timestamp(ms: int) -> str:
@@ -114,8 +115,7 @@ def build_cue_sheet(
 
 def write_sidecar_cover(cover: Cover, target_path: str) -> str:
     """Write `cover` bytes to `target_path` and return the path written."""
-    with open(target_path, "wb") as f:
-        f.write(cover.image)
+    atomic_write_bytes(target_path, cover.image)
     return target_path
 
 
@@ -126,8 +126,7 @@ def write_sidecar_opf(
 ) -> str:
     """Write an OPF XML metadata sidecar file to `target_path`."""
     content = build_opf_xml(metadata, cover_filename=cover_filename)
-    with open(target_path, "w", encoding="utf-8") as f:
-        f.write(content)
+    atomic_write_text(target_path, content, encoding="utf-8")
     return target_path
 
 
@@ -144,8 +143,7 @@ def write_sidecar_cue(
         chapters=chapters,
         authors=metadata.authors,
     )
-    with open(target_path, "w", encoding="utf-8") as f:
-        f.write(content)
+    atomic_write_text(target_path, content, encoding="utf-8")
     return target_path
 
 
@@ -166,11 +164,12 @@ def build_abs_metadata_dict(
             series_entry["sequence"] = str(metadata.series_order)
         series_list.append(series_entry)
 
+    ordered_chapters = sorted(chapters, key=lambda ch: int(ch.start))
     abs_chapters = []
-    for idx, ch in enumerate(chapters):
+    for idx, ch in enumerate(ordered_chapters):
         start_sec = round(max(0, int(ch.start)) / 1000.0, 3)
-        if idx + 1 < len(chapters):
-            end_sec = round(max(start_sec, int(chapters[idx + 1].start) / 1000.0), 3)
+        if idx + 1 < len(ordered_chapters):
+            end_sec = round(max(start_sec, int(ordered_chapters[idx + 1].start) / 1000.0), 3)
         elif duration_seconds is not None and duration_seconds > start_sec:
             end_sec = round(max(start_sec, float(duration_seconds)), 3)
         else:
@@ -230,6 +229,9 @@ def write_sidecar_abs_metadata(
         abridged=abridged,
         duration_seconds=duration_seconds,
     )
-    with open(target_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
+    atomic_write_text(
+        target_path,
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
     return target_path

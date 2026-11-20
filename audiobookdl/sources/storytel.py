@@ -530,7 +530,10 @@ class StorytelSource(Source):
 
     def download_books_from_website(self, url: str) -> Series[str]:
         """Download series details from a Storytel web page."""
-        title = self.find_elems_in_page(url, "h1")[-1].text
+        headings = self.find_elems_in_page(url, "h1")
+        if not headings:
+            raise BookNotFound
+        title = headings[-1].text
         items = self.find_elems_in_page(url, 'a[href*="/books/"]')
         books: list[BookId[str] | Audiobook] = []
         seen_ids: set[str] = set()

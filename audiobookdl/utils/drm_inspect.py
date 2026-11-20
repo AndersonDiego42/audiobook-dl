@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from typing import Any, Literal
 from urllib.parse import urljoin, urlparse
 from uuid import UUID
@@ -11,8 +12,10 @@ from attrs import frozen
 import m3u8
 import requests
 
+from audiobookdl import logging
 from audiobookdl.exceptions import (
     CloudflareBlocked,
+    DownloadCancelled,
     GenericAudiobookDLException,
     RequestError,
     UserNotAuthorized,
@@ -39,6 +42,7 @@ from audiobookdl.utils.pssh import (
 )
 
 DEFAULT_INSPECT_MAX_BYTES = 8 * 1024 * 1024
+_CF_SAMPLE_BYTES = 16 * 1024
 _ISOBMFF_BOX_TYPES = frozenset(
     {b"ftyp", b"styp", b"moov", b"moof", b"pssh", b"sidx", b"free", b"skip", b"wide"}
 )
@@ -265,6 +269,7 @@ def _fetch_bounded_bytes(
     max_bytes: int,
     timeout: float | tuple[float, float] = DEFAULT_HTTP_TIMEOUT,
     headers: dict[str, str] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[bytes, str]:
     try:
         resp = session.get(url, stream=True, timeout=timeout, headers=headers or {})
@@ -274,28 +279,42 @@ def _fetch_bounded_bytes(
         raise GenericAudiobookDLException(f"Failed to fetch {url}: {exc}") from exc
 
     try:
-        if is_cloudflare_challenge(resp):
-            raise CloudflareBlocked(
-                detail=f"HTTP {resp.status_code} Cloudflare challenge from {url}"
-            )
-        if resp.status_code in (401, 403):
-            raise UserNotAuthorized(detail=f"HTTP {resp.status_code} from {url}")
-        if resp.status_code not in (200, 206):
-            raise RequestError(detail=f"HTTP {resp.status_code} from {url}")
-
         buf = bytearray()
-        for chunk in resp.iter_content(chunk_size=64 * 1024):
-            if not chunk:
-                continue
-            remaining = max_bytes - len(buf)
-            if remaining <= 0:
-                break
-            buf.extend(chunk[:remaining])
-            if len(buf) >= max_bytes:
-                break
+        checked_response = False
         resolved_url = getattr(resp, "url", None)
         final_url = resolved_url if isinstance(resolved_url, str) and resolved_url else url
-        return bytes(buf), final_url
+        for chunk in resp.iter_content(chunk_size=64 * 1024):
+            if cancel_event is not None and cancel_event.is_set():
+                raise DownloadCancelled
+            if not chunk:
+                continue
+            buf.extend(chunk)
+            # Run challenge/status checks once we have a bounded body sample
+            # (or the stream ended / hit the cap) instead of buffering `resp.content`.
+            if not checked_response and (
+                len(buf) >= _CF_SAMPLE_BYTES or len(buf) >= max_bytes
+            ):
+                checked_response = True
+                if is_cloudflare_challenge(resp, body=bytes(buf[:_CF_SAMPLE_BYTES])):
+                    raise CloudflareBlocked(
+                        detail=f"HTTP {resp.status_code} Cloudflare challenge from {url}"
+                    )
+                if resp.status_code in (401, 403):
+                    raise UserNotAuthorized(detail=f"HTTP {resp.status_code} from {url}")
+                if resp.status_code not in (200, 206):
+                    raise RequestError(detail=f"HTTP {resp.status_code} from {url}")
+            if len(buf) >= max_bytes:
+                break
+        if not checked_response:
+            if is_cloudflare_challenge(resp, body=bytes(buf[:_CF_SAMPLE_BYTES])):
+                raise CloudflareBlocked(
+                    detail=f"HTTP {resp.status_code} Cloudflare challenge from {url}"
+                )
+            if resp.status_code in (401, 403):
+                raise UserNotAuthorized(detail=f"HTTP {resp.status_code} from {url}")
+            if resp.status_code not in (200, 206):
+                raise RequestError(detail=f"HTTP {resp.status_code} from {url}")
+        return bytes(buf[:max_bytes]), final_url
     finally:
         resp.close()
 
@@ -336,8 +355,12 @@ def inspect_url(
     *,
     max_bytes: int = DEFAULT_INSPECT_MAX_BYTES,
     timeout: float | tuple[float, float] = DEFAULT_HTTP_TIMEOUT,
+    cancel_event: threading.Event | None = None,
 ) -> ProtectionReport:
     """Fetch up to `max_bytes` from `url` and return a `ProtectionReport`."""
+    if cancel_event is None:
+        ctx = logging.get_job_context()
+        cancel_event = ctx.cancel_event if ctx is not None else None
     cleaned = url.strip()
     parsed = urlparse(cleaned)
     if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
@@ -351,6 +374,7 @@ def inspect_url(
             active_session,
             max_bytes=max_bytes,
             timeout=timeout,
+            cancel_event=cancel_event,
         )
         report = inspect_bytes(raw, source_label=resolved_url)
         if report.container == "hls":
@@ -365,6 +389,7 @@ def inspect_url(
                         active_session,
                         max_bytes=max_bytes,
                         timeout=timeout,
+                        cancel_event=cancel_event,
                     )
                     var_report = inspect_bytes(var_raw, source_label=var_url)
                     report = _merge_reports(report, var_report)
@@ -390,6 +415,7 @@ def inspect_url(
                         max_bytes=max_bytes,
                         timeout=timeout,
                         headers=range_hdr,
+                        cancel_event=cancel_event,
                     )
                     init_boxes = parse_pssh_boxes(init_raw) if _looks_like_isobmff(init_raw) else []
                     init_kids = extract_cenc_kids_safe(init_raw)

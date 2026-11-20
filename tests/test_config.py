@@ -522,7 +522,7 @@ def test_env_config_overrides_portable_mode_in_config_dir(tmp_path, monkeypatch)
 def test_debug_and_cover_keys_merge_from_config(tmp_path):
     from audiobookdl.config import structure_config
     from audiobookdl.options_schema import build_default_options
-    from audiobookdl.pipeline import apply_runtime_options
+    from audiobookdl.pipeline import resolve_runtime_options
 
     cfg = structure_config(
         str(tmp_path / "audiobook-dl.toml"),
@@ -530,9 +530,9 @@ def test_debug_and_cover_keys_merge_from_config(tmp_path):
         credential_store=None,
     )
     opts = build_default_options()
-    apply_runtime_options(opts, cfg)
-    assert opts.debug is True
-    assert opts.cover is True
+    resolved = resolve_runtime_options(opts, cfg)
+    assert resolved.debug is True
+    assert resolved.cover is True
 
 
 def test_gui_clipboard_sync_schedule_and_check_updates_round_trip(tmp_path):
@@ -833,3 +833,84 @@ def test_source_device_id_is_isolated_per_profile(tmp_path):
         s_default.close()
         s_work.close()
 
+
+
+def test_metadata_provider_vault_keys_do_not_pollute_config_sources(tmp_path):
+    from audiobookdl.config import structure_config
+    from audiobookdl.credentials import CredentialStore
+
+    class _VaultStore(CredentialStore):
+        is_secure = True
+
+        def __init__(self) -> None:
+            self.data: dict[tuple[str, str | None], str] = {
+                ("storytel", "reader@example.com"): "pw",
+            }
+
+        def get_password(self, service_key: str, username: str | None) -> str | None:
+            return self.data.get((service_key, username))
+
+        def set_password(self, service_key: str, username: str | None, password: str) -> None:
+            self.data[(service_key, username)] = password
+
+        def delete_password(self, service_key: str, username: str | None) -> None:
+            self.data.pop((service_key, username), None)
+
+        def stored_services(self) -> dict[str, str | None]:
+            return {
+                "metadata_provider:hardcover": "https://abs-hardcover.example.com",
+                "storytel": "reader@example.com",
+            }
+
+        def stored_oauth_profiles(self) -> set[str]:
+            return {"metadata_provider:hardcover"}
+
+        def get_oauth_token(self, profile_key: str) -> str | None:
+            return "{}" if profile_key == "metadata_provider:hardcover" else None
+
+    store = _VaultStore()
+    cfg = structure_config(
+        str(tmp_path / "audiobook-dl.toml"),
+        {},
+        credential_store=store,
+    )
+    assert "metadata_provider:hardcover" not in cfg.sources
+    assert cfg.sources["storytel"].username == "reader@example.com"
+
+
+def test_audiobookshelf_api_key_migrates_to_vault_and_is_scrubbed(tmp_path):
+    from audiobookdl.credentials import CredentialStore
+
+    class _MemSecureStore(CredentialStore):
+        is_secure = True
+
+        def __init__(self) -> None:
+            self.data: dict[tuple[str, str | None], str] = {}
+
+        def get_password(self, service_key: str, username: str | None) -> str | None:
+            return self.data.get((service_key, username))
+
+        def set_password(self, service_key: str, username: str | None, password: str) -> None:
+            self.data[(service_key, username)] = password
+
+        def delete_password(self, service_key: str, username: str | None) -> None:
+            self.data.pop((service_key, username), None)
+
+    cfg_path = tmp_path / "audiobook-dl.toml"
+    cfg_path.write_text(
+        "[audiobookshelf]\n"
+        'url = "https://abs.example.com"\n'
+        'api_key = "abs-secret-token"\n'
+        'library_id = "lib1"\n',
+        encoding="utf-8",
+    )
+    store = _MemSecureStore()
+    loaded = load_config(str(cfg_path), credential_store=store)
+
+    assert loaded.audiobookshelf.api_key == "abs-secret-token"
+    assert loaded.audiobookshelf.library_id == "lib1"
+    assert "abs-secret-token" not in cfg_path.read_text(encoding="utf-8")
+    assert (
+        store.get_password("integration:audiobookshelf", "https://abs.example.com")
+        == "abs-secret-token"
+    )

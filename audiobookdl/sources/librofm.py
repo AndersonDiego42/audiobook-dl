@@ -10,7 +10,7 @@ from urllib.parse import quote, urlparse
 from .source import CatalogBook, Source
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover
 from audiobookdl.exceptions import BookNotFound, RequestError, UserNotAuthorized
-from audiobookdl.utils.oauth import OAuthProviderConfig, OAuthTokenBundle
+from audiobookdl.utils.oauth import OAuthTokenBundle
 
 
 def _join_people(raw: Any) -> str:
@@ -39,11 +39,6 @@ class LibrofmSource(Source):
     login_data = ["username", "password"]
     supports_search = True
     supports_library = True
-    oauth_provider = OAuthProviderConfig(
-        authorization_url="https://libro.fm/oauth/token",
-        token_url="https://libro.fm/oauth/token",
-        client_id="",
-    )
 
     match = [
         r"https?://(?:www\.)?libro\.fm/audiobooks/([^/?#]+)",

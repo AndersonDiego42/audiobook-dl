@@ -1,0 +1,46 @@
+"""audiobook-dl configuration: models, TOML I/O, migrations, and mutation APIs."""
+
+from audiobookdl.config.io import (
+    DEFAULT_AUTO_SYNC_MODE as DEFAULT_AUTO_SYNC_MODE,
+    tomllib as tomllib,
+    VALID_AUTO_SYNC_MODES as VALID_AUTO_SYNC_MODES,
+    config_dir as config_dir,
+    get_config_location as get_config_location,
+    is_portable_mode as is_portable_mode,
+    load_config as load_config,
+    read_config as read_config,
+    structure_config as structure_config,
+)
+from audiobookdl.config.models import (
+    DEFAULT_PROFILE as DEFAULT_PROFILE,
+    AudiobookshelfConfig as AudiobookshelfConfig,
+    Config as Config,
+    CustomMetadataProviderConfig as CustomMetadataProviderConfig,
+    GuiConfig as GuiConfig,
+    SourceConfig as SourceConfig,
+    get_source_config as get_source_config,
+    list_configured_source_profiles as list_configured_source_profiles,
+    list_source_profiles as list_source_profiles,
+    make_source_profile_key as make_source_profile_key,
+    normalize_profile_name as normalize_profile_name,
+    normalize_source_key as normalize_source_key,
+    profile_scoped_filename as profile_scoped_filename,
+    resolve_effective_source_profile as resolve_effective_source_profile,
+    sanitize_profile_filename_part as sanitize_profile_filename_part,
+    split_source_profile_key as split_source_profile_key,
+)
+from audiobookdl.config.mutations import (
+    delete_custom_metadata_provider as delete_custom_metadata_provider,
+    delete_source_oauth_token as delete_source_oauth_token,
+    delete_source_profile as delete_source_profile,
+    load_source_oauth_token as load_source_oauth_token,
+    rename_source_profile as rename_source_profile,
+    save_audiobookshelf_config as save_audiobookshelf_config,
+    save_check_updates as save_check_updates,
+    save_custom_metadata_provider as save_custom_metadata_provider,
+    save_ffmpeg_dir as save_ffmpeg_dir,
+    save_gui_preferences as save_gui_preferences,
+    save_output_preferences as save_output_preferences,
+    save_source_credentials as save_source_credentials,
+    save_source_oauth_token as save_source_oauth_token,
+)

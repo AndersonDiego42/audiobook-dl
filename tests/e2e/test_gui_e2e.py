@@ -62,7 +62,7 @@ def test_gui_preview_and_download_m4b_end_to_end(
     monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
 
     app = gui_harness.start()
-    app.urls_text.insert("1.0", f"{book_url}\n")
+    app.download_page.urls_text.insert("1.0", f"{book_url}\n")
     app._urls.on_urls_changed()
     assert app.service_label_var.get() == "Librivox"
 
@@ -90,9 +90,9 @@ def test_gui_preview_and_download_m4b_end_to_end(
     )
 
     assert app.status_var.get() == "Completed"
-    assert float(app.progressbar.cget("value")) == pytest.approx(100.0)
+    assert float(app.download_page.queue_panel.progressbar.cget("value")) == pytest.approx(100.0)
     assert float(app.shell.footer_progressbar.cget("value")) == pytest.approx(100.0)
-    log_text = app.log_text.get("1.0", tk.END)
+    log_text = app.download_page.queue_panel.log_text.get("1.0", tk.END)
     assert "GUI E2E Audiobook" in log_text
     assert "--- Completed ---" in log_text
 

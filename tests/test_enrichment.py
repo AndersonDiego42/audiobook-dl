@@ -8,7 +8,8 @@ import pytest
 import requests
 
 from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover
-from audiobookdl.options_schema import OPTIONS_BY_NAME, build_default_options
+from audiobookdl.gui.options_binding import GUI_OPTION_BINDINGS
+from audiobookdl.options_schema import build_default_options
 from audiobookdl.utils.enrichment import (
     DEFAULT_CONFIDENCE_THRESHOLD,
     DEFAULT_PROVIDERS,
@@ -434,8 +435,7 @@ def test_interactive_selector_chooses_candidate_or_skips():
 
 
 def test_enrichment_providers_validation_and_options():
-    binding = OPTIONS_BY_NAME["enrich_providers"].gui
-    assert binding is not None
+    binding = GUI_OPTION_BINDINGS["enrich_providers"]
     assert binding.read_option("apple,google_books") == "itunes,google"
     with pytest.raises(ValueError):
         binding.read_option("invalid_provider")
@@ -623,7 +623,7 @@ def test_abs_custom_provider_search_mapping_and_enrichment(tmp_path):
 @pytest.mark.no_worker_cap
 def test_search_enrichment_candidates_runs_concurrently_when_session_is_none(monkeypatch):
     import threading
-    from audiobookdl.utils import enrichment as enr_mod
+    from audiobookdl.utils.enrichment.providers import dispatch as dispatch_mod
 
     active = 0
     peak_active = 0
@@ -648,7 +648,7 @@ def test_search_enrichment_candidates_runs_concurrently_when_session_is_none(mon
             with lock:
                 active -= 1
 
-    monkeypatch.setattr(enr_mod, "_query_provider", _fake_query)
+    monkeypatch.setattr(dispatch_mod, "_query_provider", _fake_query)
     meta = AudiobookMetadata(title="Dune", authors=["Frank Herbert"])
     results = search_enrichment_candidates(meta, providers=("itunes", "google", "openlibrary"))
     assert peak_active >= 2
@@ -673,8 +673,10 @@ def test_enrichment_plugin_entry_point_discovery_and_query(monkeypatch):
             ]
 
     fake_ep = SimpleNamespace(name="localwiki", load=lambda: _FakePlugin())
+    import importlib.metadata
+
     monkeypatch.setattr(
-        enr_mod.importlib.metadata,
+        importlib.metadata,
         "entry_points",
         lambda *, group="": [fake_ep] if group == enr_mod.ENRICHMENT_ENTRY_POINT_GROUP else [],
     )
@@ -800,3 +802,45 @@ def test_audnexus_override_chapters_replaces_existing_source_chapters():
     ]
 
 
+
+
+def test_make_cache_key_includes_headers():
+    base = make_cache_key("custom", "https://example.com/search", {"q": "Dune"})
+    authed = make_cache_key(
+        "custom",
+        "https://example.com/search",
+        {"q": "Dune"},
+        headers={"Authorization": "Bearer secret-a"},
+    )
+    other = make_cache_key(
+        "custom",
+        "https://example.com/search",
+        {"q": "Dune"},
+        headers={"Authorization": "Bearer secret-b"},
+    )
+    assert base != authed
+    assert authed != other
+    # Header name casing/whitespace does not fragment keys
+    assert authed == make_cache_key(
+        "custom",
+        "https://example.com/search",
+        {"q": "Dune"},
+        headers={"authorization": "  Bearer secret-a  "},
+    )
+
+
+def test_enrichment_cache_prune_expired(tmp_path):
+    cache_path = default_enrichment_cache_path(str(tmp_path))
+    with EnrichmentCache(cache_path, ttl_seconds=100.0) as cache:
+        cache.set("k-stale", "google", {"v": 1}, now=1000.0)
+        cache.set("k-fresh", "google", {"v": 2}, now=1050.0)
+        removed = cache.prune_expired(now=1150.0)
+        assert removed == 1
+        assert cache.get("k-stale", ttl_seconds=0.0, now=1150.0) is None
+        assert cache.get("k-fresh", ttl_seconds=10_000.0, now=1150.0) == {"v": 2}
+        # Lazy prune on first set() also clears expired rows
+    with EnrichmentCache(cache_path, ttl_seconds=100.0) as cache2:
+        cache2.set("k-new", "google", {"v": 3}, now=2000.0)
+        # fetched_at 2000 with ttl 100 -> cutoff 1900; k-fresh (1050) pruned, k-new kept
+        assert cache2.get("k-fresh", ttl_seconds=10_000.0, now=2001.0) is None
+        assert cache2.get("k-new", ttl_seconds=10_000.0, now=2001.0) == {"v": 3}

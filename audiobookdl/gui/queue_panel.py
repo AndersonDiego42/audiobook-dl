@@ -13,7 +13,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Literal
 
 from audiobookdl.config import DEFAULT_PROFILE, list_source_profiles
-from audiobookdl.gui.controller import GuiController, QueuedJob
+from audiobookdl.gui.controller import QueuedJob
 from audiobookdl.gui.events import (
     BatchItemEvent,
     ControllerEvent,
@@ -36,6 +36,7 @@ from audiobookdl.gui.formatting import (
 )
 from audiobookdl.utils.audiobook import format_bytes
 from audiobookdl.gui.notifications import format_completion_notification, send_os_notification_async
+from audiobookdl.gui.page_deps import QueuePanelDeps
 from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, make_bold_font, scale_px
 from audiobookdl.gui.widgets import (
     ModalDialog,
@@ -45,11 +46,11 @@ from audiobookdl.gui.widgets import (
     TreeColumnSpec,
     resolve_responsive_mode,
 )
-from audiobookdl.options_schema import (
+from audiobookdl.gui.options_binding import (
     GUI_INTRO_CHAPTER_MODES,
     GUI_MEDIA_TYPE_OPTIONS,
+    GUI_OPTION_BINDINGS,
     GUI_OUTPUT_FORMATS,
-    OPTIONS_BY_NAME,
 )
 from audiobookdl.pipeline import DownloadSummary
 from audiobookdl.sources import detect_service_key
@@ -198,9 +199,9 @@ class _JobOptionsDialog(ModalDialog):
         else:
             cur_overwrite = "Ask"
 
-        intro_binding = OPTIONS_BY_NAME["intro_chapter_mode"].gui
-        assert intro_binding is not None
-        cur_intro_mode = intro_binding.init_value(ov_map.get("intro_chapter_mode"))
+        cur_intro_mode = GUI_OPTION_BINDINGS["intro_chapter_mode"].init_value(
+            ov_map.get("intro_chapter_mode")
+        )
 
         self._profile_var = tk.StringVar(value=cur_prof)
         self._format_var = tk.StringVar(value=cur_fmt)
@@ -337,9 +338,9 @@ class _JobOptionsDialog(ModalDialog):
         except ValueError as exc:
             messagebox.showwarning("Invalid Option", str(exc), parent=self)
             return
-        intro_binding = OPTIONS_BY_NAME["intro_chapter_mode"].gui
-        assert intro_binding is not None
-        intro_mode = intro_binding.read_option(self._intro_mode_var.get())
+        intro_mode = GUI_OPTION_BINDINGS["intro_chapter_mode"].read_option(
+            self._intro_mode_var.get()
+        )
         overwrite_val = {"Overwrite": True, "Keep existing": False}.get(self._overwrite_var.get())
         overrides: dict[str, Any] = {
             "output_format": fmt,
@@ -529,57 +530,34 @@ class ActivityQueuePanel(ttk.LabelFrame):
         self,
         master: tk.Misc,
         root: tk.Tk,
-        controller: GuiController,
-        *,
-        status_var: tk.StringVar,
-        batch_var: tk.StringVar,
-        metrics_var: tk.StringVar,
-        on_start_download: Callable[[], None],
-        on_cancel_download: Callable[[], None],
-        on_preview_metadata: Callable[[], None],
-        on_pack_local: Callable[[], Any],
-        on_open_folder: Callable[[], None],
-        on_retry_failed: Callable[[], None],
-        service_label_for_url: Callable[[str], str],
-        on_retry_selected: Callable[[Sequence[str]], None] | None = None,
-        on_preview_url: Callable[[str], None] | None = None,
-        on_send_to_urls: Callable[[Sequence[str]], None] | None = None,
-        on_open_path: Callable[[str, bool], None] | None = None,
-        on_import_queue: Callable[[list[dict[str, Any]]], None] | None = None,
-        on_queue_summary_changed: Callable[[int, int], None] | None = None,
-        on_progress_mode_changed: Callable[[str], None] | None = None,
-        progress_var: tk.DoubleVar | None = None,
-        active_job_var: tk.StringVar | None = None,
-        concurrency_var: tk.IntVar | None = None,
-        on_concurrency_changed: Callable[[int], None] | None = None,
-        palette: ThemePalette | None = None,
+        deps: QueuePanelDeps,
     ) -> None:
         super().__init__(master, text="Activity", padding=(scale_px(master, 10), scale_px(master, 6)))
         self._window = root
-        self._controller = controller
-        self._palette = palette or LIGHT_PALETTE
-        self.status_var = status_var
-        self.batch_var = batch_var
+        self._controller = deps.controller
+        self._palette = deps.palette or LIGHT_PALETTE
+        self.status_var = deps.status_var
+        self.batch_var = deps.batch_var
         self.stage_var = tk.StringVar(value="")
-        self.metrics_var = metrics_var
-        self.progress_var = progress_var or tk.DoubleVar(value=0.0)
-        self.active_job_var = active_job_var or tk.StringVar(value="Idle")
-        self.concurrency_var = concurrency_var or tk.IntVar(value=controller.queue_concurrency)
-        self._on_concurrency_changed = on_concurrency_changed
-        self._on_start_download = on_start_download
-        self._on_cancel_download = on_cancel_download
-        self._on_preview_metadata = on_preview_metadata
-        self._on_pack_local = on_pack_local
-        self._on_open_folder = on_open_folder
-        self._on_retry_failed = on_retry_failed
-        self._service_label_for_url = service_label_for_url
-        self._on_retry_selected = on_retry_selected
-        self._on_preview_url = on_preview_url
-        self._on_send_to_urls = on_send_to_urls
-        self._on_open_path = on_open_path
-        self._on_import_queue = on_import_queue
-        self._on_queue_summary_changed = on_queue_summary_changed
-        self._on_progress_mode_changed = on_progress_mode_changed
+        self.metrics_var = deps.metrics_var
+        self.progress_var = deps.progress_var or tk.DoubleVar(value=0.0)
+        self.active_job_var = deps.active_job_var or tk.StringVar(value="Idle")
+        self.concurrency_var = deps.concurrency_var or tk.IntVar(value=deps.controller.queue_concurrency)
+        self._on_concurrency_changed = deps.on_concurrency_changed
+        self._on_start_download = deps.on_start_download
+        self._on_cancel_download = deps.on_cancel_download
+        self._on_preview_metadata = deps.on_preview_metadata
+        self._on_pack_local = deps.on_pack_local
+        self._on_open_folder = deps.on_open_folder
+        self._on_retry_failed = deps.on_retry_failed
+        self._service_label_for_url = deps.service_label_for_url
+        self._on_retry_selected = deps.on_retry_selected
+        self._on_preview_url = deps.on_preview_url
+        self._on_send_to_urls = deps.on_send_to_urls
+        self._on_open_path = deps.on_open_path
+        self._on_import_queue = deps.on_import_queue
+        self._on_queue_summary_changed = deps.on_queue_summary_changed
+        self._on_progress_mode_changed = deps.on_progress_mode_changed
 
         self.current_ui_run_id = 0
         self.ui_item_index = 0
@@ -1104,7 +1082,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
         try:
             count = export_queue_to_path(records, path)
             self.status_var.set(f"Exported {count} queue item(s)")
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             messagebox.showerror("Export Failed", str(exc), parent=self._window)
 
     def import_queue_dialog(self) -> None:
@@ -1120,7 +1098,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
             return
         try:
             items = load_queue_import_file(path)
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             messagebox.showerror("Import Failed", str(exc), parent=self._window)
             return
         if not items:
@@ -1166,7 +1144,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
         return ()
 
     @staticmethod
-    def _classify_log_tag(level: str, text: str) -> str:
+    def classify_log_tag(level: str, text: str) -> str:
         stripped = text.strip()
         if level == "ERROR" or stripped.startswith("[ERROR]"):
             return "error"
@@ -1178,9 +1156,11 @@ class ActivityQueuePanel(ttk.LabelFrame):
             return "section"
         return "info"
 
+    _classify_log_tag = classify_log_tag
+
     def _log_entry_matches(self, level: str, text: str) -> bool:
         level_filter = self.log_level_var.get()
-        tag = self._classify_log_tag(level, text)
+        tag = self.classify_log_tag(level, text)
         if level_filter == "Info+" and tag == "debug":
             return False
         if level_filter == "Errors Only" and tag not in ("error", "warn"):
@@ -1271,7 +1251,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
     def _rerender_logs(self) -> None:
         self._cancel_after("_log_search_after_id")
         matched = [
-            (line, self._classify_log_tag(level, line))
+            (line, self.classify_log_tag(level, line))
             for level, line in self._log_entries
             if self._log_entry_matches(level, line)
         ]
@@ -1305,7 +1285,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
         for level, text in entries:
             self._log_entries.append((level, text))
             if self._log_entry_matches(level, text):
-                matched.append((text, self._classify_log_tag(level, text)))
+                matched.append((text, self.classify_log_tag(level, text)))
 
         if not matched:
             return
@@ -1325,7 +1305,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
 
     def append_log(self, text: str) -> None:
         """Append a line to the scrollable activity log, capping total line count."""
-        tag = self._classify_log_tag("INFO", text)
+        tag = self.classify_log_tag("INFO", text)
         level = {"error": "ERROR", "warn": "WARNING", "debug": "DEBUG"}.get(tag, "INFO")
         self.append_log_batch([(level, text)])
 
@@ -1575,7 +1555,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
         state.last_row_render_at = now
         self.queue_tree.set(job_id, "detail", self._format_live_row_detail(state))
 
-    def _set_progress(self, value: float, *, indeterminate: bool = False) -> None:
+    def set_progress(self, value: float, *, indeterminate: bool = False) -> None:
         if indeterminate:
             self.progressbar.configure(mode="indeterminate")
             self.progress_var.set(0.0)
@@ -1591,7 +1571,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
 
     def prepare_run_ui_state(self, run_id: int, item_total: int, log_header: str) -> None:
         """Initialize progress, timer, and batch counters for a fresh queue run."""
-        self._set_progress(0.0)
+        self.set_progress(0.0)
         self.status_var.set("Starting...")
         self.active_job_var.set("Starting...")
         self.stage_var.set("Stage: Preparing")
@@ -1744,6 +1724,15 @@ class ActivityQueuePanel(ttk.LabelFrame):
                 tags=self._status_tag(str(rec.get("status") or "")),
             )
         self._apply_queue_filter()
+
+    @property
+    def queue_order(self) -> list[str]:
+        """Ordered queue job IDs currently displayed in the queue table."""
+        return self._queue_order
+
+    def service_label_for_url(self, url: str) -> str:
+        """Resolve the display service label for a download URL."""
+        return self._service_label_for_url(url)
 
     def register_queue_job(self, job: QueuedJob, *, persist: bool = True) -> None:
         """Insert a queued job row into the Queue & History table and internal index."""
@@ -2396,7 +2385,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
                 self.refresh_batch_label()
             return True
         if isinstance(item, ProgressStartEvent):
-            self._set_progress(0.0)
+            self.set_progress(0.0)
             key, state = self._get_or_create_progress_state(item.job_id)
             state.pct = 0.0
             state.speed_bps = 0.0
@@ -2455,7 +2444,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
     ) -> None:
         """Reset progress/metrics UI and report run completion/failure/cancellation."""
         notify_fn = notifier or send_os_notification_async
-        self._set_progress(0.0)
+        self.set_progress(0.0)
         final_elapsed = (
             format_duration(max(0.0, time.monotonic() - self._run_start_time))
             if self._run_start_time is not None
@@ -2467,7 +2456,7 @@ class ActivityQueuePanel(ttk.LabelFrame):
         self.batch_var.set("")
         self.stage_var.set("")
         if exc is not None:
-            self._set_progress(0.0)
+            self.set_progress(0.0)
             self.metrics_var.set("")
             self.status_var.set("Error")
             self.active_job_var.set("Idle (last run failed)")
@@ -2480,24 +2469,24 @@ class ActivityQueuePanel(ttk.LabelFrame):
             return
 
         if summary is None or summary.cancelled:
-            self._set_progress(0.0)
+            self.set_progress(0.0)
             self.metrics_var.set("")
             self.status_var.set("Cancelled")
             self.active_job_var.set("Idle (cancelled)")
             return
 
         if summary.failed > 0 and summary.completed == 0:
-            self._set_progress(0.0)
+            self.set_progress(0.0)
             self.metrics_var.set("")
             self.status_var.set("Failed")
             self.active_job_var.set("Idle (failed)")
         elif summary.failed > 0:
-            self._set_progress(100.0)
+            self.set_progress(100.0)
             self.metrics_var.set(f"Elapsed {final_elapsed}" if final_elapsed else "")
             self.status_var.set(f"Done ({summary.completed} ok, {summary.failed} failed)")
             self.active_job_var.set(f"Done ({summary.completed} ok, {summary.failed} failed)")
         else:
-            self._set_progress(100.0)
+            self.set_progress(100.0)
             self.metrics_var.set(f"Elapsed {final_elapsed}" if final_elapsed else "")
             self.status_var.set("Completed")
             self.active_job_var.set("Completed")

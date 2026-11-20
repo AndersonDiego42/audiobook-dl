@@ -10,6 +10,7 @@ from tkinter import messagebox, simpledialog
 from typing import TYPE_CHECKING, Any
 
 from audiobookdl.gui.controller import GuiController
+from audiobookdl.gui.deferred_activity import DeferredActivityHandler
 from audiobookdl.gui.events import (
     AbsUploadDoneEvent,
     AccountsVerificationDoneEvent,
@@ -104,8 +105,13 @@ class EventDispatcher:
         self._is_tray_running_provider = is_tray_running_provider
         self._drain_tray_actions = drain_tray_actions
 
-        self._pending_log_entries: deque[tuple[str | None, str]] = deque(
-            maxlen=ActivityQueuePanel.MAX_LOG_LINES
+        self._deferred_activity = DeferredActivityHandler(
+            controller,
+            status_var=status_var,
+            active_job_var=active_job_var,
+            progress_var=progress_var,
+            append_log=self.append_log,
+            update_download_badge=self.update_download_badge_from_records,
         )
         self._poll_after_id: str | None = None
         self._modal_prompt_active = False
@@ -134,73 +140,14 @@ class EventDispatcher:
             else:
                 dl_page.queue_panel.append_log_batch([(level, text)])
             return
-        self._pending_log_entries.append((level, text))
+        self._deferred_activity.buffer_log(level, text)
 
     def flush_pending_logs(self, panel: ActivityQueuePanel) -> None:
-        if not self._pending_log_entries:
-            return
-        entries: list[tuple[str, str]] = []
-        for level, text in self._pending_log_entries:
-            if level is None:
-                tag = panel._classify_log_tag("INFO", text)
-                resolved = {"error": "ERROR", "warn": "WARNING", "debug": "DEBUG"}.get(tag, "INFO")
-                entries.append((resolved, text))
-            else:
-                entries.append((level, text))
-        self._pending_log_entries.clear()
-        panel.append_log_batch(entries)
+        self._deferred_activity.flush_pending_logs(panel)
 
     def handle_deferred_activity_event(self, item: ControllerEvent) -> bool:
         """Handle activity events without forcing lazy `DownloadPage` creation."""
-        if isinstance(item, LogEvent):
-            prefix = f"[{item.level}] " if item.level in ("DEBUG", "ERROR") else ""
-            self.append_log(f"{prefix}{item.message}", level=item.level)
-            if item.level == "INFO" and item.message.strip():
-                self._status_var.set(item.message.strip().splitlines()[0][:80])
-            return True
-        if isinstance(item, LogBatchEvent):
-            last_info = ""
-            for level, message in item.entries:
-                prefix = f"[{level}] " if level in ("DEBUG", "ERROR") else ""
-                self.append_log(f"{prefix}{message}", level=level)
-                if level == "INFO" and message.strip():
-                    last_info = message
-            if last_info:
-                self._status_var.set(last_info.strip().splitlines()[0][:80])
-            return True
-        if isinstance(item, JobStatusEvent):
-            self._controller.update_queue_record(item.job_id, item.status, item.detail)
-            with self._controller.queue_lock:
-                records = list(self._controller.queue_records.values())
-            self.update_download_badge_from_records(records)
-            return True
-        if isinstance(item, JobMetaEvent):
-            self._controller.update_queue_metadata(
-                item.job_id,
-                title=item.title or None,
-                output_path=item.output_path or None,
-            )
-            if item.title:
-                self._active_job_var.set(item.title.strip()[:60])
-            return True
-        if isinstance(item, ProgressStartEvent):
-            self._progress_var.set(0.0)
-            self._status_var.set(item.description[:80])
-            if item.description.strip():
-                self._active_job_var.set(item.description.strip()[:60])
-            return True
-        if isinstance(item, ProgressAdvanceEvent):
-            pct = (item.completed / item.total * 100.0) if item.total > 0 else 0.0
-            self._progress_var.set(min(100.0, max(0.0, pct)))
-            return True
-        if isinstance(item, ProgressMetricsEvent):
-            pct = (item.completed / item.total * 100.0) if item.total > 0 else 0.0
-            self._progress_var.set(min(100.0, max(0.0, pct)))
-            return True
-        if isinstance(item, ProgressFinishEvent):
-            self._progress_var.set(100.0)
-            return True
-        return isinstance(item, (BatchItemEvent, ItemProgressEvent, DownloadEstimateEvent))
+        return self._deferred_activity.handle(item)
 
     def schedule_poll_soon(self, delay_ms: int = 10) -> None:
         self.cancel_poll_timer()
@@ -214,7 +161,7 @@ class EventDispatcher:
         stdlib_logging.getLogger(__name__).exception("Unhandled error in %s", context, exc_info=exc)
         try:
             self.append_log(f"[ERROR] Dispatch error ({context}): {exc}", level="ERROR")
-        except Exception:
+        except tk.TclError:
             pass
 
     def _safe_handle_event(self, item: ControllerEvent) -> None:
@@ -407,7 +354,12 @@ class EventDispatcher:
         elif isinstance(item, CatalogLoadedEvent):
             if item.request_id != self._controller.catalog_request_id:
                 return
-            catalog_tab: CatalogTab = item.target_tab
+            lib_page = self._shell.get_page("library")
+            catalog_tab: CatalogTab | None = (
+                lib_page.catalog_tab if lib_page is not None else None
+            )
+            if catalog_tab is None:
+                return
             try:
                 if not catalog_tab.winfo_exists():
                     return

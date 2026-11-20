@@ -7,7 +7,7 @@ from audiobookdl.utils.audiobook import (
     parse_language,
     parse_release_date,
 )
-from audiobookdl.utils.oauth import OAuthProviderConfig, OAuthTokenBundle
+from audiobookdl.utils.oauth import OAuthTokenBundle
 
 import os
 import re
@@ -20,11 +20,6 @@ class SaxoSource(Source):
     names = ["Saxo"]
     supports_search = True
     supports_library = True
-    oauth_provider = OAuthProviderConfig(
-        authorization_url="https://auth-read.saxo.com/auth/token",
-        token_url="https://auth-read.saxo.com/auth/token",
-        client_id="",
-    )
     match = [
         r"https?://(?:www\.)?saxo\.(?:com|dk)/[^/]+/.+",
     ]

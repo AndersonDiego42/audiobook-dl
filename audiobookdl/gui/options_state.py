@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 import platformdirs
 
 from audiobookdl import output
+from audiobookdl.exceptions import AudiobookDLException
 from audiobookdl.config import (
     DEFAULT_PROFILE,
     VALID_AUTO_SYNC_MODES,
@@ -32,10 +33,14 @@ from audiobookdl.gui.formatting import (
     default_output_dir,
     parse_url_text,
 )
-from audiobookdl.gui.window_manager import open_path_in_os
-from audiobookdl.options_schema import (
+from audiobookdl.gui.options_binding import (
+    GUI_OPTION_BINDINGS,
     GUI_OPTION_SPECS,
     PERSISTED_GUI_OPTION_SPECS,
+)
+from audiobookdl.gui.options_view_model import OptionsViewModel
+from audiobookdl.gui.window_manager import open_path_in_os
+from audiobookdl.options_schema import (
     DownloadOptions,
     build_default_options,
 )
@@ -144,6 +149,7 @@ class OptionsCoordinator:
         self._loaded_post_exec_display: str = ""
         self._pending_untrusted_post_exec: str | list[str] | None = None
         self._trace_suppress_depth: int = 0
+        self.view_model: OptionsViewModel | None = None
 
     @contextmanager
     def _suppress_traces(self) -> Iterator[None]:
@@ -168,47 +174,64 @@ class OptionsCoordinator:
         self._set_theme = set_theme
 
     def init_variables(self) -> None:
-        """Populate Tkinter option, auth, preference, and status variables on the app."""
+        """Populate the `OptionsViewModel` with option, auth, preference, and status variables."""
         o = self._owner
         cfg = self._controller.config
+        namespace: dict[str, tk.Variable] = {}
+
         saved_output_dir = (cfg.gui.output_dir or "").strip()
-        o.output_dir_var = tk.StringVar(value=saved_output_dir or default_output_dir())
+        namespace["output_dir_var"] = tk.StringVar(value=saved_output_dir or default_output_dir())
         saved_template = (cfg.gui.output_template or "").strip() or "{title}"
-        o.template_var = tk.StringVar(value=saved_template)
-        o.template_preset_var = tk.StringVar(
+        namespace["template_var"] = tk.StringVar(value=saved_template)
+        namespace["template_preset_var"] = tk.StringVar(
             value=TEMPLATE_TO_PRESET_LABEL.get(saved_template, "Custom")
         )
-        o.template_preview_var = tk.StringVar(value="")
-        o.template_standalone_preview_var = tk.StringVar(value="")
+        namespace["template_preview_var"] = tk.StringVar(value="")
+        namespace["template_standalone_preview_var"] = tk.StringVar(value="")
 
         first_label = self._services[0].label if self._services else ""
-        o.service_label_var = tk.StringVar(value=first_label)
-        o.profile_var = tk.StringVar(value=DEFAULT_PROFILE)
-        o.service_hint_var = tk.StringVar(value="")
-        o.saved_badge_var = tk.StringVar(value="")
+        namespace["service_label_var"] = tk.StringVar(value=first_label)
+        namespace["profile_var"] = tk.StringVar(value=DEFAULT_PROFILE)
+        namespace["service_hint_var"] = tk.StringVar(value="")
+        namespace["saved_badge_var"] = tk.StringVar(value="")
 
-        o.cookie_file_var = tk.StringVar(value="")
-        o.username_var = tk.StringVar(value="")
-        o.password_var = tk.StringVar(value="")
-        o.library_var = tk.StringVar(value="")
-        o.show_password_var = tk.BooleanVar(value=False)
-        o.remember_login_var = tk.BooleanVar(value=True)
+        namespace["cookie_file_var"] = tk.StringVar(value="")
+        namespace["username_var"] = tk.StringVar(value="")
+        namespace["password_var"] = tk.StringVar(value="")
+        namespace["library_var"] = tk.StringVar(value="")
+        namespace["show_password_var"] = tk.BooleanVar(value=False)
+        namespace["remember_login_var"] = tk.BooleanVar(value=True)
 
         for spec in GUI_OPTION_SPECS:
-            binding = spec.gui
-            if binding is None:
-                continue
+            binding = GUI_OPTION_BINDINGS[spec.name]
             if spec.name == "post_exec":
-                setattr(o, binding.var_attr, tk.StringVar(value=""))
+                namespace[binding.var_attr] = tk.StringVar(value="")
                 continue
             cfg_val = getattr(cfg, spec.config_key, None) if spec.config_key else None
             initial = binding.init_value(cfg_val)
-            var: tk.Variable = (
+            namespace[binding.var_attr] = (
                 tk.BooleanVar(value=bool(initial))
                 if binding.var_type == "bool"
                 else tk.StringVar(value=str(initial))
             )
-            setattr(o, binding.var_attr, var)
+
+        notify_default = True if cfg.gui.notify_on_complete is None else cfg.gui.notify_on_complete
+        namespace["m4b_var"] = tk.BooleanVar(
+            value=(namespace["output_format_var"].get() == "m4b")
+        )
+        namespace["notify_on_complete_var"] = tk.BooleanVar(value=notify_default)
+        namespace["clipboard_monitor_var"] = tk.BooleanVar(value=bool(cfg.gui.clipboard_monitor))
+        namespace["minimize_to_tray_var"] = tk.BooleanVar(value=bool(cfg.gui.minimize_to_tray))
+        namespace["check_updates_var"] = tk.BooleanVar(value=(cfg.check_updates is not False))
+        namespace["status_var"] = tk.StringVar(value="Ready")
+        namespace["active_job_var"] = tk.StringVar(value="Idle")
+        namespace["progress_var"] = tk.DoubleVar(value=0.0)
+        namespace["batch_var"] = tk.StringVar(value="")
+        namespace["metrics_var"] = tk.StringVar(value="")
+        namespace["ffmpeg_status_var"] = tk.StringVar(value="")
+
+        self.view_model = OptionsViewModel(**namespace)  # type: ignore[arg-type]
+
         initial_post_exec = _normalize_post_exec_value(cfg.post_exec)
         if initial_post_exec is not None:
             if self.is_post_exec_trusted(initial_post_exec):
@@ -220,19 +243,6 @@ class OptionsCoordinator:
             self._apply_loaded_post_exec(None)
         if cfg.gui.use_download_archive is not None:
             o.download_archive_var.set(cfg.gui.use_download_archive)
-        o.m4b_var = tk.BooleanVar(value=(o.output_format_var.get() == "m4b"))
-        notify_default = True if cfg.gui.notify_on_complete is None else cfg.gui.notify_on_complete
-        o.notify_on_complete_var = tk.BooleanVar(value=notify_default)
-
-        o.clipboard_monitor_var = tk.BooleanVar(value=bool(cfg.gui.clipboard_monitor))
-        o.minimize_to_tray_var = tk.BooleanVar(value=bool(cfg.gui.minimize_to_tray))
-        o.check_updates_var = tk.BooleanVar(value=(cfg.check_updates is not False))
-        o.status_var = tk.StringVar(value="Ready")
-        o.active_job_var = tk.StringVar(value="Idle")
-        o.progress_var = tk.DoubleVar(value=0.0)
-        o.batch_var = tk.StringVar(value="")
-        o.metrics_var = tk.StringVar(value="")
-        o.ffmpeg_status_var = tk.StringVar(value="")
         self.sync_cached_network_prefs()
         o.proxy_var.trace_add(
             "write",
@@ -372,7 +382,7 @@ class OptionsCoordinator:
                 suffix = f".{ext}"
             o.template_preview_var.set(f"{rendered_series}{suffix}")
             o.template_standalone_preview_var.set(f"{rendered_standalone}{suffix}")
-        except Exception as exc:
+        except (KeyError, IndexError, ValueError) as exc:
             o.template_preview_var.set(f"(invalid template: {exc})")
             o.template_standalone_preview_var.set("")
 
@@ -477,7 +487,7 @@ class OptionsCoordinator:
             self._on_log("[WARN] Disabled untrusted post_exec command from startup configuration.")
 
     def read_gui_option_value(self, spec: Any, custom_providers: Mapping[str, Any]) -> Any:
-        raw_val = getattr(self._owner, spec.gui.var_attr).get()
+        raw_val = getattr(self._owner, GUI_OPTION_BINDINGS[spec.name].var_attr).get()
         if spec.name == "enrich_providers":
             cleaned = str(raw_val).strip()
             if not cleaned:
@@ -511,7 +521,7 @@ class OptionsCoordinator:
                     raise ValueError(f"Invalid post_exec argv syntax: {exc}") from exc
                 return parsed or None
             return text
-        return spec.gui.read_option(raw_val)
+        return GUI_OPTION_BINDINGS[spec.name].read_option(raw_val)
 
     def build_options(self, urls_override: Sequence[str] | None = None) -> DownloadOptions:
         """Build `DownloadOptions` from current UI field values."""
@@ -525,7 +535,6 @@ class OptionsCoordinator:
         option_values = {
             spec.name: self.read_gui_option_value(spec, custom_providers)
             for spec in GUI_OPTION_SPECS
-            if spec.gui is not None
         }
         if option_values.get("split_chapters"):
             option_values["combine"] = False
@@ -579,9 +588,6 @@ class OptionsCoordinator:
         prefs: dict[str, Any] = {}
         custom_providers = self._controller.config_snapshot().custom_metadata_providers
         for spec in PERSISTED_GUI_OPTION_SPECS:
-            binding = spec.gui
-            if binding is None:
-                continue
             try:
                 prefs[spec.name] = self.read_gui_option_value(spec, custom_providers)
             except ValueError:
@@ -611,7 +617,7 @@ class OptionsCoordinator:
             else (self._shell.get_page("download") if self._shell is not None else None)
         )
         if dl_page is not None:
-            dl_page.options_panel.update_custom_providers_hint(names)
+            dl_page.update_options_custom_providers_hint(names)
 
     def browse_output_dir(self) -> None:
         chosen = filedialog.askdirectory(
@@ -644,8 +650,8 @@ class OptionsCoordinator:
                 o.output_dir_var.set((cfg.gui.output_dir or "").strip() or default_output_dir())
                 o.template_var.set((cfg.gui.output_template or "").strip() or "{title}")
                 for spec in GUI_OPTION_SPECS:
-                    binding = spec.gui
-                    if binding is None or not spec.config_key or spec.name == "post_exec":
+                    binding = GUI_OPTION_BINDINGS[spec.name]
+                    if not spec.config_key or spec.name == "post_exec":
                         continue
                     cfg_val = getattr(cfg, spec.config_key, None)
                     getattr(o, binding.var_attr).set(binding.init_value(cfg_val))
@@ -712,5 +718,5 @@ class OptionsCoordinator:
             self.update_download_summaries()
             o.status_var.set("Config reloaded")
             self._on_log("Reloaded configuration.")
-        except Exception as exc:
+        except (OSError, ValueError, AudiobookDLException) as exc:
             messagebox.showerror("Config Error", str(exc), parent=self._root)

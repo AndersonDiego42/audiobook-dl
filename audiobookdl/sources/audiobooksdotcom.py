@@ -10,7 +10,7 @@ from audiobookdl import (
     Series,
     logging,
 )
-from audiobookdl.exceptions import DataNotPresent, GenericAudiobookDLException, NoSourceFound, RequestError, UserNotAuthorized
+from audiobookdl.exceptions import DataNotPresent, DownloadCancelled, GenericAudiobookDLException, NoSourceFound, RequestError, UserNotAuthorized
 from audiobookdl.utils.audiobook import parse_duration_ms
 from audiobookdl.utils.http import DEFAULT_USER_AGENT, extract_session_cookies, get_header_ci
 
@@ -113,11 +113,19 @@ class AudiobooksdotcomSource(Source):
         logging.debug(f"Downloading library from {url}")
         entries: list[tuple[str, str, str | None, str]] = []
         seen_ids = set()
+        visited_urls: set[str] = set()
         page_url: str | None = url
         parsed_initial_url = parse_url(url)
         origin = f"{parsed_initial_url.scheme}://{parsed_initial_url.host}"
 
         while page_url:
+            ctx = logging.get_job_context()
+            cancel_event = ctx.cancel_event if ctx is not None else None
+            if cancel_event is not None and cancel_event.is_set():
+                raise DownloadCancelled
+            if page_url in visited_urls:
+                break
+            visited_urls.add(page_url)
             logging.debug(f"Scraping page {page_url}")
             page_html = self._get_page(page_url).decode("utf-8", errors="replace")
             tree = lxml.html.fromstring(page_html)

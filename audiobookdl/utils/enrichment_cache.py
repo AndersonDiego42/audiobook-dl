@@ -18,17 +18,27 @@ def default_enrichment_cache_path(database_directory: str) -> str:
     return os.path.join(database_directory, "enrichment_cache.db")
 
 
-def make_cache_key(provider: str, endpoint: str, params: Mapping[str, Any] | None = None) -> str:
+def make_cache_key(
+    provider: str,
+    endpoint: str,
+    params: Mapping[str, Any] | None = None,
+    headers: Mapping[str, str] | None = None,
+) -> str:
     """Build a deterministic SHA-256 cache key for a provider HTTP query."""
     normalized_params = sorted(
         (str(k), "" if v is None else str(v))
         for k, v in (params or {}).items()
+    )
+    normalized_headers = sorted(
+        (str(k).lower(), str(v).strip())
+        for k, v in (headers or {}).items()
     )
     canonical = json.dumps(
         {
             "provider": provider.strip().lower(),
             "endpoint": endpoint.strip(),
             "params": normalized_params,
+            "headers": normalized_headers,
         },
         separators=(",", ":"),
         ensure_ascii=True,
@@ -52,6 +62,7 @@ class EnrichmentCache:
         self._persistent = persistent
         self._lock = threading.RLock()
         self._conn: sqlite3.Connection | None = None
+        self._pruned = False
         parent = os.path.dirname(self.db_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -139,6 +150,17 @@ class EnrichmentCache:
         except (TypeError, ValueError):
             return None
 
+    def prune_expired(self, *, now: float | None = None) -> int:
+        """Delete rows older than `ttl_seconds` and return the number removed."""
+        current_ts = time.time() if now is None else float(now)
+        cutoff = current_ts - self.ttl_seconds
+        with self._connection() as conn:
+            cursor = conn.execute(
+                "DELETE FROM enrichment_cache WHERE fetched_at < ?",
+                (cutoff,),
+            )
+            return int(cursor.rowcount)
+
     def set(
         self,
         cache_key: str,
@@ -148,6 +170,12 @@ class EnrichmentCache:
         now: float | None = None,
     ) -> None:
         """Persist `payload` as JSON for `cache_key` under `provider`."""
+        if not self._pruned:
+            self._pruned = True
+            try:
+                self.prune_expired()
+            except sqlite3.Error:
+                pass
         serialized = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
         timestamp = time.time() if now is None else float(now)
         with self._connection() as conn:

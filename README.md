@@ -170,7 +170,7 @@ enabled = true
 ```
 
 ### Credential Storage & Session Cookies
-- **Passwords & API tokens**: Passwords, Audiobookshelf API keys, and `[enrichment.custom.<name>]` API keys are stored in `credentials.dpapi` (Windows DPAPI) or the OS keyring with a `credentials.keyring.json` index (macOS/Linux) rather than plaintext in `audiobook-dl.toml`. Legacy `password = "..."` or `api_key = "..."` entries in `audiobook-dl.toml` are automatically migrated and scrubbed on load when a secure store is available. In headless containers without an OS keyring, set `AUDIOBOOK_DL_ALLOW_PLAINTEXT_CREDENTIALS=1` if you want to opt into plaintext config storage (or use cookie files).
+- **Passwords & API tokens**: Passwords, Audiobookshelf API keys, and `[enrichment.custom.<name>]` API keys are stored in `credentials.dpapi` (Windows DPAPI) or the OS keyring with a `credentials.keyring.json` index (macOS/Linux) rather than plaintext in `audiobook-dl.toml`. Legacy `password = "..."` or `api_key = "..."` entries in `audiobook-dl.toml` are automatically migrated and scrubbed on load when a secure store is available. In headless containers without an OS keyring, set `AUDIOBOOK_DL_ALLOW_PLAINTEXT_CREDENTIALS=1` to opt into plaintext storage persisted in `credentials.plaintext.json` beside `audiobook-dl.toml` (or use cookie files).
 - **Session cookies**: Cached automatically after authentication at `<database_directory>/<service>/session_cookies.txt` (or `session_cookies_<profile>.txt` for named profiles) with owner-only file permissions.
 
 ### Environment Variables

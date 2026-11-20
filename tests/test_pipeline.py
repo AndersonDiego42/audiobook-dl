@@ -113,8 +113,8 @@ def test_downloader_events_isolation_and_selective_workflow(monkeypatch):
             prog.advance(task, 50.0)
             prog.advance(task, 50.0)
 
-    monkeypatch.setattr("audiobookdl.pipeline.find_compatible_source", lambda _url: _FakeAuthSource)
-    monkeypatch.setattr("audiobookdl.pipeline.process_audiobook", fake_process_audiobook)
+    monkeypatch.setattr("audiobookdl.pipeline.jobs.find_compatible_source", lambda _url: _FakeAuthSource)
+    monkeypatch.setattr("audiobookdl.pipeline.jobs.process_audiobook", fake_process_audiobook)
 
     assert not logging.is_debug_mode()
     assert not logging.is_quiet_mode()
@@ -180,7 +180,7 @@ def test_downloader_fetch_metadata_and_cancel_event(monkeypatch):
         def download(self, _url: str) -> Audiobook:
             return single_book
 
-    monkeypatch.setattr("audiobookdl.pipeline.find_compatible_source", lambda _url: _SimpleSource)
+    monkeypatch.setattr("audiobookdl.pipeline.jobs.find_compatible_source", lambda _url: _SimpleSource)
 
     cfg = Config(sources={}, output_template=None, database_directory=None, skip_downloaded=None)
     cancel_event = threading.Event()
@@ -194,7 +194,7 @@ def test_downloader_fetch_metadata_and_cancel_event(monkeypatch):
 
 
 def test_apply_runtime_options_merges_resume_and_audio_bitrate():
-    from audiobookdl.pipeline import apply_runtime_options
+    from audiobookdl.pipeline import resolve_runtime_options
 
     cfg = Config(
         sources={},
@@ -205,14 +205,17 @@ def test_apply_runtime_options_merges_resume_and_audio_bitrate():
         audio_bitrate="192k",
     )
     opts = build_default_options()
-    apply_runtime_options(opts, cfg)
-    assert opts.resume is True
-    assert opts.audio_bitrate == "192k"
+    resolved = resolve_runtime_options(opts, cfg)
+    assert resolved.resume is True
+    assert resolved.audio_bitrate == "192k"
+    # Resolution is pure: the caller's options instance is not mutated
+    assert opts.resume is False
+    assert opts.audio_bitrate is None
 
     # Explicit "auto" option override beats config audio_bitrate
     opts_auto = build_default_options(audio_bitrate="auto")
-    apply_runtime_options(opts_auto, cfg)
-    assert opts_auto.audio_bitrate == "auto"
+    resolved_auto = resolve_runtime_options(opts_auto, cfg)
+    assert resolved_auto.audio_bitrate == "auto"
 
 
 def test_downloader_keyboard_interrupt_marks_cancelled_and_stops_batch(monkeypatch):
@@ -222,7 +225,7 @@ def test_downloader_keyboard_interrupt_marks_cancelled_and_stops_batch(monkeypat
         processed.append(url)
         raise KeyboardInterrupt
 
-    monkeypatch.setattr("audiobookdl.pipeline.process_url", fake_process_url)
+    monkeypatch.setattr("audiobookdl.pipeline.core.process_url", fake_process_url)
     cfg = Config(sources={}, output_template=None, database_directory=None, skip_downloaded=None)
     downloader = Downloader(cfg, build_default_options())
 
@@ -290,7 +293,7 @@ def test_download_cover_respects_output_template_and_creates_parents(tmp_path, m
 
 
 def test_apply_runtime_options_toml_fallback_and_explicit_override(tmp_path):
-    from audiobookdl.pipeline import apply_runtime_options
+    from audiobookdl.pipeline import resolve_runtime_options
 
     cfg = Config(
         sources={},
@@ -306,17 +309,17 @@ def test_apply_runtime_options_toml_fallback_and_explicit_override(tmp_path):
         timeout=30.0,
     )
     omitted_opts = build_default_options()
-    apply_runtime_options(omitted_opts, cfg)
-    assert omitted_opts.output_template == "{author}/{title}"
-    assert omitted_opts.database_directory == str(tmp_path / "custom_db")
-    assert omitted_opts.output_format == "m4b"
-    assert omitted_opts.combine is True
-    assert omitted_opts.skip_downloaded is True
-    assert omitted_opts.overwrite is True
-    assert omitted_opts.max_workers == 6
-    assert omitted_opts.book_delay == 0.5
-    assert omitted_opts.proxy == "http://127.0.0.1:9000"
-    assert omitted_opts.timeout == 30.0
+    resolved = resolve_runtime_options(omitted_opts, cfg)
+    assert resolved.output_template == "{author}/{title}"
+    assert resolved.database_directory == str(tmp_path / "custom_db")
+    assert resolved.output_format == "m4b"
+    assert resolved.combine is True
+    assert resolved.skip_downloaded is True
+    assert resolved.overwrite is True
+    assert resolved.max_workers == 6
+    assert resolved.book_delay == 0.5
+    assert resolved.proxy == "http://127.0.0.1:9000"
+    assert resolved.timeout == 30.0
 
     # Explicit overrides (even back to "{title}" or False) must win over config
     explicit_opts = build_default_options(
@@ -325,11 +328,11 @@ def test_apply_runtime_options_toml_fallback_and_explicit_override(tmp_path):
         skip_downloaded=False,
         overwrite=False,
     )
-    apply_runtime_options(explicit_opts, cfg)
-    assert explicit_opts.output_template == "{title}"
-    assert explicit_opts.combine is False
-    assert explicit_opts.skip_downloaded is False
-    assert explicit_opts.overwrite is False
+    resolved_explicit = resolve_runtime_options(explicit_opts, cfg)
+    assert resolved_explicit.output_template == "{title}"
+    assert resolved_explicit.combine is False
+    assert resolved_explicit.skip_downloaded is False
+    assert resolved_explicit.overwrite is False
 
 
 def test_series_summary_tracks_partial_failures(monkeypatch):
@@ -360,10 +363,10 @@ def test_series_summary_tracks_partial_failures(monkeypatch):
         def on_download_complete(self, _ab: Audiobook) -> None:
             pass
 
-    monkeypatch.setattr("audiobookdl.pipeline.find_compatible_source", lambda _url: _MixedSeriesSource)
+    monkeypatch.setattr("audiobookdl.pipeline.jobs.find_compatible_source", lambda _url: _MixedSeriesSource)
     downloaded: list[str] = []
     monkeypatch.setattr(
-        "audiobookdl.pipeline.process_audiobook",
+        "audiobookdl.pipeline.jobs.process_audiobook",
         lambda _s, ab, _o, **_kw: downloaded.append(ab.title),
     )
 
@@ -392,7 +395,7 @@ def test_download_archive_records_and_skips_repeat_downloads(tmp_path, monkeypat
     def fake_download(audiobook, opts, interaction=None, cancel_event=None):
         download_calls.append(audiobook.title)
 
-    monkeypatch.setattr("audiobookdl.pipeline.download", fake_download)
+    monkeypatch.setattr("audiobookdl.pipeline.jobs.download", fake_download)
 
     fake_source = MagicMock()
     fake_source.name = "librivox"
@@ -475,11 +478,11 @@ def test_resolve_redirect_url_fallback_and_prepare_source_result(tmp_path, monke
         raise NoSourceFound()
 
     monkeypatch.setattr(
-        "audiobookdl.pipeline.resolve_redirect_url",
+        "audiobookdl.pipeline.jobs.resolve_redirect_url",
         lambda url, **_kw: "https://librivox.org/the-time-machine",
     )
     monkeypatch.setattr(
-        "audiobookdl.pipeline.find_compatible_source",
+        "audiobookdl.pipeline.jobs.find_compatible_source",
         _find_compat,
     )
 
@@ -579,7 +582,7 @@ def test_verify_service_auth_caches_and_reloads_cookies(tmp_path, monkeypatch):
             loaded_paths.append(cookie_file)
             super().load_cookie_file(cookie_file)
 
-    monkeypatch.setattr("audiobookdl.pipeline.find_source_by_name", lambda _name: _CookieTestSource)
+    monkeypatch.setattr("audiobookdl.pipeline.auth.find_source_by_name", lambda _name: _CookieTestSource)
 
     cfg = Config(sources={}, output_template=None, database_directory=str(tmp_path), skip_downloaded=False)
     opts = build_default_options()
@@ -657,7 +660,7 @@ def test_search_service_librivox_and_list_service_library_storytel(tmp_path, mon
 
 
 def test_apply_runtime_options_media_type_precedence():
-    from audiobookdl.pipeline import apply_runtime_options
+    from audiobookdl.pipeline import resolve_runtime_options
 
     cfg = Config(
         sources={},
@@ -667,12 +670,12 @@ def test_apply_runtime_options_media_type_precedence():
         media_type="ebook",
     )
     opts_default = build_default_options()
-    apply_runtime_options(opts_default, cfg)
-    assert opts_default.media_type == "ebook"
+    resolved_default = resolve_runtime_options(opts_default, cfg)
+    assert resolved_default.media_type == "ebook"
 
     opts_explicit = build_default_options(media_type="both")
-    apply_runtime_options(opts_explicit, cfg)
-    assert opts_explicit.media_type == "both"
+    resolved_explicit = resolve_runtime_options(opts_explicit, cfg)
+    assert resolved_explicit.media_type == "both"
 
 
 def test_archive_distinguishes_ebook_and_audiobook_and_records_epub_format(tmp_path, monkeypatch):
@@ -837,8 +840,8 @@ def test_enrichment_and_updater_close_auto_sessions_and_process_isolates_source_
         enrich_metadata=True,
     )
     with (
-        patch("audiobookdl.pipeline.enrich_audiobook_metadata", side_effect=fake_enrich),
-        patch("audiobookdl.pipeline.download"),
+        patch("audiobookdl.pipeline.jobs.enrich_audiobook_metadata", side_effect=fake_enrich),
+        patch("audiobookdl.pipeline.jobs.download"),
     ):
         from audiobookdl.pipeline import process_audiobook
 
@@ -944,7 +947,7 @@ def test_explicit_none_download_archive_bypasses_reading_and_writing_downloads_d
         files=[AudiobookFile(url="https://ex.com/fresh.mp3", ext="mp3")],
     )
 
-    with patch("audiobookdl.pipeline.download") as mock_dl:
+    with patch("audiobookdl.pipeline.jobs.download") as mock_dl:
         # Must NOT skip pre-recorded entry when download_archive=None is explicitly passed
         assert process_audiobook(src, book, opts) is True
         # Must NOT insert new entry into downloads.db when download_archive=None is explicitly passed
@@ -1008,7 +1011,7 @@ def test_fetch_metadata_and_process_url_close_owned_source_sessions(tmp_path, mo
             )
 
     monkeypatch.setattr(
-        "audiobookdl.pipeline.prepare_source_result",
+        "audiobookdl.pipeline.jobs.prepare_source_result",
         lambda url, *_a, **_kw: (_MockSource(), _MockSource().download(url)),
     )
     opts = build_default_options(output_template=str(tmp_path / "{title}"), skip_downloaded=False)
@@ -1017,7 +1020,7 @@ def test_fetch_metadata_and_process_url_close_owned_source_sessions(tmp_path, mo
     fetch_metadata("https://example.com/book", opts, cfg)
     assert len(closed_flags) == 1
 
-    monkeypatch.setattr("audiobookdl.pipeline.download_result", lambda *_a, **_kw: None)
+    monkeypatch.setattr("audiobookdl.pipeline.jobs.download_result", lambda *_a, **_kw: None)
     process_url("https://example.com/book", opts, cfg)
     assert len(closed_flags) == 2
 
@@ -1027,17 +1030,16 @@ def test_post_exec_hook_injects_metadata_env_vars(tmp_path):
     from unittest.mock import patch
     from audiobookdl.pipeline import DEFAULT_POST_EXEC_TIMEOUT, run_post_exec_hook
 
-    # run_post_exec_hook injects AUDIOBOOK_DL_* environment variables and passes timeout/capture_output
+    # run_post_exec_hook injects AUDIOBOOK_DL_* environment variables and passes timeout/capture_stdout
     captured_env = {}
 
-    def fake_subproc_run(cmd, shell=False, env=None, check=False, **kwargs):
+    def fake_subproc_run(cmd, *, env=None, timeout=None, capture_stdout=False, **_kwargs):
         captured_env["cmd"] = cmd
-        captured_env["shell"] = shell
         captured_env["env"] = dict(env or {})
-        captured_env["kwargs"] = kwargs
-        return type("_R", (), {"returncode": 0, "stdout": "ok\n", "stderr": ""})()
+        captured_env["kwargs"] = {"timeout": timeout, "capture_stdout": capture_stdout}
+        return type("_R", (), {"returncode": 0, "stdout": b"ok\n", "stderr": b""})()
 
-    with patch("audiobookdl.pipeline.subprocess.run", side_effect=fake_subproc_run):
+    with patch("audiobookdl.pipeline.common.run_cancellable_subprocess", side_effect=fake_subproc_run):
         rc = run_post_exec_hook(
             "notify-hook",
             output_path=str(tmp_path / "Book.m4b"),
@@ -1045,10 +1047,9 @@ def test_post_exec_hook_injects_metadata_env_vars(tmp_path):
             audio_format="m4b",
         )
     assert rc == 0
-    assert captured_env["cmd"] == "notify-hook"
+    assert captured_env["cmd"][-1] == "notify-hook"
     assert captured_env["kwargs"]["timeout"] == DEFAULT_POST_EXEC_TIMEOUT
-    assert captured_env["kwargs"]["capture_output"] is True
-    assert captured_env["kwargs"]["text"] is True
+    assert captured_env["kwargs"]["capture_stdout"] is True
     assert captured_env["env"]["AUDIOBOOK_DL_TITLE"] == "Hook Book"
     assert captured_env["env"]["AUDIOBOOK_DL_AUTHOR"] == "Hook Author"
     assert captured_env["env"]["AUDIOBOOK_DL_FORMAT"] == "m4b"
@@ -1058,7 +1059,7 @@ def test_post_exec_hook_injects_metadata_env_vars(tmp_path):
     logged: list[str] = []
     with (
         patch(
-            "audiobookdl.pipeline.subprocess.run",
+            "audiobookdl.pipeline.common.run_cancellable_subprocess",
             side_effect=subprocess.TimeoutExpired("notify-hook", 1.5, stderr=b"hung"),
         ),
         patch("audiobookdl.pipeline.logging.error", side_effect=logged.append),
@@ -1078,8 +1079,8 @@ def test_post_exec_hook_injects_metadata_env_vars(tmp_path):
     logged.clear()
     with (
         patch(
-            "audiobookdl.pipeline.subprocess.run",
-            return_value=type("_R", (), {"returncode": 2, "stdout": "", "stderr": "boom"})(),
+            "audiobookdl.pipeline.common.run_cancellable_subprocess",
+            return_value=type("_R", (), {"returncode": 2, "stdout": b"", "stderr": b"boom"})(),
         ),
         patch("audiobookdl.pipeline.logging.error", side_effect=logged.append),
     ):
@@ -1242,8 +1243,8 @@ def test_process_audiobook_uses_custom_metadata_provider_from_config(tmp_path):
         enrich_providers="hardcover",
     )
     with (
-        patch("audiobookdl.pipeline.enrich_audiobook_metadata", side_effect=fake_enrich),
-        patch("audiobookdl.pipeline.download"),
+        patch("audiobookdl.pipeline.jobs.enrich_audiobook_metadata", side_effect=fake_enrich),
+        patch("audiobookdl.pipeline.jobs.download"),
     ):
         process_audiobook(src, book, opts, config=cfg)
 
@@ -1284,13 +1285,13 @@ def test_post_exec_hook_supports_argv_list_without_shell_and_blocks_disallowed_s
     from unittest.mock import patch
     from audiobookdl.pipeline import run_post_exec_hook
 
-    seen: list[tuple[object, bool]] = []
+    seen: list[object] = []
 
-    def fake_run(cmd, shell=False, **_kw):
-        seen.append((cmd, shell))
-        return type("_R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    def fake_run(cmd, **_kw):
+        seen.append(cmd)
+        return type("_R", (), {"returncode": 0, "stdout": b"", "stderr": b""})()
 
-    with patch("audiobookdl.pipeline.subprocess.run", side_effect=fake_run):
+    with patch("audiobookdl.pipeline.common.run_cancellable_subprocess", side_effect=fake_run):
         rc = run_post_exec_hook(
             ["notify-send", "Done"],
             output_path=str(tmp_path / "Book.m4b"),
@@ -1299,12 +1300,12 @@ def test_post_exec_hook_supports_argv_list_without_shell_and_blocks_disallowed_s
             allow_shell=False,
         )
     assert rc == 0
-    assert seen == [(["notify-send", "Done"], False)]
+    assert seen == [["notify-send", "Done"]]
 
     seen.clear()
     warnings: list[str] = []
     with (
-        patch("audiobookdl.pipeline.subprocess.run", side_effect=fake_run),
+        patch("audiobookdl.pipeline.common.run_cancellable_subprocess", side_effect=fake_run),
         patch("audiobookdl.pipeline.logging.warning", side_effect=warnings.append),
     ):
         rc_blocked = run_post_exec_hook(
@@ -1373,7 +1374,7 @@ def test_prepare_source_result_reauthenticates_once_on_expired_cached_cookies(tm
         skip_downloaded=False,
     )
     monkeypatch.setattr(
-        "audiobookdl.pipeline.find_compatible_source",
+        "audiobookdl.pipeline.jobs.find_compatible_source",
         lambda _url: _RetryAuthSource,
     )
 
@@ -1429,7 +1430,7 @@ def test_process_audiobook_skips_cross_source_duplicate_when_skip_downloaded(tmp
         )
 
     download_called = []
-    monkeypatch.setattr("audiobookdl.pipeline.download", lambda *a, **kw: download_called.append(True))
+    monkeypatch.setattr("audiobookdl.pipeline.jobs.download", lambda *a, **kw: download_called.append(True))
 
     book = Audiobook(
         session=requests.Session(),
@@ -1490,8 +1491,8 @@ def test_process_audiobook_override_chapters_passes_flags_to_enrichment_and_down
         override_chapters=True,
     )
     with (
-        patch("audiobookdl.pipeline.enrich_audiobook_metadata", side_effect=fake_enrich),
-        patch("audiobookdl.pipeline.download", side_effect=fake_download),
+        patch("audiobookdl.pipeline.jobs.enrich_audiobook_metadata", side_effect=fake_enrich),
+        patch("audiobookdl.pipeline.jobs.download", side_effect=fake_download),
     ):
         process_audiobook(src, book, opts)
 
@@ -1523,7 +1524,7 @@ def test_bulk_downloads_skip_unavailable_books_and_fail_on_auth_errors(monkeypat
         processed.append(url)
         kwargs["summary"].books_completed += 1
 
-    monkeypatch.setattr("audiobookdl.pipeline.process_url", fake_process_url)
+    monkeypatch.setattr("audiobookdl.pipeline.core.process_url", fake_process_url)
 
     # Multi-URL bulk run skips unavailable books and continues to later valid URLs
     summary = Downloader(cfg, build_default_options()).download(
@@ -1592,10 +1593,10 @@ def test_series_skips_inaccessible_and_missing_books(monkeypatch):
         def on_download_complete(self, _ab: Audiobook) -> None:
             pass
 
-    monkeypatch.setattr("audiobookdl.pipeline.find_compatible_source", lambda _url: _FakeSeriesSource)
+    monkeypatch.setattr("audiobookdl.pipeline.jobs.find_compatible_source", lambda _url: _FakeSeriesSource)
     downloaded: list[str] = []
     monkeypatch.setattr(
-        "audiobookdl.pipeline.process_audiobook",
+        "audiobookdl.pipeline.jobs.process_audiobook",
         lambda _s, ab, _o, **_kw: downloaded.append(ab.title) or True,
     )
 
@@ -1635,3 +1636,102 @@ def test_get_cookie_path_ignores_cwd_cookies_txt(tmp_path, monkeypatch):
     opts_with_file = build_default_options(cookie_file=str(opt_cookie))
     assert get_cookie_path(opts_with_file, src_cfg) == str(opt_cookie)
 
+
+
+def test_process_audiobook_skipped_outcome_returns_false_without_side_effects(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock
+
+    from audiobookdl.output.download import DownloadOutcome
+    from audiobookdl.pipeline import process_audiobook
+    from audiobookdl.utils.archive import DownloadArchive
+    from audiobookdl.utils.audiobook import AudiobookFile
+
+    archive_file = tmp_path / "ledger.db"
+    book = Audiobook(
+        session=requests.Session(),
+        metadata=AudiobookMetadata(title="Already Have", scrape_url="https://example.com/b/1"),
+        files=[AudiobookFile(url="https://example.com/1.mp3", ext="mp3")],
+    )
+    source = MagicMock()
+    source.name = "fakesource"
+    monkeypatch.setattr(
+        "audiobookdl.pipeline.jobs.download",
+        lambda *a, **k: DownloadOutcome(status="skipped", output_dir=str(tmp_path / "Already Have")),
+    )
+    opts = build_default_options(
+        download_archive=str(archive_file),
+        database_directory=str(tmp_path / "db"),
+        output_template=str(tmp_path / "{title}"),
+    )
+    cfg = Config(sources={}, output_template=None, database_directory=None, skip_downloaded=None)
+
+    assert process_audiobook(source, book, opts, config=cfg) is False
+    source.on_download_complete.assert_not_called()
+    assert DownloadArchive(str(archive_file)).list_entries() == []
+
+
+def test_downloader_isolates_unexpected_per_book_errors(monkeypatch):
+    calls: list[str] = []
+
+    def fake_process_url(url, _options, _config, summary=None, **_kwargs):
+        calls.append(url)
+        if "bad" in url:
+            raise ValueError("boom")
+        if summary is not None:
+            summary.books_completed += 1
+
+    monkeypatch.setattr("audiobookdl.pipeline.core.process_url", fake_process_url)
+    cfg = Config(sources={}, output_template=None, database_directory=None, skip_downloaded=None)
+
+    summary = Downloader(cfg, build_default_options()).download(
+        ["https://example.com/good1", "https://example.com/bad", "https://example.com/good2"]
+    )
+
+    assert calls == [
+        "https://example.com/good1",
+        "https://example.com/bad",
+        "https://example.com/good2",
+    ]
+    assert summary.completed == 2
+    assert summary.failed == 1
+    assert summary.books_completed == 2
+    assert summary.books_failed == 1
+    assert len(summary.book_errors) == 1
+    assert "boom" in summary.book_errors[0][1]
+
+
+def test_downloader_skip_unavailable_from_config_for_single_url(monkeypatch):
+    from audiobookdl.exceptions import BookNotFound
+
+    def fake_prepare_source_result(*_a, **_kw):
+        raise BookNotFound
+
+    monkeypatch.setattr("audiobookdl.pipeline.jobs.prepare_source_result", fake_prepare_source_result)
+    cfg = Config(
+        sources={},
+        output_template=None,
+        database_directory=None,
+        skip_downloaded=None,
+        skip_unavailable=True,
+    )
+
+    summary = Downloader(cfg, build_default_options()).download(["https://example.com/missing"])
+    assert summary.completed == 1
+    assert summary.failed == 0
+    assert summary.books_skipped == 1
+    assert summary.books_failed == 0
+
+    # Without config skip_unavailable, the same failure is recorded as a book failure
+    cfg_no_skip = Config(
+        sources={},
+        output_template=None,
+        database_directory=None,
+        skip_downloaded=None,
+        skip_unavailable=False,
+    )
+    summary_fail = Downloader(cfg_no_skip, build_default_options()).download(
+        ["https://example.com/missing"]
+    )
+    assert summary_fail.completed == 0
+    assert summary_fail.failed == 1
+    assert summary_fail.books_failed == 1

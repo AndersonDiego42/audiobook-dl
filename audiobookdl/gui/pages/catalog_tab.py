@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-import sqlite3
 import sys
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -1060,8 +1059,6 @@ class CatalogTab(ttk.Frame):
         def _worker() -> None:
             try:
                 resolved = list(resolver(service_key, books_snapshot))
-            except sqlite3.Error:
-                return
             except Exception:
                 return
             else:

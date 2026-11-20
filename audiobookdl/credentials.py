@@ -1,12 +1,12 @@
 from abc import ABC, abstractmethod
 import base64
-import ctypes
-from ctypes import wintypes
 import json
 import os
 from typing import Any
 
 from audiobookdl import logging
+from audiobookdl.utils._win32 import dpapi_protect as _dpapi_protect
+from audiobookdl.utils._win32 import dpapi_unprotect as _dpapi_unprotect
 from audiobookdl.utils.fs import atomic_write_text, file_lock
 
 
@@ -15,7 +15,6 @@ _PLAINTEXT_OPT_IN_ENV_ALIASES = (
     PLAINTEXT_OPT_IN_ENV,
     "AUDIOBOOKDL_ALLOW_PLAINTEXT_CREDENTIALS",
 )
-_CRYPTPROTECT_UI_FORBIDDEN = 0x1
 _OAUTH_KEY_SUFFIX = "#oauth"
 _OAUTH_USERNAME = "__oauth_token__"
 
@@ -77,112 +76,8 @@ class CredentialStore(ABC):
         return set()
 
 
-class _DataBlob(ctypes.Structure):
-    _fields_ = [
-        ("cbData", wintypes.DWORD),
-        ("pbData", ctypes.POINTER(ctypes.c_ubyte)),
-    ]
-
-
-def _make_blob(data: bytes) -> tuple[_DataBlob, ctypes.Array | None]:
-    if not data:
-        return _DataBlob(0, None), None
-    buf = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
-    return _DataBlob(len(data), buf), buf
-
-
 def _dpapi_entropy(service_key: str, username: str | None) -> bytes:
     return f"audiobook-dl\0{service_key}\0{username or ''}".encode()
-
-
-def _dpapi_protect(plaintext: bytes, entropy: bytes) -> bytes:
-    windll: Any = getattr(ctypes, "windll", None)
-    if windll is None:
-        raise OSError("Windows DPAPI is unavailable on this platform")
-    crypt32 = windll.crypt32
-    kernel32 = windll.kernel32
-    win_error: Any = getattr(ctypes, "WinError", OSError)
-    crypt32.CryptProtectData.argtypes = [
-        ctypes.POINTER(_DataBlob),
-        wintypes.LPCWSTR,
-        ctypes.POINTER(_DataBlob),
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        ctypes.POINTER(_DataBlob),
-    ]
-    crypt32.CryptProtectData.restype = wintypes.BOOL
-    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
-    kernel32.LocalFree.restype = wintypes.HLOCAL
-
-    in_blob, _in_buf = _make_blob(plaintext)
-    entropy_blob, _ent_buf = _make_blob(entropy)
-    out_blob = _DataBlob()
-    ok = crypt32.CryptProtectData(
-        ctypes.byref(in_blob),
-        "audiobook-dl",
-        ctypes.byref(entropy_blob),
-        None,
-        None,
-        _CRYPTPROTECT_UI_FORBIDDEN,
-        ctypes.byref(out_blob),
-    )
-    if not ok:
-        raise win_error()
-    try:
-        return bytes(
-            ctypes.cast(
-                out_blob.pbData,
-                ctypes.POINTER(ctypes.c_ubyte * out_blob.cbData),
-            ).contents
-        )
-    finally:
-        kernel32.LocalFree(out_blob.pbData)
-
-
-def _dpapi_unprotect(ciphertext: bytes, entropy: bytes) -> bytes:
-    windll: Any = getattr(ctypes, "windll", None)
-    if windll is None:
-        raise OSError("Windows DPAPI is unavailable on this platform")
-    crypt32 = windll.crypt32
-    kernel32 = windll.kernel32
-    win_error: Any = getattr(ctypes, "WinError", OSError)
-    crypt32.CryptUnprotectData.argtypes = [
-        ctypes.POINTER(_DataBlob),
-        ctypes.POINTER(wintypes.LPWSTR),
-        ctypes.POINTER(_DataBlob),
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        ctypes.POINTER(_DataBlob),
-    ]
-    crypt32.CryptUnprotectData.restype = wintypes.BOOL
-    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
-    kernel32.LocalFree.restype = wintypes.HLOCAL
-
-    in_blob, _in_buf = _make_blob(ciphertext)
-    entropy_blob, _ent_buf = _make_blob(entropy)
-    out_blob = _DataBlob()
-    ok = crypt32.CryptUnprotectData(
-        ctypes.byref(in_blob),
-        None,
-        ctypes.byref(entropy_blob),
-        None,
-        None,
-        _CRYPTPROTECT_UI_FORBIDDEN,
-        ctypes.byref(out_blob),
-    )
-    if not ok:
-        raise win_error()
-    try:
-        return bytes(
-            ctypes.cast(
-                out_blob.pbData,
-                ctypes.POINTER(ctypes.c_ubyte * out_blob.cbData),
-            ).contents
-        )
-    finally:
-        kernel32.LocalFree(out_blob.pbData)
 
 
 class DpapiCredentialStore(CredentialStore):
@@ -313,10 +208,6 @@ class KeyringCredentialStore(CredentialStore):
     def _write_index(self, entries: dict[str, str | None]) -> None:
         if not self.index_path:
             return
-        if not entries:
-            if os.path.exists(self.index_path):
-                os.remove(self.index_path)
-            return
         atomic_write_text(
             self.index_path,
             json.dumps({"version": 1, "entries": entries}, indent=2),
@@ -348,21 +239,23 @@ class KeyringCredentialStore(CredentialStore):
                 self._write_index(entries)
 
     def delete_password(self, service_key: str, username: str | None) -> None:
-        try:
-            self._keyring.delete_password(
-                self._SERVICE_NAME,
-                self._account_key(service_key, username),
-            )
-        except Exception as exc:
-            logging.debug(f"Keyring delete ignored for '{service_key}': {exc}")
+        account_keys = {self._account_key(service_key, username)}
         if self.index_path:
             with file_lock(self.index_path):
                 entries = self._read_index()
                 if service_key in entries and (
                     username is None or entries.get(service_key) == username
                 ):
+                    account_keys.add(
+                        self._account_key(service_key, entries.get(service_key))
+                    )
                     entries.pop(service_key, None)
                     self._write_index(entries)
+        for account_key in account_keys:
+            try:
+                self._keyring.delete_password(self._SERVICE_NAME, account_key)
+            except Exception as exc:
+                logging.debug(f"Keyring delete ignored for '{service_key}': {exc}")
 
     def stored_services(self) -> dict[str, str | None]:
         if not self.index_path:
@@ -532,6 +425,12 @@ def get_keyring_index_path(config_location: str) -> str:
     return os.path.join(config_dir, "credentials.keyring.json")
 
 
+def get_plaintext_vault_path(config_location: str) -> str:
+    """Return path to the persisted plaintext-fallback vault beside `config_location`."""
+    config_dir = os.path.dirname(os.path.abspath(config_location))
+    return os.path.join(config_dir, "credentials.plaintext.json")
+
+
 def get_credential_store(
     config_location: str,
     allow_plaintext: bool | None = None,
@@ -553,4 +452,7 @@ def get_credential_store(
             os.environ.get(env_name, "").strip().lower() in ("1", "true", "yes")
             for env_name in _PLAINTEXT_OPT_IN_ENV_ALIASES
         )
-    return PlaintextFallbackCredentialStore(allow_plaintext=allow_plaintext)
+    return PlaintextFallbackCredentialStore(
+        allow_plaintext=allow_plaintext,
+        vault_path=get_plaintext_vault_path(config_location),
+    )

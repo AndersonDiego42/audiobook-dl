@@ -179,7 +179,7 @@ def test_abs_config_persistence_and_client_upload_scan(tmp_path):
 
 
 def test_pipeline_process_audiobook_triggers_abs_sync(tmp_path, monkeypatch):
-    monkeypatch.setattr("audiobookdl.pipeline.download", lambda *a, **kw: None)
+    monkeypatch.setattr("audiobookdl.pipeline.jobs.download", lambda *a, **kw: None)
     fake_abs_session = _FakeAbsSession()
 
     class _Src:
@@ -256,7 +256,7 @@ def test_gui_abs_dialog_saves_settings(tmp_path):
         cfg_path = tmp_path / "audiobook-dl.toml"
         cfg_path.write_text("", encoding="utf-8")
         app = AudiobookDLApp(root, config_location=str(cfg_path))
-        with patch("audiobookdl.gui.controller.save_audiobookshelf_config") as mock_save:
+        with patch("audiobookdl.gui.config_store.save_audiobookshelf_config") as mock_save:
             page = app.navigate("settings")
             page._url_var.set("https://abs.myhost.tld/")
             page._token_var.set("tok-123")
@@ -369,6 +369,57 @@ def test_multipart_upload_stream_computes_exact_length_and_streams_chunks(tmp_pa
     assert b"--test-boundary-123--\r\n" in assembled
 
 
+def test_multipart_upload_stream_reset_invokes_on_reset(tmp_path):
+    from audiobookdl.integrations.audiobookshelf import _MultipartUploadStream
+
+    audio = tmp_path / "book.m4b"
+    audio.write_bytes(b"x" * 1000)
+    resets = []
+    stream = _MultipartUploadStream(
+        {"library": "lib-1"},
+        [("0", str(audio))],
+        on_reset=lambda: resets.append(1),
+    )
+    try:
+        stream.read(64)
+        stream.reset()
+        assert resets == [1]
+    finally:
+        stream.close()
+
+
+def test_upload_book_resets_progress_counters_on_retry(tmp_path):
+    audio = tmp_path / "book.m4b"
+    audio.write_bytes(b"audio-bytes" * 40000)  # ~440 KB
+    sent_values: list[int] = []
+    attempts = {"count": 0}
+
+    class FlakyAbsSession(_FakeAbsSession):
+        def request(self, method, url, headers=None, json=None, data=None, files=None, timeout=None):
+            if url.endswith("/api/upload"):
+                attempts["count"] += 1
+                if attempts["count"] == 1 and hasattr(data, "read"):
+                    data.read(100_000)  # partial send before the failure
+                    return _MockResponse(503, text="busy")
+            return super().request(
+                method, url, headers=headers, json=json, data=data, files=files, timeout=timeout
+            )
+
+    session = FlakyAbsSession()
+    client = AudiobookshelfClient("https://abs.example.com", "tok", session=session)
+    meta = AudiobookMetadata(title="Retry Book")
+    ok = client.upload_book(
+        str(audio),
+        library_id="lib-1",
+        metadata=meta,
+        on_progress=lambda sent, total: sent_values.append(sent),
+    )
+    assert ok is True
+    assert attempts["count"] == 2
+    # The retried attempt restarts `sent` near zero, so progress values decrease.
+    assert any(cur < prev for prev, cur in zip(sent_values, sent_values[1:], strict=False))
+
+
 def test_collect_upload_files_shared_directory_uses_stem_sidecars_only(tmp_path):
     client = AudiobookshelfClient("https://abs.example.com", "tok")
 
@@ -423,7 +474,7 @@ def test_abs_upload_retries_transient_503_tracks_progress_skips_duplicate_and_we
     from audiobookdl.integrations import audiobookshelf as abs_mod
     from audiobookdl.output.metadata.sidecars import build_opf_xml
 
-    monkeypatch.setattr(abs_mod.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(abs_mod, "sleep_or_cancel", lambda _d, _e=None: None)
     book_file = tmp_path / "RetryBook.m4b"
     book_file.write_bytes(b"M4B-DATA-" * 100)
 

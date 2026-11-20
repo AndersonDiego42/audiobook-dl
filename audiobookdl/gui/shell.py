@@ -86,11 +86,9 @@ class SidebarShell(ttk.Frame):
         progress_var: tk.DoubleVar,
         on_toggle_pause: Callable[[], None],
         on_cancel: Callable[[], None],
-        on_page_changed: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__(parent)
         self._palette_provider = palette_provider
-        self._on_page_changed = on_page_changed
         self._factories: dict[str, Callable[[ttk.Frame], ttk.Frame]] = {}
         self._pages: dict[str, ttk.Frame] = {}
         self._nav_buttons: dict[str, ttk.Button] = {}
@@ -481,8 +479,6 @@ class SidebarShell(ttk.Frame):
         if callable(on_show):
             on_show()
         self._refresh_nav_header()
-        if self._on_page_changed is not None:
-            self._on_page_changed(route.page_id)
         return page
 
     def set_download_badge(self, active_count: int, failed_count: int) -> None:

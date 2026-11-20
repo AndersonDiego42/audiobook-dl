@@ -354,11 +354,11 @@ class UrlInputCoordinator:
         try:
             target.drop_target_register("DND_Text", "DND_Files")
             target.dnd_bind("<<Drop>>", _handler)
-        except Exception:
+        except tk.TclError:
             try:
                 target.drop_target_register("DND_Text")
                 target.dnd_bind("<<Drop>>", _handler)
-            except Exception:
+            except tk.TclError:
                 pass
 
     def install_root_drop(self) -> None:

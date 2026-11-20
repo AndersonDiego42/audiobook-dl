@@ -593,10 +593,10 @@ class ChapterEditorFrame(ttk.Frame):
             try:
                 proc.terminate()
                 proc.wait(timeout=1.0)
-            except Exception:
+            except (OSError, subprocess.SubprocessError):
                 try:
                     proc.kill()
-                except Exception:
+                except (OSError, subprocess.SubprocessError):
                     pass
         try:
             if self.winfo_exists():
@@ -860,7 +860,7 @@ class ChapterEditorFrame(ttk.Frame):
             return
         try:
             loaded = parse_chapters_from_file(path)
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             messagebox.showerror("Import Failed", str(exc), parent=self)
             return
         if not loaded:
@@ -897,5 +897,5 @@ class ChapterEditorFrame(ttk.Frame):
             return
         try:
             export_chapters_to_file(path, self._chapters)
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             messagebox.showerror("Export Failed", str(exc), parent=self)

@@ -492,11 +492,6 @@ def _configure_clam_palette(
     style.configure("Banner.TFrame", background=palette.surface_alt, bordercolor=palette.warning)
     style.configure("Banner.TLabel", background=palette.surface_alt, foreground=palette.warning)
     style.configure(
-        "BannerMuted.TLabel",
-        background=palette.surface_alt,
-        foreground=palette.fg_secondary,
-    )
-    style.configure(
         "Chip.TButton",
         background=palette.surface_alt,
         foreground=palette.fg_secondary,

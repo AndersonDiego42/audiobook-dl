@@ -1,13 +1,20 @@
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
 import os
-import subprocess
+import threading
 from typing import Literal, Protocol
 
 from Crypto.Cipher import AES, ChaCha20, ChaCha20_Poly1305
 from Crypto.Util.Padding import unpad
 
-from audiobookdl.exceptions import GenericAudiobookDLException, MissingDependency
-from audiobookdl.utils import find_executable, subprocess_kwargs
+from audiobookdl import logging
+from audiobookdl.exceptions import (
+    DownloadCancelled,
+    GenericAudiobookDLException,
+    MissingDependency,
+)
+from audiobookdl.utils import find_executable
+from audiobookdl.utils.concurrency import run_cancellable_subprocess
+from audiobookdl.utils.fs import replace_with_retry
 from audiobookdl.utils.audiobook import (
     AESCBCEncryption,
     AESCTREncryption,
@@ -21,6 +28,20 @@ from audiobookdl.utils.audiobook import (
 from audiobookdl.utils.pssh import extract_cenc_kids_safe, read_mp4_init_boxes
 
 DECRYPT_CHUNK_SIZE = 64 * 1024  # 64 KiB, an exact multiple of AES's 16-byte block size
+
+
+def _resolve_cancel_event(cancel_event: threading.Event | None) -> threading.Event | None:
+    """Return `cancel_event`, falling back to the active `JobContext` cancel event."""
+    if cancel_event is not None:
+        return cancel_event
+    ctx = logging.get_job_context()
+    return ctx.cancel_event if ctx is not None else None
+
+
+def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
+    ev = _resolve_cancel_event(cancel_event)
+    if ev is not None and ev.is_set():
+        raise DownloadCancelled
 AEAD_TAG_SIZE = 16
 TS_PACKET_SIZE = 188
 TS_SYNC_BYTE = 0x47
@@ -442,12 +463,11 @@ def _parse_ts_psi_section(pkt: bytes) -> bytes | None:
     return pkt[sec_start:sec_end]
 
 
-def _parse_pmt_streams(ts_data: bytes) -> dict[int, int]:
-    """Extract `{elementary_pid: stream_type}` from PAT and PMT in an MPEG-TS buffer."""
+def _parse_pmt_streams(packets: Iterable[bytes]) -> dict[int, int]:
+    """Extract `{elementary_pid: stream_type}` from PAT and PMT across TS packets."""
     pmt_pids: set[int] = set()
     elem_streams: dict[int, int] = {}
-    for pkt_offset in range(0, len(ts_data), TS_PACKET_SIZE):
-        pkt = ts_data[pkt_offset : pkt_offset + TS_PACKET_SIZE]
+    for pkt in packets:
         pid = ((pkt[1] & 0x1F) << 8) | pkt[2]
         if pid == 0x0000:
             sec = _parse_ts_psi_section(pkt)
@@ -478,6 +498,79 @@ def _parse_pmt_streams(ts_data: bytes) -> dict[int, int]:
     return elem_streams
 
 
+def _iter_ts_data_packets(ts_data: bytes) -> Iterator[bytes]:
+    for off in range(0, len(ts_data), TS_PACKET_SIZE):
+        yield ts_data[off : off + TS_PACKET_SIZE]
+
+
+def _iter_ts_file_packets(src) -> Iterator[bytes]:
+    """Yield validated 188-byte TS packets from a binary file object."""
+    offset = 0
+    while True:
+        pkt = src.read(TS_PACKET_SIZE)
+        if not pkt:
+            return
+        if len(pkt) != TS_PACKET_SIZE:
+            raise ValueError(
+                f"MPEG-TS stream length must be a multiple of {TS_PACKET_SIZE} bytes"
+            )
+        if pkt[0] != TS_SYNC_BYTE:
+            raise ValueError(f"Invalid MPEG-TS sync byte at offset {offset}")
+        offset += TS_PACKET_SIZE
+        yield pkt
+
+
+def _decrypt_ts_packet_stream(
+    packets: Iterable[bytes],
+    elem_streams: dict[int, int],
+    key: bytes,
+    iv: bytes,
+) -> Iterator[bytearray]:
+    """Yield decrypted 188-byte TS packets, buffering at most one PES per encrypted PID."""
+    pending: dict[int, list[tuple[bytearray, int, int]]] = {pid: [] for pid in elem_streams}
+
+    def _commit(pid: int) -> list[bytearray]:
+        entries = pending[pid]
+        if not entries:
+            return []
+        pes = bytearray()
+        for pkt, start, end in entries:
+            pes.extend(pkt[start:end])
+        if len(pes) >= 9 and pes[:3] == b"\x00\x00\x01":
+            pes_header_len = 9 + pes[8]
+            if pes_header_len < len(pes):
+                decrypted_es = _decrypt_sample_aes_elementary(
+                    elem_streams[pid],
+                    bytes(pes[pes_header_len:]),
+                    key,
+                    iv,
+                )
+                pes[pes_header_len:] = decrypted_es
+                cursor = 0
+                for pkt, start, end in entries:
+                    span = end - start
+                    pkt[start:end] = pes[cursor : cursor + span]
+                    cursor += span
+        committed = [pkt for pkt, _, _ in entries]
+        entries.clear()
+        return committed
+
+    for raw_pkt in packets:
+        pkt = bytearray(raw_pkt)
+        pid = ((pkt[1] & 0x1F) << 8) | pkt[2]
+        if pid in elem_streams:
+            bounds = _extract_ts_payload_slice(pkt)
+            if bounds is not None:
+                if pkt[1] & 0x40:
+                    yield from _commit(pid)
+                pending[pid].append((pkt, bounds[0], bounds[1]))
+                continue
+        yield pkt
+
+    for pid in elem_streams:
+        yield from _commit(pid)
+
+
 def decrypt_mpegts_sample_aes(ts_data: bytes, key: bytes, iv: bytes) -> bytes:
     """Decrypt an HLS `SAMPLE-AES` MPEG-TS segment in-place over TS packet payloads."""
     if len(key) != 16:
@@ -495,52 +588,15 @@ def decrypt_mpegts_sample_aes(ts_data: bytes, key: bytes, iv: bytes) -> bytes:
         if ts_data[pkt_offset] != TS_SYNC_BYTE:
             raise ValueError(f"Invalid MPEG-TS sync byte at offset {pkt_offset}")
 
-    elem_streams = _parse_pmt_streams(ts_data)
+    elem_streams = _parse_pmt_streams(_iter_ts_data_packets(ts_data))
     if not elem_streams:
         return ts_data
 
-    out = bytearray(ts_data)
-    pes_slices: dict[int, list[tuple[int, int]]] = {pid: [] for pid in elem_streams}
-
-    def _commit_pes(pid: int) -> None:
-        slices = pes_slices[pid]
-        if not slices:
-            return
-        pes = bytearray()
-        for start, end in slices:
-            pes.extend(out[start:end])
-        if len(pes) >= 9 and pes[:3] == b"\x00\x00\x01":
-            pes_header_len = 9 + pes[8]
-            if pes_header_len < len(pes):
-                decrypted_es = _decrypt_sample_aes_elementary(
-                    elem_streams[pid],
-                    bytes(pes[pes_header_len:]),
-                    key,
-                    iv,
-                )
-                pes[pes_header_len:] = decrypted_es
-                cursor = 0
-                for start, end in slices:
-                    span = end - start
-                    out[start:end] = pes[cursor : cursor + span]
-                    cursor += span
-        slices.clear()
-
-    for pkt_offset in range(0, len(out), TS_PACKET_SIZE):
-        pkt = bytes(out[pkt_offset : pkt_offset + TS_PACKET_SIZE])
-        pid = ((pkt[1] & 0x1F) << 8) | pkt[2]
-        if pid not in elem_streams:
-            continue
-        bounds = _extract_ts_payload_slice(pkt)
-        if bounds is None:
-            continue
-        if pkt[1] & 0x40:
-            _commit_pes(pid)
-        rel_start, rel_end = bounds
-        pes_slices[pid].append((pkt_offset + rel_start, pkt_offset + rel_end))
-
-    for pid in elem_streams:
-        _commit_pes(pid)
+    out = bytearray()
+    for pkt in _decrypt_ts_packet_stream(
+        _iter_ts_data_packets(ts_data), elem_streams, key, iv
+    ):
+        out.extend(pkt)
     return bytes(out)
 
 
@@ -551,20 +607,46 @@ def decrypt_file_sample_aes(
     output_path: str | None = None,
     *,
     prefix: bytes = b"",
+    cancel_event: threading.Event | None = None,
 ) -> None:
-    """Decrypt an MPEG-TS `SAMPLE-AES` file atomically via a sibling temp file."""
+    """Decrypt an MPEG-TS `SAMPLE-AES` file atomically via a sibling temp file.
+
+    Streams 188-byte TS packets in two passes (PAT/PMT scan, then decrypt) so
+    memory stays bounded by the largest PES rather than the whole file.
+    """
+    if len(key) != 16:
+        raise ValueError(f"SAMPLE-AES key must be 16 bytes (got {len(key)})")
+    if len(iv) != AES.block_size:
+        raise ValueError(f"SAMPLE-AES IV must be {AES.block_size} bytes (got {len(iv)})")
+    _raise_if_cancelled(cancel_event)
     target = output_path or path
     tmp_path = f"{target}.dec.tmp"
     try:
         with open(path, "rb") as src:
-            raw = src.read()
-        decrypted = decrypt_mpegts_sample_aes(raw, key, iv)
-        with open(tmp_path, "wb") as dst:
-            if prefix:
-                dst.write(prefix)
-            if decrypted:
-                dst.write(decrypted)
-        os.replace(tmp_path, target)
+            elem_streams = _parse_pmt_streams(_iter_ts_file_packets(src))
+            src.seek(0)
+            _raise_if_cancelled(cancel_event)
+            with open(tmp_path, "wb") as dst:
+                if prefix:
+                    dst.write(prefix)
+                if elem_streams:
+                    packet_count = 0
+                    for pkt in _decrypt_ts_packet_stream(
+                        _iter_ts_file_packets(src), elem_streams, key, iv
+                    ):
+                        dst.write(pkt)
+                        packet_count += 1
+                        if packet_count % 512 == 0:
+                            _raise_if_cancelled(cancel_event)
+                else:
+                    while True:
+                        _raise_if_cancelled(cancel_event)
+                        chunk = src.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+        _raise_if_cancelled(cancel_event)
+        replace_with_retry(tmp_path, target)
     except BaseException:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -599,6 +681,7 @@ def decrypt_file_cenc(
     output_path: str | None = None,
     *,
     prefix: bytes = b"",
+    cancel_event: threading.Event | None = None,
 ) -> None:
     """Decrypt an ISO BMFF CENC/cbcs MP4 or fMP4 file using FFmpeg and replace atomically."""
     ffmpeg = find_executable("ffmpeg")
@@ -624,6 +707,7 @@ def decrypt_file_cenc(
             with open(combined_in, "wb") as dst, open(path, "rb") as src:
                 dst.write(prefix)
                 while True:
+                    _raise_if_cancelled(cancel_event)
                     chunk = src.read(DECRYPT_CHUNK_SIZE)
                     if not chunk:
                         break
@@ -643,13 +727,19 @@ def decrypt_file_cenc(
             "mp4",
             tmp_out,
         ]
-        result = subprocess.run(command, capture_output=True, text=True, **subprocess_kwargs())
+        result = run_cancellable_subprocess(
+            command,
+            cancel_event=_resolve_cancel_event(cancel_event),
+            capture_stdout=True,
+        )
         if result.returncode != 0:
-            detail = (result.stderr or result.stdout or "").strip()
+            stderr_txt = (result.stderr or b"").decode("utf-8", errors="replace")
+            stdout_txt = (result.stdout or b"").decode("utf-8", errors="replace")
+            detail = (stderr_txt or stdout_txt).strip()
             raise GenericAudiobookDLException(
                 f"FFmpeg CENC decryption failed{f': {detail}' if detail else ''}"
             )
-        os.replace(tmp_out, target)
+        replace_with_retry(tmp_out, target)
     except BaseException:
         if os.path.exists(tmp_out):
             os.remove(tmp_out)
@@ -668,6 +758,7 @@ def _decrypt_file_stream(
     output_path: str | None = None,
     *,
     prefix: bytes = b"",
+    cancel_event: threading.Event | None = None,
 ) -> None:
     """Stream-decrypt a file via a sibling temp file and replace atomically."""
     target = output_path or path
@@ -677,6 +768,7 @@ def _decrypt_file_stream(
             if prefix:
                 dst.write(prefix)
             while True:
+                _raise_if_cancelled(cancel_event)
                 chunk = src.read(DECRYPT_CHUNK_SIZE)
                 if not chunk:
                     break
@@ -686,7 +778,7 @@ def _decrypt_file_stream(
             tail = decryptor.finalize()
             if tail:
                 dst.write(tail)
-        os.replace(tmp_path, target)
+        replace_with_retry(tmp_path, target)
     except BaseException:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -699,11 +791,18 @@ def decrypt_file(
     output_path: str | None = None,
     *,
     prefix: bytes = b"",
+    cancel_event: threading.Event | None = None,
 ) -> None:
     """Decrypt encrypted file in place, or atomically into `output_path` when provided."""
     decryptor = create_stream_decryptor(encryption_method)
     if decryptor is not None:
-        _decrypt_file_stream(path, decryptor, output_path=output_path, prefix=prefix)
+        _decrypt_file_stream(
+            path,
+            decryptor,
+            output_path=output_path,
+            prefix=prefix,
+            cancel_event=cancel_event,
+        )
         return
     if isinstance(encryption_method, SampleAESEncryption):
         decrypt_file_sample_aes(
@@ -712,6 +811,7 @@ def decrypt_file(
             encryption_method.iv,
             output_path=output_path,
             prefix=prefix,
+            cancel_event=cancel_event,
         )
         return
     if isinstance(encryption_method, CENCDecryption):
@@ -720,6 +820,7 @@ def decrypt_file(
             encryption_method,
             output_path=output_path,
             prefix=prefix,
+            cancel_event=cancel_event,
         )
         return
     raise ValueError(f"Unsupported encryption method: {type(encryption_method).__name__}")

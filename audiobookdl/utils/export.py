@@ -10,7 +10,7 @@ from collections.abc import Sequence
 
 from audiobookdl.exceptions import GenericAudiobookDLException
 from audiobookdl.utils.archive import ArchiveEntry
-from audiobookdl.utils.fs import atomic_write_text
+from audiobookdl.utils.fs import atomic_write_text, replace_with_retry
 
 _FORMULA_PREFIXES = ("=", "+", "-", "@")
 
@@ -155,7 +155,7 @@ def export_library_entries(
         os.close(fd)
         try:
             workbook.save(tmp_path)
-            os.replace(tmp_path, abs_path)
+            replace_with_retry(tmp_path, abs_path)
         except Exception:
             try:
                 if os.path.exists(tmp_path):

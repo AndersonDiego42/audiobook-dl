@@ -4,18 +4,19 @@ from collections.abc import Callable, Mapping, Sequence
 import io
 import mimetypes
 import os
-import time
+import threading
 from typing import Any, IO
 from urllib.parse import quote as url_quote
 import uuid
 import requests
 
 from audiobookdl import logging
-from audiobookdl.exceptions import AudiobookDLException
+from audiobookdl.exceptions import AudiobookDLException, DownloadCancelled
 from audiobookdl.utils.audiobook import AudiobookMetadata
 from audiobookdl.utils.http import (
     DEFAULT_HTTP_TIMEOUT,
     create_configured_http_session,
+    sleep_or_cancel,
     warn_if_insecure_token_url,
 )
 
@@ -75,8 +76,12 @@ class _MultipartUploadStream(io.RawIOBase):
         *,
         boundary: str | None = None,
         on_bytes: Callable[[int], None] | None = None,
+        on_reset: Callable[[], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         self.boundary = boundary or f"----audiobookdl-{uuid.uuid4().hex}"
+        self._cancel_event = cancel_event
+        self._on_reset = on_reset
         self._segments: list[bytes | str] = []
         total_len = 0
         b_bytes = self.boundary.encode("ascii")
@@ -126,6 +131,8 @@ class _MultipartUploadStream(io.RawIOBase):
         self._close_active_file()
         self._seg_index = 0
         self._seg_offset = 0
+        if self._on_reset is not None:
+            self._on_reset()
 
     def __len__(self) -> int:
         return self._total_len
@@ -149,6 +156,8 @@ class _MultipartUploadStream(io.RawIOBase):
             return b""
         if size == 0:
             return b""
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise DownloadCancelled
         chunks: list[bytes] = []
         remaining = size if size is not None and size > 0 else None
 
@@ -196,6 +205,7 @@ class AudiobookshelfClient:
         session: requests.Session | None = None,
         proxy: str | None = None,
         timeout: Any = DEFAULT_HTTP_TIMEOUT,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         self.base_url = _normalize_base_url(base_url)
         if not self.base_url:
@@ -220,6 +230,13 @@ class AudiobookshelfClient:
             self._owns_session = False
             self.session = session
         self.timeout = timeout
+        self._cancel_event = cancel_event
+
+    def _effective_cancel_event(self) -> threading.Event | None:
+        if self._cancel_event is not None:
+            return self._cancel_event
+        ctx = logging.get_job_context()
+        return ctx.cancel_event if ctx is not None else None
 
     def close(self) -> None:
         if self._owns_session:
@@ -249,8 +266,11 @@ class AudiobookshelfClient:
         attempts = max(1, (max_retries + 1) if can_retry else 1)
         last_exc: requests.RequestException | None = None
         resp: requests.Response | None = None
+        cancel_event = self._effective_cancel_event()
 
         for attempt in range(attempts):
+            if cancel_event is not None and cancel_event.is_set():
+                raise DownloadCancelled
             if attempt > 0 and hasattr(data, "reset"):
                 data.reset()
             try:
@@ -266,13 +286,17 @@ class AudiobookshelfClient:
             except requests.RequestException as exc:
                 last_exc = exc
                 if attempt + 1 < attempts:
-                    time.sleep(min(4.0, 0.5 * (2 ** attempt)))
+                    sleep_or_cancel(min(4.0, 0.5 * (2 ** attempt)), cancel_event)
                     continue
                 raise AudiobookshelfError(
                     f"Audiobookshelf request failed ({method} {path}): {exc}"
                 ) from exc
             if resp.status_code in self._RETRIABLE_STATUS_CODES and attempt + 1 < attempts:
-                time.sleep(min(4.0, 0.5 * (2 ** attempt)))
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                sleep_or_cancel(min(4.0, 0.5 * (2 ** attempt)), cancel_event)
                 continue
             break
 
@@ -446,6 +470,7 @@ class AudiobookshelfClient:
         folder_id: str | None = None,
         on_progress: Callable[[int, int], None] | None = None,
         skip_if_exists: bool = False,
+        cancel_event: threading.Event | None = None,
     ) -> bool:
         """Upload local audiobook files and sidecars via `POST /api/upload`."""
         if not library_id.strip():
@@ -472,6 +497,10 @@ class AudiobookshelfClient:
         uploaded_bytes = 0
         total_len = 0
 
+        def _reset_bytes() -> None:
+            nonlocal uploaded_bytes
+            uploaded_bytes = 0
+
         def _track_bytes(delta: int) -> None:
             nonlocal uploaded_bytes
             uploaded_bytes += delta
@@ -482,6 +511,8 @@ class AudiobookshelfClient:
             form_data,
             file_entries,
             on_bytes=_track_bytes if on_progress is not None else None,
+            on_reset=_reset_bytes if on_progress is not None else None,
+            cancel_event=cancel_event,
         )
         total_len = len(stream)
         if on_progress is not None and total_len > 0:
@@ -511,6 +542,7 @@ def sync_book_to_audiobookshelf(
     proxy: str | None = None,
     timeout: Any = DEFAULT_HTTP_TIMEOUT,
     skip_if_exists: bool = False,
+    cancel_event: threading.Event | None = None,
 ) -> bool:
     """Upload and/or trigger a library scan on Audiobookshelf when configured.
 
@@ -533,7 +565,14 @@ def sync_book_to_audiobookshelf(
     if not (want_upload or auto_scan):
         return False
 
-    client = AudiobookshelfClient(url, token, session=session, proxy=proxy, timeout=timeout)
+    client = AudiobookshelfClient(
+        url,
+        token,
+        session=session,
+        proxy=proxy,
+        timeout=timeout,
+        cancel_event=cancel_event,
+    )
     try:
         if want_upload:
             logging.book_update("Uploading to Audiobookshelf")
@@ -547,6 +586,10 @@ def sync_book_to_audiobookshelf(
                         return
                     if task_id is None:
                         task_id = prog.add_task("Uploading to Audiobookshelf", total=float(total))
+                    if sent < reported:
+                        # Multipart retry restarted the byte stream: rewind the bar.
+                        prog.advance(task_id, -float(reported))
+                        reported = 0
                     delta = sent - reported
                     if delta > 0:
                         reported = sent
@@ -558,6 +601,7 @@ def sync_book_to_audiobookshelf(
                     metadata=metadata,
                     on_progress=_on_upload_progress,
                     skip_if_exists=skip_if_exists,
+                    cancel_event=cancel_event,
                 )
         if auto_scan:
             client.scan_library(library_id)

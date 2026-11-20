@@ -125,7 +125,7 @@ _BUILTIN_SOURCE_DESCRIPTORS: tuple[SourceDescriptor, ...] = (
         module="audiobookdl.sources.nextory",
         class_name="NextorySource",
         names=("Nextory",),
-        match=(r"https?://((www|catalog-\w\w)\.)?nextory.+",),
+        match=(r"https?://((www|catalog-\w\w)\.)?nextory\..+",),
         auth_methods=("login",),
         supports_search=True,
         supports_library=True,
@@ -166,9 +166,9 @@ _BUILTIN_SOURCE_DESCRIPTORS: tuple[SourceDescriptor, ...] = (
         class_name="PodimoSource",
         names=("Podimo",),
         match=(
-            r"https://open.podimo.com/audiobook/[^/]+",
-            r"https://open.podimo.com/podcast/[^/]+",
-            r"https://share.podimo.com/s/[^/]+",
+            r"https://open\.podimo\.com/audiobook/[^/]+",
+            r"https://open\.podimo\.com/podcast/[^/]+",
+            r"https://share\.podimo\.com/s/[^/]+",
         ),
         auth_methods=("login",),
         supports_search=True,
@@ -495,22 +495,36 @@ def find_compatible_source(url: str) -> type[Source]:
 PLUGIN_API_VERSION = 1
 
 
+@dataclass(frozen=True)
+class PluginSourceDiagnostic:
+    """Diagnostic record for a `audiobookdl.sources` entry-point plugin."""
+
+    name: str
+    ok: bool
+    detail: str = ""
+
+
+_PLUGIN_DIAGNOSTICS: list[PluginSourceDiagnostic] = []
+
+
 def reset_plugin_sources_cache() -> None:
     """Clear cached third-party entry-point source discovery results."""
+    global _PLUGIN_DIAGNOSTICS
+    _PLUGIN_DIAGNOSTICS = []
     _discover_plugin_sources.cache_clear()
 
 
-@functools.lru_cache(maxsize=1)
-def _discover_plugin_sources() -> list[type[Source]]:
-    """Discover third-party `Source` subclasses via the `audiobookdl.sources` entry point group."""
+def _plugin_entry_point_scan() -> tuple[list[type[Source]], list[PluginSourceDiagnostic]]:
+    """Discover third-party `Source` subclasses via entry points, retaining per-plugin diagnostics."""
     from audiobookdl import logging
 
     discovered: list[type[Source]] = []
+    diagnostics: list[PluginSourceDiagnostic] = []
     try:
         eps = importlib.metadata.entry_points(group="audiobookdl.sources")
     except Exception as exc:
         logging.debug(f"Failed querying source entry points: {exc}")
-        return discovered
+        return discovered, diagnostics
 
     known_names = {
         str(name).lower()
@@ -523,6 +537,9 @@ def _discover_plugin_sources() -> list[type[Source]]:
             cls = ep.load()
         except Exception as exc:
             logging.debug(f"Failed loading source plugin '{ep_name}': {exc}")
+            diagnostics.append(
+                PluginSourceDiagnostic(name=str(ep_name), ok=False, detail=f"load failed: {exc}")
+            )
             continue
         if not (
             isinstance(cls, type)
@@ -532,26 +549,60 @@ def _discover_plugin_sources() -> list[type[Source]]:
             and getattr(cls, "match", None)
         ):
             logging.debug(f"Ignoring invalid source plugin entry point '{ep_name}': {cls!r}")
+            diagnostics.append(
+                PluginSourceDiagnostic(name=str(ep_name), ok=False, detail=f"invalid plugin class: {cls!r}")
+            )
             continue
         api_version = getattr(cls, "plugin_api_version", PLUGIN_API_VERSION)
         if api_version != PLUGIN_API_VERSION:
             logging.debug(
                 f"Ignoring source plugin '{ep_name}' with incompatible plugin_api_version={api_version!r} (expected {PLUGIN_API_VERSION})"
             )
+            diagnostics.append(
+                PluginSourceDiagnostic(
+                    name=str(ep_name),
+                    ok=False,
+                    detail=f"incompatible plugin_api_version={api_version!r}",
+                )
+            )
             continue
         plugin_names = [str(name).strip().lower() for name in cls.names if str(name).strip()]
         if not plugin_names:
             logging.debug(f"Ignoring source plugin '{ep_name}' with empty service names")
+            diagnostics.append(
+                PluginSourceDiagnostic(name=str(ep_name), ok=False, detail="empty service names")
+            )
             continue
         collisions = [name for name in plugin_names if name in known_names]
         if collisions:
             logging.debug(
                 f"Ignoring source plugin '{ep_name}' due to service name collision: {collisions}"
             )
+            diagnostics.append(
+                PluginSourceDiagnostic(
+                    name=str(ep_name), ok=False, detail=f"service name collision: {collisions}"
+                )
+            )
             continue
         known_names.update(plugin_names)
         discovered.append(cls)
+        diagnostics.append(PluginSourceDiagnostic(name=str(ep_name), ok=True))
+    return discovered, diagnostics
+
+
+@functools.lru_cache(maxsize=1)
+def _discover_plugin_sources() -> list[type[Source]]:
+    """Discover third-party `Source` subclasses via the `audiobookdl.sources` entry point group."""
+    global _PLUGIN_DIAGNOSTICS
+    discovered, diagnostics = _plugin_entry_point_scan()
+    _PLUGIN_DIAGNOSTICS = diagnostics
     return discovered
+
+
+def list_plugin_diagnostics() -> list[PluginSourceDiagnostic]:
+    """Return load diagnostics for every discovered `audiobookdl.sources` entry-point plugin."""
+    _discover_plugin_sources()
+    return list(_PLUGIN_DIAGNOSTICS)
 
 
 def get_source_classes() -> list[type[Source]]:

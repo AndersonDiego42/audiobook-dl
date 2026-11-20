@@ -7,10 +7,10 @@ from typing import Any
 from collections.abc import Callable
 
 from audiobookdl.gui.formatting import MEDIA_TYPE_OPTIONS, OUTPUT_FORMATS, OVERWRITE_OPTIONS
-from audiobookdl.gui.pages.drm_inspect_dialog import DrmInspectDialog
-from audiobookdl.gui.theme import LIGHT_PALETTE, ThemePalette, scale_px
+from audiobookdl.gui.options_binding import GUI_INTRO_CHAPTER_MODES, GUI_OPTION_BINDINGS
+from audiobookdl.gui.theme import ThemePalette, scale_px
 from audiobookdl.gui.widgets import attach_tooltip, update_label_wraplength
-from audiobookdl.options_schema import GUI_INTRO_CHAPTER_MODES, OPTIONS_BY_NAME
+from audiobookdl.options_schema import OPTIONS_BY_NAME
 from audiobookdl.utils import (
     AUDIO_BITRATE_PRESETS,
     AUDIO_SAMPLE_RATE_PRESETS,
@@ -28,8 +28,9 @@ def _option_help(name: str) -> str:
     spec = OPTIONS_BY_NAME.get(name)
     if spec is None:
         return ""
-    if spec.gui is not None and spec.gui.tooltip:
-        return spec.gui.tooltip
+    binding = GUI_OPTION_BINDINGS.get(name)
+    if binding is not None and binding.tooltip:
+        return binding.tooltip
     return spec.get_help()
 
 
@@ -44,6 +45,7 @@ class OptionsPanel(ttk.LabelFrame):
         on_m4b_toggled: Callable[[], None],
         on_format_selected: Callable[[tk.Event | None], None],
         palette_provider: Callable[[], ThemePalette] | None = None,
+        on_open_drm_inspector: Callable[[tk.Misc], None] | None = None,
     ) -> None:
         super().__init__(
             master,
@@ -54,9 +56,9 @@ class OptionsPanel(ttk.LabelFrame):
         self._on_m4b_toggled = on_m4b_toggled
         self._on_format_selected = on_format_selected
         self._palette_provider = palette_provider
+        self._on_open_drm_inspector = on_open_drm_inspector
         self._widgets: list[OptionWidget] = []
         self._panel_enabled = True
-        self._dependency_traces_wired = False
         self._build_widgets()
         self._attach_tooltips()
         self._wire_dependencies()
@@ -617,9 +619,6 @@ class OptionsPanel(ttk.LabelFrame):
             attach_tooltip(widget, help_text, palette_provider=self._palette_provider)
 
     def _wire_dependencies(self) -> None:
-        if self._dependency_traces_wired:
-            return
-        self._dependency_traces_wired = True
         for var in (
             self._vars.enrich_metadata_var,
             self._vars.cover_only_var,
@@ -662,29 +661,8 @@ class OptionsPanel(ttk.LabelFrame):
         )
 
     def _open_drm_inspector(self) -> None:
-        palette = self._palette_provider() if self._palette_provider is not None else LIGHT_PALETTE
-        proxy_var = getattr(self._vars, "proxy_var", None)
-        proxy = proxy_var.get().strip() or None if proxy_var is not None else None
-        impersonate_var = getattr(self._vars, "impersonate_var", None)
-        impersonate = impersonate_var.get().strip() or None if impersonate_var is not None else None
-        timeout: float | None = None
-        timeout_var = getattr(self._vars, "timeout_var", None)
-        if timeout_var is not None:
-            raw_timeout = str(timeout_var.get()).strip()
-            if raw_timeout:
-                try:
-                    parsed = float(raw_timeout)
-                    if parsed > 0:
-                        timeout = parsed
-                except ValueError:
-                    timeout = None
-        DrmInspectDialog(
-            self,
-            palette=palette,
-            proxy=proxy,
-            timeout=timeout,
-            impersonate=impersonate,
-        )
+        if self._on_open_drm_inspector is not None:
+            self._on_open_drm_inspector(self)
 
     def _on_media_selected(self, _event: tk.Event | None = None) -> None:
         if self._vars.media_type_var.get().strip().lower() == "video":

@@ -38,7 +38,7 @@ _TLD_LOCALES: dict[str, str] = {
 
 class NextorySource(Source):
     match = [
-        r"https?://((www|catalog-\w\w)\.)?nextory.+",
+        r"https?://((www|catalog-\w\w)\.)?nextory\..+",
     ]
     names = ["Nextory"]
     _authentication_methods = ["login"]
@@ -139,9 +139,12 @@ class NextorySource(Source):
 
         login_token = session_response_json.get("login_token")
         if login_token is None:
-            error = session_response_json.get("error", {})
-            reason = error.get("key", {})
+            error = session_response_json.get("error")
+            error = error if isinstance(error, dict) else {}
+            reason = error.get("key")
+            reason = reason if isinstance(reason, str) and reason.strip() else "UnknownError"
             error_details = error.get("description", "Unknown Error")
+            error_details = error_details if isinstance(error_details, str) else str(error_details)
             if reason == "UserNotFound":
                 raise UserNotAuthorized()
             raise GenericAudiobookDLException(heading=reason, body=error_details)
@@ -310,6 +313,7 @@ class NextorySource(Source):
                 uri,
                 headers=session_headers,
                 expected_content_type=("audio/aac", "audio/x-aac", "video/MP2T"),
+                credentials=False,
             )
             if files:
                 return files
@@ -321,6 +325,7 @@ class NextorySource(Source):
                 uri.replace("master", "media"),
                 headers=session_headers,
                 expected_content_type=("audio/aac", "audio/x-aac", "video/MP2T"),
+                credentials=False,
             )
         return []
 
@@ -333,10 +338,13 @@ class NextorySource(Source):
                 files.extend(self._resolve_stream_uri(file["uri"], session_headers))
             return files
 
+        ctx = logging.get_job_context()
+        cancel_event = ctx.cancel_event if ctx is not None else None
         grouped = run_cancellable_pool(
             lambda entry: self._resolve_stream_uri(entry["uri"], session_headers),
             raw_files,
             max_workers=min(8, len(raw_files)),
+            cancel_event=cancel_event,
         )
         return [item for part_files in grouped for item in part_files]
 

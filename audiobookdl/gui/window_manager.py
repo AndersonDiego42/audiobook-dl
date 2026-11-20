@@ -476,7 +476,7 @@ class WindowManager:
                             )
                         self._icon_photo: Any = photo
                         self._root.iconphoto(True, photo)
-                    except Exception:
+                    except (OSError, ValueError, tk.TclError):
                         pass
         except Exception:
             pass

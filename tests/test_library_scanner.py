@@ -190,3 +190,35 @@ def test_split_folder_units_groups_m4a_parts_and_splits_distinct_m4b(tmp_path):
         distinct_m4b = _split_folder_units(str(m4b_dir), [str(m4b_1), str(m4b_2)])
     assert len(distinct_m4b) == 2
 
+
+
+def test_scan_local_library_reads_track_tags_once_per_file(tmp_path):
+    from unittest.mock import Mock
+
+    lib_root = tmp_path / "M4BBooks"
+    lib_root.mkdir()
+    book1 = lib_root / "book1.m4b"
+    book2 = lib_root / "book2.m4b"
+    book1.write_bytes(b"b1")
+    book2.write_bytes(b"b2")
+
+    tags = {
+        str(book1): TrackTagInfo(track_number=1, album="Same Album", metadata=AudiobookMetadata(title="Same Album")),
+        str(book2): TrackTagInfo(track_number=2, album="Same Album", metadata=AudiobookMetadata(title="Same Album")),
+    }
+    reader = Mock(side_effect=lambda p: tags[p])
+
+    archive = DownloadArchive(str(tmp_path / "downloads.db"))
+    with patch("audiobookdl.utils.library_scanner.read_track_tags", reader), patch(
+        "audiobookdl.pack.read_track_tags", reader
+    ):
+        res = scan_local_library([str(lib_root)], archive)
+
+    assert res.scanned_books == 1  # same album + track numbers -> single grouped book
+    # Each audio file's tags must be read exactly once across split + sort
+    calls_per_path = {}
+    for call in reader.call_args_list:
+        path = call.args[0] if call.args else call.kwargs.get("path")
+        calls_per_path[path] = calls_per_path.get(path, 0) + 1
+    assert calls_per_path.get(str(book1)) == 1
+    assert calls_per_path.get(str(book2)) == 1

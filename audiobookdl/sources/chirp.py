@@ -1,5 +1,5 @@
 from .source import CatalogBook, Source
-from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover
+from audiobookdl import Audiobook, AudiobookFile, AudiobookMetadata, Chapter, Cover, logging
 from audiobookdl.exceptions import BookNotFound, DataNotPresent, RequestError, UserNotAuthorized
 
 import base64
@@ -155,8 +155,8 @@ class ChirpSource(Source):
     def _create_key(self, url: str, user_id: int) -> tuple[bytes, bytes]:
         """Creates key and iv to decrypt audio url"""
         key = bytes(self.find_elem_in_page(url, "div.user-audiobook", "data-dk"), "UTF-8")
-        padding = "x" * (12 - len(str(user_id)))
-        padded_user_id = f"{padding}{user_id}"
+        user_id_str = str(user_id)
+        padded_user_id = user_id_str[-12:].rjust(12, "x")
         iv = base64.b64encode(bytes(padded_user_id, "UTF-8"))
         return key, iv
 
@@ -215,8 +215,8 @@ class ChirpSource(Source):
                 )
             if books:
                 return books
-        except Exception:
-            pass
+        except (RequestError, UserNotAuthorized, ValueError, KeyError, TypeError) as exc:
+            logging.debug(f"Chirp GraphQL library fetch failed, falling back to HTML: {exc}")
 
         html = self._get_page("https://www.chirpbooks.com/users/library", use_cache=False).decode(
             "utf-8", errors="replace"

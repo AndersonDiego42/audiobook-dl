@@ -349,7 +349,7 @@ class SyncCoordinator:
         was_appended, run_id, queued_jobs, new_total = self._controller.start_or_enqueue_jobs(
             download_specs=dl_specs,
             service_label_resolver=(
-                dl_page.queue_panel._service_label_for_url if dl_page is not None else None
+                dl_page.queue_panel.service_label_for_url if dl_page is not None else None
             ),
         )
         self._register_enqueued_batch(
